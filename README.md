@@ -6,7 +6,7 @@
   </picture>
 </p>
 
-# Maskura: pluggable processing gateway for object storage
+# Maskura
 
 <p align="center">
   <a href="https://github.com/231self/maskura/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/231self/maskura/ci.yml?branch=main&label=CI" /></a>
@@ -15,15 +15,17 @@
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" /></a>
 </p>
 
-Maskura is an S3-compatible gateway that runs your WebAssembly plugins over every object
-in transit. Point any S3 SDK, CLI, or tool at Maskura; each object passes through your
-plugin pipeline — filter, redact, encrypt, validate, route — and the result
-is forwarded to any S3-compatible storage backend.
+Maskura is a privacy boundary between agents and object data. It sits in front of your
+existing S3-compatible storage and redacts or encrypts sensitive data on the way through,
+so agents get the view you allow and the raw object never leaves your bucket.
 
-The name combines the English word "mask" with the Japanese "kura", meaning storage.
+**Read path** — agents see the view you allow; the raw object stays in storage.
 
-**Bring your own plugin.** The gateway is a router: plugins are Wasm components
-compiled once and uploaded at runtime. No gateway rebuild, no restart, no lock-in.
+![Read path](docs/assets/read-flow.gif)
+
+**Write path** — protection is applied before the object reaches storage.
+
+![Write path](docs/assets/write-flow.gif)
 
 - **Pluggable pipeline** — plugins run in order; each can emit, drop, or reject. A tiny
   WIT interface (`begin` / `transform` / `finish`), pure byte-in/byte-out.
@@ -279,14 +281,6 @@ Full details: [examples/README.md](examples/README.md) and
 
 The same PII file, three ways — raw, redacted, and deterministic-encrypted — pushed
 through `aws s3` pointed at Maskura. [Watch the interactive demo (pause, scrub, speed) →](https://231self.github.io/maskura/demo.html)
-
-**Read path** — agents see the view you allow; the raw object stays in storage.
-
-![Read path](docs/assets/read-flow.gif)
-
-**Write path** — protection is applied before the object reaches storage.
-
-![Write path](docs/assets/write-flow.gif)
 
 ## How it works
 
