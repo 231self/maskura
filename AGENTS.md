@@ -84,11 +84,11 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 ### Database
 
-- **Supabase Postgres** (local: supabase CLI Docker containers; cloud: Supabase Pro).
+- **Supabase Postgres** (local: supabase CLI Docker containers).
 - ORM: `sea-orm` (built on `sqlx`). Queries use entities (`crates/gateway/src/entity/`) and the SeaORM query builder — no raw SQL strings in code. `sqlx::migrate!` runs the `.sql` schema migrations.
 - Migration files in workspace-root `migrations/`, versioned sequentially (`YYYYMMDDHHMMSS_description.sql`). The gateway runs `sqlx::migrate!()` at startup.
 - `sqlx migrate run` applies; `sqlx migrate info` checks status. Never use `psql` or `docker exec` directly.
-- **API keys are persisted in Postgres** when `DATABASE_URL` is set (`PostgresKeyStore`); otherwise the in-memory `KeyStore` is used (local dev). Both implement the async `KeyRepository` trait. `PostgresKeyStore` survives restarts / scale-to-zero.
+- **API keys are persisted in Postgres** when `DATABASE_URL` is set (`PostgresKeyStore`); otherwise the in-memory `KeyStore` is used (local dev). Both implement the async `KeyRepository` trait. `PostgresKeyStore` survives restarts.
 
 ### Storage (Object Data)
 
@@ -162,15 +162,12 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 - Single internal Rust binary (`s4-gateway`). No separate frontend server in dev.
 - **Local**: `restart-dev.sh` builds filters + gateway, kills stale port, nohup-launches.
-- **Cloud candidates**: any container platform (fly.io, render, run.dev). Domain: `s4.the-no-corp.com`.
-- **Emails**: loops.so for transactional (welcome, key created). Supabase Auth handles magic-link emails.
-- **Control plane**: Cloudflare Workers + Pages (per plan Phase 3), deferred until alpha has paying users.
 
 ### Secrets & Config
 
 - All secrets via environment variables, never in source or committed config.
 - `LISTEN_ADDR`, `S3_ENDPOINT`, `DATABASE_URL`, `SUPABASE_JWT_SECRET`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and the explicit customer/operator settings documented in `docs/security.md`.
-- Local dev uses Supabase CLI default credentials; cloud uses Supabase dashboard values.
+- Local dev uses Supabase CLI default credentials.
 
 ### Key Formats
 

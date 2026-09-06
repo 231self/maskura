@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="420" viewBox="0 0 1024 420" role="img" aria-label="Maskura logo">
+  <title>Maskura logo</title>
+  <g transform="translate(38 18) scale(.72)">
+    <path d="M72 190 256 76l184 114" fill="none" stroke="#1b211d" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M104 174v258h304V174" fill="none" stroke="#1b211d" stroke-width="22" stroke-linejoin="round"/>
+    <path d="M256 188v220" fill="none" stroke="#626c66" stroke-width="12" stroke-linecap="round"/>
+    <path d="M138 226h82l36 34-36 34h-82z" fill="none" stroke="#2f6f55" stroke-width="22" stroke-linejoin="round"/>
+    <path d="M374 226h-82l-36 34 36 34h82z" fill="none" stroke="#326f82" stroke-width="22" stroke-linejoin="round"/>
+    <path d="M154 350h204" fill="none" stroke="#1b211d" stroke-width="20" stroke-linecap="round"/>
+  </g>
+  <text x="405" y="228" fill="#1b211d" font-family="ui-monospace, 'SF Mono', Menlo, 'Hiragino Kaku Gothic ProN', sans-serif" font-size="116" font-weight="800" letter-spacing="4">MASK蔵</text>
+  <path d="M413.5 278h183" stroke="#2f6f55" stroke-width="9" stroke-linecap="round"/>
+  <path d="M624.5 278h183" stroke="#326f82" stroke-width="9" stroke-linecap="round"/>
+  <text x="410" y="326" fill="#626c66" font-family="ui-monospace, 'SF Mono', Menlo, monospace" font-size="23" font-weight="600" letter-spacing="5">OBJECT DATA, MASKED.</text>
+</svg>
