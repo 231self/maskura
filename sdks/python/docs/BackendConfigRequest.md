@@ -9,6 +9,7 @@ Name | Type | Description | Notes
 **access_key** | **str** |  | [optional] 
 **backend_type** | [**BackendType**](BackendType.md) |  | 
 **endpoint** | **str** |  | [optional] 
+**external_id** | **str** |  | [optional] 
 **region** | **str** |  | [optional] 
 **role_arn** | **str** |  | [optional] 
 **secret_key** | **str** |  | [optional] 

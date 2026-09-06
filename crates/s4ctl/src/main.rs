@@ -202,6 +202,12 @@ enum BackendCmd {
         /// IAM Role ARN (from Step 1 of AWS setup)
         #[arg(long)]
         role_arn: String,
+        /// AWS region for the role's S3 access
+        #[arg(long, default_value = "us-east-1")]
+        region: String,
+        /// External ID to assert when assuming the role (confused-deputy protection)
+        #[arg(long)]
+        external_id: Option<String>,
     },
 
     /// Configure Cloudflare R2 backend
@@ -1272,11 +1278,19 @@ async fn main() -> anyhow::Result<()> {
                     let cfg: serde_json::Value = client.api_get("/dashboard/api/backend").await?;
                     println!("{}", serde_json::to_string_pretty(&cfg)?);
                 }
-                BackendCmd::SetAws { role_arn } => {
-                    let body = serde_json::json!({
+                BackendCmd::SetAws {
+                    role_arn,
+                    region,
+                    external_id,
+                } => {
+                    let mut body = serde_json::json!({
                         "backend_type": "aws_role",
                         "role_arn": role_arn,
+                        "region": region,
                     });
+                    if let Some(external_id) = external_id {
+                        body["external_id"] = serde_json::Value::String(external_id.to_string());
+                    }
                     client.api_put("/dashboard/api/backend", &body).await?;
                     println!("Backend set to AWS IAM Role: {}", role_arn);
                 }

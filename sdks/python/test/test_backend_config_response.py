@@ -39,6 +39,7 @@ class TestBackendConfigResponse(unittest.TestCase):
                 backend_type = 's3_compatible',
                 configured = True,
                 endpoint = '',
+                external_id = '',
                 region = '',
                 role_arn = '',
                 secret_key_configured = True

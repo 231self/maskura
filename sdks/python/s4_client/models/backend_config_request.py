@@ -30,10 +30,11 @@ class BackendConfigRequest(BaseModel):
     access_key: Optional[StrictStr] = None
     backend_type: BackendType
     endpoint: Optional[StrictStr] = None
+    external_id: Optional[StrictStr] = None
     region: Optional[StrictStr] = None
     role_arn: Optional[StrictStr] = None
     secret_key: Optional[StrictStr] = None
-    __properties: ClassVar[List[str]] = ["access_key", "backend_type", "endpoint", "region", "role_arn", "secret_key"]
+    __properties: ClassVar[List[str]] = ["access_key", "backend_type", "endpoint", "external_id", "region", "role_arn", "secret_key"]
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -74,6 +75,11 @@ class BackendConfigRequest(BaseModel):
             exclude=excluded_fields,
             exclude_none=True,
         )
+        # set to None if external_id (nullable) is None
+        # and model_fields_set contains the field
+        if self.external_id is None and "external_id" in self.model_fields_set:
+            _dict['external_id'] = None
+
         return _dict
 
     @classmethod
@@ -89,6 +95,7 @@ class BackendConfigRequest(BaseModel):
             "access_key": obj.get("access_key"),
             "backend_type": obj.get("backend_type"),
             "endpoint": obj.get("endpoint"),
+            "external_id": obj.get("external_id"),
             "region": obj.get("region"),
             "role_arn": obj.get("role_arn"),
             "secret_key": obj.get("secret_key")

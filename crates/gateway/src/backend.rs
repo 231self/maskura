@@ -345,6 +345,70 @@ impl BackendResolver {
                     workspace_routing,
                 });
             }
+            Some(RuntimeBackendConfig::AwsRole {
+                role_arn,
+                region,
+                external_id,
+            }) => {
+                // AWS-native role assumption. The destination is the canonical
+                // AWS S3 endpoint for the role's region, so the operator
+                // endpoint allowlist does not apply; the trust boundary is the
+                // role ARN plus the default credential chain identity allowed
+                // to assume it.
+                let endpoint = Url::parse(&format!("https://s3.{region}.amazonaws.com"))
+                    .map_err(|_| "workspace storage is unavailable".to_string())?;
+                let workspace_streaming = workspace_streaming_binding(
+                    &endpoint,
+                    resolution.streaming.as_ref(),
+                    resolution.routing,
+                );
+                let sts_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .region(Region::new(region.clone()))
+                    .retry_config(s3_retry_config())
+                    .timeout_config(s3_timeout_config())
+                    .http_client(workspace_s3_http_client())
+                    .load()
+                    .await;
+                let sts_client = aws_sdk_sts::Client::new(&sts_config);
+                let assumed = sts_client
+                    .assume_role()
+                    .role_arn(&role_arn)
+                    .role_session_name("maskura-gateway")
+                    .set_external_id(external_id.clone())
+                    .send()
+                    .await
+                    .map_err(|_| "workspace storage is unavailable".to_string())?;
+                let sts_credentials = assumed
+                    .credentials()
+                    .ok_or_else(|| "workspace storage is unavailable".to_string())?;
+                let expires_after = SystemTime::try_from(*sts_credentials.expiration()).ok();
+                let session_token = sts_credentials.session_token();
+                let credentials = Credentials::new(
+                    sts_credentials.access_key_id().to_string(),
+                    sts_credentials.secret_access_key().to_string(),
+                    (!session_token.is_empty()).then(|| session_token.to_string()),
+                    expires_after,
+                    "sts-assume-role",
+                );
+                let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .region(Region::new(region))
+                    .endpoint_url(endpoint.as_str())
+                    .credentials_provider(credentials)
+                    .retry_config(s3_retry_config())
+                    .timeout_config(s3_timeout_config())
+                    .http_client(workspace_s3_http_client())
+                    .load()
+                    .await;
+                let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config).build();
+                return Ok(ResolvedBackendSelection {
+                    backend: ResolvedBackend::S3 {
+                        kind: BackendKind::PerUserS3,
+                        client: Client::from_conf(s3_config),
+                        workspace_streaming,
+                    },
+                    workspace_routing,
+                });
+            }
             None => {}
         }
 
@@ -1410,6 +1474,7 @@ mod tests {
                     secret_key: "secret".to_string(),
                     region: "us-east-1".to_string(),
                     role_arn: String::new(),
+                    external_id: None,
                 },
             )
             .await
@@ -1491,6 +1556,7 @@ mod tests {
                     secret_key: String::new(),
                     region: String::new(),
                     role_arn: String::new(),
+                    external_id: None,
                 },
             )
             .await
@@ -1564,6 +1630,7 @@ mod tests {
                     secret_key: "secret".to_string(),
                     region: "us-east-1".to_string(),
                     role_arn: String::new(),
+                    external_id: None,
                 },
             )
             .await
@@ -2079,6 +2146,7 @@ mod tests {
                         secret_key: "secret".to_string(),
                         region: "us-east-1".to_string(),
                         role_arn: String::new(),
+                        external_id: None,
                     },
                 )
                 .await
@@ -2132,6 +2200,7 @@ mod tests {
                         secret_key: "secret".to_string(),
                         region: "us-east-1".to_string(),
                         role_arn: String::new(),
+                        external_id: None,
                     },
                 )
                 .await

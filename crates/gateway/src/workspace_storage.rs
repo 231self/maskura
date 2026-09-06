@@ -58,12 +58,17 @@ pub struct BackendConfigRequest {
     pub region: String,
     #[serde(default)]
     pub role_arn: String,
+    #[serde(default)]
+    pub external_id: Option<String>,
 }
 
 /// Redacted dashboard representation. Credential material is intentionally
 /// absent from this type, so a GET cannot serialize it by mistake. Its exact
 /// JSON keys are `configured`, `backend_type`, `endpoint`, `region`,
-/// `role_arn`, `access_key_configured`, and `secret_key_configured`.
+/// `role_arn`, `external_id`, `access_key_configured`, and
+/// `secret_key_configured`. `external_id` is not a secret: it is the
+/// confused-deputy-prevention correlation value an operator pastes into the
+/// role trust policy.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
 pub struct BackendConfigResponse {
     pub configured: bool,
@@ -71,6 +76,7 @@ pub struct BackendConfigResponse {
     pub endpoint: Option<String>,
     pub region: Option<String>,
     pub role_arn: Option<String>,
+    pub external_id: Option<String>,
     pub access_key_configured: bool,
     pub secret_key_configured: bool,
 }
@@ -83,6 +89,7 @@ impl BackendConfigResponse {
             endpoint: None,
             region: None,
             role_arn: None,
+            external_id: None,
             access_key_configured: false,
             secret_key_configured: false,
         }
@@ -98,6 +105,11 @@ pub enum RuntimeBackendConfig {
         access_key: String,
         secret_key: String,
         region: String,
+    },
+    AwsRole {
+        role_arn: String,
+        region: String,
+        external_id: Option<String>,
     },
     Managed,
 }
@@ -116,8 +128,23 @@ impl RuntimeBackendConfig {
                 endpoint: Some(endpoint.clone()),
                 region: Some(region.clone()),
                 role_arn: None,
+                external_id: None,
                 access_key_configured: !access_key.is_empty(),
                 secret_key_configured: !secret_key.is_empty(),
+            },
+            Self::AwsRole {
+                role_arn,
+                region,
+                external_id,
+            } => BackendConfigResponse {
+                configured: true,
+                backend_type: Some(BackendType::AwsRole),
+                endpoint: None,
+                region: Some(region.clone()),
+                role_arn: Some(role_arn.clone()),
+                external_id: external_id.clone(),
+                access_key_configured: false,
+                secret_key_configured: false,
             },
             Self::Managed => BackendConfigResponse {
                 configured: true,
@@ -125,6 +152,7 @@ impl RuntimeBackendConfig {
                 endpoint: None,
                 region: None,
                 role_arn: None,
+                external_id: None,
                 access_key_configured: false,
                 secret_key_configured: false,
             },
@@ -374,9 +402,33 @@ impl TryFrom<BackendConfigRequest> for RuntimeBackendConfig {
 
     fn try_from(request: BackendConfigRequest) -> Result<Self, Self::Error> {
         match request.backend_type {
-            BackendType::AwsRole => Err(WorkspaceStorageError::UnsupportedConfig(
-                "aws_role backend authentication is not implemented".to_string(),
-            )),
+            BackendType::AwsRole => {
+                if !request.role_arn.starts_with("arn:") || !request.role_arn.contains(":role/") {
+                    return Err(WorkspaceStorageError::InvalidConfig(
+                        "role_arn must be an IAM role ARN of the form arn:...:role/...".to_string(),
+                    ));
+                }
+                if request.region.trim().is_empty() {
+                    return Err(WorkspaceStorageError::InvalidConfig(
+                        "region is required for aws_role backends".to_string(),
+                    ));
+                }
+                if [&request.endpoint, &request.access_key, &request.secret_key]
+                    .iter()
+                    .any(|value| !value.trim().is_empty())
+                {
+                    return Err(WorkspaceStorageError::InvalidConfig(
+                        "aws_role backends must not include an endpoint or static credentials"
+                            .to_string(),
+                    ));
+                }
+                let external_id = request.external_id.filter(|value| !value.trim().is_empty());
+                Ok(Self::AwsRole {
+                    role_arn: request.role_arn,
+                    region: request.region,
+                    external_id,
+                })
+            }
             BackendType::Managed => {
                 if [
                     request.endpoint,
@@ -387,6 +439,10 @@ impl TryFrom<BackendConfigRequest> for RuntimeBackendConfig {
                 ]
                 .iter()
                 .any(|value| !value.trim().is_empty())
+                    || request
+                        .external_id
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty())
                 {
                     return Err(WorkspaceStorageError::InvalidConfig(
                         "managed backend configuration must not include endpoint, region, role, or credentials"
@@ -1335,6 +1391,7 @@ mod tests {
             secret_key: "secret".to_string(),
             region: "us-east-1".to_string(),
             role_arn: String::new(),
+            external_id: None,
         }
     }
 
@@ -1397,7 +1454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incomplete_and_unsupported_configs_are_rejected() {
+    async fn incomplete_and_invalid_aws_role_configs_are_rejected() {
         let repository = InMemoryWorkspaceStorageRepository::new();
         let workspace = repository.resolve_workspace("user-1").await.unwrap();
         let mut incomplete = valid_request();
@@ -1407,12 +1464,44 @@ mod tests {
             Err(WorkspaceStorageError::InvalidConfig(_))
         ));
 
-        let mut unsupported = valid_request();
-        unsupported.backend_type = BackendType::AwsRole;
-        unsupported.role_arn = "arn:aws:iam::123456789012:role/maskura".to_string();
+        let aws_role = |role_arn: &str, region: &str| BackendConfigRequest {
+            backend_type: BackendType::AwsRole,
+            endpoint: String::new(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            region: region.to_string(),
+            role_arn: role_arn.to_string(),
+            external_id: None,
+        };
+
+        let malformed_arn = aws_role("not-an-arn", "us-east-1");
         assert!(matches!(
-            repository.put_config(&workspace, unsupported).await,
-            Err(WorkspaceStorageError::UnsupportedConfig(_))
+            repository.put_config(&workspace, malformed_arn).await,
+            Err(WorkspaceStorageError::InvalidConfig(_))
+        ));
+
+        let missing_region = aws_role("arn:aws:iam::123456789012:role/maskura", "");
+        assert!(matches!(
+            repository.put_config(&workspace, missing_region).await,
+            Err(WorkspaceStorageError::InvalidConfig(_))
+        ));
+
+        let mut with_creds = aws_role("arn:aws:iam::123456789012:role/maskura", "us-east-1");
+        with_creds.access_key = "static".to_string();
+        assert!(matches!(
+            repository.put_config(&workspace, with_creds).await,
+            Err(WorkspaceStorageError::InvalidConfig(_))
+        ));
+
+        let valid = aws_role("arn:aws:iam::123456789012:role/maskura", "us-east-1");
+        let response = repository.put_config(&workspace, valid).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(response).unwrap()["backend_type"],
+            "aws_role"
+        );
+        assert!(matches!(
+            repository.get_runtime_config(&workspace).await.unwrap(),
+            Some(RuntimeBackendConfig::AwsRole { .. })
         ));
     }
 
@@ -1430,6 +1519,7 @@ mod tests {
                     secret_key: String::new(),
                     region: String::new(),
                     role_arn: String::new(),
+                    external_id: None,
                 },
             )
             .await
@@ -1442,6 +1532,7 @@ mod tests {
                 "endpoint": null,
                 "region": null,
                 "role_arn": null,
+                "external_id": null,
                 "access_key_configured": false,
                 "secret_key_configured": false,
             })
@@ -1462,6 +1553,7 @@ mod tests {
                         secret_key: String::new(),
                         region: String::new(),
                         role_arn: String::new(),
+                        external_id: None,
                     },
                 )
                 .await,

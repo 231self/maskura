@@ -20,6 +20,7 @@ export class BackendConfigRequest {
     'accessKey'?: string;
     'backendType': BackendType;
     'endpoint'?: string;
+    'externalId'?: string | null;
     'region'?: string;
     'roleArn'?: string;
     'secretKey'?: string;
@@ -44,6 +45,12 @@ export class BackendConfigRequest {
         {
             "name": "endpoint",
             "baseName": "endpoint",
+            "type": "string",
+            "format": ""
+        },
+        {
+            "name": "externalId",
+            "baseName": "external_id",
             "type": "string",
             "format": ""
         },
