@@ -74,7 +74,6 @@ docker run --rm --network "$NETWORK" -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-co
 docker run -d --name "$GATEWAY_NAME" --network "$NETWORK" \
   -p "127.0.0.1:${GATEWAY_PORT}:8080" \
   -e AUTH_DISABLED=true \
-  -e MASKURA_STREAMING_WRITE_MODE=all \
   -e MASKURA_STREAMING_S3_PROVIDER=minio \
   -e DATABASE_URL="postgres://postgres:postgres@${POSTGRES_NAME}:5432/maskura" \
   -e MASKURA_KEYS_FILE=/tmp/keys.json \

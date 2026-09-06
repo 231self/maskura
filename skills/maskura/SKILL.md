@@ -37,10 +37,11 @@ forwarded to any S3-compatible backend (MinIO, AWS, GCS, B2, R2, …).
 - **Storage** — resolution is explicit managed override, presigned URL, repository-
   backed per-workspace config, then configured service storage
   (`S4_SERVICE_BUCKETS`, consistent-hash ring + dual-write + read fail-over).
-  Workspace config supports `managed` and static-credential `s3_compatible`;
-  `aws_role` is unsupported. Global `S3_ENDPOINT` and `MemoryStore` fallback are
-  explicit-single-tenant only; multi-tenant mode requires managed storage and
-  fails closed.
+  Workspace config supports `managed`, static-credential `s3_compatible`, and
+  `aws_role` (STS assume-role via the default credential chain, per request).
+  Global `S3_ENDPOINT` (static keys, or the AWS default credential chain when
+  keys are absent) and `MemoryStore` fallback are explicit-single-tenant only;
+  multi-tenant mode requires managed storage and fails closed.
 - **Tenant endpoint safety** — canonical workspace IDs scope storage. Persisted
   endpoints require an operator-trusted provider allowlist because the proxy-free
   AWS SDK client resolves DNS after validation. Presigned clients also disable

@@ -71,7 +71,6 @@ No cloud account, no database, no repo clone — run the published image:
 ```bash
 docker run --rm -p 127.0.0.1:8791:8080 \
   -e AUTH_DISABLED=true \
-  -e MASKURA_STREAMING_WRITE_MODE=single \
   -e MASKURA_STREAMING_READ_MODE=passthrough \
   ghcr.io/231self/maskura/maskura:latest
 # open http://localhost:8791 → demo dashboard (no sign-up)

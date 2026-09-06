@@ -28,10 +28,9 @@ pipeline() {
 comment "pull the gateway image"
 cmd docker pull "$IMG"
 
-comment "run it — auth off, streaming read/write on, in-memory store"
+comment "run it — auth off, streaming read on, in-memory store"
 cmd docker run --rm -d --name "$NAME" -p 127.0.0.1:8791:8080 \
   -e AUTH_DISABLED=true \
-  -e MASKURA_STREAMING_WRITE_MODE=single \
   -e MASKURA_STREAMING_READ_MODE=passthrough "$IMG"
 
 for _ in $(seq 1 30); do curl -s -m 2 "$EP/health" >/dev/null 2>&1 && break; sleep 1; done
