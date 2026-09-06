@@ -80,6 +80,9 @@ pub mod aliases {
     pub const DEV_MEMORY_STREAMING: EnvAlias =
         EnvAlias::new("MASKURA_DEV_MEMORY_STREAMING", "S4_DEV_MEMORY_STREAMING");
     pub const KEYS_FILE: EnvAlias = EnvAlias::new("MASKURA_KEYS_FILE", "S4_KEYS_FILE");
+    pub const BOOTSTRAP_KEY: EnvAlias = EnvAlias::new("MASKURA_BOOTSTRAP_KEY", "S4_BOOTSTRAP_KEY");
+    pub const BOOTSTRAP_SECRET: EnvAlias =
+        EnvAlias::new("MASKURA_BOOTSTRAP_SECRET", "S4_BOOTSTRAP_SECRET");
 
     pub const GATEWAY_CUSTOMER_SETTINGS: &[EnvAlias] = &[
         FILTER_COMPONENT,
@@ -102,6 +105,8 @@ pub mod aliases {
         DEV_MEMORY_MAX_OBJECT_BYTES,
         DEV_MEMORY_STREAMING,
         KEYS_FILE,
+        BOOTSTRAP_KEY,
+        BOOTSTRAP_SECRET,
         PORT,
     ];
 

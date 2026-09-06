@@ -11289,6 +11289,27 @@ pub async fn build_state_with_pipeline_template(
         }
     }
 
+    // Operator bootstrap: seed a preconfigured key id/secret pair so headless
+    // automation has a stable credential without the interactive mint step.
+    // Idempotent: an existing key with the same id is left untouched.
+    let bootstrap_key = resolve_customer_env(customer_env::BOOTSTRAP_KEY)?;
+    let bootstrap_secret = resolve_customer_env(customer_env::BOOTSTRAP_SECRET)?;
+    match (bootstrap_key, bootstrap_secret) {
+        (Some(key_id), Some(secret)) => {
+            if keys.get_key(&key_id).await?.is_none() {
+                keys.bootstrap_key(&key_id, &secret, "demo-user", "bootstrapped")
+                    .await?;
+                info!("Bootstrapped API key {key_id}");
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!(
+                "MASKURA_BOOTSTRAP_KEY and MASKURA_BOOTSTRAP_SECRET must be set together"
+            );
+        }
+        (None, None) => {}
+    }
+
     let mut continuation_token_key = [0; 32];
     OsRng.fill_bytes(&mut continuation_token_key);
     let state = Arc::new(AppState {
