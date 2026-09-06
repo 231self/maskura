@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Maskura storehouse mask mark">
+  <title>Maskura storehouse mask mark</title>
+  <path d="M72 190 256 76l184 114" fill="none" stroke="#edf2ed" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M104 174v258h304V174" fill="none" stroke="#edf2ed" stroke-width="22" stroke-linejoin="round"/>
+  <path d="M256 188v220" fill="none" stroke="#a3aea7" stroke-width="12" stroke-linecap="round"/>
+  <path d="M138 226h82l36 34-36 34h-82z" fill="none" stroke="#78a58c" stroke-width="22" stroke-linejoin="round"/>
+  <path d="M374 226h-82l-36 34 36 34h82z" fill="none" stroke="#78a9ba" stroke-width="22" stroke-linejoin="round"/>
+  <path d="M154 350h204" fill="none" stroke="#edf2ed" stroke-width="20" stroke-linecap="round"/>
+  <circle cx="210" cy="260" r="10" fill="#78a58c"/>
+  <circle cx="302" cy="260" r="10" fill="#78a9ba"/>
+</svg>
