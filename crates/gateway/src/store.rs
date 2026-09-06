@@ -208,6 +208,16 @@ pub trait KeyRepository: Send + Sync {
         public_key_pem: Option<String>,
     ) -> anyhow::Result<(String, ApiKey)>;
 
+    /// Seed a preconfigured key id/secret pair (operator bootstrap). Rejects a
+    /// malformed pair or a key id that already exists.
+    async fn bootstrap_key(
+        &self,
+        key_id: &str,
+        secret: &str,
+        user_id: &str,
+        label: &str,
+    ) -> anyhow::Result<ApiKey>;
+
     async fn set_public_key(
         &self,
         key_id: &str,
@@ -382,6 +392,63 @@ fn generate_api_key(
         public_key_pem,
     );
     Ok((api_key, secret))
+}
+
+fn validate_bootstrap_key_id(key_id: &str) -> anyhow::Result<()> {
+    let valid = key_id
+        .strip_prefix("s4_")
+        .is_some_and(|rest| rest.len() == 32 && rest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if !valid {
+        anyhow::bail!("bootstrap key id must match `s4_<32-hex>`");
+    }
+    Ok(())
+}
+
+fn validate_bootstrap_secret(secret: &str) -> anyhow::Result<()> {
+    let valid = secret
+        .strip_prefix("s4s_")
+        .is_some_and(|rest| rest.len() == 32 && rest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if !valid {
+        anyhow::bail!("bootstrap secret must match `s4s_<32-hex>`");
+    }
+    Ok(())
+}
+
+fn bootstrap_api_key(
+    key_id: &str,
+    secret: &str,
+    user_id: &str,
+    label: &str,
+    cipher: Option<&SecretCipher>,
+) -> anyhow::Result<(ApiKey, String)> {
+    validate_bootstrap_key_id(key_id)?;
+    validate_bootstrap_secret(secret)?;
+    let label = canonicalize_credential_label(label)?;
+    let secret_hash = sha256_hash(secret);
+    let secret_encrypted = match cipher {
+        Some(cipher) => Some(
+            cipher
+                .encrypt(key_id, secret)
+                .context("API key secret encryption failed")?,
+        ),
+        None => {
+            tracing::warn!(
+                "secret encryption is not configured; key {key_id} supports header authentication only"
+            );
+            None
+        }
+    };
+    let api_key = build_api_key(
+        key_id,
+        user_id,
+        &label,
+        secret_hash,
+        secret_encrypted,
+        chrono_now(),
+        None,
+        None,
+    );
+    Ok((api_key, secret.to_string()))
 }
 
 fn generate_mcp_token(
@@ -624,6 +691,27 @@ impl KeyRepository for KeyStore {
             .map_err(|_| anyhow::anyhow!("KeyStore API key lock poisoned"))?
             .insert(key_id.clone(), api_key);
         Ok((secret, committed))
+    }
+
+    async fn bootstrap_key(
+        &self,
+        key_id: &str,
+        secret: &str,
+        user_id: &str,
+        label: &str,
+    ) -> anyhow::Result<ApiKey> {
+        let (api_key, _) =
+            bootstrap_api_key(key_id, secret, user_id, label, self.cipher.as_deref())?;
+        let committed = api_key.clone();
+        let mut keys = self
+            .keys
+            .write()
+            .map_err(|_| anyhow::anyhow!("KeyStore API key lock poisoned"))?;
+        if keys.contains_key(key_id) {
+            anyhow::bail!("bootstrap key id already exists");
+        }
+        keys.insert(key_id.to_string(), api_key);
+        Ok(committed)
     }
 
     async fn set_public_key(
@@ -945,6 +1033,40 @@ impl KeyRepository for FileKeyStore {
         Ok((secret, inserted))
     }
 
+    async fn bootstrap_key(
+        &self,
+        key_id: &str,
+        secret: &str,
+        user_id: &str,
+        label: &str,
+    ) -> anyhow::Result<ApiKey> {
+        let (api_key, _) =
+            bootstrap_api_key(key_id, secret, user_id, label, self.cipher.as_deref())?;
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FileKeyStore mutation lock poisoned"))?;
+        let inserted = api_key.clone();
+        let mut keys = self
+            .keys
+            .write()
+            .map_err(|_| anyhow::anyhow!("FileKeyStore API key lock poisoned"))?;
+        if keys.contains_key(key_id) {
+            anyhow::bail!("bootstrap key id already exists");
+        }
+        let mcp_tokens = self
+            .mcp_tokens
+            .read()
+            .map_err(|_| anyhow::anyhow!("FileKeyStore MCP token lock poisoned"))?
+            .clone();
+        keys.insert(key_id.to_string(), api_key);
+        if let Err(error) = self.persist_snapshot(&keys, &mcp_tokens) {
+            keys.remove(key_id);
+            return Err(error.context("FileKeyStore persist failed"));
+        }
+        Ok(inserted)
+    }
+
     async fn set_public_key(
         &self,
         key_id: &str,
@@ -1250,6 +1372,41 @@ impl KeyRepository for PostgresKeyStore {
             .await
             .context("Postgres API key insert failed")?;
         Ok((secret, inserted.into()))
+    }
+
+    async fn bootstrap_key(
+        &self,
+        key_id: &str,
+        secret: &str,
+        user_id: &str,
+        label: &str,
+    ) -> anyhow::Result<ApiKey> {
+        let (api_key, _) =
+            bootstrap_api_key(key_id, secret, user_id, label, self.cipher.as_deref())?;
+        if fetch_key(&self.db, key_id).await?.is_some() {
+            anyhow::bail!("bootstrap key id already exists");
+        }
+        let expires_at = api_key
+            .expires_at
+            .as_deref()
+            .map(str::parse::<i64>)
+            .transpose()
+            .context("API key expiry is outside the Postgres timestamp range")?;
+        let model = api_key::ActiveModel {
+            user_id: Set(api_key.user_id.clone()),
+            key_id: Set(api_key.key_id.clone()),
+            secret_hash: Set(api_key.secret_hash.clone()),
+            secret_encrypted: Set(api_key.secret_encrypted.clone()),
+            label: Set(api_key.label.clone()),
+            expires_at: Set(expires_at),
+            public_key_pem: Set(api_key.public_key_pem.clone()),
+            ..Default::default()
+        };
+        let inserted = model
+            .insert(&self.db)
+            .await
+            .context("Postgres API key insert failed")?;
+        Ok(inserted.into())
     }
 
     async fn set_public_key(
@@ -1733,6 +1890,54 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("secret encryption failed"));
+        assert!(store.keys.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_key_seeds_a_resolvable_stable_credential() {
+        let store = KeyStore::with_cipher(test_cipher());
+        let key_id = format!("s4_{}", "a".repeat(32));
+        let secret = format!("s4s_{}", "b".repeat(32));
+
+        let created = store
+            .bootstrap_key(&key_id, &secret, "demo-user", "bootstrapped")
+            .await
+            .unwrap();
+        assert_eq!(created.key_id, key_id);
+        assert_eq!(created.label, "bootstrapped");
+
+        let resolved = store.resolve_credentials(&key_id, &secret).await.unwrap();
+        assert_eq!(resolved, Some(("demo-user".to_string(), None)));
+
+        let decrypted = store.decrypt_secret(&key_id).await.unwrap();
+        assert_eq!(decrypted.as_deref(), Some(secret.as_str()));
+
+        assert!(
+            store
+                .bootstrap_key(&key_id, &secret, "demo-user", "bootstrapped")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_key_rejects_malformed_id_and_secret() {
+        let store = KeyStore::with_cipher(test_cipher());
+        let secret = format!("s4s_{}", "b".repeat(32));
+        assert!(
+            store
+                .bootstrap_key("not-a-key", &secret, "demo-user", "bootstrapped")
+                .await
+                .is_err()
+        );
+
+        let key_id = format!("s4_{}", "a".repeat(32));
+        assert!(
+            store
+                .bootstrap_key(&key_id, "not-a-secret", "demo-user", "bootstrapped")
+                .await
+                .is_err()
+        );
         assert!(store.keys.read().unwrap().is_empty());
     }
 
