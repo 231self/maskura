@@ -7678,6 +7678,7 @@ mod tests {
                 secret_key: "secret".to_string(),
                 region: "us-east-1".to_string(),
                 role_arn: String::new(),
+                external_id: None,
             },
         )
         .await;
@@ -10969,10 +10970,24 @@ pub async fn build_state_with_pipeline_template(
                     Some(Client::from_conf(s3_config))
                 }
                 _ => {
-                    warn!(
-                        "S3_ENDPOINT is set but S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY are missing; falling back to in-memory storage"
+                    // No static key pair: defer to the AWS default credential
+                    // provider chain (EC2 instance profile, ECS task role, EKS
+                    // IRSA, SSO, OIDC web identity). This is the keyless path
+                    // for AWS-hosted deployments; credentials resolve lazily.
+                    info!(
+                        "S3_ENDPOINT set without static keys; using the default AWS credential provider chain"
                     );
-                    None
+                    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                        .region(Region::new(region))
+                        .endpoint_url(endpoint)
+                        .retry_config(s3_retry_config())
+                        .timeout_config(s3_timeout_config())
+                        .load()
+                        .await;
+                    let s3_config = aws_sdk_s3::config::Builder::from(&config)
+                        .force_path_style(true)
+                        .build();
+                    Some(Client::from_conf(s3_config))
                 }
             }
         }

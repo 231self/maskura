@@ -74,6 +74,7 @@ const request: BackendApiPutBackendRequest = {
     accessKey: "accessKey_example",
     backendType: "s3_compatible",
     endpoint: "endpoint_example",
+    externalId: "externalId_example",
     region: "region_example",
     roleArn: "roleArn_example",
     secretKey: "secretKey_example",

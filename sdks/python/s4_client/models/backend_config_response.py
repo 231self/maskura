@@ -25,16 +25,17 @@ from typing_extensions import Self
 
 class BackendConfigResponse(BaseModel):
     """
-    Redacted dashboard representation. Credential material is intentionally absent from this type, so a GET cannot serialize it by mistake. Its exact JSON keys are `configured`, `backend_type`, `endpoint`, `region`, `role_arn`, `access_key_configured`, and `secret_key_configured`.
+    Redacted dashboard representation. Credential material is intentionally absent from this type, so a GET cannot serialize it by mistake. Its exact JSON keys are `configured`, `backend_type`, `endpoint`, `region`, `role_arn`, `external_id`, `access_key_configured`, and `secret_key_configured`. `external_id` is not a secret: it is the confused-deputy-prevention correlation value an operator pastes into the role trust policy.
     """ # noqa: E501
     access_key_configured: StrictBool
     backend_type: Optional[BackendType] = None
     configured: StrictBool
     endpoint: Optional[StrictStr] = None
+    external_id: Optional[StrictStr] = None
     region: Optional[StrictStr] = None
     role_arn: Optional[StrictStr] = None
     secret_key_configured: StrictBool
-    __properties: ClassVar[List[str]] = ["access_key_configured", "backend_type", "configured", "endpoint", "region", "role_arn", "secret_key_configured"]
+    __properties: ClassVar[List[str]] = ["access_key_configured", "backend_type", "configured", "endpoint", "external_id", "region", "role_arn", "secret_key_configured"]
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -85,6 +86,11 @@ class BackendConfigResponse(BaseModel):
         if self.endpoint is None and "endpoint" in self.model_fields_set:
             _dict['endpoint'] = None
 
+        # set to None if external_id (nullable) is None
+        # and model_fields_set contains the field
+        if self.external_id is None and "external_id" in self.model_fields_set:
+            _dict['external_id'] = None
+
         # set to None if region (nullable) is None
         # and model_fields_set contains the field
         if self.region is None and "region" in self.model_fields_set:
@@ -111,6 +117,7 @@ class BackendConfigResponse(BaseModel):
             "backend_type": obj.get("backend_type"),
             "configured": obj.get("configured"),
             "endpoint": obj.get("endpoint"),
+            "external_id": obj.get("external_id"),
             "region": obj.get("region"),
             "role_arn": obj.get("role_arn"),
             "secret_key_configured": obj.get("secret_key_configured")

@@ -1,6 +1,6 @@
 # BackendConfigResponse
 
-Redacted dashboard representation. Credential material is intentionally absent from this type, so a GET cannot serialize it by mistake. Its exact JSON keys are `configured`, `backend_type`, `endpoint`, `region`, `role_arn`, `access_key_configured`, and `secret_key_configured`.
+Redacted dashboard representation. Credential material is intentionally absent from this type, so a GET cannot serialize it by mistake. Its exact JSON keys are `configured`, `backend_type`, `endpoint`, `region`, `role_arn`, `external_id`, `access_key_configured`, and `secret_key_configured`. `external_id` is not a secret: it is the confused-deputy-prevention correlation value an operator pastes into the role trust policy.
 
 ## Properties
 
@@ -10,6 +10,7 @@ Name | Type | Description | Notes
 **backend_type** | [**BackendType**](BackendType.md) |  | [optional] 
 **configured** | **bool** |  | 
 **endpoint** | **str** |  | [optional] 
+**external_id** | **str** |  | [optional] 
 **region** | **str** |  | [optional] 
 **role_arn** | **str** |  | [optional] 
 **secret_key_configured** | **bool** |  | 

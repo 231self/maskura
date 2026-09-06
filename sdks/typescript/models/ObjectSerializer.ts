@@ -8,8 +8,8 @@ export * from '../models/ListKeyResponse';
 export * from '../models/ObjectResponse';
 
 import { ApiKeyResponse } from '../models/ApiKeyResponse';
-import { BackendConfigRequest       } from '../models/BackendConfigRequest';
-import { BackendConfigResponse        } from '../models/BackendConfigResponse';
+import { BackendConfigRequest        } from '../models/BackendConfigRequest';
+import { BackendConfigResponse         } from '../models/BackendConfigResponse';
 import { BackendType } from '../models/BackendType';
 import { CreateKeyRequest } from '../models/CreateKeyRequest';
 import { DeleteKeyRequest } from '../models/DeleteKeyRequest';

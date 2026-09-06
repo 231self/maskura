@@ -614,7 +614,7 @@ async fn backend_api_requires_real_auth_rejects_unsupported_config_and_never_ret
         StatusCode::UNAUTHORIZED
     );
 
-    let unsupported = Request::builder()
+    let incomplete_aws_role = Request::builder()
         .method("PUT")
         .uri("/dashboard/api/backend")
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -624,7 +624,11 @@ async fn backend_api_requires_real_auth_rejects_unsupported_config_and_never_ret
         ))
         .unwrap();
     assert_eq!(
-        app.clone().oneshot(unsupported).await.unwrap().status(),
+        app.clone()
+            .oneshot(incomplete_aws_role)
+            .await
+            .unwrap()
+            .status(),
         StatusCode::BAD_REQUEST
     );
 
@@ -689,6 +693,7 @@ async fn backend_api_requires_real_auth_rejects_unsupported_config_and_never_ret
             "endpoint": null,
             "region": null,
             "role_arn": null,
+            "external_id": null,
             "access_key_configured": false,
             "secret_key_configured": false,
         })

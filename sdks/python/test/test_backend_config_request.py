@@ -38,6 +38,7 @@ class TestBackendConfigRequest(unittest.TestCase):
                 access_key = '',
                 backend_type = 's3_compatible',
                 endpoint = '',
+                external_id = '',
                 region = '',
                 role_arn = '',
                 secret_key = ''

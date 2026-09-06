@@ -392,17 +392,20 @@ echo "Role ARN: $(aws iam get-role --role-name maskura-pii-filter --query 'Role.
       </div>
 
       <div class="card-title" style="margin-top:16px">Step 2: Paste your Role ARN</div>
-      <div class="card-subtitle">Copy the Role ARN from the output above and paste it below. Your External ID is auto-generated.</div>
+      <div class="card-subtitle">Copy the Role ARN from the output above and paste it below, together with the region and an external ID for confused-deputy protection.</div>
       <div class="form-row" style="margin-top:10px">
         <div style="flex:2">
           <div class="form-label">Role ARN</div>
           <input class="form-input" id="backend-role-arn" placeholder="arn:aws:iam::123456789012:role/maskura-pii-filter" />
         </div>
         <div style="flex:1">
-          <div class="form-label">External ID (copy this)</div>
+          <div class="form-label">Region</div>
+          <input class="form-input" id="backend-role-region" placeholder="us-east-1" />
+        </div>
+        <div style="flex:1">
+          <div class="form-label">External ID (optional)</div>
           <div style="display:flex;gap:6px">
-            <input class="form-input" id="backend-external-id" readonly style="font-family:monospace;font-size:12px;background:var(--code-bg)" />
-            <button class="btn btn-ghost" onclick="copyField('backend-external-id')" style="flex-shrink:0;padding:6px 10px;font-size:11px">Copy</button>
+            <input class="form-input" id="backend-external-id" placeholder="shared-external-id" />
           </div>
         </div>
       </div>
@@ -740,6 +743,7 @@ window.loadBackend = function() {
   api('GET', '/dashboard/api/backend').then(function(cfg) {
     document.getElementById('backend-external-id').value = cfg.external_id || '';
     document.getElementById('backend-role-arn').value = cfg.role_arn || '';
+    document.getElementById('backend-role-region').value = cfg.backend_type === 'aws_role' ? (cfg.region || '') : '';
     document.getElementById('backend-r2-endpoint').value = cfg.backend_type === 'aws_role' ? '' : cfg.endpoint || '';
     document.getElementById('backend-r2-token').value = cfg.backend_type === 'aws_role' ? '' : cfg.secret_key || '';
     document.getElementById('backend-b2-endpoint').value = cfg.endpoint || '';
@@ -763,7 +767,8 @@ window.saveBackend = function() {
     config = {
       backend_type: 'aws_role',
       role_arn: document.getElementById('backend-role-arn').value,
-      external_id: document.getElementById('backend-external-id').value
+      region: document.getElementById('backend-role-region').value,
+      external_id: document.getElementById('backend-external-id').value || null
     };
   } else if (type === 'Cloudflare R2') {
     config = {
