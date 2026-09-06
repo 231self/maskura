@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/maskura-mark-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/maskura-mark-light.svg" />
+    <img alt="Maskura" src="docs/assets/maskura-mark-light.svg" width="128" />
+  </picture>
+</p>
+
 # Maskura: pluggable processing gateway for object storage
 
 Maskura is an S3-compatible gateway that runs your WebAssembly plugins over every object
@@ -10,6 +18,21 @@ The name combines the English word "mask" with the Japanese "kura", meaning stor
 **Bring your own plugin.** The gateway is a router: plugins are Wasm components
 compiled once and uploaded at runtime. No gateway rebuild, no restart, no lock-in.
 
+## Watch it in 90 seconds
+
+[![asciicast](https://asciinema.org/a/AIIlm0JjYVFP2Ta8.svg)](https://asciinema.org/a/AIIlm0JjYVFP2Ta8)
+
+The same PII file, three ways — raw, redacted, and deterministic-encrypted — pushed
+through `aws s3` pointed at Maskura.
+
+**Read path** — agents see the view you allow; the raw object stays in storage.
+
+![Read path](docs/assets/read-flow.gif)
+
+**Write path** — protection is applied before the object reaches storage.
+
+![Write path](docs/assets/write-flow.gif)
+
 - **Pluggable pipeline** — plugins run in order; each can emit, drop, or reject. A tiny
   WIT interface (`begin` / `transform` / `finish`), pure byte-in/byte-out.
 - **Sandboxed** — wasmtime, 64 MiB memory, fuel-limited, no host imports.
@@ -18,8 +41,8 @@ compiled once and uploaded at runtime. No gateway rebuild, no restart, no lock-i
 - **Any S3-compatible storage** — MinIO, AWS S3, Google Cloud Storage, Backblaze B2,
   Cloudflare R2, Vultr Object Storage — single or multi-cloud (consistent-hash ring,
   dual-write, read fail-over). MinIO is covered by the CI end-to-end suite;
-  Backblaze B2 is validated by the credentialed provider harness against a real
-  bucket (redaction and envelope-encryption round-trips).
+  Backblaze B2 is tested against a real bucket (redaction and
+  envelope-encryption round-trips).
 - **Agent-safe reads** — read data through Maskura with `x-maskura-process: read`: the pipeline
   runs on the way *out*, so AI agents get redacted/encrypted output while the object
   at rest stays raw. No second cleaned copy to keep in sync.
@@ -34,6 +57,7 @@ emails / SSNs / credit cards), `email-detect`, `ssn-detect`, `card-detect`,
 
 ## Contents
 
+- [Watch it in 90 seconds](#watch-it-in-90-seconds)
 - [Try it in 60 seconds](#try-it-in-60-seconds)
 - [Install the CLI (optional)](#install-the-cli-optional)
 - [Compatibility](#compatibility)
@@ -48,30 +72,45 @@ emails / SSNs / credit cards), `email-detect`, `ssn-detect`, `card-detect`,
 
 ## Try it in 60 seconds
 
-No cloud account, no database, no repo clone — run the published image and open
-the demo dashboard:
+No cloud account, no database, no repo clone — run the published image:
 
 ```bash
-docker run --rm -p 127.0.0.1:8791:8080 -e AUTH_DISABLED=true \
+docker run --rm -p 127.0.0.1:8791:8080 \
+  -e AUTH_DISABLED=true \
+  -e MASKURA_STREAMING_WRITE_MODE=single \
+  -e MASKURA_STREAMING_READ_MODE=passthrough \
   ghcr.io/231self/maskura/maskura:latest
 # open http://localhost:8791 → demo dashboard (no sign-up)
-
-# Grab an API key from the dashboard's "API Keys" tab, then either follow its
-# "Quick Start" (the snippets auto-fill your port) or run:
-echo "jane.doe@example.com 4111111111111111" > data.jsonl
-curl -X PUT http://localhost:8791/ingest/data.jsonl \
-  -H "x-maskura-access-key: YOUR_KEY_ID" \
-  -H "x-maskura-secret-key: YOUR_SECRET" \
-  --data-binary @data.jsonl
-curl http://localhost:8791/ingest/data.jsonl \
-  -H "x-maskura-access-key: YOUR_KEY_ID" \
-  -H "x-maskura-secret-key: YOUR_SECRET"
 ```
 
-The container listens on `8080`; `8791` is just the uncommon host port this
-example maps it to, so nothing already on `8080` collides. Dashboard snippets
-rewrite themselves to whatever `host:port` you open, so copy-paste works for any
-mapping.
+The gateway speaks SigV4, so your existing `aws s3` CLI works as-is:
+
+```bash
+export AWS_ACCESS_KEY_ID=demo AWS_SECRET_ACCESS_KEY=demo
+printf '{"email":"jane@example.com","card":"4111111111111111"}\n' > data.jsonl
+
+# Write through the pipeline; pii-default redacts on the way in:
+aws s3 --endpoint-url http://localhost:8791 \
+  cp data.jsonl s3://s4-local/ingest/data.jsonl --content-type application/x-ndjson
+
+# Read it back:
+aws s3 --endpoint-url http://localhost:8791 cp s3://s4-local/ingest/data.jsonl -
+# → {"email":"[REDACTED_EMAIL]","card":"[REDACTED_CARD]"}
+```
+
+`curl` works too — `x-maskura-*` headers are the non-SigV4 alternative:
+
+```bash
+echo "jane.doe@example.com 4111111111111111" > data.txt
+curl -X PUT http://localhost:8791/s4-local/ingest/data.txt \
+  -H "Content-Type: text/plain" --data-binary @data.txt
+curl http://localhost:8791/s4-local/ingest/data.txt
+# → [REDACTED_EMAIL] [REDACTED_CARD]
+```
+
+We map the container's `8080` to `8791` on your host so it doesn't collide with
+anything you already run. The dashboard's copy-paste snippets use whatever
+`host:port` you opened, so they just work.
 
 ## Install the CLI (optional)
 
@@ -97,8 +136,8 @@ maskura get ingest/data.csv --bucket s4-local
 `maskura local init` pulls the gateway image tagged with the CLI version
 (`ghcr.io/231self/maskura/maskura:v0.3.3` for `maskura` 0.3.3; CLI and gateway always
 match, never `:latest`) and runs it in local mode (`AUTH_DISABLED=true`, keys
-persisted on a volume, in-memory storage); it picks a free port (8080+) and binds
-the loopback interface only. `maskura local down` stops it. For durable local
+persisted on a volume, in-memory storage); it picks a free port (8080+) and only
+listens on localhost. `maskura local down` stops it. For durable local
 storage (MinIO), clone the repo and use `just dev-up`.
 
 ## Compatibility
@@ -279,9 +318,9 @@ See `CONTRIBUTING.md`.
 ## Security
 
 Maskura transforms sensitive data before it reaches storage and applies strict,
-fail-closed guarantees on the streaming data plane (see
-[docs/security.md](docs/security.md) for the full model, including deployment
-responsibilities and non-guarantees).
+fail-closed guarantees on the streaming data plane. See
+[docs/security.md](docs/security.md) for the full model — what's guaranteed and
+what's on you.
 
 Found a vulnerability? Report it **privately** — via
 [Maskura private vulnerability reporting](https://github.com/231self/maskura/security/advisories/new)
@@ -305,7 +344,7 @@ response timeline, and what to include in a report.
 ## LLM agents
 
 Coding agents (Claude Code, Kilo, Cursor, …) read `AGENTS.md` from the repo root
-automatically. For reusable, domain-specific Maskura context, install the bundled skill:
+automatically. For project-specific Maskura context, install the bundled skill:
 
 ```bash
 # Claude Code (user-global):

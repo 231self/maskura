@@ -12,6 +12,23 @@ const DEFAULT_GATEWAY: &str = "http://localhost:9000";
 const HOSTED_WORKSPACE_ID_ENV: EnvAlias = EnvAlias::new("MASKURA_WORKSPACE_ID", "S4_WORKSPACE_ID");
 const HOSTED_ACCESS_TOKEN_ENV: EnvAlias = EnvAlias::new("MASKURA_ACCESS_TOKEN", "S4_ACCESS_TOKEN");
 
+/// Map a destination key's file extension to the streaming Content-Type the
+/// gateway needs to select a format. Falls back to `text/plain` (raw text),
+/// which the pipeline treats as an opaque passthrough.
+fn content_type_for_key(key: &str) -> &'static str {
+    let ext = std::path::Path::new(key)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("jsonl") | Some("ndjson") | Some("jsonlines") => "application/x-ndjson",
+        Some("json") => "application/json",
+        Some("csv") => "text/csv",
+        Some("tsv") => "text/tab-separated-values",
+        _ => "text/plain",
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "maskura",
@@ -661,10 +678,15 @@ impl Client {
     }
 
     async fn s3_put(&self, bucket: &str, key: &str, data: Vec<u8>) -> anyhow::Result<()> {
+        let mut headers = self.auth_headers()?;
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static(content_type_for_key(key)),
+        );
         let resp = self
             .http
             .put(format!("{}/{}/{}", self.gateway, bucket, key))
-            .headers(self.auth_headers()?)
+            .headers(headers)
             .body(data)
             .send()
             .await?;
@@ -1892,6 +1914,10 @@ async fn main() -> anyhow::Result<()> {
                             "AUTH_DISABLED=true",
                             "-e",
                             "MASKURA_KEYS_FILE=/app/data/keys.json",
+                            "-e",
+                            "MASKURA_STREAMING_WRITE_MODE=single",
+                            "-e",
+                            "MASKURA_STREAMING_READ_MODE=passthrough",
                             &local_gateway_image,
                         ])
                         .status()?;
