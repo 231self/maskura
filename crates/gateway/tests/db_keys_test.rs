@@ -2864,7 +2864,6 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
             std::env::remove_var("S4_FILTER_COMPONENT");
             std::env::remove_var("S4_MANAGED_STREAMING_MODE");
             std::env::remove_var("S4_MANAGED_STREAMING_TRANSACTIONAL");
-            std::env::set_var("S4_STREAMING_WRITE_MODE", "all");
             std::env::set_var("S4_STREAMING_READ_MODE", "passthrough");
             std::env::set_var("S4_DEV_MEMORY_STREAMING", "1");
             std::env::set_var("S4_MULTIPART_MODE", "staged");

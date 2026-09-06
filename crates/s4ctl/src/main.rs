@@ -1279,10 +1279,6 @@ async fn main() -> anyhow::Result<()> {
                     });
                     client.api_put("/dashboard/api/backend", &body).await?;
                     println!("Backend set to AWS IAM Role: {}", role_arn);
-                    println!(
-                        "Run '{} backend get' to see your External ID for the trust policy.",
-                        cli.program.name()
-                    );
                 }
                 BackendCmd::SetR2 { endpoint, token } => {
                     let body = serde_json::json!({
@@ -1914,8 +1910,6 @@ async fn main() -> anyhow::Result<()> {
                             "AUTH_DISABLED=true",
                             "-e",
                             "MASKURA_KEYS_FILE=/app/data/keys.json",
-                            "-e",
-                            "MASKURA_STREAMING_WRITE_MODE=single",
                             "-e",
                             "MASKURA_STREAMING_READ_MODE=passthrough",
                             &local_gateway_image,
