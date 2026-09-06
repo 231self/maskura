@@ -44,8 +44,8 @@ use crate::backend::{
 };
 use crate::control::{
     AuthenticatedRequestContext, AuthorizationDecision, AuthorizationError, AuthorizationGrant,
-    ControlPlane, MeteringError, PipelineAttempt, RequestKind, StreamingWriteMode,
-    UsageAuthorization, UsageEvent, UsageRoute,
+    ControlPlane, MeteringError, PipelineAttempt, RequestKind, UsageAuthorization, UsageEvent,
+    UsageRoute,
 };
 use crate::customer_headers;
 use crate::integrity::{BodyVerifier, IntegrityError};
@@ -113,7 +113,6 @@ pub struct AppState {
     pub control: Arc<dyn ControlPlane>,
     pub legacy_max_object_bytes: usize,
     pub streaming_read_mode: StreamingReadMode,
-    pub streaming_write_mode: StreamingWriteMode,
     pub source_body_limits: BodyLimits,
     pub max_pipeline_output_bytes: u64,
     pub presigned_http_policy: PresignedHttpPolicy,
@@ -919,20 +918,6 @@ fn prefix_safe_component_hashes() -> anyhow::Result<HashSet<String>> {
                 }
             })
             .collect(),
-    )
-}
-
-fn streaming_write_mode() -> anyhow::Result<StreamingWriteMode> {
-    Ok(
-        match resolve_customer_env(customer_env::STREAMING_WRITE_MODE)?.as_deref() {
-            Some("single") => StreamingWriteMode::Single,
-            Some("all") => StreamingWriteMode::All,
-            Some("off") | None => StreamingWriteMode::Off,
-            Some(value) => {
-                warn!("invalid MASKURA_STREAMING_WRITE_MODE={value:?}; using off");
-                StreamingWriteMode::Off
-            }
-        },
     )
 }
 
@@ -4029,8 +4014,7 @@ fn managed_logical_key(auth: &Auth, bucket: &str, key: &str) -> LogicalObjectKey
 }
 
 fn staged_multipart(state: &AppState) -> Option<&Arc<MultipartStaging>> {
-    (state.streaming_write_mode == StreamingWriteMode::All
-        && state.multipart_mode == MultipartMode::Staged)
+    (state.multipart_mode == MultipartMode::Staged)
         .then_some(state.multipart_staging.as_ref())
         .flatten()
 }
@@ -5394,15 +5378,6 @@ async fn s3_upload_part(
     if let Some(response) = client_metering_id_rejection(&parts.headers, &key) {
         return response;
     }
-    if state
-        .control
-        .streaming_write_mode(&authentication.auth.context)
-        .await
-        .unwrap_or(state.streaming_write_mode)
-        < StreamingWriteMode::All
-    {
-        return s3_error::multipart_not_supported(&key);
-    }
     let Some(staging) = staged_multipart(&state).cloned() else {
         return s3_error::multipart_not_supported(&key);
     };
@@ -5712,12 +5687,6 @@ async fn s3_put(
             .await;
         }
     };
-    let tenant_write_mode = state
-        .control
-        .streaming_write_mode(&auth.context)
-        .await
-        .unwrap_or(state.streaming_write_mode);
-    let effective_write_mode = state.streaming_write_mode.min(tenant_write_mode);
     let backend = match resolve_backend(&state, auth, &parts.headers, StorageOperation::Put).await {
         Ok(backend) => backend,
         Err(_) => {
@@ -5758,31 +5727,8 @@ async fn s3_put(
                 )
                 .await;
             }
-            ManagedStreamingMode::Enforce if effective_write_mode < StreamingWriteMode::Single => {
-                return release_failure(
-                    state.control.as_ref(),
-                    &auth.context,
-                    &grant,
-                    &key,
-                    s3_error::not_implemented(&key),
-                )
-                .await;
-            }
             ManagedStreamingMode::Off | ManagedStreamingMode::Enforce => {}
         }
-    }
-    // Legacy buffered PUT was removed in Phase 12. A write-mode below `single`
-    // rejects without polling the request body; there is no fallback to a
-    // whole-object buffer.
-    if effective_write_mode < StreamingWriteMode::Single {
-        return release_failure(
-            state.control.as_ref(),
-            &auth.context,
-            &grant,
-            &key,
-            s3_error::not_implemented(&key),
-        )
-        .await;
     }
     match streaming_single_put(
         &state,
@@ -8981,15 +8927,6 @@ async fn s3_post(
                     );
                 }
             };
-        if state
-            .control
-            .streaming_write_mode(&auth.context)
-            .await
-            .unwrap_or(state.streaming_write_mode)
-            < StreamingWriteMode::All
-        {
-            return s3_error::multipart_not_supported(&key);
-        }
         let selected = match parse_complete_multipart_xml(&body) {
             Ok(parts) => parts,
             Err(error) if error.contains("sorted") => {
@@ -9304,15 +9241,6 @@ async fn s3_post(
         let Some(staging) = staged_multipart(&state).cloned() else {
             return s3_error::multipart_not_supported(&key);
         };
-        if state
-            .control
-            .streaming_write_mode(&auth.context)
-            .await
-            .unwrap_or(state.streaming_write_mode)
-            < StreamingWriteMode::All
-        {
-            return s3_error::multipart_not_supported(&key);
-        }
         // Freeze and serialize policy before creating managed multipart state.
         // Resolver or serialization failures therefore cannot orphan a managed
         // registration without a corresponding staging upload.
@@ -10849,7 +10777,6 @@ struct MultipartStartupDependencies {
     directory: bool,
     tenant_quota: bool,
     global_quota: bool,
-    streaming_all: bool,
 }
 
 fn validate_multipart_startup(
@@ -10882,10 +10809,6 @@ fn validate_multipart_startup(
             dependencies.global_quota,
             "S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES",
         ),
-        (
-            dependencies.streaming_all,
-            "MASKURA_STREAMING_WRITE_MODE=all",
-        ),
     ];
     let missing = checks
         .into_iter()
@@ -10914,7 +10837,6 @@ fn staged_multipart_startup_requires_every_production_dependency() {
         directory: true,
         tenant_quota: true,
         global_quota: true,
-        streaming_all: true,
     };
     validate_multipart_startup(MultipartMode::Staged, complete).unwrap();
     validate_multipart_startup(
@@ -10926,7 +10848,7 @@ fn staged_multipart_startup_requires_every_production_dependency() {
     )
     .unwrap();
 
-    let missing_one: [fn(&mut MultipartStartupDependencies); 11] = [
+    let missing_one: [fn(&mut MultipartStartupDependencies); 10] = [
         |value| value.durable_wrapping = false,
         |value| value.database = false,
         |value| value.endpoint = false,
@@ -10937,7 +10859,6 @@ fn staged_multipart_startup_requires_every_production_dependency() {
         |value| value.directory = false,
         |value| value.tenant_quota = false,
         |value| value.global_quota = false,
-        |value| value.streaming_all = false,
     ];
     for remove in missing_one {
         let mut incomplete = complete;
@@ -11095,7 +11016,6 @@ pub async fn build_state_with_pipeline_template(
                 })
         })
         .transpose()?;
-    let streaming_write_mode = streaming_write_mode()?;
     validate_multipart_startup(
         multipart_mode,
         MultipartStartupDependencies {
@@ -11109,7 +11029,6 @@ pub async fn build_state_with_pipeline_template(
             directory: nonempty_env("S4_MULTIPART_STAGING_DIR"),
             tenant_quota: nonempty_env("S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES"),
             global_quota: nonempty_env("S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES"),
-            streaming_all: streaming_write_mode >= StreamingWriteMode::All,
         },
     )?;
     let s3_streaming_capabilities = configured_s3_streaming_capabilities()?;
@@ -11373,7 +11292,6 @@ pub async fn build_state_with_pipeline_template(
         control,
         legacy_max_object_bytes: legacy_max_object_bytes()?,
         streaming_read_mode: StreamingReadMode::from_env()?,
-        streaming_write_mode,
         source_body_limits,
         max_pipeline_output_bytes,
         presigned_http_policy: PresignedHttpPolicy::from_env().map_err(anyhow::Error::msg)?,

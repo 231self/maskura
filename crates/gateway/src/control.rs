@@ -436,14 +436,6 @@ pub enum AuthorizationError {
     Unavailable,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub enum StreamingWriteMode {
-    #[default]
-    Off,
-    Single,
-    All,
-}
-
 /// Why a request was blocked. `code` is S3-style, `message` is human-readable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockReason {
@@ -499,15 +491,6 @@ pub trait ControlPlane: Send + Sync + 'static {
         _attempt: &PipelineAttempt,
     ) -> Result<(), MeteringError> {
         Ok(())
-    }
-
-    /// Optional tenant ceiling. `None` inherits the deployment ceiling; a
-    /// tenant can only lower, never raise, the configured mode.
-    async fn streaming_write_mode(
-        &self,
-        _context: &AuthenticatedRequestContext,
-    ) -> Option<StreamingWriteMode> {
-        None
     }
 }
 

@@ -16,8 +16,8 @@ use s4_gateway::backend::{
 };
 use s4_gateway::control::{
     AuthenticatedRequestContext, AuthorizationDecision, AuthorizationError, AuthorizationGrant,
-    BlockReason, ControlPlane, MeteringError, NoopControlPlane, RequestKind, StreamingWriteMode,
-    UsageAuthorization, UsageEvent, UsageRoute,
+    BlockReason, ControlPlane, MeteringError, NoopControlPlane, RequestKind, UsageAuthorization,
+    UsageEvent, UsageRoute,
 };
 use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher, default_wrapping};
 use s4_gateway::object::BodyLimits;
@@ -216,45 +216,6 @@ impl http_body::Body for ChannelBody {
         self.receiver
             .poll_recv(cx)
             .map(|value| value.map(|bytes| Ok(Frame::data(bytes))))
-    }
-}
-
-#[derive(Debug)]
-struct StreamingOffControl;
-
-#[async_trait::async_trait]
-impl ControlPlane for StreamingOffControl {
-    async fn authorize(
-        &self,
-        _context: &AuthenticatedRequestContext,
-        authorization: &UsageAuthorization,
-    ) -> Result<AuthorizationDecision, AuthorizationError> {
-        Ok(AuthorizationDecision::Granted(test_authorization_grant(
-            authorization,
-        )))
-    }
-
-    async fn release(
-        &self,
-        _context: &AuthenticatedRequestContext,
-        _operation_id: uuid::Uuid,
-    ) -> Result<(), AuthorizationError> {
-        Ok(())
-    }
-
-    async fn record(
-        &self,
-        _context: &AuthenticatedRequestContext,
-        _event: &UsageEvent,
-    ) -> Result<(), MeteringError> {
-        Ok(())
-    }
-
-    async fn streaming_write_mode(
-        &self,
-        _context: &AuthenticatedRequestContext,
-    ) -> Option<StreamingWriteMode> {
-        Some(StreamingWriteMode::Off)
     }
 }
 
@@ -577,7 +538,6 @@ fn test_pipeline_template() -> &'static StatePipelineTemplate {
             std::env::remove_var("S4_MAX_OBJECT_BYTES");
             std::env::remove_var("S4_MAX_PIPELINE_OUTPUT_BYTES");
             std::env::remove_var("S4_STREAMING_READ_MODE");
-            std::env::remove_var("S4_STREAMING_WRITE_MODE");
             std::env::remove_var("S4_TRANSFORMED_READ_SPOOL");
             std::env::remove_var("S4_PREFIX_SAFE_COMPONENT_HASHES");
             std::env::remove_var("S4_SPOOL_DIR");
@@ -591,7 +551,6 @@ fn test_pipeline_template() -> &'static StatePipelineTemplate {
             std::env::remove_var("S4_MULTIPART_MODE");
             // Phase 12 removed the legacy buffered PUT/GET path entirely; the
             // streaming in-memory dev backend is the only write/read path left.
-            std::env::set_var("S4_STREAMING_WRITE_MODE", "single");
             std::env::set_var("S4_STREAMING_READ_MODE", "passthrough");
             std::env::set_var("S4_DEV_MEMORY_STREAMING", "1");
             // Load the built filter components so the full pipeline (including
@@ -1926,7 +1885,6 @@ async fn streaming_put_is_frame_invariant_and_preserves_separators() {
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.auth_disabled = true;
     state_mut.dev_memory_streaming_enabled = true;
-    state_mut.streaming_write_mode = StreamingWriteMode::Single;
     state_mut.source_body_limits.max_frame_bytes = input.len().max(1);
     let app = build_router(state.clone());
     for split in 0..=input.len() {
@@ -1958,7 +1916,6 @@ async fn streaming_put_limit_failure_has_no_partial_visibility() {
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.auth_disabled = true;
     state_mut.dev_memory_streaming_enabled = true;
-    state_mut.streaming_write_mode = StreamingWriteMode::Single;
     state_mut.source_body_limits.max_frame_bytes = 4;
     state_mut.source_body_limits.max_bytes = 7;
     let app = build_router(state.clone());
@@ -1981,62 +1938,12 @@ async fn streaming_put_limit_failure_has_no_partial_visibility() {
 }
 
 #[tokio::test]
-async fn tenant_mode_can_only_lower_the_deployment_ceiling() {
-    let mut state = test_state().await;
-    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.auth_disabled = true;
-    state_mut.streaming_write_mode = StreamingWriteMode::All;
-    state_mut.control = Arc::new(StreamingOffControl);
-    let app = build_router(state.clone());
-    let request = Request::builder()
-        .method("PUT")
-        .uri("/stream/tenant-off.txt")
-        .header(header::CONTENT_TYPE, "text/plain")
-        .body(Body::from("12345"))
-        .unwrap();
-    let response = app.oneshot(request).await.unwrap();
-    // Phase 12: a write-mode below `single` rejects outright; there is no
-    // legacy buffered fallback to run a size cap against.
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert!(String::from_utf8_lossy(&body).contains("<Code>NotImplemented</Code>"));
-    assert!(state.store.get("stream", "tenant-off.txt").is_none());
-}
-
-#[tokio::test]
-async fn streaming_off_rejects_put_without_polling_and_get_without_buffering() {
+async fn streaming_read_off_rejects_get_without_buffering() {
     let mut state = test_state().await;
     let (access_key, secret_key) = make_key(&state).await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_write_mode = StreamingWriteMode::Off;
     state_mut.streaming_read_mode = StreamingReadMode::Off;
-    state_mut.dev_memory_streaming_enabled = true;
     let app = build_router(state.clone());
-
-    // Write mode off: PUT rejects without polling the request body.
-    let polls = Arc::new(AtomicUsize::new(0));
-    let put = add_headers(
-        Request::builder()
-            .method("PUT")
-            .uri("/off/object.txt")
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::new(PollTrackingBody {
-                polls: polls.clone(),
-                data: Some(Bytes::from_static(b"must not be read")),
-            }))
-            .unwrap(),
-        &auth_headers(&access_key, &secret_key),
-    );
-    let response = app.clone().oneshot(put).await.unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(
-        polls.load(Ordering::SeqCst),
-        0,
-        "write-mode-off PUT must not poll the body"
-    );
-    assert!(state.store.get("off", "object.txt").is_none());
 
     // Read mode off: GET rejects without buffering or disclosing the object.
     state.store.put(
@@ -2069,7 +1976,6 @@ async fn unsupported_streaming_backend_is_rejected_without_polling_body() {
     let mut state = test_state().await;
     let (access_key, secret_key) = make_key(&state).await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_write_mode = StreamingWriteMode::Single;
     state_mut.dev_memory_streaming_enabled = false;
     let app = build_router(state);
     let polls = Arc::new(AtomicUsize::new(0));
@@ -2102,7 +2008,6 @@ async fn avro_acquires_workspace_lease_before_first_body_poll() {
     .expect("build attested test state");
     let (access_key, secret_key) = make_key(&state).await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_write_mode = StreamingWriteMode::Single;
     state_mut.binary_avro_enabled = true;
     state_mut.dev_memory_streaming_enabled = false;
     let journal: Arc<dyn OperationJournal> = Arc::new(InMemoryOperationJournal::durable_for_test());
@@ -4683,7 +4588,6 @@ async fn non_sigv4_api_key_auth_rejects_duplicate_semantic_headers() {
 async fn streaming_sigv4_hash_is_checked_before_atomic_commit() {
     let mut state = test_state().await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_write_mode = StreamingWriteMode::Single;
     state_mut.dev_memory_streaming_enabled = true;
     let (access_key, secret_key) = make_key(&state).await;
     let app = build_router(state.clone());
