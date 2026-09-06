@@ -20,7 +20,7 @@ compiled once and uploaded at runtime. No gateway rebuild, no restart, no lock-i
 
 ## Watch it in 90 seconds
 
-[![asciicast](https://asciinema.org/a/AIIlm0JjYVFP2Ta8.svg)](https://asciinema.org/a/AIIlm0JjYVFP2Ta8)
+[![asciicast](https://asciinema.org/a/8BIbdS1f1J3Ax4A0.svg)](https://asciinema.org/a/8BIbdS1f1J3Ax4A0)
 
 The same PII file, three ways — raw, redacted, and deterministic-encrypted — pushed
 through `aws s3` pointed at Maskura.
