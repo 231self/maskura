@@ -1,37 +1,29 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/maskura-mark-dark.svg" />
-    <source media="(prefers-color-scheme: light)" srcset="docs/assets/maskura-mark-light.svg" />
-    <img alt="Maskura" src="docs/assets/maskura-mark-light.svg" width="128" />
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/maskura-lockup-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/maskura-lockup-light.svg" />
+    <img alt="Maskura — object data, masked." src="docs/assets/maskura-lockup-light.svg" width="400" />
   </picture>
 </p>
 
 # Maskura: pluggable processing gateway for object storage
 
+<p align="center">
+  <a href="https://github.com/231self/maskura/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/231self/maskura/ci.yml?branch=main&label=CI" /></a>
+  <a href="https://github.com/231self/maskura/actions/workflows/docs.yml"><img alt="Docs" src="https://img.shields.io/github/actions/workflow/status/231self/maskura/docs.yml?branch=main&label=docs" /></a>
+  <a href="https://github.com/231self/maskura/releases"><img alt="Release" src="https://img.shields.io/github/v/release/231self/maskura" /></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" /></a>
+</p>
+
 Maskura is an S3-compatible gateway that runs your WebAssembly plugins over every object
 in transit. Point any S3 SDK, CLI, or tool at Maskura; each object passes through your
-plugin pipeline — filter, redact, encrypt, convert, validate, route — and the result
+plugin pipeline — filter, redact, encrypt, validate, route — and the result
 is forwarded to any S3-compatible storage backend.
 
 The name combines the English word "mask" with the Japanese "kura", meaning storage.
 
 **Bring your own plugin.** The gateway is a router: plugins are Wasm components
 compiled once and uploaded at runtime. No gateway rebuild, no restart, no lock-in.
-
-## Watch it in 90 seconds
-
-[![asciicast](https://asciinema.org/a/8BIbdS1f1J3Ax4A0.svg)](https://asciinema.org/a/8BIbdS1f1J3Ax4A0)
-
-The same PII file, three ways — raw, redacted, and deterministic-encrypted — pushed
-through `aws s3` pointed at Maskura.
-
-**Read path** — agents see the view you allow; the raw object stays in storage.
-
-![Read path](docs/assets/read-flow.gif)
-
-**Write path** — protection is applied before the object reaches storage.
-
-![Write path](docs/assets/write-flow.gif)
 
 - **Pluggable pipeline** — plugins run in order; each can emit, drop, or reject. A tiny
   WIT interface (`begin` / `transform` / `finish`), pure byte-in/byte-out.
@@ -57,12 +49,12 @@ emails / SSNs / credit cards), `email-detect`, `ssn-detect`, `card-detect`,
 
 ## Contents
 
-- [Watch it in 90 seconds](#watch-it-in-90-seconds)
-- [Try it in 60 seconds](#try-it-in-60-seconds)
+- [Quickstart](#quickstart)
 - [Install the CLI (optional)](#install-the-cli-optional)
 - [Compatibility](#compatibility)
 - [Run your own plugin](#run-your-own-plugin)
 - [Usage examples](#usage-examples)
+- [Demo](#demo)
 - [How it works](#how-it-works)
 - [Development](#development)
 - [Security](#security)
@@ -70,7 +62,7 @@ emails / SSNs / credit cards), `email-detect`, `ssn-detect`, `card-detect`,
 - [LLM agents](#llm-agents)
 - [License](#license)
 
-## Try it in 60 seconds
+## Quickstart
 
 No cloud account, no database, no repo clone — run the published image:
 
@@ -134,7 +126,7 @@ maskura get ingest/data.csv --bucket s4-local
 ```
 
 `maskura local init` pulls the gateway image tagged with the CLI version
-(`ghcr.io/231self/maskura/maskura:v0.3.3` for `maskura` 0.3.3; CLI and gateway always
+(`ghcr.io/231self/maskura/maskura:v0.4.1` for `maskura` 0.4.1; CLI and gateway always
 match, never `:latest`) and runs it in local mode (`AUTH_DISABLED=true`, keys
 persisted on a volume, in-memory storage); it picks a free port (8080+) and only
 listens on localhost. `maskura local down` stops it. For durable local
@@ -281,14 +273,28 @@ print(client.decrypt_payload(blob, priv))              # you hold the key
 Full details: [examples/README.md](examples/README.md) and
 [docs/plugins.md](docs/plugins.md).
 
+## Demo
+
+![The same PII file written three ways — raw, redacted, and deterministic-encrypted — through Maskura](docs/assets/demo.gif)
+
+The same PII file, three ways — raw, redacted, and deterministic-encrypted — pushed
+through `aws s3` pointed at Maskura. [Watch the interactive demo (pause, scrub, speed) →](https://231self.github.io/maskura/demo.html)
+
+**Read path** — agents see the view you allow; the raw object stays in storage.
+
+![Read path](docs/assets/read-flow.gif)
+
+**Write path** — protection is applied before the object reaches storage.
+
+![Write path](docs/assets/write-flow.gif)
+
 ## How it works
 
 ```
 S3 SDK / CLI / tool ──▶ Maskura Gateway (Wasm plugin pipeline) ──▶ storage
                             │
-                            ├─ filter  → redact, strip fields, validate
-                            ├─ encrypt → per-field envelope encryption
-                            ├─ convert → CSV ⇄ JSONL ⇄ text
+                            ├─ filter  → redact emails, SSNs, credit cards
+                            ├─ encrypt → per-field envelope / deterministic encryption
                             └─ ...     → your plugins, in order
 ```
 

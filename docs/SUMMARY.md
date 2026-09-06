@@ -1,6 +1,7 @@
 # Summary
 
 - [Home](index.md)
+- [Demo](demo.md)
 - [Plugins](plugins.md)
 - [Avro gate](avro.md)
 - [Binary adapters](binary-adapters.md)
