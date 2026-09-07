@@ -100,9 +100,10 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 - **Presigned URL proxy**: User generates a presigned PUT/GET URL for their bucket with their own SDK. Sends it as `x-maskura-backend-url`. Maskura validates the API key, filters PII, and forwards to the presigned URL. No backend credentials are stored. Platform-agnostic (S3, R2, B2, MinIO).
 
 - **Per-workspace backend**: `WorkspaceStorageRepository` maps authenticated users
-  to canonical, unchanged `WorkspaceId` values and returns either `managed` or
-  `s3_compatible` configuration with static credentials. `aws_role` is not
-  implemented and is rejected; there is no per-user `BackendRegistry` contract.
+  to canonical, unchanged `WorkspaceId` values and returns `managed`,
+  `s3_compatible` (static credentials), or `aws_role` (IAM role ARN + region +
+  optional `external_id`, assumed via STS per request). There is no per-user
+  `BackendRegistry` contract.
 
 - **Tenant storage boundary**: Multi-tenant startup requires non-empty
   `S4_SERVICE_BUCKETS` and rejects `S3_ENDPOINT`. Missing workspace configuration
@@ -135,7 +136,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 ### CLI (`maskura`)
 
 - Binary crate at `crates/s4ctl/`. Full-featured CLI for Maskura operations; `s4ctl` remains an alias.
-- Subcommands: `login`, `logout`, `whoami`, `key {create,list,revoke}`, `backend {get,set-aws,set-r2,set-b2,set-minio,presign}`, `put`, `get`, `list`, `health`, `local {init,down}`, `test upload`. The legacy `set-aws` command submits unsupported `aws_role` configuration and is rejected by the gateway.
+- Subcommands: `login`, `logout`, `whoami`, `key {create,list,revoke}`, `backend {get,set-aws,set-r2,set-b2,set-minio,presign}`, `put`, `get`, `list`, `health`, `local {init,down}`, `test upload`. `set-aws` configures an `aws_role` backend (role ARN + region + optional external ID).
 - Auth from the preserved `~/.config/s4/config.json`, `MASKURA_ACCESS_KEY`/`MASKURA_SECRET_KEY` (with permanent `S4_*` aliases), or demo mode.
 - Key expiry support: `--expiry never|30d|90d|1y` (or raw seconds).
 - Backend presign: generates presigned URLs via local AWS CLI for use with the Maskura proxy.

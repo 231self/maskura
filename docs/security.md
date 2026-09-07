@@ -278,11 +278,11 @@ deliberately strict:
   URL with their own cloud SDK; Maskura filters and forwards. **No backend
   credential is stored.** The gateway applies SSRF controls before any request
   is made (see §10).
-- **Per-workspace backend config** — `managed`, or `s3_compatible` with an
-  endpoint, region, and static access credentials. `aws_role` remains
-  unsupported and is rejected. Runtime S3-compatible endpoints are governed by
-  `WorkspaceEndpointPolicy` (see §10), and dashboard reads return only a
-  redacted configuration.
+- **Per-workspace backend config** — `managed`, `s3_compatible` with an
+  endpoint, region, and static access credentials, or `aws_role` (IAM role ARN
+  + region + optional `external_id`) that is assumed via STS per request.
+  Runtime S3-compatible endpoints are governed by `WorkspaceEndpointPolicy`
+  (see §10), and dashboard reads return only a redacted configuration.
 - **Service storage** — Maskura-managed multi-cloud buckets (`S4_SERVICE_BUCKETS`),
   tenant-namespaced by workspace and optionally backed by authoritative
   placement metadata (see §9).
@@ -342,8 +342,8 @@ through a durable staging subsystem:
 
 ## 8. Transactional writes — journal, atomic commit, reconciliation
 
-Streaming writes (`MASKURA_STREAMING_WRITE_MODE=single` or `all`) run through a
-durable transaction layer:
+Streaming writes (single-part `PUT`, and staged multipart when
+`MASKURA_MULTIPART_MODE=staged`) run through a durable transaction layer:
 
 - **Operation journal.** A Postgres-backed `OperationJournal`
   (`DATABASE_URL`) records each operation's state machine:
@@ -557,12 +557,21 @@ names and are not exposed through customer aliases.
   conditional reads/HEAD. The capability gate refuses streaming eligibility
   without incomplete-upload discovery, abort, completion reconciliation, and a
   cleanup SLA within five minutes.
-- **Feature-gate defaults** — all streaming features are **off/reject by
-  default** and must be explicitly enabled:
-  `MASKURA_STREAMING_READ_MODE=off`, `MASKURA_STREAMING_WRITE_MODE=off`,
-  `MASKURA_MULTIPART_MODE=reject`, `S4_MANAGED_STREAMING_MODE=off`. Enabling them
-  without the corresponding durable dependencies causes startup to refuse
-  configuration rather than silently degrade.
+- **Feature-gate defaults** — transformed reads and managed streaming are
+  **off/reject by default** and must be explicitly enabled:
+  `MASKURA_STREAMING_READ_MODE=off`, `MASKURA_MULTIPART_MODE=reject`,
+  `S4_MANAGED_STREAMING_MODE=off`. Single-part streaming writes are always
+  enabled; staged multipart additionally requires `MASKURA_MULTIPART_MODE=staged`
+  plus the durable staging dependencies. Enabling a gated feature without the
+  corresponding durable dependencies causes startup to refuse configuration
+  rather than silently degrade.
+- **Outbound credentials** — the global `S3_ENDPOINT` client accepts static
+  `S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY` and, when those are absent, falls
+  back to the AWS default credential provider chain (EC2 instance profile,
+  ECS task role, EKS IRSA, SSO, OIDC web identity). Per-workspace `aws_role`
+  backends assume an IAM role via STS: temporary credentials are used once per
+  request, never serialized, and the role ARN plus an optional `external_id`
+  form the trust boundary (see ADR).
 - **Self-host hardening** — run the container as non-root; limit egress to the
   configured backends, KMS/Vault, and Supabase; do not ship `MASKURA_KEYS_FILE` or
   `keys.json` in the image; do not set `AUTH_DISABLED` in production; put the
