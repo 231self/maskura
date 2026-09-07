@@ -31,9 +31,75 @@ gateway does provide the foundation used by a hosted transport: shared typed
 contracts in `maskura-mcp-protocol` (re-exported as `s4_gateway::mcp`) and trusted in-process execution through
 `s4_gateway::server::invoke_mcp`.
 
-## Configure
+## Run locally
 
-Create an MCP token in the Maskura dashboard, then configure the local server:
+Start the published gateway image and copy the loopback URL printed by the CLI:
+
+```bash
+maskura local init
+# Gateway: http://127.0.0.1:8080 (the selected port may differ)
+```
+
+The local gateway runs with `AUTH_DISABLED=true`. `maskura-mcp` still requires
+an explicit credential shape so a configuration cannot accidentally become
+credential-free when pointed at production. Use local-only placeholder values:
+
+```json
+{
+  "mcpServers": {
+    "maskura-local": {
+      "command": "maskura-mcp",
+      "env": {
+        "MASKURA_GATEWAY_URL": "http://127.0.0.1:8080",
+        "MASKURA_ACCESS_KEY": "local",
+        "MASKURA_SECRET_KEY": "local"
+      }
+    }
+  }
+}
+```
+
+Use the exact port printed by `maskura local init`. These placeholder
+credentials are accepted only because that loopback gateway explicitly disables
+authentication; never use `AUTH_DISABLED` on a network-accessible deployment.
+
+For Kilo, the equivalent local entry in `kilo.json` is:
+
+```json
+{
+  "mcp": {
+    "maskura-local": {
+      "type": "local",
+      "command": ["maskura-mcp"],
+      "environment": {
+        "MASKURA_GATEWAY_URL": "http://127.0.0.1:8080",
+        "MASKURA_ACCESS_KEY": "local",
+        "MASKURA_SECRET_KEY": "local"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+## Connect to a hosted gateway
+
+Create an MCP token in the Maskura dashboard, or through the dashboard API with
+a signed-in session JWT:
+
+```bash
+curl --fail-with-body \
+  --request POST "$MASKURA_GATEWAY_URL/dashboard/api/mcp-tokens" \
+  --header "Authorization: Bearer $MASKURA_SESSION_JWT" \
+  --header "Content-Type: application/json" \
+  --data '{"label":"desktop-agent","expires_in":2592000}'
+```
+
+The response reveals the `s4m_...` token once. Store it in a secret manager,
+not in source control. The token remains bound to the workspace selected when
+it was created.
+
+Claude Desktop and Cursor use the standard `mcpServers` shape:
 
 ```json
 {
@@ -49,6 +115,32 @@ Create an MCP token in the Maskura dashboard, then configure the local server:
 }
 ```
 
+For Claude Desktop on macOS, place this under the `mcpServers` key in
+`~/Library/Application Support/Claude/claude_desktop_config.json`. Cursor uses
+`.cursor/mcp.json` in a project or its equivalent global MCP settings.
+
+Kilo uses its local-process MCP configuration shape in `kilo.json`:
+
+```json
+{
+  "mcp": {
+    "maskura": {
+      "type": "local",
+      "command": ["maskura-mcp"],
+      "environment": {
+        "MASKURA_GATEWAY_URL": "https://api.s4.231self.com",
+        "MASKURA_MCP_TOKEN": "s4m_your_token"
+      },
+      "enabled": true
+    }
+  }
+}
+```
+
+Restart the client after changing its MCP configuration. Desktop applications
+often do not inherit shell environment variables, so use the client's secret
+storage or a restricted configuration file when literal values are required.
+
 A Maskura API key pair can be used instead:
 
 ```json
@@ -63,6 +155,37 @@ A Maskura API key pair can be used instead:
 values are validated at startup and are omitted from debug output.
 Legacy `S4_*` names remain accepted. If both forms are set, their values must
 match exactly, including empty values, or startup fails closed.
+
+## Try it locally
+
+The stdlib-only example connects over MCP stdio and lists the available tools:
+
+```bash
+export MASKURA_GATEWAY_URL="http://127.0.0.1:8080" # use the printed port
+export MASKURA_ACCESS_KEY="local"
+export MASKURA_SECRET_KEY="local"
+python3 examples/mcp-client.py
+```
+
+Run a complete put, filtered get, paged list, and delete lifecycle:
+
+```bash
+MCP_EXAMPLE_RUN_MUTATIONS=1 \
+MCP_EXAMPLE_BUCKET=agent-data \
+python3 examples/mcp-client.py
+```
+
+The upload contains `alice@example.com`; the read result should contain
+`[REDACTED_EMAIL]`, proving the MCP call used the normal gateway filter path.
+
+Equivalent requests from an MCP-enabled agent are:
+
+```text
+Store "Contact alice@example.com" at agent-data/examples/mcp.txt with Maskura.
+Read agent-data/examples/mcp.txt and show me the stored value.
+List up to 10 keys under examples/ in agent-data.
+Delete agent-data/examples/mcp.txt.
+```
 
 ## Tool behavior
 

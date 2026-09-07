@@ -175,7 +175,8 @@ documented in [docs/avro.md](docs/avro.md). A runnable PUT/read example is in
 
 The local stdio MCP server exposes put, get, list, and delete tools to agent
 clients while preserving the gateway's normal auth, pipeline, and metering path.
-See [docs/mcp.md](docs/mcp.md).
+See [docs/mcp.md](docs/mcp.md) for Claude Desktop, Cursor, and Kilo setup, plus
+the runnable [`examples/mcp-client.py`](examples/mcp-client.py) lifecycle.
 
 ## Usage examples
 
