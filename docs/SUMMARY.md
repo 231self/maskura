@@ -12,7 +12,6 @@
 # Roadmap (planned, not shipped)
 
 - [Post-quantum encryption](post-quantum-crypto.md)
-- [SQL proxy](sql-proxy.md)
 
 # Architecture Decision Records
 
