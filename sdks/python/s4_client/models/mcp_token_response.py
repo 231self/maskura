@@ -22,17 +22,17 @@ from typing import Any, ClassVar, Dict, List, Optional
 from typing import Optional, Set
 from typing_extensions import Self
 
-class ListKeyResponse(BaseModel):
+class McpTokenResponse(BaseModel):
     """
-    ListKeyResponse
+    McpTokenResponse
     """ # noqa: E501
     created_at: StrictStr
+    credential_id: StrictStr
     expires_at: Optional[StrictStr] = None
-    key_id: StrictStr
     label: StrictStr
-    public_key_pem: Optional[StrictStr] = None
+    token_hash: StrictStr
     workspace_id: Optional[StrictStr] = None
-    __properties: ClassVar[List[str]] = ["created_at", "expires_at", "key_id", "label", "public_key_pem", "workspace_id"]
+    __properties: ClassVar[List[str]] = ["created_at", "credential_id", "expires_at", "label", "token_hash", "workspace_id"]
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -52,7 +52,7 @@ class ListKeyResponse(BaseModel):
 
     @classmethod
     def from_json(cls, json_str: str) -> Optional[Self]:
-        """Create an instance of ListKeyResponse from a JSON string"""
+        """Create an instance of McpTokenResponse from a JSON string"""
         return cls.from_dict(json.loads(json_str))
 
     def to_dict(self) -> Dict[str, Any]:
@@ -78,11 +78,6 @@ class ListKeyResponse(BaseModel):
         if self.expires_at is None and "expires_at" in self.model_fields_set:
             _dict['expires_at'] = None
 
-        # set to None if public_key_pem (nullable) is None
-        # and model_fields_set contains the field
-        if self.public_key_pem is None and "public_key_pem" in self.model_fields_set:
-            _dict['public_key_pem'] = None
-
         # set to None if workspace_id (nullable) is None
         # and model_fields_set contains the field
         if self.workspace_id is None and "workspace_id" in self.model_fields_set:
@@ -92,7 +87,7 @@ class ListKeyResponse(BaseModel):
 
     @classmethod
     def from_dict(cls, obj: Optional[Dict[str, Any]]) -> Optional[Self]:
-        """Create an instance of ListKeyResponse from a dict"""
+        """Create an instance of McpTokenResponse from a dict"""
         if obj is None:
             return None
 
@@ -101,10 +96,10 @@ class ListKeyResponse(BaseModel):
 
         _obj = cls.model_validate({
             "created_at": obj.get("created_at"),
+            "credential_id": obj.get("credential_id"),
             "expires_at": obj.get("expires_at"),
-            "key_id": obj.get("key_id"),
             "label": obj.get("label"),
-            "public_key_pem": obj.get("public_key_pem"),
+            "token_hash": obj.get("token_hash"),
             "workspace_id": obj.get("workspace_id")
         })
         return _obj

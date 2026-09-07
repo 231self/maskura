@@ -43,6 +43,7 @@ use s4_gateway::transaction::{
     OperationState, PartRecord, PostgresOperationJournal, StoredObjectMeta,
     WorkspaceDestinationBinding,
 };
+use s4_gateway::workspace_storage::WorkspaceId;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
@@ -299,6 +300,121 @@ fn engine_migration_helper_ignores_unknown_private_versions_but_rejects_checksum
         s4_gateway::run_engine_migrations(&pool)
             .await
             .expect("restored public checksum must migrate cleanly");
+    });
+}
+
+#[test]
+fn public_migrations_apply_fresh_after_private_shared_history() {
+    with_pool(|pool| async move {
+        let schema = format!("fresh_public_{}", uuid::Uuid::new_v4().simple());
+        sqlx::raw_sql(&format!(
+            "CREATE SCHEMA \"{schema}\"; \
+             CREATE TABLE \"{schema}\"._sqlx_migrations (\
+                version BIGINT PRIMARY KEY, description TEXT NOT NULL, \
+                installed_on TIMESTAMPTZ NOT NULL DEFAULT NOW(), success BOOLEAN NOT NULL, \
+                checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL); \
+             INSERT INTO \"{schema}\"._sqlx_migrations \
+                (version, description, success, checksum, execution_time) \
+             VALUES (20260907000001, 'private artifact inventory cycle', TRUE, '\\x01', 0)"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let url = std::env::var("DATABASE_URL").unwrap();
+        let setup_schema = schema.clone();
+        let isolated = PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(move |connection, _| {
+                let statement = format!("SET search_path TO \"{setup_schema}\"");
+                Box::pin(async move {
+                    sqlx::query(&statement).execute(&mut *connection).await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .unwrap();
+        s4_gateway::run_engine_migrations(&isolated)
+            .await
+            .expect("fresh public schema must migrate around private history");
+
+        let workspace_type: String = sqlx::query_scalar(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_schema = $1 AND table_name = 'api_keys' AND column_name = 'workspace_id'",
+        )
+        .bind(&schema)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(workspace_type, "text");
+        let versions: Vec<i64> = sqlx::query_scalar(&format!(
+            "SELECT version FROM \"{schema}\"._sqlx_migrations \
+             WHERE version >= 20260907000001 ORDER BY version"
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(versions, [20260907000001, 20260907000002]);
+        isolated.close().await;
+        sqlx::raw_sql(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn workspace_credential_migration_upgrades_hosted_uuid_schema() {
+    with_pool(|pool| async move {
+        let schema = format!("hosted_upgrade_{}", uuid::Uuid::new_v4().simple());
+        let api_keys = include_str!("../../../migrations/20260809000001_api_keys.sql");
+        let mcp_tokens = include_str!("../../../migrations/20260816000001_mcp_tokens.sql");
+        let migration =
+            include_str!("../../../migrations/20260907000002_workspace_bound_credentials.sql");
+        let bound = uuid::Uuid::new_v4();
+        let upgrade = format!(
+            "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\"; \
+             {api_keys} {mcp_tokens} \
+             CREATE TABLE workspaces (id UUID PRIMARY KEY); \
+             ALTER TABLE api_keys ADD COLUMN workspace_id UUID \
+                REFERENCES workspaces(id) ON DELETE SET NULL; \
+             INSERT INTO workspaces (id) VALUES ('{bound}'); \
+             INSERT INTO api_keys (key_id, secret_hash, user_id, label, created_at, workspace_id) \
+                 VALUES ('s4_bound', 'hash', 'user', 'bound', '1970-01-01T00:00:00Z', '{bound}'), \
+                        ('s4_unbound', 'hash2', 'user', 'unbound', '1970-01-01T00:00:00Z', NULL); \
+             {migration}"
+        );
+        sqlx::raw_sql(&upgrade).execute(&pool).await.unwrap();
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT key_id, workspace_id FROM \"{schema}\".api_keys ORDER BY key_id"
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("s4_bound".to_string(), Some(bound.to_string())),
+                ("s4_unbound".to_string(), None),
+            ]
+        );
+        let foreign_keys: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_constraint c \
+             JOIN pg_class t ON t.oid = c.conrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             WHERE n.nspname = $1 AND t.relname = 'api_keys' AND c.contype = 'f'",
+        )
+        .bind(&schema)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(foreign_keys, 0);
+        sqlx::raw_sql(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+            .execute(&pool)
+            .await
+            .unwrap();
     });
 }
 
@@ -689,7 +805,13 @@ fn postgres_secret_envelope_roundtrip() {
         let store = PostgresKeyStore::with_cipher(pool, cipher);
         let user = format!("unit-{}", uuid::Uuid::new_v4());
         let (secret, created) = store
-            .create_key(&user, "encrypted", 0, None)
+            .create_key(
+                &user,
+                &WorkspaceId::new(user.clone()).unwrap(),
+                "encrypted",
+                0,
+                None,
+            )
             .await
             .expect("create encrypted Postgres API key");
         let key_id = created.key_id;
@@ -2240,7 +2362,13 @@ fn postgres_v1_secret_is_rewrapped_to_identity_bound_v2() {
         let store = PostgresKeyStore::with_cipher(pool, cipher.clone());
         let user = format!("unit-v1-{}", uuid::Uuid::new_v4());
         let (secret, created) = store
-            .create_key(&user, "legacy-rewrap", 0, None)
+            .create_key(
+                &user,
+                &WorkspaceId::new(user.clone()).unwrap(),
+                "legacy-rewrap",
+                0,
+                None,
+            )
             .await
             .expect("create Postgres API key");
         let key_id = created.key_id;
@@ -2275,7 +2403,13 @@ fn postgres_v1_hash_mismatch_returns_none_without_rewrap() {
         let store = PostgresKeyStore::with_cipher(pool, cipher);
         let user = format!("unit-v1-hash-{}", uuid::Uuid::new_v4());
         let (secret, created) = store
-            .create_key(&user, "legacy-hash-mismatch", 0, None)
+            .create_key(
+                &user,
+                &WorkspaceId::new(user.clone()).unwrap(),
+                "legacy-hash-mismatch",
+                0,
+                None,
+            )
             .await
             .expect("create Postgres API key");
         let key_id = created.key_id;
@@ -2299,7 +2433,13 @@ fn postgres_v1_rewrap_cas_accepts_concurrent_matching_v2() {
         let initial_store = PostgresKeyStore::new(pool.clone());
         let user = format!("unit-v1-cas-{}", uuid::Uuid::new_v4());
         let (secret, created) = initial_store
-            .create_key(&user, "legacy-cas", 0, None)
+            .create_key(
+                &user,
+                &WorkspaceId::new(user.clone()).unwrap(),
+                "legacy-cas",
+                0,
+                None,
+            )
             .await
             .expect("create hash-only Postgres API key");
         let key_id = created.key_id;
@@ -2354,7 +2494,13 @@ fn postgres_key_roundtrip() {
         let store = PostgresKeyStore::new(pool);
         let user = format!("unit-{}", uuid::Uuid::new_v4());
         let (secret, created) = store
-            .create_key(&user, "roundtrip", 0, None)
+            .create_key(
+                &user,
+                &WorkspaceId::new(user.clone()).unwrap(),
+                "roundtrip",
+                0,
+                None,
+            )
             .await
             .expect("create Postgres API key");
         let key_id = created.key_id.clone();
@@ -2369,7 +2515,8 @@ fn postgres_key_roundtrip() {
             .await
             .unwrap()
             .expect("valid credentials resolve");
-        assert_eq!(uid, user);
+        assert_eq!(uid.user_id, user);
+        assert_eq!(uid.workspace_id.as_str(), uid.user_id);
         assert!(pk.is_none());
         assert!(
             store
@@ -2404,7 +2551,13 @@ fn postgres_public_key_binding() {
         let store = PostgresKeyStore::new(pool);
         let user = format!("unit-{}", uuid::Uuid::new_v4());
         let (secret, created) = store
-            .create_key(&user, "enc", 0, None)
+            .create_key(
+                &user,
+                &WorkspaceId::new(user.clone()).unwrap(),
+                "enc",
+                0,
+                None,
+            )
             .await
             .expect("create Postgres API key");
         let key_id = created.key_id;
@@ -2426,7 +2579,7 @@ fn postgres_public_key_binding() {
             .await
             .unwrap()
             .expect("resolve after binding");
-        assert_eq!(uid, user);
+        assert_eq!(uid.user_id, user);
         assert_eq!(pk.as_deref(), Some(TEST_PUBLIC_KEY_PEM.trim()));
         delete_api_key(&db, &key_id).await;
     });
@@ -2439,7 +2592,13 @@ fn postgres_expired_key_rejected() {
         let store = PostgresKeyStore::new(pool);
         let user = format!("unit-{}", uuid::Uuid::new_v4());
         let (secret, created) = store
-            .create_key(&user, "exp", 1, None)
+            .create_key(
+                &user,
+                &WorkspaceId::new(user.clone()).unwrap(),
+                "exp",
+                1,
+                None,
+            )
             .await
             .expect("create Postgres API key");
         let key_id = created.key_id;
@@ -2462,7 +2621,12 @@ fn postgres_mcp_creation_returns_persisted_metadata() {
         let store = PostgresKeyStore::new(pool);
         let user = format!("unit-{}", uuid::Uuid::new_v4());
         let (token, created) = store
-            .create_mcp_token(&user, "  agent  ", 3600)
+            .create_mcp_token(
+                &user,
+                &WorkspaceId::new(user.clone()).unwrap(),
+                "  agent  ",
+                3600,
+            )
             .await
             .expect("create Postgres MCP token");
         let listed = store
@@ -2475,6 +2639,20 @@ fn postgres_mcp_creation_returns_persisted_metadata() {
 
         assert!(token.starts_with("s4m_"));
         assert_eq!(created, listed);
+        let principal = store
+            .resolve_mcp_token(&token)
+            .await
+            .unwrap()
+            .expect("persisted MCP token resolves");
+        let principal_id = principal.credential_id().to_string();
+        assert_eq!(
+            created.credential_id.as_deref(),
+            Some(principal_id.as_str())
+        );
+        assert_eq!(
+            principal.credential_policy_id(),
+            format!("mcp:{}", principal.credential_id())
+        );
         assert_eq!(created.label, "agent");
         assert!(created.expires_at.is_some());
         assert!(
@@ -2887,7 +3065,13 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         .expect("build_state with durable staged multipart");
         let (sk, created) = state
             .keys
-            .create_key("test-user", "multipart-test", 0, None)
+            .create_key(
+                "test-user",
+                &WorkspaceId::new("test-user").unwrap(),
+                "multipart-test",
+                0,
+                None,
+            )
             .await
             .expect("create test API key");
         let ak = created.key_id;

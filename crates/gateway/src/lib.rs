@@ -10,6 +10,7 @@ pub mod format;
 pub mod integrity;
 pub mod key_cipher;
 pub mod managed;
+pub use maskura_mcp_protocol as mcp;
 pub mod multipart_staging;
 pub mod object;
 pub mod pipeline;

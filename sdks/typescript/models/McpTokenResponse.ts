@@ -12,12 +12,12 @@
 
 import { HttpFile } from '../http/http';
 
-export class ListKeyResponse {
+export class McpTokenResponse {
     'createdAt': string;
+    'credentialId': string;
     'expiresAt'?: string | null;
-    'keyId': string;
     'label': string;
-    'publicKeyPem'?: string | null;
+    'tokenHash': string;
     'workspaceId'?: string | null;
 
     static readonly discriminator: string | undefined = undefined;
@@ -32,14 +32,14 @@ export class ListKeyResponse {
             "format": ""
         },
         {
-            "name": "expiresAt",
-            "baseName": "expires_at",
+            "name": "credentialId",
+            "baseName": "credential_id",
             "type": "string",
             "format": ""
         },
         {
-            "name": "keyId",
-            "baseName": "key_id",
+            "name": "expiresAt",
+            "baseName": "expires_at",
             "type": "string",
             "format": ""
         },
@@ -50,8 +50,8 @@ export class ListKeyResponse {
             "format": ""
         },
         {
-            "name": "publicKeyPem",
-            "baseName": "public_key_pem",
+            "name": "tokenHash",
+            "baseName": "token_hash",
             "type": "string",
             "format": ""
         },
@@ -63,7 +63,7 @@ export class ListKeyResponse {
         }    ];
 
     static getAttributeTypeMap() {
-        return ListKeyResponse.attributeTypeMap;
+        return McpTokenResponse.attributeTypeMap;
     }
 
     public constructor() {

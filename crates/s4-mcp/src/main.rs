@@ -6,14 +6,17 @@ use std::fmt;
 
 use futures_util::StreamExt;
 use maskura_customer_config::{aliases as customer_env, resolve as resolve_customer_env};
+use maskura_mcp_protocol::{
+    DeleteObjectRequest as DeleteObjectParams, GetObjectRequest as GetObjectParams,
+    ListObjectsRequest as ListObjectsParams, ListObjectsResult as ListObjectsPage,
+    PutObjectRequest as PutObjectParams, parse_list_objects_result,
+};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
-use rmcp::schemars::JsonSchema;
 use rmcp::tool;
 use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, ServiceExt, tool_router};
-use serde::{Deserialize, Serialize};
 use url::Url;
 
 const DEFAULT_GATEWAY_URL: &str = "http://localhost:8080";
@@ -129,9 +132,6 @@ impl MaskuraServer {
     }
 
     fn object_url(&self, bucket: &str, key: &str) -> anyhow::Result<Url> {
-        if bucket.is_empty() {
-            anyhow::bail!("bucket must not be empty");
-        }
         let mut url = self.config.gateway_url.clone();
         url.set_query(None);
         url.set_fragment(None);
@@ -148,53 +148,6 @@ impl MaskuraServer {
     }
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-struct PutObjectParams {
-    /// Bucket to write into.
-    bucket: String,
-    /// Object key within the bucket.
-    key: String,
-    /// UTF-8 object body.
-    body: String,
-    /// Content-Type used by Maskura to select the processing format.
-    #[serde(default = "default_content_type")]
-    content_type: String,
-}
-
-fn default_content_type() -> String {
-    "text/plain; charset=utf-8".to_string()
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct GetObjectParams {
-    bucket: String,
-    key: String,
-    /// Run the configured processing pipeline before returning the object.
-    #[serde(default)]
-    process: bool,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct ListObjectsParams {
-    bucket: String,
-    #[serde(default)]
-    prefix: String,
-    /// Opaque token returned by the previous truncated page.
-    continuation_token: Option<String>,
-    /// Maximum number of keys and common prefixes to return (S3 caps this at 1000).
-    max_keys: Option<u32>,
-    /// Group keys that share the substring between the prefix and this delimiter.
-    delimiter: Option<String>,
-    /// On the first page, begin listing lexicographically after this key.
-    start_after: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct DeleteObjectParams {
-    bucket: String,
-    key: String,
-}
-
 #[tool_router(server_handler)]
 impl MaskuraServer {
     #[tool(description = "Store a UTF-8 object through the configured Maskura pipeline")]
@@ -202,6 +155,11 @@ impl MaskuraServer {
         &self,
         Parameters(params): Parameters<PutObjectParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = maskura_mcp_protocol::ToolRequest::PutObject(params.clone())
+            .validate(maskura_mcp_protocol::MAX_TEXT_BODY_BYTES)
+        {
+            return Ok(tool_error(error.to_string()));
+        }
         let url = match object_url_for_tool(self, &params.bucket, &params.key, true) {
             Ok(url) => url,
             Err(result) => return Ok(result),
@@ -226,6 +184,11 @@ impl MaskuraServer {
         &self,
         Parameters(params): Parameters<GetObjectParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = maskura_mcp_protocol::ToolRequest::GetObject(params.clone())
+            .validate(maskura_mcp_protocol::MAX_TEXT_BODY_BYTES)
+        {
+            return Ok(tool_error(error.to_string()));
+        }
         let url = match object_url_for_tool(self, &params.bucket, &params.key, true) {
             Ok(url) => url,
             Err(result) => return Ok(result),
@@ -252,6 +215,11 @@ impl MaskuraServer {
         &self,
         Parameters(params): Parameters<ListObjectsParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = maskura_mcp_protocol::ToolRequest::ListObjects(params.clone())
+            .validate(maskura_mcp_protocol::MAX_TEXT_BODY_BYTES)
+        {
+            return Ok(tool_error(error.to_string()));
+        }
         let mut url = match self.object_url(&params.bucket, "") {
             Ok(url) => url,
             Err(error) => return Ok(tool_error(error.to_string())),
@@ -291,7 +259,7 @@ impl MaskuraServer {
             Ok(body) => body,
             Err(error) => return Ok(tool_error(error)),
         };
-        let page = match parse_s3_list_page(&body) {
+        let page = match parse_list_objects_result(&body) {
             Ok(page) => page,
             Err(error) => {
                 return Ok(tool_error(format!(
@@ -307,6 +275,11 @@ impl MaskuraServer {
         &self,
         Parameters(params): Parameters<DeleteObjectParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = maskura_mcp_protocol::ToolRequest::DeleteObject(params.clone())
+            .validate(maskura_mcp_protocol::MAX_TEXT_BODY_BYTES)
+        {
+            return Ok(tool_error(error.to_string()));
+        }
         let url = match object_url_for_tool(self, &params.bucket, &params.key, true) {
             Ok(url) => url,
             Err(result) => return Ok(result),
@@ -414,74 +387,6 @@ async fn read_text_bounded(response: reqwest::Response, limit: usize) -> Result<
 
 fn tool_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message.into())])
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename = "ListBucketResult")]
-struct ListBucketResult {
-    #[serde(rename = "Contents", default)]
-    contents: Vec<ListObject>,
-    #[serde(rename = "CommonPrefixes", default)]
-    common_prefixes: Vec<CommonPrefix>,
-    #[serde(rename = "IsTruncated", default)]
-    is_truncated: bool,
-    #[serde(rename = "NextContinuationToken")]
-    next_continuation_token: Option<String>,
-    #[serde(rename = "KeyCount")]
-    key_count: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ListObject {
-    #[serde(rename = "Key")]
-    key: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CommonPrefix {
-    #[serde(rename = "Prefix")]
-    prefix: String,
-}
-
-#[derive(Debug, Serialize, PartialEq)]
-struct ListObjectsPage {
-    keys: Vec<String>,
-    common_prefixes: Vec<String>,
-    is_truncated: bool,
-    next_continuation_token: Option<String>,
-    key_count: usize,
-}
-
-fn parse_s3_list_page(xml: &str) -> anyhow::Result<ListObjectsPage> {
-    let result: ListBucketResult = quick_xml::de::from_str(xml)?;
-    if result.is_truncated
-        && result
-            .next_continuation_token
-            .as_deref()
-            .is_none_or(str::is_empty)
-    {
-        anyhow::bail!("truncated response has no next continuation token");
-    }
-    let keys = result
-        .contents
-        .into_iter()
-        .map(|object| object.key)
-        .collect::<Vec<_>>();
-    let common_prefixes = result
-        .common_prefixes
-        .into_iter()
-        .map(|prefix| prefix.prefix)
-        .collect::<Vec<_>>();
-    let key_count = result
-        .key_count
-        .unwrap_or(keys.len() + common_prefixes.len());
-    Ok(ListObjectsPage {
-        keys,
-        common_prefixes,
-        is_truncated: result.is_truncated,
-        next_continuation_token: result.next_continuation_token,
-        key_count,
-    })
 }
 
 fn list_page_result(page: ListObjectsPage, prefix: &str) -> CallToolResult {
@@ -717,7 +622,7 @@ mod tests {
   <CommonPrefixes><Prefix>dir/nested&amp;/</Prefix></CommonPrefixes>
 </ListBucketResult>"#;
         assert_eq!(
-            parse_s3_list_page(xml).unwrap(),
+            parse_list_objects_result(xml).unwrap(),
             ListObjectsPage {
                 keys: vec!["a.txt".to_string(), "dir/a&b.txt".to_string()],
                 common_prefixes: vec!["dir/nested&/".to_string()],
@@ -730,7 +635,7 @@ mod tests {
 
     #[test]
     fn empty_s3_list_has_no_keys() {
-        let page = parse_s3_list_page("<ListBucketResult/>").unwrap();
+        let page = parse_list_objects_result("<ListBucketResult/>").unwrap();
         assert!(page.keys.is_empty());
         assert!(page.common_prefixes.is_empty());
         assert!(!page.is_truncated);

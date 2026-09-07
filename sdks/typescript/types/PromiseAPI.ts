@@ -7,8 +7,12 @@ import { BackendConfigRequest } from '../models/BackendConfigRequest';
 import { BackendConfigResponse } from '../models/BackendConfigResponse';
 import { BackendType } from '../models/BackendType';
 import { CreateKeyRequest } from '../models/CreateKeyRequest';
+import { CreateMcpTokenRequest } from '../models/CreateMcpTokenRequest';
 import { DeleteKeyRequest } from '../models/DeleteKeyRequest';
+import { DeleteMcpTokenRequest } from '../models/DeleteMcpTokenRequest';
 import { ListKeyResponse } from '../models/ListKeyResponse';
+import { McpTokenCreatedResponse } from '../models/McpTokenCreatedResponse';
+import { McpTokenResponse } from '../models/McpTokenResponse';
 import { ObjectResponse } from '../models/ObjectResponse';
 import { ObservableBackendApi } from './ObservableAPI';
 
@@ -132,6 +136,83 @@ export class PromiseKeysApi {
     public getKeys(_options?: PromiseConfigurationOptions): Promise<Array<ListKeyResponse>> {
         const observableOptions = wrapOptions(_options);
         const result = this.api.getKeys(observableOptions);
+        return result.toPromise();
+    }
+
+
+}
+
+
+
+import { ObservableMcpApi } from './ObservableAPI';
+
+import { McpApiRequestFactory, McpApiResponseProcessor} from "../apis/McpApi";
+export class PromiseMcpApi {
+    private api: ObservableMcpApi
+
+    public constructor(
+        configuration: Configuration,
+        requestFactory?: McpApiRequestFactory,
+        responseProcessor?: McpApiResponseProcessor
+    ) {
+        this.api = new ObservableMcpApi(configuration, requestFactory, responseProcessor);
+    }
+
+    /**
+     * Create an MCP bearer token (`s4m_...`). The plaintext token is returned once and only its hash is stored.
+     * @param createMcpTokenRequest
+     */
+    public createMcpTokenWithHttpInfo(createMcpTokenRequest: CreateMcpTokenRequest, _options?: PromiseConfigurationOptions): Promise<HttpInfo<McpTokenCreatedResponse>> {
+        const observableOptions = wrapOptions(_options);
+        const result = this.api.createMcpTokenWithHttpInfo(createMcpTokenRequest, observableOptions);
+        return result.toPromise();
+    }
+
+    /**
+     * Create an MCP bearer token (`s4m_...`). The plaintext token is returned once and only its hash is stored.
+     * @param createMcpTokenRequest
+     */
+    public createMcpToken(createMcpTokenRequest: CreateMcpTokenRequest, _options?: PromiseConfigurationOptions): Promise<McpTokenCreatedResponse> {
+        const observableOptions = wrapOptions(_options);
+        const result = this.api.createMcpToken(createMcpTokenRequest, observableOptions);
+        return result.toPromise();
+    }
+
+    /**
+     * Revoke an MCP bearer token.
+     * @param deleteMcpTokenRequest
+     */
+    public deleteMcpTokenWithHttpInfo(deleteMcpTokenRequest: DeleteMcpTokenRequest, _options?: PromiseConfigurationOptions): Promise<HttpInfo<void>> {
+        const observableOptions = wrapOptions(_options);
+        const result = this.api.deleteMcpTokenWithHttpInfo(deleteMcpTokenRequest, observableOptions);
+        return result.toPromise();
+    }
+
+    /**
+     * Revoke an MCP bearer token.
+     * @param deleteMcpTokenRequest
+     */
+    public deleteMcpToken(deleteMcpTokenRequest: DeleteMcpTokenRequest, _options?: PromiseConfigurationOptions): Promise<void> {
+        const observableOptions = wrapOptions(_options);
+        const result = this.api.deleteMcpToken(deleteMcpTokenRequest, observableOptions);
+        return result.toPromise();
+    }
+
+    /**
+     * List MCP bearer tokens for the authenticated user (hashes only).
+     */
+    public getMcpTokensWithHttpInfo(_options?: PromiseConfigurationOptions): Promise<HttpInfo<Array<McpTokenResponse>>> {
+        const observableOptions = wrapOptions(_options);
+        const result = this.api.getMcpTokensWithHttpInfo(observableOptions);
+        return result.toPromise();
+    }
+
+    /**
+     * List MCP bearer tokens for the authenticated user (hashes only).
+     */
+    public getMcpTokens(_options?: PromiseConfigurationOptions): Promise<Array<McpTokenResponse>> {
+        const observableOptions = wrapOptions(_options);
+        const result = this.api.getMcpTokens(observableOptions);
         return result.toPromise();
     }
 

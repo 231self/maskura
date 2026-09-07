@@ -19,6 +19,7 @@ export class ApiKeyResponse {
     'label': string;
     'publicKeyPem'?: string | null;
     'secret': string;
+    'workspaceId': string;
 
     static readonly discriminator: string | undefined = undefined;
 
@@ -58,6 +59,12 @@ export class ApiKeyResponse {
         {
             "name": "secret",
             "baseName": "secret",
+            "type": "string",
+            "format": ""
+        },
+        {
+            "name": "workspaceId",
+            "baseName": "workspace_id",
             "type": "string",
             "format": ""
         }    ];

@@ -1,4 +1,4 @@
-# ListKeyResponse
+# McpTokenResponse
 
 
 ## Properties
@@ -6,28 +6,28 @@
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
 **created_at** | **str** |  | 
+**credential_id** | **str** |  | 
 **expires_at** | **str** |  | [optional] 
-**key_id** | **str** |  | 
 **label** | **str** |  | 
-**public_key_pem** | **str** |  | [optional] 
+**token_hash** | **str** |  | 
 **workspace_id** | **str** |  | [optional] 
 
 ## Example
 
 ```python
-from maskura_client.models.list_key_response import ListKeyResponse
+from maskura_client.models.mcp_token_response import McpTokenResponse
 
 # TODO update the JSON string below
 json = "{}"
-# create an instance of ListKeyResponse from a JSON string
-list_key_response_instance = ListKeyResponse.from_json(json)
+# create an instance of McpTokenResponse from a JSON string
+mcp_token_response_instance = McpTokenResponse.from_json(json)
 # print the JSON string representation of the object
-print(ListKeyResponse.to_json())
+print(McpTokenResponse.to_json())
 
 # convert the object into a dict
-list_key_response_dict = list_key_response_instance.to_dict()
-# create an instance of ListKeyResponse from a dict
-list_key_response_from_dict = ListKeyResponse.from_dict(list_key_response_dict)
+mcp_token_response_dict = mcp_token_response_instance.to_dict()
+# create an instance of McpTokenResponse from a dict
+mcp_token_response_from_dict = McpTokenResponse.from_dict(mcp_token_response_dict)
 ```
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)
 

@@ -8,8 +8,12 @@ import { BackendConfigRequest } from '../models/BackendConfigRequest';
 import { BackendConfigResponse } from '../models/BackendConfigResponse';
 import { BackendType } from '../models/BackendType';
 import { CreateKeyRequest } from '../models/CreateKeyRequest';
+import { CreateMcpTokenRequest } from '../models/CreateMcpTokenRequest';
 import { DeleteKeyRequest } from '../models/DeleteKeyRequest';
+import { DeleteMcpTokenRequest } from '../models/DeleteMcpTokenRequest';
 import { ListKeyResponse } from '../models/ListKeyResponse';
+import { McpTokenCreatedResponse } from '../models/McpTokenCreatedResponse';
+import { McpTokenResponse } from '../models/McpTokenResponse';
 import { ObjectResponse } from '../models/ObjectResponse';
 
 import { BackendApiRequestFactory, BackendApiResponseProcessor} from "../apis/BackendApi";
@@ -196,6 +200,118 @@ export class ObservableKeysApi {
      */
     public getKeys(_options?: ConfigurationOptions): Observable<Array<ListKeyResponse>> {
         return this.getKeysWithHttpInfo(_options).pipe(map((apiResponse: HttpInfo<Array<ListKeyResponse>>) => apiResponse.data));
+    }
+
+}
+
+import { McpApiRequestFactory, McpApiResponseProcessor} from "../apis/McpApi";
+export class ObservableMcpApi {
+    private requestFactory: McpApiRequestFactory;
+    private responseProcessor: McpApiResponseProcessor;
+    private configuration: Configuration;
+
+    public constructor(
+        configuration: Configuration,
+        requestFactory?: McpApiRequestFactory,
+        responseProcessor?: McpApiResponseProcessor
+    ) {
+        this.configuration = configuration;
+        this.requestFactory = requestFactory || new McpApiRequestFactory(configuration);
+        this.responseProcessor = responseProcessor || new McpApiResponseProcessor();
+    }
+
+    /**
+     * Create an MCP bearer token (`s4m_...`). The plaintext token is returned once and only its hash is stored.
+     * @param createMcpTokenRequest
+     */
+    public createMcpTokenWithHttpInfo(createMcpTokenRequest: CreateMcpTokenRequest, _options?: ConfigurationOptions): Observable<HttpInfo<McpTokenCreatedResponse>> {
+        const _config = mergeConfiguration(this.configuration, _options);
+
+        const requestContextPromise = this.requestFactory.createMcpToken(createMcpTokenRequest, _config);
+        // build promise chain
+        let middlewarePreObservable = from<RequestContext>(requestContextPromise);
+        for (const middleware of _config.middleware) {
+            middlewarePreObservable = middlewarePreObservable.pipe(mergeMap((ctx: RequestContext) => middleware.pre(ctx)));
+        }
+
+        return middlewarePreObservable.pipe(mergeMap((ctx: RequestContext) => _config.httpApi.send(ctx))).
+            pipe(mergeMap((response: ResponseContext) => {
+                let middlewarePostObservable = of(response);
+                for (const middleware of _config.middleware.reverse()) {
+                    middlewarePostObservable = middlewarePostObservable.pipe(mergeMap((rsp: ResponseContext) => middleware.post(rsp)));
+                }
+                return middlewarePostObservable.pipe(map((rsp: ResponseContext) => this.responseProcessor.createMcpTokenWithHttpInfo(rsp)));
+            }));
+    }
+
+    /**
+     * Create an MCP bearer token (`s4m_...`). The plaintext token is returned once and only its hash is stored.
+     * @param createMcpTokenRequest
+     */
+    public createMcpToken(createMcpTokenRequest: CreateMcpTokenRequest, _options?: ConfigurationOptions): Observable<McpTokenCreatedResponse> {
+        return this.createMcpTokenWithHttpInfo(createMcpTokenRequest, _options).pipe(map((apiResponse: HttpInfo<McpTokenCreatedResponse>) => apiResponse.data));
+    }
+
+    /**
+     * Revoke an MCP bearer token.
+     * @param deleteMcpTokenRequest
+     */
+    public deleteMcpTokenWithHttpInfo(deleteMcpTokenRequest: DeleteMcpTokenRequest, _options?: ConfigurationOptions): Observable<HttpInfo<void>> {
+        const _config = mergeConfiguration(this.configuration, _options);
+
+        const requestContextPromise = this.requestFactory.deleteMcpToken(deleteMcpTokenRequest, _config);
+        // build promise chain
+        let middlewarePreObservable = from<RequestContext>(requestContextPromise);
+        for (const middleware of _config.middleware) {
+            middlewarePreObservable = middlewarePreObservable.pipe(mergeMap((ctx: RequestContext) => middleware.pre(ctx)));
+        }
+
+        return middlewarePreObservable.pipe(mergeMap((ctx: RequestContext) => _config.httpApi.send(ctx))).
+            pipe(mergeMap((response: ResponseContext) => {
+                let middlewarePostObservable = of(response);
+                for (const middleware of _config.middleware.reverse()) {
+                    middlewarePostObservable = middlewarePostObservable.pipe(mergeMap((rsp: ResponseContext) => middleware.post(rsp)));
+                }
+                return middlewarePostObservable.pipe(map((rsp: ResponseContext) => this.responseProcessor.deleteMcpTokenWithHttpInfo(rsp)));
+            }));
+    }
+
+    /**
+     * Revoke an MCP bearer token.
+     * @param deleteMcpTokenRequest
+     */
+    public deleteMcpToken(deleteMcpTokenRequest: DeleteMcpTokenRequest, _options?: ConfigurationOptions): Observable<void> {
+        return this.deleteMcpTokenWithHttpInfo(deleteMcpTokenRequest, _options).pipe(map((apiResponse: HttpInfo<void>) => apiResponse.data));
+    }
+
+    /**
+     * List MCP bearer tokens for the authenticated user (hashes only).
+     */
+    public getMcpTokensWithHttpInfo(_options?: ConfigurationOptions): Observable<HttpInfo<Array<McpTokenResponse>>> {
+        const _config = mergeConfiguration(this.configuration, _options);
+
+        const requestContextPromise = this.requestFactory.getMcpTokens(_config);
+        // build promise chain
+        let middlewarePreObservable = from<RequestContext>(requestContextPromise);
+        for (const middleware of _config.middleware) {
+            middlewarePreObservable = middlewarePreObservable.pipe(mergeMap((ctx: RequestContext) => middleware.pre(ctx)));
+        }
+
+        return middlewarePreObservable.pipe(mergeMap((ctx: RequestContext) => _config.httpApi.send(ctx))).
+            pipe(mergeMap((response: ResponseContext) => {
+                let middlewarePostObservable = of(response);
+                for (const middleware of _config.middleware.reverse()) {
+                    middlewarePostObservable = middlewarePostObservable.pipe(mergeMap((rsp: ResponseContext) => middleware.post(rsp)));
+                }
+                return middlewarePostObservable.pipe(map((rsp: ResponseContext) => this.responseProcessor.getMcpTokensWithHttpInfo(rsp)));
+            }));
+    }
+
+    /**
+     * List MCP bearer tokens for the authenticated user (hashes only).
+     */
+    public getMcpTokens(_options?: ConfigurationOptions): Observable<Array<McpTokenResponse>> {
+        return this.getMcpTokensWithHttpInfo(_options).pipe(map((apiResponse: HttpInfo<Array<McpTokenResponse>>) => apiResponse.data));
     }
 
 }

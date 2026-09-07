@@ -11,6 +11,7 @@ Name | Type | Description | Notes
 **label** | **str** |  | 
 **public_key_pem** | **str** |  | [optional] 
 **secret** | **str** |  | 
+**workspace_id** | **str** |  | 
 
 ## Example
 

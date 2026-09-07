@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "card-detect"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "pii-shared",
  "wit-bindgen 0.60.0",
@@ -1928,7 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "email-detect"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "pii-shared",
  "wit-bindgen 0.60.0",
@@ -1957,7 +1957,7 @@ dependencies = [
 
 [[package]]
 name = "envelope-encrypt"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -3076,8 +3076,19 @@ dependencies = [
 
 [[package]]
 name = "maskura-customer-config"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "maskura-mcp-protocol"
+version = "0.5.0"
+dependencies = [
+ "quick-xml",
+ "schemars",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
 ]
 
@@ -3231,7 +3242,7 @@ dependencies = [
 
 [[package]]
 name = "noop"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "wit-bindgen 0.60.0",
 ]
@@ -3527,7 +3538,7 @@ dependencies = [
 
 [[package]]
 name = "pii-default"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "pii-shared",
  "wit-bindgen 0.60.0",
@@ -3535,7 +3546,7 @@ dependencies = [
 
 [[package]]
 name = "pii-shared"
-version = "0.4.1"
+version = "0.5.0"
 
 [[package]]
 name = "pin-project-lite"
@@ -4470,14 +4481,14 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s4-error"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "s4-gateway"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "aes-siv",
@@ -4506,6 +4517,7 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "maskura-customer-config",
+ "maskura-mcp-protocol",
  "md-5 0.10.6",
  "num-bigint",
  "pin-project-lite",
@@ -4543,19 +4555,17 @@ dependencies = [
 
 [[package]]
 name = "s4-mcp"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
  "futures-util",
  "http-body-util",
  "maskura-customer-config",
- "quick-xml",
+ "maskura-mcp-protocol",
  "reqwest",
  "rmcp",
  "s4-gateway",
- "schemars",
- "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -4566,7 +4576,7 @@ dependencies = [
 
 [[package]]
 name = "s4-policy"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "ciborium",
  "ed25519-dalek",
@@ -4579,7 +4589,7 @@ dependencies = [
 
 [[package]]
 name = "s4-wasm-runtime"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -4594,7 +4604,7 @@ dependencies = [
 
 [[package]]
 name = "s4ctl"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -5296,7 +5306,7 @@ dependencies = [
 
 [[package]]
 name = "ssn-detect"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "pii-shared",
  "wit-bindgen 0.60.0",
@@ -5304,7 +5314,7 @@ dependencies = [
 
 [[package]]
 name = "stable-encrypt"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "aes-siv",
  "base64 0.22.1",
@@ -5484,21 +5494,21 @@ dependencies = [
 
 [[package]]
 name = "test-binary-reductor"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "wit-bindgen 0.60.0",
 ]
 
 [[package]]
 name = "test-filter"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "wit-bindgen 0.60.0",
 ]
 
 [[package]]
 name = "test-filter-v02"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "wit-bindgen 0.60.0",
 ]
