@@ -1,0 +1,15 @@
+[package]
+name = "maskura-mcp-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Transport-independent Maskura MCP protocol contracts"
+publish = false
+
+[dependencies]
+quick-xml = { version = "0.38", features = ["serialize"] }
+schemars = "1"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

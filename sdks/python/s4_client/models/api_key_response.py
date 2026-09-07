@@ -32,7 +32,8 @@ class ApiKeyResponse(BaseModel):
     label: StrictStr
     public_key_pem: Optional[StrictStr] = None
     secret: StrictStr
-    __properties: ClassVar[List[str]] = ["created_at", "expires_at", "key_id", "label", "public_key_pem", "secret"]
+    workspace_id: StrictStr
+    __properties: ClassVar[List[str]] = ["created_at", "expires_at", "key_id", "label", "public_key_pem", "secret", "workspace_id"]
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -100,7 +101,8 @@ class ApiKeyResponse(BaseModel):
             "key_id": obj.get("key_id"),
             "label": obj.get("label"),
             "public_key_pem": obj.get("public_key_pem"),
-            "secret": obj.get("secret")
+            "secret": obj.get("secret"),
+            "workspace_id": obj.get("workspace_id")
         })
         return _obj
 

@@ -14,10 +14,10 @@
 
 import unittest
 
-from s4_client.models.list_key_response import ListKeyResponse
+from s4_client.models.mcp_token_response import McpTokenResponse
 
-class TestListKeyResponse(unittest.TestCase):
-    """ListKeyResponse unit test stubs"""
+class TestMcpTokenResponse(unittest.TestCase):
+    """McpTokenResponse unit test stubs"""
 
     def setUp(self):
         pass
@@ -25,33 +25,34 @@ class TestListKeyResponse(unittest.TestCase):
     def tearDown(self):
         pass
 
-    def make_instance(self, include_optional) -> ListKeyResponse:
-        """Test ListKeyResponse
+    def make_instance(self, include_optional) -> McpTokenResponse:
+        """Test McpTokenResponse
             include_optional is a boolean, when False only required
             params are included, when True both required and
             optional params are included """
-        # uncomment below to create an instance of `ListKeyResponse`
+        # uncomment below to create an instance of `McpTokenResponse`
         """
-        model = ListKeyResponse()
+        model = McpTokenResponse()
         if include_optional:
-            return ListKeyResponse(
+            return McpTokenResponse(
                 created_at = '',
+                credential_id = '',
                 expires_at = '',
-                key_id = '',
                 label = '',
-                public_key_pem = '',
+                token_hash = '',
                 workspace_id = ''
             )
         else:
-            return ListKeyResponse(
+            return McpTokenResponse(
                 created_at = '',
-                key_id = '',
+                credential_id = '',
                 label = '',
+                token_hash = '',
         )
         """
 
-    def testListKeyResponse(self):
-        """Test ListKeyResponse"""
+    def testMcpTokenResponse(self):
+        """Test McpTokenResponse"""
         # inst_req_only = self.make_instance(include_optional=False)
         # inst_req_and_optional = self.make_instance(include_optional=True)
 

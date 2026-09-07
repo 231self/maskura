@@ -20,6 +20,10 @@ use s4_gateway::control::{
     UsageEvent, UsageRoute,
 };
 use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher, default_wrapping};
+use s4_gateway::mcp::{
+    DeleteObjectRequest, GetObjectRequest, ListObjectsRequest, PutObjectRequest, ToolRequest,
+    ToolResult,
+};
 use s4_gateway::object::BodyLimits;
 use s4_gateway::pipeline::{
     ComponentSource, PipelineDirection, PipelineResolution, PipelineResolver,
@@ -27,8 +31,8 @@ use s4_gateway::pipeline::{
 };
 use s4_gateway::plugin_registry::{PipelineLimits, PluginRegistry};
 use s4_gateway::server::{
-    AppState, StatePipelineTemplate, StreamingReadMode, build_router,
-    build_state_with_pipeline_template,
+    AppState, InvocationError, InvocationLimits, StatePipelineTemplate, StreamingReadMode,
+    TrustedInvocationContext, build_router, build_state_with_pipeline_template, invoke_mcp,
 };
 use s4_gateway::sigv4::SigV4Policy;
 use s4_gateway::store::{
@@ -234,6 +238,47 @@ struct RecordingMeteringControl {
     authorization_failure: Option<AuthorizationError>,
     block_reason: Option<BlockReason>,
     failure: Option<MeteringError>,
+}
+
+#[derive(Debug, Default)]
+struct BlockingSettlementControl {
+    record_started: tokio::sync::Notify,
+    finish_record: tokio::sync::Notify,
+    events: Mutex<Vec<UsageEvent>>,
+    releases: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ControlPlane for BlockingSettlementControl {
+    async fn authorize(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        authorization: &UsageAuthorization,
+    ) -> Result<AuthorizationDecision, AuthorizationError> {
+        Ok(AuthorizationDecision::Granted(test_authorization_grant(
+            authorization,
+        )))
+    }
+
+    async fn release(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        _operation_id: uuid::Uuid,
+    ) -> Result<(), AuthorizationError> {
+        self.releases.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn record(
+        &self,
+        _context: &AuthenticatedRequestContext,
+        event: &UsageEvent,
+    ) -> Result<(), MeteringError> {
+        self.events.lock().unwrap().push(event.clone());
+        self.record_started.notify_one();
+        self.finish_record.notified().await;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -574,6 +619,20 @@ async fn test_state() -> Arc<AppState> {
     .expect("build_state")
 }
 
+async fn trusted_context(state: &Arc<AppState>, workspace_id: &str) -> TrustedInvocationContext {
+    let (token, _) = state
+        .keys
+        .create_mcp_token(
+            "hosted-user",
+            &WorkspaceId::new(workspace_id).unwrap(),
+            "test-hosted-mcp",
+            0,
+        )
+        .await
+        .unwrap();
+    TrustedInvocationContext::new(state.keys.resolve_mcp_token(&token).await.unwrap().unwrap())
+}
+
 async fn router() -> (Router, Arc<AppState>) {
     let state = test_state().await;
     (build_router(state.clone()), state)
@@ -750,7 +809,13 @@ async fn public_key_persistence_failure_returns_generic_503_and_rolls_back() {
     let path = parent.join("keys.json");
     let file_store = Arc::new(FileKeyStore::new(path.clone()).unwrap());
     let (secret_key, created) = file_store
-        .create_key("test-user", "persist-failure", 0, None)
+        .create_key(
+            "test-user",
+            &WorkspaceId::new("test-user").unwrap(),
+            "persist-failure",
+            0,
+            None,
+        )
         .await
         .unwrap();
     let key_id = created.key_id;
@@ -935,7 +1000,13 @@ async fn make_key(state: &Arc<AppState>) -> (String, String) {
 async fn make_key_for(state: &Arc<AppState>, user_id: &str) -> (String, String) {
     let (secret, created) = state
         .keys
-        .create_key(user_id, "sigv4-test", 0, None)
+        .create_key(
+            user_id,
+            &WorkspaceId::new(user_id).unwrap(),
+            "sigv4-test",
+            0,
+            None,
+        )
         .await
         .expect("create test API key");
     (created.key_id, secret)
@@ -1237,7 +1308,12 @@ async fn public_key_mutation_rejects_duplicate_security_headers_without_mutation
     let (key_id, secret_key) = make_key(&state).await;
     let mcp_token = state
         .keys
-        .create_mcp_token("test-user", "duplicate-test", 0)
+        .create_mcp_token(
+            "test-user",
+            &WorkspaceId::new("test-user").unwrap(),
+            "duplicate-test",
+            0,
+        )
         .await
         .unwrap()
         .0;
@@ -1301,7 +1377,12 @@ async fn public_key_mutation_rejects_mixed_credential_classes_without_mutation()
     let (key_id, secret_key) = make_key(&state).await;
     let mcp_token = state
         .keys
-        .create_mcp_token("test-user", "mixed-test", 0)
+        .create_mcp_token(
+            "test-user",
+            &WorkspaceId::new("test-user").unwrap(),
+            "mixed-test",
+            0,
+        )
         .await
         .unwrap()
         .0;
@@ -1587,7 +1668,12 @@ async fn mcp_tokens_cannot_mutate_public_keys() {
     let (key_id, _) = make_key_for(&state, "mcp-user").await;
     let token = state
         .keys
-        .create_mcp_token("mcp-user", "mutation-test", 0)
+        .create_mcp_token(
+            "mcp-user",
+            &WorkspaceId::new("mcp-user").unwrap(),
+            "mutation-test",
+            0,
+        )
         .await
         .unwrap()
         .0;
@@ -4135,7 +4221,13 @@ async fn sigv4_wrapping_provider_failure_returns_generic_service_unavailable() {
     ))));
     let store = Arc::new(KeyStore::with_cipher(cipher));
     let (secret, created) = store
-        .create_key("test-user", "unwrap-outage", 0, None)
+        .create_key(
+            "test-user",
+            &WorkspaceId::new("test-user").unwrap(),
+            "unwrap-outage",
+            0,
+            None,
+        )
         .await
         .unwrap();
     Arc::get_mut(&mut state)
@@ -4734,13 +4826,25 @@ async fn managed_storage_isolates_users() {
     let (app, state) = router().await;
     let (sk1, created1) = state
         .keys
-        .create_key("user-one", "ns-test", 0, None)
+        .create_key(
+            "user-one",
+            &WorkspaceId::new("user-one").unwrap(),
+            "ns-test",
+            0,
+            None,
+        )
         .await
         .expect("create user-one API key");
     let ak1 = created1.key_id;
     let (sk2, created2) = state
         .keys
-        .create_key("user-two", "ns-test", 0, None)
+        .create_key(
+            "user-two",
+            &WorkspaceId::new("user-two").unwrap(),
+            "ns-test",
+            0,
+            None,
+        )
         .await
         .expect("create user-two API key");
     let ak2 = created2.key_id;
@@ -5078,7 +5182,13 @@ async fn non_expiring_key_works() {
     // expires_in=0 means never expires.
     let (sk, created) = state
         .keys
-        .create_key("never-exp", "exp", 0, None)
+        .create_key(
+            "never-exp",
+            &WorkspaceId::new("never-exp").unwrap(),
+            "exp",
+            0,
+            None,
+        )
         .await
         .expect("create non-expiring API key");
     let ak = created.key_id;
@@ -5103,7 +5213,12 @@ async fn mcp_token_roundtrip_and_auth() {
     // Create an MCP token.
     let token = state
         .keys
-        .create_mcp_token("mcp-user", "agent", 0)
+        .create_mcp_token(
+            "mcp-user",
+            &WorkspaceId::new("mcp-user").unwrap(),
+            "agent",
+            0,
+        )
         .await
         .unwrap()
         .0;
@@ -5171,17 +5286,27 @@ async fn mcp_token_roundtrip_and_auth() {
 }
 
 #[tokio::test]
-async fn mcp_token_identity_is_per_user() {
+async fn mcp_token_identity_is_workspace_bound() {
     let (app, state) = router().await;
     let t1 = state
         .keys
-        .create_mcp_token("user-a", "agent", 0)
+        .create_mcp_token(
+            "user-a",
+            &WorkspaceId::new("workspace-a").unwrap(),
+            "agent",
+            0,
+        )
         .await
         .unwrap()
         .0;
     let t2 = state
         .keys
-        .create_mcp_token("user-b", "agent", 0)
+        .create_mcp_token(
+            "user-b",
+            &WorkspaceId::new("workspace-b").unwrap(),
+            "agent",
+            0,
+        )
         .await
         .unwrap()
         .0;
@@ -5200,11 +5325,300 @@ async fn mcp_token_identity_is_per_user() {
         StatusCode::OK
     );
 
-    // Tokens resolve to distinct users.
+    // Tokens resolve to immutable user/workspace principals.
     let uid1 = state.keys.resolve_mcp_token(&t1).await.unwrap().unwrap();
     let uid2 = state.keys.resolve_mcp_token(&t2).await.unwrap().unwrap();
-    assert_ne!(uid1, uid2, "tokens must bind to distinct users");
-    assert_eq!(uid1, "user-a");
+    assert_ne!(uid1, uid2, "tokens must bind to distinct principals");
+    assert_eq!(uid1.context().user_id, "user-a");
+    assert_eq!(uid1.context().workspace_id.as_str(), "workspace-a");
+    assert_eq!(uid2.context().user_id, "user-b");
+    assert_eq!(uid2.context().workspace_id.as_str(), "workspace-b");
+}
+
+#[tokio::test]
+async fn trusted_mcp_invocation_uses_gateway_pipeline_without_auth_headers() {
+    let state = test_state().await;
+    let context = trusted_context(&state, "hosted-workspace").await;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let put = invoke_mcp(
+        state.clone(),
+        context.clone(),
+        uuid::Uuid::now_v7(),
+        ToolRequest::PutObject(PutObjectRequest {
+            bucket: "trusted".to_string(),
+            key: "record.txt".to_string(),
+            body: "contact alice@example.com".to_string(),
+            content_type: "text/plain".to_string(),
+        }),
+        InvocationLimits::default(),
+        cancellation.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(put, ToolResult::PutObject(_)));
+
+    let get = invoke_mcp(
+        state,
+        context,
+        uuid::Uuid::now_v7(),
+        ToolRequest::GetObject(GetObjectRequest {
+            bucket: "trusted".to_string(),
+            key: "record.txt".to_string(),
+            process: false,
+        }),
+        InvocationLimits::default(),
+        cancellation,
+    )
+    .await
+    .unwrap();
+    let ToolResult::GetObject(get) = get else {
+        panic!("expected get result")
+    };
+    assert!(get.body.contains("[REDACTED_EMAIL]"));
+}
+
+#[tokio::test]
+async fn trusted_mcp_invocation_enforces_limits_and_cancellation() {
+    let state = test_state().await;
+    let context = trusted_context(&state, "hosted-workspace").await;
+    let request = || {
+        ToolRequest::PutObject(PutObjectRequest {
+            bucket: "trusted".to_string(),
+            key: "bounded.txt".to_string(),
+            body: "too large".to_string(),
+            content_type: "text/plain".to_string(),
+        })
+    };
+    let error = invoke_mcp(
+        state.clone(),
+        context.clone(),
+        uuid::Uuid::now_v7(),
+        request(),
+        InvocationLimits::new(2, 8 * 1024 * 1024, std::time::Duration::from_secs(30)).unwrap(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, InvocationError::Invalid(_)));
+
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    let error = invoke_mcp(
+        state,
+        context,
+        uuid::Uuid::now_v7(),
+        request(),
+        InvocationLimits::default(),
+        cancellation,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, InvocationError::Cancelled));
+}
+
+#[tokio::test]
+async fn trusted_mcp_operation_ids_reject_conflicting_complete_identities() {
+    let state = test_state().await;
+    state
+        .store
+        .put("trusted", "source.txt", "value", "text/plain");
+    let context = trusted_context(&state, "hosted-workspace").await;
+
+    let cases = [
+        (
+            ToolRequest::PutObject(PutObjectRequest {
+                bucket: "trusted".into(),
+                key: "put-a.txt".into(),
+                body: "a".into(),
+                content_type: "text/plain".into(),
+            }),
+            ToolRequest::PutObject(PutObjectRequest {
+                bucket: "trusted".into(),
+                key: "put-b.txt".into(),
+                body: "b".into(),
+                content_type: "text/plain".into(),
+            }),
+        ),
+        (
+            ToolRequest::GetObject(GetObjectRequest {
+                bucket: "trusted".into(),
+                key: "source.txt".into(),
+                process: false,
+            }),
+            ToolRequest::GetObject(GetObjectRequest {
+                bucket: "trusted".into(),
+                key: "other.txt".into(),
+                process: false,
+            }),
+        ),
+        (
+            ToolRequest::ListObjects(ListObjectsRequest {
+                bucket: "trusted".into(),
+                prefix: String::new(),
+                continuation_token: None,
+                max_keys: Some(10),
+                delimiter: None,
+                start_after: None,
+            }),
+            ToolRequest::ListObjects(ListObjectsRequest {
+                bucket: "trusted".into(),
+                prefix: "other".into(),
+                continuation_token: None,
+                max_keys: Some(10),
+                delimiter: Some("/".into()),
+                start_after: None,
+            }),
+        ),
+        (
+            ToolRequest::DeleteObject(DeleteObjectRequest {
+                bucket: "trusted".into(),
+                key: "source.txt".into(),
+            }),
+            ToolRequest::DeleteObject(DeleteObjectRequest {
+                bucket: "trusted".into(),
+                key: "other.txt".into(),
+            }),
+        ),
+    ];
+
+    for (first, conflict) in cases {
+        let operation_id = uuid::Uuid::now_v7();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let first_result = invoke_mcp(
+            state.clone(),
+            context.clone(),
+            operation_id,
+            first.clone(),
+            InvocationLimits::default(),
+            cancellation.clone(),
+        )
+        .await;
+        assert!(!matches!(first_result, Err(InvocationError::Invalid(_))));
+        let exact_retry = invoke_mcp(
+            state.clone(),
+            context.clone(),
+            operation_id,
+            first,
+            InvocationLimits::default(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(!matches!(exact_retry, Err(InvocationError::Invalid(_))));
+        let conflict = invoke_mcp(
+            state.clone(),
+            context.clone(),
+            operation_id,
+            conflict,
+            InvocationLimits::default(),
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(conflict, InvocationError::Invalid(message) if message.contains("already bound"))
+        );
+    }
+}
+
+#[test]
+fn trusted_mcp_limits_have_non_configurable_hard_ceilings() {
+    assert!(InvocationLimits::new(0, 1, Duration::from_secs(1)).is_err());
+    assert!(
+        InvocationLimits::new(
+            s4_gateway::mcp::MAX_TEXT_BODY_BYTES + 1,
+            1,
+            Duration::from_secs(1)
+        )
+        .is_err()
+    );
+    assert!(
+        InvocationLimits::new(
+            1,
+            s4_gateway::server::MAX_INVOCATION_RESPONSE_BYTES + 1,
+            Duration::from_secs(1)
+        )
+        .is_err()
+    );
+    assert!(InvocationLimits::new(1, 1, Duration::ZERO).is_err());
+    assert!(InvocationLimits::new(1, 1, Duration::from_secs(121)).is_err());
+}
+
+#[tokio::test]
+async fn active_trusted_mcp_cancellation_releases_precommit_reservation() {
+    let control = Arc::new(RecordingMeteringControl::default());
+    let state = build_state_with_pipeline_template(
+        control.clone(),
+        default_wrapping().expect("wrapping"),
+        Arc::new(InMemoryWorkspaceStorageRepository::new()),
+        test_pipeline_template(),
+    )
+    .await
+    .unwrap();
+    let context = trusted_context(&state, "hosted-workspace").await;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let operation_cancellation = cancellation.clone();
+    let operation = tokio::spawn(invoke_mcp(
+        state,
+        context,
+        uuid::Uuid::now_v7(),
+        ToolRequest::PutObject(PutObjectRequest {
+            bucket: "trusted".into(),
+            key: "cancelled.txt".into(),
+            body: "contact alice@example.com\n".repeat(100_000),
+            content_type: "text/plain".into(),
+        }),
+        InvocationLimits::default(),
+        operation_cancellation,
+    ));
+    while control.authorizations.lock().unwrap().is_empty() {
+        tokio::task::yield_now().await;
+    }
+    cancellation.cancel();
+
+    assert!(matches!(
+        operation.await.unwrap(),
+        Err(InvocationError::Cancelled)
+    ));
+    assert_eq!(control.releases.lock().unwrap().len(), 1);
+    assert!(control.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cancellation_during_committed_settlement_returns_success_without_release() {
+    let control = Arc::new(BlockingSettlementControl::default());
+    let state = build_state_with_pipeline_template(
+        control.clone(),
+        default_wrapping().expect("wrapping"),
+        Arc::new(InMemoryWorkspaceStorageRepository::new()),
+        test_pipeline_template(),
+    )
+    .await
+    .unwrap();
+    let context = trusted_context(&state, "hosted-workspace").await;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let operation = tokio::spawn(invoke_mcp(
+        state,
+        context,
+        uuid::Uuid::now_v7(),
+        ToolRequest::PutObject(PutObjectRequest {
+            bucket: "trusted".into(),
+            key: "committed.txt".into(),
+            body: "stored".into(),
+            content_type: "text/plain".into(),
+        }),
+        InvocationLimits::default(),
+        cancellation.clone(),
+    ));
+    control.record_started.notified().await;
+    cancellation.cancel();
+    control.finish_record.notify_one();
+
+    assert!(matches!(
+        operation.await.unwrap(),
+        Ok(ToolResult::PutObject(_))
+    ));
+    assert_eq!(control.events.lock().unwrap().len(), 1);
+    assert_eq!(control.releases.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

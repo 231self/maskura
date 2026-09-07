@@ -77,8 +77,7 @@ use crate::service_storage::{ServiceStorage, parse_service_backends};
 use crate::sigv4::{RequestAuthorization, SigV4Error, SigV4Policy, SigningKeyCache};
 use crate::store::{
     FileKeyStore, KeyRepository, KeyStore, MAX_PUBLIC_KEY_PEM_BYTES, MemoryStore, PostgresKeyStore,
-    canonicalize_credential_label, canonicalize_public_key_pem, sha256_hash,
-    validate_credential_ttl,
+    canonicalize_credential_label, canonicalize_public_key_pem, validate_credential_ttl,
 };
 use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, BackendError, BackendErrorKind,
@@ -136,11 +135,35 @@ pub struct AppState {
     continuation_token_key: [u8; 32],
 }
 
+#[derive(Clone)]
 pub struct Auth {
     context: AuthenticatedRequestContext,
     credential_policy_id: String,
     public_key_pem: Option<String>,
     stable_key: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TrustedInvocationContext {
+    principal: crate::store::AuthenticatedMcpPrincipal,
+}
+
+impl TrustedInvocationContext {
+    pub fn new(principal: crate::store::AuthenticatedMcpPrincipal) -> Self {
+        Self { principal }
+    }
+}
+
+#[derive(Clone)]
+struct TrustedInvocation {
+    auth: Auth,
+    operation: OperationIdentity,
+    cancellation: tokio_util::sync::CancellationToken,
+    committed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+tokio::task_local! {
+    static TRUSTED_INVOCATION: TrustedInvocation;
 }
 
 impl Auth {
@@ -187,11 +210,26 @@ fn operation_id_for_receipt(receipt_id: Uuid) -> Uuid {
 }
 
 fn request_operation_identity() -> OperationIdentity {
+    if let Ok(operation) = TRUSTED_INVOCATION.try_with(|value| value.operation) {
+        return operation;
+    }
     let receipt_id = Uuid::now_v7();
     OperationIdentity {
         receipt_id,
         operation_id: operation_id_for_receipt(receipt_id),
     }
+}
+
+fn trusted_wasm_cancellation() -> s4_wasm_runtime::CancellationToken {
+    let pipeline = s4_wasm_runtime::CancellationToken::new();
+    if let Ok(invocation) = TRUSTED_INVOCATION.try_with(|value| value.cancellation.clone()) {
+        let pipeline_on_cancel = pipeline.clone();
+        tokio::spawn(async move {
+            invocation.cancelled().await;
+            pipeline_on_cancel.cancel();
+        });
+    }
+    pipeline
 }
 
 impl OperationIdentity {
@@ -329,6 +367,11 @@ async fn record_usage(
     event: &UsageEvent,
     key: &str,
 ) -> Result<(), axum::response::Response> {
+    let _ = TRUSTED_INVOCATION.try_with(|invocation| {
+        invocation
+            .committed
+            .store(true, std::sync::atomic::Ordering::Release);
+    });
     control.record(context, event).await.map_err(|error| {
         warn!(event_id = %event.receipt_id(), ?error, "usage event was not recorded");
         metering_error_response(key, error)
@@ -1024,6 +1067,7 @@ fn derive_stable_key(secret: &str) -> Vec<u8> {
 #[derive(Serialize, ToSchema)]
 struct ApiKeyResponse {
     key_id: String,
+    workspace_id: String,
     secret: String,
     label: String,
     created_at: String,
@@ -1039,6 +1083,7 @@ struct InternalErrorResponse {
 #[derive(Serialize, ToSchema)]
 struct ListKeyResponse {
     key_id: String,
+    workspace_id: Option<String>,
     label: String,
     created_at: String,
     expires_at: Option<String>,
@@ -1067,7 +1112,9 @@ struct DeleteKeyRequest {
 
 #[derive(Serialize, ToSchema)]
 struct McpTokenResponse {
+    credential_id: String,
     token_hash: String,
+    workspace_id: Option<String>,
     label: String,
     created_at: String,
     expires_at: Option<String>,
@@ -1075,7 +1122,9 @@ struct McpTokenResponse {
 
 #[derive(Serialize, ToSchema)]
 struct McpTokenCreatedResponse {
+    credential_id: String,
     token: String,
+    workspace_id: String,
     label: String,
     created_at: String,
     expires_at: Option<String>,
@@ -1128,10 +1177,11 @@ struct S3Query {
         version = "0.3.5",
         description = "Pluggable processing gateway for S3-compatible storage. Manage plugins and API keys, proxy S3 requests through a Wasm plugin pipeline."
     ),
-    paths(get_keys, create_key, delete_key, get_backend, put_backend, list_objects),
-    components(schemas(ApiKeyResponse, ListKeyResponse, CreateKeyRequest, DeleteKeyRequest, ObjectResponse, BackendConfigRequest, BackendConfigResponse)),
+    paths(get_keys, create_key, delete_key, get_mcp_tokens, create_mcp_token, delete_mcp_token, get_backend, put_backend, list_objects),
+    components(schemas(ApiKeyResponse, ListKeyResponse, CreateKeyRequest, DeleteKeyRequest, McpTokenResponse, McpTokenCreatedResponse, CreateMcpTokenRequest, DeleteMcpTokenRequest, ObjectResponse, BackendConfigRequest, BackendConfigResponse)),
     tags(
         (name = "keys", description = "API key management"),
+        (name = "mcp", description = "Hosted MCP credential management"),
         (name = "objects", description = "Object store listing")
     )
 )]
@@ -1800,6 +1850,33 @@ async fn authenticated_request(
     })
 }
 
+fn authenticated_credential(
+    context: AuthenticatedRequestContext,
+    credential_policy_id: String,
+    public_key_pem: Option<String>,
+    stable_key: Option<Vec<u8>>,
+) -> Auth {
+    Auth {
+        context,
+        credential_policy_id,
+        public_key_pem,
+        stable_key,
+    }
+}
+
+fn persisted_credential_context(
+    user_id: String,
+    workspace_id: Option<String>,
+) -> Result<AuthenticatedRequestContext, HeaderAuthError> {
+    let workspace_id = workspace_id
+        .and_then(|value| WorkspaceId::new(value).ok())
+        .ok_or(HeaderAuthError::Denied)?;
+    Ok(AuthenticatedRequestContext {
+        user_id,
+        workspace_id,
+    })
+}
+
 impl From<SigV4Error> for HeaderAuthError {
     fn from(error: SigV4Error) -> Self {
         match error {
@@ -1833,6 +1910,9 @@ async fn authenticate_headers(
     keys: &Arc<dyn KeyRepository>,
     state: &AppState,
 ) -> Result<HeaderAuthentication, HeaderAuthError> {
+    if let Ok(auth) = TRUSTED_INVOCATION.try_with(|value| value.auth.clone()) {
+        return Ok(HeaderAuthentication::without_body(auth));
+    }
     customer_headers::validate_all(headers).map_err(|_| HeaderAuthError::Denied)?;
     if let Some(sigv4) = RequestAuthorization::parse(uri, headers).map_err(HeaderAuthError::from)? {
         // AUTH_DISABLED is an explicit local-only bypass retained for the
@@ -1875,14 +1955,12 @@ async fn authenticate_headers(
             )
             .map_err(HeaderAuthError::from)?;
         return Ok(HeaderAuthentication {
-            auth: authenticated_request(
-                state,
-                key.user_id.clone(),
+            auth: authenticated_credential(
+                persisted_credential_context(key.user_id.clone(), key.workspace_id.clone())?,
                 key.key_id.clone(),
                 key.public_key_pem.clone(),
                 Some(derive_stable_key(&secret)),
-            )
-            .await?,
+            ),
             body_verifier: Some(body_verifier),
         });
     }
@@ -1893,26 +1971,24 @@ async fn authenticate_headers(
             let token = &a[7..];
             // MCP bearer token (s4m_...): a self-contained credential.
             if token.starts_with("s4m_") {
-                let user_id = keys.resolve_mcp_token(token).await.map_err(|error| {
+                let context = keys.resolve_mcp_token(token).await.map_err(|error| {
                     HeaderAuthError::CredentialStoreUnavailable(error.to_string())
                 })?;
-                if let Some(user_id) = user_id {
+                if let Some(principal) = context {
                     return Ok(HeaderAuthentication::without_body(
-                        authenticated_request(
-                            state,
-                            user_id,
-                            format!("mcp:{}", sha256_hash(token)),
+                        authenticated_credential(
+                            principal.context,
+                            principal.credential_policy_id,
                             None,
                             None,
-                        )
-                        .await?,
+                        ),
                     ));
                 }
                 return Err(HeaderAuthError::Denied);
             }
             // Try API key format: Bearer s4_xxx:s4s_xxx
             if let Some((ak, sk)) = token.split_once(':') {
-                let (user_id, public_key_pem) = keys
+                let (context, public_key_pem) = keys
                     .resolve_credentials(ak, sk)
                     .await
                     .map_err(|error| {
@@ -1920,14 +1996,12 @@ async fn authenticate_headers(
                     })?
                     .ok_or(HeaderAuthError::Denied)?;
                 return Ok(HeaderAuthentication::without_body(
-                    authenticated_request(
-                        state,
-                        user_id,
+                    authenticated_credential(
+                        context,
                         ak.to_string(),
                         public_key_pem,
                         Some(derive_stable_key(sk)),
-                    )
-                    .await?,
+                    ),
                 ));
             }
             // Try JWT
@@ -1947,23 +2021,21 @@ async fn authenticate_headers(
     if let Some(tok) = customer_headers::validated(headers, customer_headers::MCP_TOKEN)
         .and_then(|v| v.to_str().ok())
     {
-        let user_id = if tok.starts_with("s4m_") {
+        let context = if tok.starts_with("s4m_") {
             keys.resolve_mcp_token(tok)
                 .await
                 .map_err(|error| HeaderAuthError::CredentialStoreUnavailable(error.to_string()))?
         } else {
             None
         };
-        if let Some(user_id) = user_id {
+        if let Some(principal) = context {
             return Ok(HeaderAuthentication::without_body(
-                authenticated_request(
-                    state,
-                    user_id,
-                    format!("mcp:{}", sha256_hash(tok)),
+                authenticated_credential(
+                    principal.context,
+                    principal.credential_policy_id,
                     None,
                     None,
-                )
-                .await?,
+                ),
             ));
         }
         return Err(HeaderAuthError::Denied);
@@ -1978,16 +2050,14 @@ async fn authenticate_headers(
         .resolve_credentials(ak, sk)
         .await
         .map_err(|error| HeaderAuthError::CredentialStoreUnavailable(error.to_string()))?;
-    if let Some((user_id, public_key_pem)) = resolved {
+    if let Some((context, public_key_pem)) = resolved {
         return Ok(HeaderAuthentication::without_body(
-            authenticated_request(
-                state,
-                user_id,
+            authenticated_credential(
+                context,
                 ak.to_string(),
                 public_key_pem,
                 Some(derive_stable_key(sk)),
-            )
-            .await?,
+            ),
         ));
     }
     // Allow access in demo mode only when auth is explicitly disabled or
@@ -2502,7 +2572,7 @@ async fn execute_demo_records(
     records: Vec<crate::record::Record>,
     deadline: Instant,
 ) -> Result<(Vec<crate::record::Record>, Vec<crate::record::Record>), s4_error::S4Error> {
-    let cancellation = s4_wasm_runtime::CancellationToken::new();
+    let cancellation = trusted_wasm_cancellation();
     let mut pipeline = snapshot
         .start_streaming_session_with_deadline(session, cancellation, deadline)
         .await?;
@@ -3604,7 +3674,7 @@ async fn streaming_single_put(
         stable_key: authentication.auth.stable_key.clone(),
         stable_fields,
     };
-    let cancellation = s4_wasm_runtime::CancellationToken::new();
+    let cancellation = trusted_wasm_cancellation();
     let pipeline_started = std::time::Instant::now();
     let mut pipeline = match snapshot
         .clone()
@@ -4488,7 +4558,7 @@ async fn complete_staged_multipart(
         &content_type,
     )
     .await?;
-    let cancellation = s4_wasm_runtime::CancellationToken::new();
+    let cancellation = trusted_wasm_cancellation();
     let session = s4_wasm_runtime::Session {
         format: format.as_str().to_string(),
         content_type,
@@ -6450,7 +6520,7 @@ async fn transformed_read_response(
     let pipeline_started = std::time::Instant::now();
     let source_cancellation = object.cancellation.clone();
     let source_counters = object.counters.clone();
-    let pipeline_cancellation = s4_wasm_runtime::CancellationToken::new();
+    let pipeline_cancellation = trusted_wasm_cancellation();
     let pipeline = match snapshot
         .clone()
         .start_streaming_session(
@@ -10155,6 +10225,7 @@ async fn get_keys(
         .into_iter()
         .map(|k| ListKeyResponse {
             key_id: k.key_id,
+            workspace_id: k.workspace_id,
             label: k.label,
             created_at: k.created_at,
             expires_at: k.expires_at,
@@ -10196,9 +10267,13 @@ async fn create_key(
         Ok(public_key_pem) => public_key_pem,
         Err(_) => return invalid_credential_mutation_response(),
     };
+    let workspace = match state.workspace_storage.resolve_workspace(&uid).await {
+        Ok(workspace) => workspace,
+        Err(error) => return workspace_storage_error_response(error),
+    };
     let result = state
         .keys
-        .create_key(&uid, &label, body.expires_in, public_key_pem)
+        .create_key(&uid, &workspace, &label, body.expires_in, public_key_pem)
         .await;
     let (secret, created) = match result {
         Ok(created) => created,
@@ -10219,6 +10294,9 @@ async fn create_key(
     };
     Json(ApiKeyResponse {
         key_id: created.key_id,
+        workspace_id: created
+            .workspace_id
+            .expect("new API keys are workspace-bound"),
         secret,
         label: created.label,
         created_at: created.created_at,
@@ -10278,7 +10356,11 @@ async fn get_mcp_tokens(
     let resp: Vec<McpTokenResponse> = tokens
         .into_iter()
         .map(|t| McpTokenResponse {
+            credential_id: t
+                .credential_id
+                .expect("persisted MCP tokens have credential IDs"),
             token_hash: t.token_hash,
+            workspace_id: t.workspace_id,
             label: t.label,
             created_at: t.created_at,
             expires_at: t.expires_at,
@@ -10311,9 +10393,13 @@ async fn create_mcp_token(
     if validate_credential_ttl(body.expires_in).is_err() {
         return invalid_credential_mutation_response();
     }
+    let workspace = match state.workspace_storage.resolve_workspace(&uid).await {
+        Ok(workspace) => workspace,
+        Err(error) => return workspace_storage_error_response(error),
+    };
     let (token, created) = match state
         .keys
-        .create_mcp_token(&uid, &label, body.expires_in)
+        .create_mcp_token(&uid, &workspace, &label, body.expires_in)
         .await
     {
         Ok(created) => created,
@@ -10323,7 +10409,13 @@ async fn create_mcp_token(
         }
     };
     Json(McpTokenCreatedResponse {
+        credential_id: created
+            .credential_id
+            .expect("new MCP tokens have credential IDs"),
         token,
+        workspace_id: created
+            .workspace_id
+            .expect("new MCP tokens are workspace-bound"),
         label,
         created_at: created.created_at,
         expires_at: created.expires_at,
@@ -10529,10 +10621,10 @@ async fn authenticate_public_key_mutation(
                 tracing::error!(error = %error, "credential storage unavailable");
                 StatusCode::SERVICE_UNAVAILABLE
             })?;
-        let (user_id, _) = resolved.ok_or(StatusCode::UNAUTHORIZED)?;
+        let (context, _) = resolved.ok_or(StatusCode::UNAUTHORIZED)?;
         return Ok(PublicKeyMutationActor::ApiKey {
             access_key: access_key.to_string(),
-            user_id,
+            user_id: context.user_id,
         });
     }
 
@@ -10552,10 +10644,10 @@ async fn authenticate_public_key_mutation(
                 tracing::error!(error = %error, "credential storage unavailable");
                 StatusCode::SERVICE_UNAVAILABLE
             })?;
-        let (user_id, _) = resolved.ok_or(StatusCode::UNAUTHORIZED)?;
+        let (context, _) = resolved.ok_or(StatusCode::UNAUTHORIZED)?;
         return Ok(PublicKeyMutationActor::ApiKey {
             access_key: access_key.to_string(),
-            user_id,
+            user_id: context.user_id,
         });
     }
 
@@ -11274,10 +11366,11 @@ pub async fn build_state_with_pipeline_template(
     // Local mode: ensure a demo key exists and print it so SDK demos and
     // `aws s3 --endpoint-url` work out of the box.
     if auth_disabled {
+        let demo_workspace = workspace_storage.resolve_workspace("demo-user").await?;
         let existing = keys.list_for_user("demo-user").await?;
         if existing.is_empty() {
             let (secret, created) = keys
-                .create_key("demo-user", "local-default", 0, None)
+                .create_key("demo-user", &demo_workspace, "local-default", 0, None)
                 .await?;
             println!("MASKURA_ACCESS_KEY={}", created.key_id);
             println!("MASKURA_SECRET_KEY={secret}");
@@ -11297,7 +11390,8 @@ pub async fn build_state_with_pipeline_template(
     match (bootstrap_key, bootstrap_secret) {
         (Some(key_id), Some(secret)) => {
             if keys.get_key(&key_id).await?.is_none() {
-                keys.bootstrap_key(&key_id, &secret, "demo-user", "bootstrapped")
+                let workspace = workspace_storage.resolve_workspace("demo-user").await?;
+                keys.bootstrap_key(&key_id, &secret, "demo-user", &workspace, "bootstrapped")
                     .await?;
                 info!("Bootstrapped API key {key_id}");
             }
@@ -11433,6 +11527,355 @@ pub async fn build_state_with_pipeline_template(
         });
     }
     Ok(state)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct InvocationLimits {
+    max_request_body_bytes: usize,
+    max_response_body_bytes: usize,
+    timeout: Duration,
+}
+
+pub const MAX_INVOCATION_RESPONSE_BYTES: usize = crate::mcp::MAX_TEXT_BODY_BYTES;
+pub const MAX_INVOCATION_TIMEOUT: Duration = Duration::from_secs(120);
+
+impl InvocationLimits {
+    pub fn new(
+        max_request_body_bytes: usize,
+        max_response_body_bytes: usize,
+        timeout: Duration,
+    ) -> Result<Self, InvocationError> {
+        if max_request_body_bytes == 0 || max_request_body_bytes > crate::mcp::MAX_TEXT_BODY_BYTES {
+            return Err(InvocationError::Invalid(format!(
+                "max_request_body_bytes must be between 1 and {}",
+                crate::mcp::MAX_TEXT_BODY_BYTES
+            )));
+        }
+        if max_response_body_bytes == 0 || max_response_body_bytes > MAX_INVOCATION_RESPONSE_BYTES {
+            return Err(InvocationError::Invalid(format!(
+                "max_response_body_bytes must be between 1 and {MAX_INVOCATION_RESPONSE_BYTES}"
+            )));
+        }
+        if timeout.is_zero() || timeout > MAX_INVOCATION_TIMEOUT {
+            return Err(InvocationError::Invalid(format!(
+                "timeout must be between 1ns and {} seconds",
+                MAX_INVOCATION_TIMEOUT.as_secs()
+            )));
+        }
+        Ok(Self {
+            max_request_body_bytes,
+            max_response_body_bytes,
+            timeout,
+        })
+    }
+}
+
+impl Default for InvocationLimits {
+    fn default() -> Self {
+        Self::new(
+            crate::mcp::MAX_TEXT_BODY_BYTES,
+            MAX_INVOCATION_RESPONSE_BYTES,
+            Duration::from_secs(30),
+        )
+        .expect("default invocation limits are valid")
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InvocationError {
+    #[error("invalid invocation: {0}")]
+    Invalid(String),
+    #[error("gateway returned {status}: {message}")]
+    Gateway { status: u16, message: String },
+    #[error("trusted invocation was cancelled")]
+    Cancelled,
+    #[error("trusted invocation timed out")]
+    Timeout,
+}
+
+fn bind_mcp_operation(
+    operation_id: Uuid,
+    context: &crate::store::AuthenticatedMcpPrincipal,
+    request: &crate::mcp::ToolRequest,
+) -> Result<(), InvocationError> {
+    use sha2::Digest as _;
+    static BINDINGS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Uuid, [u8; 32]>>,
+    > = std::sync::OnceLock::new();
+    const MAX_BINDINGS: usize = 100_000;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(context.context.workspace_id.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(context.credential_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(context.credential_policy_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(request.canonical_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut bindings = BINDINGS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| InvocationError::Invalid("operation identity registry failed".to_string()))?;
+    match bindings.get(&operation_id) {
+        Some(existing) if existing == &digest => Ok(()),
+        Some(_) => Err(InvocationError::Invalid(
+            "operation_id was already bound to a different MCP operation".to_string(),
+        )),
+        None if bindings.len() >= MAX_BINDINGS => Err(InvocationError::Invalid(
+            "operation identity registry is full".to_string(),
+        )),
+        None => {
+            bindings.insert(operation_id, digest);
+            Ok(())
+        }
+    }
+}
+
+async fn collect_invocation_body(
+    mut body: axum::body::Body,
+    limit: usize,
+    cancellation: &tokio_util::sync::CancellationToken,
+    committed: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u8>, InvocationError> {
+    let mut output = Vec::new();
+    loop {
+        let frame = if committed.load(std::sync::atomic::Ordering::Acquire) {
+            body.frame().await
+        } else {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    if committed.load(std::sync::atomic::Ordering::Acquire) {
+                        body.frame().await
+                    } else {
+                        return Err(InvocationError::Cancelled);
+                    }
+                }
+                frame = body.frame() => frame,
+            }
+        };
+        let Some(frame) = frame else {
+            return Ok(output);
+        };
+        let frame = frame.map_err(|_| InvocationError::Gateway {
+            status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            message: "gateway response body failed".to_string(),
+        })?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if output.len().saturating_add(data.len()) > limit {
+            return Err(InvocationError::Gateway {
+                status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                message: format!("gateway response exceeds {limit} bytes"),
+            });
+        }
+        output.extend_from_slice(&data);
+    }
+}
+
+/// Invoke an MCP operation inside the gateway trust boundary.
+///
+/// The supplied principal is already authenticated by the hosting adapter.
+/// It is carried in task-local state that network requests cannot create, and
+/// the operation runs through the same handlers as S3 traffic. No credential,
+/// authorization, backend-selection, or metering headers are accepted.
+pub async fn invoke_mcp(
+    state: Arc<AppState>,
+    context: TrustedInvocationContext,
+    operation_id: Uuid,
+    request: crate::mcp::ToolRequest,
+    limits: InvocationLimits,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<crate::mcp::ToolResult, InvocationError> {
+    if cancellation.is_cancelled() {
+        return Err(InvocationError::Cancelled);
+    }
+    if operation_id.is_nil() {
+        return Err(InvocationError::Invalid(
+            "operation_id must not be nil".to_string(),
+        ));
+    }
+    request
+        .validate(limits.max_request_body_bytes)
+        .map_err(|error| InvocationError::Invalid(error.to_string()))?;
+    bind_mcp_operation(operation_id, &context.principal, &request)?;
+    let principal = context.principal;
+    let effective_cancellation = tokio_util::sync::CancellationToken::new();
+    let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let receipt_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, operation_id.as_bytes().as_slice());
+    let trusted = TrustedInvocation {
+        auth: authenticated_credential(
+            principal.context,
+            principal.credential_policy_id,
+            None,
+            None,
+        ),
+        operation: OperationIdentity {
+            receipt_id,
+            operation_id,
+        },
+        cancellation: effective_cancellation.clone(),
+        committed: committed.clone(),
+    };
+    let invoke = async {
+        let (response, result_kind) = match request {
+            crate::mcp::ToolRequest::PutObject(request) => {
+                let content_type = request.content_type.parse().map_err(|_| {
+                    InvocationError::Invalid("content_type is not a valid HTTP value".to_string())
+                })?;
+                let mut request_headers = HeaderMap::new();
+                request_headers.insert(header::CONTENT_TYPE, content_type);
+                let mut http_request = Request::new(axum::body::Body::from(request.body));
+                *http_request.method_mut() = Method::PUT;
+                *http_request.headers_mut() = request_headers;
+                let response = s3_put(
+                    State(state.clone()),
+                    Path((request.bucket.clone(), request.key.clone())),
+                    Query(S3Query::default()),
+                    http_request,
+                )
+                .await
+                .into_response();
+                (response, (0_u8, request.bucket, request.key))
+            }
+            crate::mcp::ToolRequest::GetObject(request) => {
+                let mut headers = HeaderMap::new();
+                if request.process {
+                    headers.insert("x-maskura-process", "read".parse().unwrap());
+                }
+                let response = s3_get(
+                    State(state.clone()),
+                    Path((request.bucket, request.key)),
+                    Query(S3Query::default()),
+                    Method::GET,
+                    Uri::from_static("/"),
+                    headers,
+                )
+                .await
+                .into_response();
+                (response, (1, String::new(), String::new()))
+            }
+            crate::mcp::ToolRequest::ListObjects(request) => {
+                let response = s3_list_objects(
+                    State(state.clone()),
+                    Path(request.bucket),
+                    Query(S3Query {
+                        list_type: Some("2".to_string()),
+                        prefix: Some(request.prefix),
+                        continuation_token: request.continuation_token,
+                        max_keys: request.max_keys,
+                        delimiter: request.delimiter,
+                        start_after: request.start_after,
+                        ..Default::default()
+                    }),
+                    Method::GET,
+                    Uri::from_static("/"),
+                    HeaderMap::new(),
+                )
+                .await
+                .into_response();
+                (response, (2, String::new(), String::new()))
+            }
+            crate::mcp::ToolRequest::DeleteObject(request) => {
+                let response = s3_delete(
+                    State(state.clone()),
+                    Path((request.bucket.clone(), request.key.clone())),
+                    Query(S3Query::default()),
+                    Method::DELETE,
+                    Uri::from_static("/"),
+                    HeaderMap::new(),
+                )
+                .await
+                .into_response();
+                (response, (3, request.bucket, request.key))
+            }
+        };
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = collect_invocation_body(
+            response.into_body(),
+            limits.max_response_body_bytes,
+            &cancellation,
+            committed.as_ref(),
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(InvocationError::Gateway {
+                status: status.as_u16(),
+                message: String::from_utf8_lossy(&body).into_owned(),
+            });
+        }
+        match result_kind {
+            (0, bucket, key) => Ok(crate::mcp::ToolResult::PutObject(
+                crate::mcp::MutationResult {
+                    bucket,
+                    key,
+                    status: status.as_u16(),
+                },
+            )),
+            (1, _, _) => String::from_utf8(body)
+                .map(|body| {
+                    crate::mcp::ToolResult::GetObject(crate::mcp::GetObjectResult {
+                        body,
+                        content_type,
+                    })
+                })
+                .map_err(|_| InvocationError::Gateway {
+                    status: status.as_u16(),
+                    message: "gateway response is not valid UTF-8".to_string(),
+                }),
+            (2, _, _) => {
+                let body = String::from_utf8(body).map_err(|_| InvocationError::Gateway {
+                    status: status.as_u16(),
+                    message: "gateway response is not valid UTF-8".to_string(),
+                })?;
+                crate::mcp::parse_list_objects_result(&body)
+                    .map(crate::mcp::ToolResult::ListObjects)
+                    .map_err(|error| InvocationError::Gateway {
+                        status: status.as_u16(),
+                        message: format!("invalid ListObjectsV2 response: {error}"),
+                    })
+            }
+            (3, bucket, key) => Ok(crate::mcp::ToolResult::DeleteObject(
+                crate::mcp::MutationResult {
+                    bucket,
+                    key,
+                    status: status.as_u16(),
+                },
+            )),
+            _ => unreachable!("invocation result kind is internal"),
+        }
+    };
+    let scoped = TRUSTED_INVOCATION.scope(trusted, invoke);
+    tokio::pin!(scoped);
+    let deadline = tokio::time::sleep(limits.timeout);
+    tokio::pin!(deadline);
+    enum Interrupted {
+        Cancelled,
+        Timeout,
+    }
+    let interrupted = tokio::select! {
+        result = &mut scoped => return result,
+        _ = cancellation.cancelled() => Interrupted::Cancelled,
+        _ = &mut deadline => Interrupted::Timeout,
+    };
+    effective_cancellation.cancel();
+    let settled = scoped.await;
+    if committed.load(std::sync::atomic::Ordering::Acquire) {
+        return settled;
+    }
+    match settled {
+        Ok(result) => Ok(result),
+        _ => match interrupted {
+            Interrupted::Cancelled => Err(InvocationError::Cancelled),
+            Interrupted::Timeout => Err(InvocationError::Timeout),
+        },
+    }
 }
 
 /// Build the axum router for the engine. The SaaS crate merges its own
@@ -11613,6 +12056,26 @@ mod demo_limiter_tests {
             "DemoErrorResponse",
         ] {
             assert!(document["components"]["schemas"].get(schema).is_none());
+        }
+    }
+
+    #[test]
+    fn credential_schemas_and_mcp_dashboard_paths_are_published() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert!(document["paths"]["/dashboard/api/mcp-tokens"].is_object());
+        for schema in ["ApiKeyResponse", "ListKeyResponse"] {
+            assert!(
+                document["components"]["schemas"][schema]["properties"]["workspace_id"].is_object()
+            );
+        }
+        for schema in ["McpTokenResponse", "McpTokenCreatedResponse"] {
+            assert!(
+                document["components"]["schemas"][schema]["properties"]["credential_id"]
+                    .is_object()
+            );
+            assert!(
+                document["components"]["schemas"][schema]["properties"]["workspace_id"].is_object()
+            );
         }
     }
 }

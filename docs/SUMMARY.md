@@ -20,3 +20,4 @@
 - [ADR 0007: Fresh Store Per Object](adr/0007-fresh-store-per-object.md)
 - [ADR 0008: Keyless AWS Credentials and Bootstrap](adr/0008-keyless-aws-credentials-and-bootstrap.md)
 - [ADR 0009: Durable Async Write Acknowledgements](adr/0009-durable-async-write-acknowledgements.md)
+- [ADR 0010: Workspace-bound Hosted MCP](adr/0010-workspace-bound-hosted-mcp.md)

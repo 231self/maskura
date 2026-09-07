@@ -79,7 +79,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 - **Supabase Auth (GoTrue)** for user signup, login, magic-link emails, and session management.
 - Supabase JS client in the dashboard browser app; `jsonwebtoken` crate in the gateway validates JWTs.
-- API keys (S3 access key + secret) are separate from user sessions. Generated on key creation, hashed with SHA-256, stored in Postgres.
+- API keys (S3 access key + secret) and MCP tokens are separate from user sessions. Each stores immutable `workspace_id` execution scope plus `user_id` dashboard ownership. Legacy unbound credentials fail authentication rather than resolving a current/default workspace.
 - Gateway verifies API keys on S3 routes via `x-maskura-access-key` / `x-maskura-secret-key` headers (with permanent `x-s4-*` aliases) or `Authorization: Bearer <access_key>:<secret>`.
 
 ### Database
@@ -88,7 +88,13 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 - ORM: `sea-orm` (built on `sqlx`). Queries use entities (`crates/gateway/src/entity/`) and the SeaORM query builder — no raw SQL strings in code. `sqlx::migrate!` runs the `.sql` schema migrations.
 - Migration files in workspace-root `migrations/`, versioned sequentially (`YYYYMMDDHHMMSS_description.sql`). The gateway runs `sqlx::migrate!()` at startup.
 - `sqlx migrate run` applies; `sqlx migrate info` checks status. Never use `psql` or `docker exec` directly.
-- **API keys are persisted in Postgres** when `DATABASE_URL` is set (`PostgresKeyStore`); otherwise the in-memory `KeyStore` is used (local dev). Both implement the async `KeyRepository` trait. `PostgresKeyStore` survives restarts.
+- **API keys and MCP tokens are persisted in Postgres** when `DATABASE_URL` is set (`PostgresKeyStore`); otherwise the in-memory/file stores are used. All implement `KeyRepository` and persist an immutable workspace-bound principal. Migration `20260907000002` leaves ambiguous legacy rows unbound and therefore unusable for authentication.
+
+### Hosted MCP
+
+- Shared typed MCP schemas, results, tool definitions/aliases, dispatch, and list parsing live in `maskura-mcp-protocol` and are re-exported as `s4_gateway::mcp`.
+- Hosted adapters authenticate externally and call `s4_gateway::server::invoke_mcp` with an atomically resolved `AuthenticatedMcpPrincipal`, server operation UUID, bounded typed request, timeout, and cancellation token.
+- Trusted invocation uses task-local context unavailable to HTTP clients and runs the existing S3 authorization, filtering, storage, transaction, and metering handlers. It never uses loopback HTTP or synthesized auth headers.
 
 ### Storage (Object Data)
 
@@ -145,7 +151,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 - OpenAPI 3.1 spec auto-generated from Rust types via `utoipa` + `utoipa-swagger-ui`.
 - Served at `/openapi.json` (raw spec) and `/docs` (Swagger UI).
-- `utoipa::ToSchema` on all API types (`ApiKeyResponse`, `ListKeyResponse`, `CreateKeyRequest`, `DeleteKeyRequest`, `ObjectResponse`, `BackendConfig`).
+- `utoipa::ToSchema` on all API types, including API key workspace scope and hosted MCP credential UUID/workspace fields.
 - `#[utoipa::path(...)]` annotations on all dashboard API handlers.
 - `just build-sdks` extracts spec, runs `openapi-generator` (Docker) to produce Python and TypeScript SDKs in `sdks/python/` and `sdks/typescript/`.
 - Schema is the single source of truth — SDKs always in sync with server changes.

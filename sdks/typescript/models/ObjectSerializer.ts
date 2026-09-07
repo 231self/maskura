@@ -3,8 +3,12 @@ export * from '../models/BackendConfigRequest';
 export * from '../models/BackendConfigResponse';
 export * from '../models/BackendType';
 export * from '../models/CreateKeyRequest';
+export * from '../models/CreateMcpTokenRequest';
 export * from '../models/DeleteKeyRequest';
+export * from '../models/DeleteMcpTokenRequest';
 export * from '../models/ListKeyResponse';
+export * from '../models/McpTokenCreatedResponse';
+export * from '../models/McpTokenResponse';
 export * from '../models/ObjectResponse';
 
 import { ApiKeyResponse } from '../models/ApiKeyResponse';
@@ -12,8 +16,12 @@ import { BackendConfigRequest        } from '../models/BackendConfigRequest';
 import { BackendConfigResponse         } from '../models/BackendConfigResponse';
 import { BackendType } from '../models/BackendType';
 import { CreateKeyRequest } from '../models/CreateKeyRequest';
+import { CreateMcpTokenRequest } from '../models/CreateMcpTokenRequest';
 import { DeleteKeyRequest } from '../models/DeleteKeyRequest';
+import { DeleteMcpTokenRequest } from '../models/DeleteMcpTokenRequest';
 import { ListKeyResponse } from '../models/ListKeyResponse';
+import { McpTokenCreatedResponse } from '../models/McpTokenCreatedResponse';
+import { McpTokenResponse } from '../models/McpTokenResponse';
 import { ObjectResponse } from '../models/ObjectResponse';
 
 /* tslint:disable:no-unused-variable */
@@ -37,8 +45,12 @@ let typeMap: {[index: string]: any} = {
     "BackendConfigRequest": BackendConfigRequest,
     "BackendConfigResponse": BackendConfigResponse,
     "CreateKeyRequest": CreateKeyRequest,
+    "CreateMcpTokenRequest": CreateMcpTokenRequest,
     "DeleteKeyRequest": DeleteKeyRequest,
+    "DeleteMcpTokenRequest": DeleteMcpTokenRequest,
     "ListKeyResponse": ListKeyResponse,
+    "McpTokenCreatedResponse": McpTokenCreatedResponse,
+    "McpTokenResponse": McpTokenResponse,
     "ObjectResponse": ObjectResponse,
 }
 

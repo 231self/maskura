@@ -40,7 +40,8 @@ class TestApiKeyResponse(unittest.TestCase):
                 key_id = '',
                 label = '',
                 public_key_pem = '',
-                secret = ''
+                secret = '',
+                workspace_id = ''
             )
         else:
             return ApiKeyResponse(
@@ -48,6 +49,7 @@ class TestApiKeyResponse(unittest.TestCase):
                 key_id = '',
                 label = '',
                 secret = '',
+                workspace_id = '',
         )
         """
 

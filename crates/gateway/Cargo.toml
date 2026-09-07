@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 maskura-customer-config.workspace = true
+maskura-mcp-protocol.workspace = true
 s4-error = { path = "../error" }
 s4-wasm-runtime = { path = "../wasm-runtime" }
 anyhow = "1"

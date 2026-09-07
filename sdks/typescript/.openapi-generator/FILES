@@ -3,10 +3,12 @@
 .openapi-generator-ignore
 BackendApi.md
 KeysApi.md
+McpApi.md
 ObjectsApi.md
 README.md
 apis/BackendApi.ts
 apis/KeysApi.ts
+apis/McpApi.ts
 apis/ObjectsApi.ts
 apis/baseapi.ts
 apis/exception.ts
@@ -22,8 +24,12 @@ models/BackendConfigRequest.ts
 models/BackendConfigResponse.ts
 models/BackendType.ts
 models/CreateKeyRequest.ts
+models/CreateMcpTokenRequest.ts
 models/DeleteKeyRequest.ts
+models/DeleteMcpTokenRequest.ts
 models/ListKeyResponse.ts
+models/McpTokenCreatedResponse.ts
+models/McpTokenResponse.ts
 models/ObjectResponse.ts
 models/ObjectSerializer.ts
 models/all.ts

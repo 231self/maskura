@@ -14,10 +14,10 @@
 
 import unittest
 
-from s4_client.models.list_key_response import ListKeyResponse
+from s4_client.models.create_mcp_token_request import CreateMcpTokenRequest
 
-class TestListKeyResponse(unittest.TestCase):
-    """ListKeyResponse unit test stubs"""
+class TestCreateMcpTokenRequest(unittest.TestCase):
+    """CreateMcpTokenRequest unit test stubs"""
 
     def setUp(self):
         pass
@@ -25,33 +25,27 @@ class TestListKeyResponse(unittest.TestCase):
     def tearDown(self):
         pass
 
-    def make_instance(self, include_optional) -> ListKeyResponse:
-        """Test ListKeyResponse
+    def make_instance(self, include_optional) -> CreateMcpTokenRequest:
+        """Test CreateMcpTokenRequest
             include_optional is a boolean, when False only required
             params are included, when True both required and
             optional params are included """
-        # uncomment below to create an instance of `ListKeyResponse`
+        # uncomment below to create an instance of `CreateMcpTokenRequest`
         """
-        model = ListKeyResponse()
+        model = CreateMcpTokenRequest()
         if include_optional:
-            return ListKeyResponse(
-                created_at = '',
-                expires_at = '',
-                key_id = '',
-                label = '',
-                public_key_pem = '',
-                workspace_id = ''
+            return CreateMcpTokenRequest(
+                expires_in = 0,
+                label = ''
             )
         else:
-            return ListKeyResponse(
-                created_at = '',
-                key_id = '',
+            return CreateMcpTokenRequest(
                 label = '',
         )
         """
 
-    def testListKeyResponse(self):
-        """Test ListKeyResponse"""
+    def testCreateMcpTokenRequest(self):
+        """Test CreateMcpTokenRequest"""
         # inst_req_only = self.make_instance(include_optional=False)
         # inst_req_and_optional = self.make_instance(include_optional=True)
 

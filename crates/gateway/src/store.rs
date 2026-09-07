@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::entity::api_key;
 use crate::entity::mcp_token;
 use crate::key_cipher::SecretCipher;
+use crate::workspace_storage::WorkspaceId;
 
 pub const MAX_CREDENTIAL_LABEL_BYTES: usize = 128;
 pub const MAX_CREDENTIAL_TTL_SECONDS: u64 = 365 * 24 * 60 * 60;
@@ -40,6 +41,8 @@ pub struct ApiKey {
     #[serde(default)]
     pub secret_encrypted: Option<String>,
     pub user_id: String,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     pub label: String,
     pub created_at: String,
     pub expires_at: Option<String>,
@@ -50,11 +53,38 @@ pub struct ApiKey {
 /// SHA-256 hash is stored.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct McpToken {
+    /// Stable credential UUID. Missing only in legacy file snapshots.
+    #[serde(default)]
+    pub credential_id: Option<String>,
     pub token_hash: String,
     pub user_id: String,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     pub label: String,
     pub created_at: String,
     pub expires_at: Option<String>,
+}
+
+/// Authenticated MCP credential identity returned atomically with its scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedMcpPrincipal {
+    pub(crate) context: crate::control::AuthenticatedRequestContext,
+    pub(crate) credential_id: Uuid,
+    pub(crate) credential_policy_id: String,
+}
+
+impl AuthenticatedMcpPrincipal {
+    pub fn context(&self) -> &crate::control::AuthenticatedRequestContext {
+        &self.context
+    }
+
+    pub fn credential_id(&self) -> Uuid {
+        self.credential_id
+    }
+
+    pub fn credential_policy_id(&self) -> &str {
+        &self.credential_policy_id
+    }
 }
 
 #[derive(Debug)]
@@ -203,6 +233,7 @@ pub trait KeyRepository: Send + Sync {
     async fn create_key(
         &self,
         user_id: &str,
+        workspace_id: &WorkspaceId,
         label: &str,
         expires_in: u64,
         public_key_pem: Option<String>,
@@ -215,6 +246,7 @@ pub trait KeyRepository: Send + Sync {
         key_id: &str,
         secret: &str,
         user_id: &str,
+        workspace_id: &WorkspaceId,
         label: &str,
     ) -> anyhow::Result<ApiKey>;
 
@@ -231,13 +263,13 @@ pub trait KeyRepository: Send + Sync {
     /// signatures). Returns `None` for legacy keys that only have a hash.
     async fn decrypt_secret(&self, key_id: &str) -> anyhow::Result<Option<String>>;
 
-    /// Validate an access key/secret pair and return the owning user id plus
-    /// the API key's public key PEM (used by the encryption pipeline).
+    /// Validate an access key/secret pair and return its immutable principal
+    /// plus the API key's public key PEM. Legacy unbound records return None.
     async fn resolve_credentials(
         &self,
         access_key: &str,
         secret_key: &str,
-    ) -> anyhow::Result<Option<(String, Option<String>)>>;
+    ) -> anyhow::Result<Option<(crate::control::AuthenticatedRequestContext, Option<String>)>>;
 
     /// Keys for a user, with the secret hash stripped.
     async fn list_for_user(&self, user_id: &str) -> anyhow::Result<Vec<ApiKey>>;
@@ -249,12 +281,16 @@ pub trait KeyRepository: Send + Sync {
     async fn create_mcp_token(
         &self,
         user_id: &str,
+        workspace_id: &WorkspaceId,
         label: &str,
         expires_in: u64,
     ) -> anyhow::Result<(String, McpToken)>;
 
-    /// Validate an MCP bearer token and return the owning user id.
-    async fn resolve_mcp_token(&self, token: &str) -> anyhow::Result<Option<String>>;
+    /// Validate an MCP bearer token and return its immutable principal.
+    async fn resolve_mcp_token(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<Option<AuthenticatedMcpPrincipal>>;
 
     /// MCP tokens for a user (hashes only).
     async fn list_mcp_tokens(&self, user_id: &str) -> anyhow::Result<Vec<McpToken>>;
@@ -323,6 +359,7 @@ pub fn canonicalize_public_key_pem(public_key_pem: &str) -> anyhow::Result<Strin
 fn build_api_key(
     key_id: &str,
     user_id: &str,
+    workspace_id: Option<String>,
     label: &str,
     secret_hash: String,
     secret_encrypted: Option<String>,
@@ -335,6 +372,7 @@ fn build_api_key(
         secret_hash,
         secret_encrypted,
         user_id: user_id.to_string(),
+        workspace_id,
         label: label.to_string(),
         created_at,
         expires_at,
@@ -344,6 +382,7 @@ fn build_api_key(
 
 fn generate_api_key(
     user_id: &str,
+    workspace_id: &WorkspaceId,
     label: &str,
     expires_in: u64,
     public_key_pem: Option<String>,
@@ -384,6 +423,7 @@ fn generate_api_key(
     let api_key = build_api_key(
         &key_id,
         user_id,
+        Some(workspace_id.as_str().to_string()),
         &label,
         secret_hash,
         secret_encrypted,
@@ -418,6 +458,7 @@ fn bootstrap_api_key(
     key_id: &str,
     secret: &str,
     user_id: &str,
+    workspace_id: &WorkspaceId,
     label: &str,
     cipher: Option<&SecretCipher>,
 ) -> anyhow::Result<(ApiKey, String)> {
@@ -441,6 +482,7 @@ fn bootstrap_api_key(
     let api_key = build_api_key(
         key_id,
         user_id,
+        Some(workspace_id.as_str().to_string()),
         &label,
         secret_hash,
         secret_encrypted,
@@ -453,6 +495,7 @@ fn bootstrap_api_key(
 
 fn generate_mcp_token(
     user_id: &str,
+    workspace_id: &WorkspaceId,
     label: &str,
     expires_in: u64,
 ) -> anyhow::Result<(McpToken, String)> {
@@ -471,14 +514,34 @@ fn generate_mcp_token(
     };
     Ok((
         McpToken {
+            credential_id: Some(Uuid::now_v7().to_string()),
             token_hash: sha256_hash(&token),
             user_id: user_id.to_string(),
+            workspace_id: Some(workspace_id.as_str().to_string()),
             label,
             created_at: chrono_now(),
             expires_at,
         },
         token,
     ))
+}
+
+fn authenticated_mcp_principal(
+    token: &McpToken,
+    workspace_id: WorkspaceId,
+) -> anyhow::Result<AuthenticatedMcpPrincipal> {
+    let credential_id = match token.credential_id.as_deref() {
+        Some(value) => value.parse().context("MCP credential ID is invalid")?,
+        None => Uuid::new_v5(&Uuid::NAMESPACE_OID, token.token_hash.as_bytes()),
+    };
+    Ok(AuthenticatedMcpPrincipal {
+        context: crate::control::AuthenticatedRequestContext {
+            user_id: token.user_id.clone(),
+            workspace_id,
+        },
+        credential_id,
+        credential_policy_id: format!("mcp:{credential_id}"),
+    })
 }
 
 fn decrypt_verified_secret(
@@ -611,7 +674,7 @@ fn resolve_credentials_in(
     keys: &RwLock<HashMap<String, ApiKey>>,
     access_key: &str,
     secret_key: &str,
-) -> anyhow::Result<Option<(String, Option<String>)>> {
+) -> anyhow::Result<Option<(crate::control::AuthenticatedRequestContext, Option<String>)>> {
     let keys = keys
         .read()
         .map_err(|_| anyhow::anyhow!("KeyStore API key lock poisoned"))?;
@@ -624,7 +687,20 @@ fn resolve_credentials_in(
     if is_expired(key.expires_at.as_deref()) {
         return Ok(None);
     }
-    Ok(Some((key.user_id.clone(), key.public_key_pem.clone())))
+    let Some(workspace_id) = key
+        .workspace_id
+        .clone()
+        .and_then(|value| WorkspaceId::new(value).ok())
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        crate::control::AuthenticatedRequestContext {
+            user_id: key.user_id.clone(),
+            workspace_id,
+        },
+        key.public_key_pem.clone(),
+    )))
 }
 
 fn list_for_user_in(
@@ -640,6 +716,7 @@ fn list_for_user_in(
             build_api_key(
                 &k.key_id,
                 &k.user_id,
+                k.workspace_id.clone(),
                 &k.label,
                 String::new(),
                 None,
@@ -673,12 +750,14 @@ impl KeyRepository for KeyStore {
     async fn create_key(
         &self,
         user_id: &str,
+        workspace_id: &WorkspaceId,
         label: &str,
         expires_in: u64,
         public_key_pem: Option<String>,
     ) -> anyhow::Result<(String, ApiKey)> {
         let (api_key, secret) = generate_api_key(
             user_id,
+            workspace_id,
             label,
             expires_in,
             public_key_pem,
@@ -698,10 +777,17 @@ impl KeyRepository for KeyStore {
         key_id: &str,
         secret: &str,
         user_id: &str,
+        workspace_id: &WorkspaceId,
         label: &str,
     ) -> anyhow::Result<ApiKey> {
-        let (api_key, _) =
-            bootstrap_api_key(key_id, secret, user_id, label, self.cipher.as_deref())?;
+        let (api_key, _) = bootstrap_api_key(
+            key_id,
+            secret,
+            user_id,
+            workspace_id,
+            label,
+            self.cipher.as_deref(),
+        )?;
         let committed = api_key.clone();
         let mut keys = self
             .keys
@@ -771,7 +857,7 @@ impl KeyRepository for KeyStore {
         &self,
         access_key: &str,
         secret_key: &str,
-    ) -> anyhow::Result<Option<(String, Option<String>)>> {
+    ) -> anyhow::Result<Option<(crate::control::AuthenticatedRequestContext, Option<String>)>> {
         resolve_credentials_in(&self.keys, access_key, secret_key)
     }
 
@@ -786,10 +872,11 @@ impl KeyRepository for KeyStore {
     async fn create_mcp_token(
         &self,
         user_id: &str,
+        workspace_id: &WorkspaceId,
         label: &str,
         expires_in: u64,
     ) -> anyhow::Result<(String, McpToken)> {
-        let (mcp, token) = generate_mcp_token(user_id, label, expires_in)?;
+        let (mcp, token) = generate_mcp_token(user_id, workspace_id, label, expires_in)?;
         self.mcp_tokens
             .write()
             .map_err(|_| anyhow::anyhow!("KeyStore MCP token lock poisoned"))?
@@ -797,7 +884,10 @@ impl KeyRepository for KeyStore {
         Ok((token, mcp))
     }
 
-    async fn resolve_mcp_token(&self, token: &str) -> anyhow::Result<Option<String>> {
+    async fn resolve_mcp_token(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<Option<AuthenticatedMcpPrincipal>> {
         let hash = sha256_hash(token);
         let tokens = self
             .mcp_tokens
@@ -809,7 +899,14 @@ impl KeyRepository for KeyStore {
         if is_expired(t.expires_at.as_deref()) {
             return Ok(None);
         }
-        Ok(Some(t.user_id.clone()))
+        let Some(workspace_id) = t
+            .workspace_id
+            .clone()
+            .and_then(|value| WorkspaceId::new(value).ok())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(authenticated_mcp_principal(t, workspace_id)?))
     }
 
     async fn list_mcp_tokens(&self, user_id: &str) -> anyhow::Result<Vec<McpToken>> {
@@ -866,9 +963,10 @@ struct PersistTestHook {
 
 impl FileKeyStore {
     pub fn new(path: PathBuf) -> anyhow::Result<Self> {
-        let (keys, mcp_tokens) = load_file_store(&path)?;
+        let (keys, mut mcp_tokens) = load_file_store(&path)?;
+        let migrated = assign_legacy_mcp_credential_ids(&mut mcp_tokens);
         ensure_file_store_parent(&path)?;
-        Ok(Self {
+        let store = Self {
             keys: RwLock::new(keys),
             mcp_tokens: RwLock::new(mcp_tokens),
             mutation_lock: Mutex::new(()),
@@ -876,13 +974,18 @@ impl FileKeyStore {
             persist_hook: Mutex::new(None),
             path,
             cipher: None,
-        })
+        };
+        if migrated {
+            store.persist()?;
+        }
+        Ok(store)
     }
 
     pub fn with_cipher(path: PathBuf, cipher: Arc<SecretCipher>) -> anyhow::Result<Self> {
-        let (keys, mcp_tokens) = load_file_store(&path)?;
+        let (keys, mut mcp_tokens) = load_file_store(&path)?;
+        let migrated = assign_legacy_mcp_credential_ids(&mut mcp_tokens);
         ensure_file_store_parent(&path)?;
-        Ok(Self {
+        let store = Self {
             keys: RwLock::new(keys),
             mcp_tokens: RwLock::new(mcp_tokens),
             mutation_lock: Mutex::new(()),
@@ -890,7 +993,11 @@ impl FileKeyStore {
             persist_hook: Mutex::new(None),
             path,
             cipher: Some(cipher),
-        })
+        };
+        if migrated {
+            store.persist()?;
+        }
+        Ok(store)
     }
 
     /// Default location for the local-mode keys file.
@@ -964,7 +1071,6 @@ impl FileKeyStore {
         Ok(())
     }
 
-    #[cfg(test)]
     fn persist(&self) -> anyhow::Result<()> {
         let keys = self
             .keys
@@ -976,6 +1082,18 @@ impl FileKeyStore {
             .map_err(|_| anyhow::anyhow!("FileKeyStore MCP token lock poisoned"))?;
         self.persist_snapshot(&keys, &mcp_tokens)
     }
+}
+
+fn assign_legacy_mcp_credential_ids(tokens: &mut HashMap<String, McpToken>) -> bool {
+    let mut migrated = false;
+    for token in tokens.values_mut() {
+        if token.credential_id.is_none() {
+            token.credential_id =
+                Some(Uuid::new_v5(&Uuid::NAMESPACE_OID, token.token_hash.as_bytes()).to_string());
+            migrated = true;
+        }
+    }
+    migrated
 }
 
 fn ensure_file_store_parent(path: &Path) -> anyhow::Result<()> {
@@ -993,12 +1111,14 @@ impl KeyRepository for FileKeyStore {
     async fn create_key(
         &self,
         user_id: &str,
+        workspace_id: &WorkspaceId,
         label: &str,
         expires_in: u64,
         public_key_pem: Option<String>,
     ) -> anyhow::Result<(String, ApiKey)> {
         let (api_key, secret) = generate_api_key(
             user_id,
+            workspace_id,
             label,
             expires_in,
             public_key_pem,
@@ -1038,10 +1158,17 @@ impl KeyRepository for FileKeyStore {
         key_id: &str,
         secret: &str,
         user_id: &str,
+        workspace_id: &WorkspaceId,
         label: &str,
     ) -> anyhow::Result<ApiKey> {
-        let (api_key, _) =
-            bootstrap_api_key(key_id, secret, user_id, label, self.cipher.as_deref())?;
+        let (api_key, _) = bootstrap_api_key(
+            key_id,
+            secret,
+            user_id,
+            workspace_id,
+            label,
+            self.cipher.as_deref(),
+        )?;
         let _mutation_guard = self
             .mutation_lock
             .lock()
@@ -1184,7 +1311,7 @@ impl KeyRepository for FileKeyStore {
         &self,
         access_key: &str,
         secret_key: &str,
-    ) -> anyhow::Result<Option<(String, Option<String>)>> {
+    ) -> anyhow::Result<Option<(crate::control::AuthenticatedRequestContext, Option<String>)>> {
         resolve_credentials_in(&self.keys, access_key, secret_key)
     }
 
@@ -1223,10 +1350,11 @@ impl KeyRepository for FileKeyStore {
     async fn create_mcp_token(
         &self,
         user_id: &str,
+        workspace_id: &WorkspaceId,
         label: &str,
         expires_in: u64,
     ) -> anyhow::Result<(String, McpToken)> {
-        let (mcp, token) = generate_mcp_token(user_id, label, expires_in)?;
+        let (mcp, token) = generate_mcp_token(user_id, workspace_id, label, expires_in)?;
         let token_hash = mcp.token_hash.clone();
         let _mutation_guard = self
             .mutation_lock
@@ -1256,7 +1384,10 @@ impl KeyRepository for FileKeyStore {
         Ok((token, inserted))
     }
 
-    async fn resolve_mcp_token(&self, token: &str) -> anyhow::Result<Option<String>> {
+    async fn resolve_mcp_token(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<Option<AuthenticatedMcpPrincipal>> {
         let hash = sha256_hash(token);
         let tokens = self
             .mcp_tokens
@@ -1268,7 +1399,14 @@ impl KeyRepository for FileKeyStore {
         if is_expired(t.expires_at.as_deref()) {
             return Ok(None);
         }
-        Ok(Some(t.user_id.clone()))
+        let Some(workspace_id) = t
+            .workspace_id
+            .clone()
+            .and_then(|value| WorkspaceId::new(value).ok())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(authenticated_mcp_principal(t, workspace_id)?))
     }
 
     async fn list_mcp_tokens(&self, user_id: &str) -> anyhow::Result<Vec<McpToken>> {
@@ -1316,6 +1454,7 @@ impl From<api_key::Model> for ApiKey {
         build_api_key(
             &m.key_id,
             &m.user_id,
+            m.workspace_id,
             &m.label,
             m.secret_hash,
             m.secret_encrypted,
@@ -1340,12 +1479,14 @@ impl KeyRepository for PostgresKeyStore {
     async fn create_key(
         &self,
         user_id: &str,
+        workspace_id: &WorkspaceId,
         label: &str,
         expires_in: u64,
         public_key_pem: Option<String>,
     ) -> anyhow::Result<(String, ApiKey)> {
         let (api_key, secret) = generate_api_key(
             user_id,
+            workspace_id,
             label,
             expires_in,
             public_key_pem,
@@ -1359,6 +1500,7 @@ impl KeyRepository for PostgresKeyStore {
             .context("API key expiry is outside the Postgres timestamp range")?;
         let model = api_key::ActiveModel {
             user_id: Set(api_key.user_id.clone()),
+            workspace_id: Set(api_key.workspace_id.clone()),
             key_id: Set(api_key.key_id.clone()),
             secret_hash: Set(api_key.secret_hash.clone()),
             secret_encrypted: Set(api_key.secret_encrypted.clone()),
@@ -1379,10 +1521,17 @@ impl KeyRepository for PostgresKeyStore {
         key_id: &str,
         secret: &str,
         user_id: &str,
+        workspace_id: &WorkspaceId,
         label: &str,
     ) -> anyhow::Result<ApiKey> {
-        let (api_key, _) =
-            bootstrap_api_key(key_id, secret, user_id, label, self.cipher.as_deref())?;
+        let (api_key, _) = bootstrap_api_key(
+            key_id,
+            secret,
+            user_id,
+            workspace_id,
+            label,
+            self.cipher.as_deref(),
+        )?;
         if fetch_key(&self.db, key_id).await?.is_some() {
             anyhow::bail!("bootstrap key id already exists");
         }
@@ -1394,6 +1543,7 @@ impl KeyRepository for PostgresKeyStore {
             .context("API key expiry is outside the Postgres timestamp range")?;
         let model = api_key::ActiveModel {
             user_id: Set(api_key.user_id.clone()),
+            workspace_id: Set(api_key.workspace_id.clone()),
             key_id: Set(api_key.key_id.clone()),
             secret_hash: Set(api_key.secret_hash.clone()),
             secret_encrypted: Set(api_key.secret_encrypted.clone()),
@@ -1504,7 +1654,7 @@ impl KeyRepository for PostgresKeyStore {
         &self,
         access_key: &str,
         secret_key: &str,
-    ) -> anyhow::Result<Option<(String, Option<String>)>> {
+    ) -> anyhow::Result<Option<(crate::control::AuthenticatedRequestContext, Option<String>)>> {
         let Some(key) = fetch_key(&self.db, access_key).await? else {
             return Ok(None);
         };
@@ -1514,7 +1664,19 @@ impl KeyRepository for PostgresKeyStore {
         if is_expired(key.expires_at.as_deref()) {
             return Ok(None);
         }
-        Ok(Some((key.user_id, key.public_key_pem)))
+        let Some(workspace_id) = key
+            .workspace_id
+            .and_then(|value| WorkspaceId::new(value).ok())
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            crate::control::AuthenticatedRequestContext {
+                user_id: key.user_id,
+                workspace_id,
+            },
+            key.public_key_pem,
+        )))
     }
 
     async fn list_for_user(&self, user_id: &str) -> anyhow::Result<Vec<ApiKey>> {
@@ -1552,10 +1714,11 @@ impl KeyRepository for PostgresKeyStore {
     async fn create_mcp_token(
         &self,
         user_id: &str,
+        workspace_id: &WorkspaceId,
         label: &str,
         expires_in: u64,
     ) -> anyhow::Result<(String, McpToken)> {
-        let (mcp, token) = generate_mcp_token(user_id, label, expires_in)?;
+        let (mcp, token) = generate_mcp_token(user_id, workspace_id, label, expires_in)?;
         let expires_at = mcp
             .expires_at
             .as_deref()
@@ -1563,7 +1726,14 @@ impl KeyRepository for PostgresKeyStore {
             .transpose()
             .context("MCP token expiry is outside the Postgres timestamp range")?;
         let model = mcp_token::ActiveModel {
+            id: Set(mcp
+                .credential_id
+                .as_deref()
+                .expect("new MCP tokens have credential IDs")
+                .parse()
+                .context("generated MCP credential ID is invalid")?),
             user_id: Set(mcp.user_id.clone()),
+            workspace_id: Set(mcp.workspace_id.clone()),
             token_hash: Set(mcp.token_hash.clone()),
             label: Set(mcp.label.clone()),
             expires_at: Set(expires_at),
@@ -1576,8 +1746,10 @@ impl KeyRepository for PostgresKeyStore {
         Ok((
             token,
             McpToken {
+                credential_id: Some(inserted.id.to_string()),
                 token_hash: inserted.token_hash,
                 user_id: inserted.user_id,
+                workspace_id: inserted.workspace_id,
                 label: inserted.label,
                 created_at: inserted.created_at.to_string(),
                 expires_at: inserted.expires_at.map(|value| value.to_string()),
@@ -1585,7 +1757,10 @@ impl KeyRepository for PostgresKeyStore {
         ))
     }
 
-    async fn resolve_mcp_token(&self, token: &str) -> anyhow::Result<Option<String>> {
+    async fn resolve_mcp_token(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<Option<AuthenticatedMcpPrincipal>> {
         let hash = sha256_hash(token);
         let row = mcp_token::Entity::find()
             .filter(mcp_token::Column::TokenHash.eq(hash))
@@ -1598,7 +1773,21 @@ impl KeyRepository for PostgresKeyStore {
         if is_expired(row.expires_at.as_ref().map(|e| e.to_string()).as_deref()) {
             return Ok(None);
         }
-        Ok(Some(row.user_id))
+        let Some(workspace_id) = row
+            .workspace_id
+            .and_then(|value| WorkspaceId::new(value).ok())
+        else {
+            return Ok(None);
+        };
+        let credential_id = row.id;
+        Ok(Some(AuthenticatedMcpPrincipal {
+            context: crate::control::AuthenticatedRequestContext {
+                user_id: row.user_id,
+                workspace_id,
+            },
+            credential_id,
+            credential_policy_id: format!("mcp:{credential_id}"),
+        }))
     }
 
     async fn list_mcp_tokens(&self, user_id: &str) -> anyhow::Result<Vec<McpToken>> {
@@ -1611,8 +1800,10 @@ impl KeyRepository for PostgresKeyStore {
         Ok(rows
             .into_iter()
             .map(|m| McpToken {
+                credential_id: Some(m.id.to_string()),
                 token_hash: m.token_hash,
                 user_id: m.user_id,
+                workspace_id: m.workspace_id,
                 label: m.label,
                 created_at: m.created_at.to_string(),
                 expires_at: m.expires_at.map(|e| e.to_string()),
@@ -1705,6 +1896,10 @@ mod tests {
         include_str!("../../../tests/fixtures/pii/crypto/rsa-1024-public.pem");
     const TEST_RSA_4096_PUBLIC_KEY_PEM: &str =
         include_str!("../../../tests/fixtures/pii/crypto/rsa-4096-public.pem");
+
+    fn workspace(value: &str) -> WorkspaceId {
+        WorkspaceId::new(value).unwrap()
+    }
 
     #[derive(Debug)]
     struct FailingKeyWrapping;
@@ -1807,6 +2002,7 @@ mod tests {
             store
                 .create_key(
                     "u1",
+                    &workspace("u1"),
                     "  bounded  ",
                     MAX_CREDENTIAL_TTL_SECONDS,
                     Some(TEST_CERTIFICATE_PEM.to_string()),
@@ -1822,13 +2018,24 @@ mod tests {
         );
         assert!(
             store
-                .create_key("u1", "too long", MAX_CREDENTIAL_TTL_SECONDS + 1, None)
+                .create_key(
+                    "u1",
+                    &workspace("u1"),
+                    "too long",
+                    MAX_CREDENTIAL_TTL_SECONDS + 1,
+                    None
+                )
                 .await
                 .is_err()
         );
 
         let (token, mcp) = store
-            .create_mcp_token("u1", "  agent  ", MAX_CREDENTIAL_TTL_SECONDS)
+            .create_mcp_token(
+                "u1",
+                &workspace("u1"),
+                "  agent  ",
+                MAX_CREDENTIAL_TTL_SECONDS,
+            )
             .await
             .unwrap();
         assert!(token.starts_with("s4m_"));
@@ -1836,7 +2043,12 @@ mod tests {
         assert!(mcp.expires_at.is_some());
         assert!(
             store
-                .create_mcp_token("u1", "agent", MAX_CREDENTIAL_TTL_SECONDS + 1)
+                .create_mcp_token(
+                    "u1",
+                    &workspace("u1"),
+                    "agent",
+                    MAX_CREDENTIAL_TTL_SECONDS + 1
+                )
                 .await
                 .is_err()
         );
@@ -1845,14 +2057,18 @@ mod tests {
     #[tokio::test]
     async fn in_memory_key_roundtrip() {
         let store = KeyStore::new();
-        let (secret, created) = store.create_key("u1", "test", 0, None).await.unwrap();
+        let (secret, created) = store
+            .create_key("u1", &workspace("u1"), "test", 0, None)
+            .await
+            .unwrap();
         let key_id = created.key_id;
         let (uid, pk) = store
             .resolve_credentials(&key_id, &secret)
             .await
             .unwrap()
             .expect("valid credentials should resolve");
-        assert_eq!(uid, "u1");
+        assert_eq!(uid.user_id, "u1");
+        assert_eq!(uid.workspace_id, workspace("u1"));
         assert!(pk.is_none());
         assert!(
             store
@@ -1881,11 +2097,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credentials_bind_workspace_independently_from_dashboard_owner() {
+        let store = KeyStore::new();
+        let workspace_a = workspace("workspace-a");
+        let workspace_b = workspace("workspace-b");
+        let (secret_a, key_a) = store
+            .create_key("same-user", &workspace_a, "a", 0, None)
+            .await
+            .unwrap();
+        let (secret_b, key_b) = store
+            .create_key("same-user", &workspace_b, "b", 0, None)
+            .await
+            .unwrap();
+        let (token, _) = store
+            .create_mcp_token("same-user", &workspace_b, "agent", 0)
+            .await
+            .unwrap();
+
+        let (principal_a, _) = store
+            .resolve_credentials(&key_a.key_id, &secret_a)
+            .await
+            .unwrap()
+            .unwrap();
+        let (principal_b, _) = store
+            .resolve_credentials(&key_b.key_id, &secret_b)
+            .await
+            .unwrap()
+            .unwrap();
+        let mcp_principal = store.resolve_mcp_token(&token).await.unwrap().unwrap();
+        assert_eq!(principal_a.workspace_id, workspace_a);
+        assert_eq!(principal_b.workspace_id, workspace_b);
+        assert_eq!(mcp_principal.context.workspace_id, workspace_b);
+        assert_eq!(
+            mcp_principal.credential_policy_id,
+            format!("mcp:{}", mcp_principal.credential_id)
+        );
+        assert_eq!(store.list_for_user("same-user").await.unwrap().len(), 2);
+        assert_eq!(store.list_mcp_tokens("same-user").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn configured_cipher_failure_does_not_create_in_memory_key() {
         let store = KeyStore::with_cipher(failing_cipher());
 
         let error = store
-            .create_key("u1", "encryption-error", 0, None)
+            .create_key("u1", &workspace("u1"), "encryption-error", 0, None)
             .await
             .unwrap_err();
 
@@ -1900,21 +2156,42 @@ mod tests {
         let secret = format!("s4s_{}", "b".repeat(32));
 
         let created = store
-            .bootstrap_key(&key_id, &secret, "demo-user", "bootstrapped")
+            .bootstrap_key(
+                &key_id,
+                &secret,
+                "demo-user",
+                &workspace("demo-user"),
+                "bootstrapped",
+            )
             .await
             .unwrap();
         assert_eq!(created.key_id, key_id);
         assert_eq!(created.label, "bootstrapped");
 
         let resolved = store.resolve_credentials(&key_id, &secret).await.unwrap();
-        assert_eq!(resolved, Some(("demo-user".to_string(), None)));
+        assert_eq!(
+            resolved,
+            Some((
+                crate::control::AuthenticatedRequestContext {
+                    user_id: "demo-user".to_string(),
+                    workspace_id: workspace("demo-user"),
+                },
+                None,
+            ))
+        );
 
         let decrypted = store.decrypt_secret(&key_id).await.unwrap();
         assert_eq!(decrypted.as_deref(), Some(secret.as_str()));
 
         assert!(
             store
-                .bootstrap_key(&key_id, &secret, "demo-user", "bootstrapped")
+                .bootstrap_key(
+                    &key_id,
+                    &secret,
+                    "demo-user",
+                    &workspace("demo-user"),
+                    "bootstrapped"
+                )
                 .await
                 .is_err()
         );
@@ -1926,7 +2203,13 @@ mod tests {
         let secret = format!("s4s_{}", "b".repeat(32));
         assert!(
             store
-                .bootstrap_key("not-a-key", &secret, "demo-user", "bootstrapped")
+                .bootstrap_key(
+                    "not-a-key",
+                    &secret,
+                    "demo-user",
+                    &workspace("demo-user"),
+                    "bootstrapped"
+                )
                 .await
                 .is_err()
         );
@@ -1934,7 +2217,13 @@ mod tests {
         let key_id = format!("s4_{}", "a".repeat(32));
         assert!(
             store
-                .bootstrap_key(&key_id, "not-a-secret", "demo-user", "bootstrapped")
+                .bootstrap_key(
+                    &key_id,
+                    "not-a-secret",
+                    "demo-user",
+                    &workspace("demo-user"),
+                    "bootstrapped"
+                )
                 .await
                 .is_err()
         );
@@ -1948,7 +2237,7 @@ mod tests {
         ))));
         let store = KeyStore::with_cipher(cipher);
         let (_, created) = store
-            .create_key("u1", "unwrap-failure", 0, None)
+            .create_key("u1", &workspace("u1"), "unwrap-failure", 0, None)
             .await
             .unwrap();
 
@@ -1970,6 +2259,7 @@ mod tests {
                 build_api_key(
                     key_id,
                     "u1",
+                    Some("u1".to_string()),
                     "legacy",
                     sha256_hash(secret),
                     Some(legacy),
@@ -2000,6 +2290,7 @@ mod tests {
             build_api_key(
                 key_id,
                 "u1",
+                Some("u1".to_string()),
                 "race",
                 secret_hash.clone(),
                 Some(current_v2.clone()),
@@ -2040,6 +2331,7 @@ mod tests {
             build_api_key(
                 key_id,
                 "u1",
+                Some("u1".to_string()),
                 "race",
                 secret_hash.clone(),
                 Some(current_v2.clone()),
@@ -2086,7 +2378,12 @@ mod tests {
                 .is_err()
         );
         assert!(store.delete_key("missing", "u1").await.is_err());
-        assert!(store.create_key("u1", "lock-error", 0, None).await.is_err());
+        assert!(
+            store
+                .create_key("u1", &workspace("u1"), "lock-error", 0, None)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2101,7 +2398,12 @@ mod tests {
 
         assert!(store.resolve_mcp_token("s4m_missing").await.is_err());
         assert!(store.list_mcp_tokens("u1").await.is_err());
-        assert!(store.create_mcp_token("u1", "lock-error", 0).await.is_err());
+        assert!(
+            store
+                .create_mcp_token("u1", &workspace("u1"), "lock-error", 0)
+                .await
+                .is_err()
+        );
         assert!(store.delete_mcp_token(&"a".repeat(64), "u1").await.is_err());
     }
 
@@ -2109,7 +2411,10 @@ mod tests {
     async fn newly_generated_encrypted_secret_uses_v2() {
         let cipher = test_cipher();
         let store = KeyStore::with_cipher(cipher);
-        let (secret, created) = store.create_key("u1", "v2", 0, None).await.unwrap();
+        let (secret, created) = store
+            .create_key("u1", &workspace("u1"), "v2", 0, None)
+            .await
+            .unwrap();
         let key_id = created.key_id;
 
         let key = store.get_key(&key_id).await.unwrap().expect("key exists");
@@ -2128,7 +2433,10 @@ mod tests {
     async fn in_memory_v1_secret_is_verified_and_rewrapped() {
         let cipher = test_cipher();
         let store = KeyStore::with_cipher(cipher.clone());
-        let (secret, created) = store.create_key("u1", "legacy", 0, None).await.unwrap();
+        let (secret, created) = store
+            .create_key("u1", &workspace("u1"), "legacy", 0, None)
+            .await
+            .unwrap();
         let key_id = created.key_id;
         let legacy = cipher.encrypt_v1(&secret).unwrap();
         store
@@ -2161,7 +2469,10 @@ mod tests {
     async fn hash_mismatch_never_returns_or_rewraps_secret() {
         let cipher = test_cipher();
         let store = KeyStore::with_cipher(cipher.clone());
-        let (secret, created) = store.create_key("u1", "legacy", 0, None).await.unwrap();
+        let (secret, created) = store
+            .create_key("u1", &workspace("u1"), "legacy", 0, None)
+            .await
+            .unwrap();
         let key_id = created.key_id;
         let legacy = cipher.encrypt_v1(&secret).unwrap();
         {
@@ -2187,8 +2498,14 @@ mod tests {
     async fn swapped_v2_store_envelopes_are_rejected() {
         let cipher = test_cipher();
         let store = KeyStore::with_cipher(cipher);
-        let (_, key_a) = store.create_key("u1", "a", 0, None).await.unwrap();
-        let (_, key_b) = store.create_key("u1", "b", 0, None).await.unwrap();
+        let (_, key_a) = store
+            .create_key("u1", &workspace("u1"), "a", 0, None)
+            .await
+            .unwrap();
+        let (_, key_b) = store
+            .create_key("u1", &workspace("u1"), "b", 0, None)
+            .await
+            .unwrap();
         let key_a = key_a.key_id;
         let key_b = key_b.key_id;
         {
@@ -2206,7 +2523,10 @@ mod tests {
     #[tokio::test]
     async fn in_memory_expiry_rejects() {
         let store = KeyStore::new();
-        let (secret, created) = store.create_key("u1", "exp", 1, None).await.unwrap();
+        let (secret, created) = store
+            .create_key("u1", &workspace("u1"), "exp", 1, None)
+            .await
+            .unwrap();
         let key_id = created.key_id;
         // expiry is now+1s; sleep 1.2s to force it
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
@@ -2222,7 +2542,10 @@ mod tests {
     #[tokio::test]
     async fn in_memory_public_key_and_delete() {
         let store = KeyStore::new();
-        let (_, created) = store.create_key("u1", "enc", 0, None).await.unwrap();
+        let (_, created) = store
+            .create_key("u1", &workspace("u1"), "enc", 0, None)
+            .await
+            .unwrap();
         let key_id = created.key_id;
         assert!(
             store
@@ -2302,6 +2625,7 @@ mod tests {
         let key = build_api_key(
             "s4_legacy",
             "u1",
+            None,
             "legacy",
             sha256_hash("secret"),
             None,
@@ -2318,6 +2642,83 @@ mod tests {
         let store = FileKeyStore::new(path.clone()).unwrap();
 
         assert_eq!(store.get_key(&key.key_id).await.unwrap(), Some(key));
+        assert!(
+            store
+                .resolve_credentials("s4_legacy", "secret")
+                .await
+                .unwrap()
+                .is_none(),
+            "legacy credentials without a workspace must fail closed"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_file_mcp_token_without_workspace_fails_closed() {
+        let path = temp_keys_file();
+        let token = "s4m_legacy";
+        let persisted = serde_json::json!({
+            "keys": {},
+            "mcp_tokens": {
+                sha256_hash(token): {
+                    "token_hash": sha256_hash(token),
+                    "user_id": "legacy-user",
+                    "label": "legacy",
+                    "created_at": "0",
+                    "expires_at": null
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+        let store = FileKeyStore::new(path.clone()).unwrap();
+        assert!(store.resolve_mcp_token(token).await.unwrap().is_none());
+        assert_eq!(store.list_mcp_tokens("legacy-user").await.unwrap().len(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_bound_file_mcp_token_gets_a_stable_credential_identity() {
+        let path = temp_keys_file();
+        let token = "s4m_legacy_bound";
+        let persisted = serde_json::json!({
+            "keys": {},
+            "mcp_tokens": {
+                sha256_hash(token): {
+                    "token_hash": sha256_hash(token),
+                    "user_id": "legacy-user",
+                    "workspace_id": "legacy-workspace",
+                    "label": "legacy",
+                    "created_at": "0",
+                    "expires_at": null
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+        let first = FileKeyStore::new(path.clone())
+            .unwrap()
+            .resolve_mcp_token(token)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = FileKeyStore::new(path.clone())
+            .unwrap()
+            .resolve_mcp_token(token)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.context.workspace_id.as_str(), "legacy-workspace");
+        assert_eq!(
+            first.credential_policy_id,
+            format!("mcp:{}", first.credential_id)
+        );
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            rewritten["mcp_tokens"][sha256_hash(token)]["credential_id"]
+                .as_str()
+                .is_some()
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2343,10 +2744,13 @@ mod tests {
         std::fs::create_dir_all(&parent).unwrap();
         let path = parent.join("keys.json");
         let store = Arc::new(FileKeyStore::new(path.clone()).unwrap());
-        let (secret, created) = store.create_key("u1", "persisted", 0, None).await.unwrap();
+        let (secret, created) = store
+            .create_key("u1", &workspace("u1"), "persisted", 0, None)
+            .await
+            .unwrap();
         let key_id = created.key_id;
         let token = store
-            .create_mcp_token("u1", "persisted", 0)
+            .create_mcp_token("u1", &workspace("u1"), "persisted", 0)
             .await
             .unwrap()
             .0;
@@ -2356,8 +2760,11 @@ mod tests {
 
         let (entered, resume) = pause_next_persist(&store);
         let create_store = store.clone();
-        let create =
-            tokio::spawn(async move { create_store.create_key("u1", "tentative", 0, None).await });
+        let create = tokio::spawn(async move {
+            create_store
+                .create_key("u1", &workspace("u1"), "tentative", 0, None)
+                .await
+        });
         entered
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
@@ -2419,8 +2826,11 @@ mod tests {
 
         let (entered, resume) = pause_next_persist(&store);
         let create_store = store.clone();
-        let create =
-            tokio::spawn(async move { create_store.create_mcp_token("u1", "tentative", 0).await });
+        let create = tokio::spawn(async move {
+            create_store
+                .create_mcp_token("u1", &workspace("u1"), "tentative", 0)
+                .await
+        });
         entered
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
@@ -2447,7 +2857,13 @@ mod tests {
         assert!(!read.is_finished(), "MCP token deletion must remain hidden");
         resume.send(()).unwrap();
         assert!(delete.await.unwrap().is_err());
-        assert_eq!(read.await.unwrap().unwrap().as_deref(), Some("u1"));
+        assert_eq!(
+            read.await
+                .unwrap()
+                .unwrap()
+                .map(|value| value.context.user_id),
+            Some("u1".to_string())
+        );
 
         std::fs::remove_file(&parent).unwrap();
         std::fs::rename(&durable_parent, &parent).unwrap();
@@ -2465,8 +2881,8 @@ mod tests {
                 .resolve_mcp_token(&token)
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("u1")
+                .map(|value| value.context.user_id),
+            Some("u1".to_string())
         );
         std::fs::remove_dir_all(parent).unwrap();
     }
@@ -2475,7 +2891,10 @@ mod tests {
     async fn file_key_store_persists_across_restarts() {
         let path = temp_keys_file();
         let store = FileKeyStore::new(path.clone()).unwrap();
-        let (secret, created) = store.create_key("u1", "persist", 0, None).await.unwrap();
+        let (secret, created) = store
+            .create_key("u1", &workspace("u1"), "persist", 0, None)
+            .await
+            .unwrap();
         let key_id = created.key_id;
         drop(store);
 
@@ -2486,7 +2905,7 @@ mod tests {
             .await
             .unwrap()
             .expect("credentials survive a restart");
-        assert_eq!(uid, "u1");
+        assert_eq!(uid.user_id, "u1");
         assert!(reloaded.list_for_user("u1").await.unwrap().len() == 1);
         assert!(reloaded.delete_key(&key_id, "u1").await.unwrap());
         drop(reloaded);
@@ -2505,7 +2924,7 @@ mod tests {
         std::fs::write(&blocking_parent, "not a directory").unwrap();
 
         let error = store
-            .create_key("u1", "persist-error", 0, None)
+            .create_key("u1", &workspace("u1"), "persist-error", 0, None)
             .await
             .unwrap_err();
 
@@ -2524,6 +2943,7 @@ mod tests {
         let (_, created) = store
             .create_key(
                 "u1",
+                &workspace("u1"),
                 "persisted-public-key",
                 0,
                 Some(TEST_PUBLIC_KEY_PEM.to_string()),
@@ -2575,7 +2995,10 @@ mod tests {
         std::fs::create_dir_all(&parent).unwrap();
         let path = parent.join("keys.json");
         let store = FileKeyStore::new(path.clone()).unwrap();
-        let (secret, created) = store.create_key("u1", "delete", 0, None).await.unwrap();
+        let (secret, created) = store
+            .create_key("u1", &workspace("u1"), "delete", 0, None)
+            .await
+            .unwrap();
         let key_id = created.key_id;
         std::fs::rename(&parent, &durable_parent).unwrap();
         std::fs::write(&parent, "not a directory").unwrap();
@@ -2612,7 +3035,7 @@ mod tests {
         let path = parent.join("keys.json");
         let store = FileKeyStore::new(path.clone()).unwrap();
         let persisted_token = store
-            .create_mcp_token("u1", "persisted", 0)
+            .create_mcp_token("u1", &workspace("u1"), "persisted", 0)
             .await
             .unwrap()
             .0;
@@ -2620,15 +3043,20 @@ mod tests {
         std::fs::rename(&parent, &durable_parent).unwrap();
         std::fs::write(&parent, "not a directory").unwrap();
 
-        assert!(store.create_mcp_token("u1", "rejected", 0).await.is_err());
+        assert!(
+            store
+                .create_mcp_token("u1", &workspace("u1"), "rejected", 0)
+                .await
+                .is_err()
+        );
         assert!(store.delete_mcp_token(&persisted_hash, "u1").await.is_err());
         assert_eq!(
             store
                 .resolve_mcp_token(&persisted_token)
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("u1")
+                .map(|value| value.context.user_id),
+            Some("u1".to_string())
         );
         std::fs::remove_file(&parent).unwrap();
         std::fs::rename(&durable_parent, &parent).unwrap();
@@ -2640,8 +3068,8 @@ mod tests {
                 .resolve_mcp_token(&persisted_token)
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("u1")
+                .map(|value| value.context.user_id),
+            Some("u1".to_string())
         );
         assert_eq!(restarted.list_mcp_tokens("u1").await.unwrap().len(), 1);
         std::fs::remove_dir_all(parent).unwrap();
@@ -2651,7 +3079,10 @@ mod tests {
     async fn file_key_store_serializes_public_key_set_before_successful_delete() {
         let path = temp_keys_file();
         let store = Arc::new(FileKeyStore::new(path.clone()).unwrap());
-        let (secret, created) = store.create_key("u1", "race", 0, None).await.unwrap();
+        let (secret, created) = store
+            .create_key("u1", &workspace("u1"), "race", 0, None)
+            .await
+            .unwrap();
         let key_id = created.key_id;
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
@@ -2716,15 +3147,18 @@ mod tests {
         });
 
         let key_store = store.clone();
-        let key_task =
-            tokio::spawn(async move { key_store.create_key("u1", "concurrent", 0, None).await });
+        let key_task = tokio::spawn(async move {
+            key_store
+                .create_key("u1", &workspace("u1"), "concurrent", 0, None)
+                .await
+        });
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         let mcp_store = store.clone();
         let mcp_task = tokio::spawn(async move {
             mcp_store
-                .create_mcp_token("u1", "concurrent-token", 0)
+                .create_mcp_token("u1", &workspace("u1"), "concurrent-token", 0)
                 .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2752,8 +3186,8 @@ mod tests {
                 .resolve_mcp_token(&token)
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("u1")
+                .map(|value| value.context.user_id),
+            Some("u1".to_string())
         );
         std::fs::remove_file(path).unwrap();
     }
@@ -2763,7 +3197,10 @@ mod tests {
         let path = temp_keys_file();
         let cipher = test_cipher();
         let store = Arc::new(FileKeyStore::with_cipher(path.clone(), cipher.clone()).unwrap());
-        let (secret, created) = store.create_key("u1", "legacy", 0, None).await.unwrap();
+        let (secret, created) = store
+            .create_key("u1", &workspace("u1"), "legacy", 0, None)
+            .await
+            .unwrap();
         let key_id = created.key_id;
         let legacy = cipher.encrypt_v1(&secret).unwrap();
         store
@@ -2789,8 +3226,11 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         let mcp_store = store.clone();
-        let mcp_task =
-            tokio::spawn(async move { mcp_store.create_mcp_token("u1", "after-rewrap", 0).await });
+        let mcp_task = tokio::spawn(async move {
+            mcp_store
+                .create_mcp_token("u1", &workspace("u1"), "after-rewrap", 0)
+                .await
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
             !mcp_task.is_finished(),
@@ -2815,8 +3255,8 @@ mod tests {
                 .resolve_mcp_token(&token)
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("u1")
+                .map(|value| value.context.user_id),
+            Some("u1".to_string())
         );
         std::fs::remove_file(path).unwrap();
     }
@@ -2825,7 +3265,11 @@ mod tests {
     async fn file_key_store_mcp_delete_does_not_self_deadlock_and_persists() {
         let path = temp_keys_file();
         let store = FileKeyStore::new(path.clone()).unwrap();
-        let token = store.create_mcp_token("u1", "delete", 0).await.unwrap().0;
+        let token = store
+            .create_mcp_token("u1", &workspace("u1"), "delete", 0)
+            .await
+            .unwrap()
+            .0;
         let token_hash = sha256_hash(&token);
 
         assert!(
@@ -2850,7 +3294,7 @@ mod tests {
         let store = FileKeyStore::with_cipher(path.clone(), failing_cipher()).unwrap();
 
         let error = store
-            .create_key("u1", "encryption-error", 0, None)
+            .create_key("u1", &workspace("u1"), "encryption-error", 0, None)
             .await
             .unwrap_err();
 
@@ -2868,14 +3312,14 @@ mod tests {
         let store = PostgresKeyStore::new(pool);
 
         let error = store
-            .create_key("u1", "database-error", 0, None)
+            .create_key("u1", &workspace("u1"), "database-error", 0, None)
             .await
             .unwrap_err();
 
         assert!(error.to_string().contains("Postgres API key insert failed"));
 
         let error = store
-            .create_mcp_token("u1", "database-error", 0)
+            .create_mcp_token("u1", &workspace("u1"), "database-error", 0)
             .await
             .unwrap_err();
         assert!(
@@ -2988,7 +3432,7 @@ mod tests {
         let store = PostgresKeyStore::with_cipher(pool, failing_cipher());
 
         let error = store
-            .create_key("u1", "encryption-error", 0, None)
+            .create_key("u1", &workspace("u1"), "encryption-error", 0, None)
             .await
             .unwrap_err();
 
@@ -2999,7 +3443,10 @@ mod tests {
     async fn file_key_store_persists_public_key_and_expiry() {
         let path = temp_keys_file();
         let store = FileKeyStore::new(path.clone()).unwrap();
-        let (_, created) = store.create_key("u1", "enc", 3600, None).await.unwrap();
+        let (_, created) = store
+            .create_key("u1", &workspace("u1"), "enc", 3600, None)
+            .await
+            .unwrap();
         let key_id = created.key_id;
         assert!(
             store
@@ -3033,7 +3480,10 @@ mod tests {
         let path = temp_keys_file();
         let cipher = test_cipher();
         let store = FileKeyStore::with_cipher(path.clone(), cipher.clone()).unwrap();
-        let (secret, created) = store.create_key("u1", "legacy", 0, None).await.unwrap();
+        let (secret, created) = store
+            .create_key("u1", &workspace("u1"), "legacy", 0, None)
+            .await
+            .unwrap();
         let key_id = created.key_id;
         let legacy = cipher.encrypt_v1(&secret).unwrap();
         store
