@@ -9,6 +9,11 @@
 - [End-to-end suite](e2e.md)
 - [Security](security.md)
 
+# Roadmap (planned, not shipped)
+
+- [Post-quantum encryption](post-quantum-crypto.md)
+- [SQL proxy](sql-proxy.md)
+
 # Architecture Decision Records
 
 - [ADR 0001: Component Model and WIT](adr/0001-component-model-wit.md)
