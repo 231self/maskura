@@ -66,6 +66,10 @@ fault-streaming:
 bench-rss:
   cargo test -p s4-gateway --test streaming_rss -- --nocapture
 
+# Micro-benchmark: per-plugin Wasm fuel, latency, and expansion (Tier 1)
+bench-filters: build-filters
+  cargo run --release -p s4-wasm-runtime --example bench_filters
+
 # Soak: high-case-count property tests + repeated streaming round-trips
 soak-streaming:
   PROPTEST_CASES=10000 cargo test -p s4-gateway --test property --test record_decoder
