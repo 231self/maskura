@@ -13,10 +13,10 @@ use maskura_mcp_protocol::{
 };
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::tool;
 use rmcp::transport::stdio;
-use rmcp::{ErrorData as McpError, ServiceExt, tool_router};
+use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool_handler, tool_router};
 use url::Url;
 
 const DEFAULT_GATEWAY_URL: &str = "http://localhost:8080";
@@ -148,7 +148,7 @@ impl MaskuraServer {
     }
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl MaskuraServer {
     #[tool(description = "Store a UTF-8 object through the configured Maskura pipeline")]
     async fn maskura_put_object(
@@ -323,6 +323,20 @@ impl MaskuraServer {
         params: Parameters<DeleteObjectParams>,
     ) -> Result<CallToolResult, McpError> {
         self.maskura_delete_object(params).await
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for MaskuraServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "maskura-mcp",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "Use Maskura tools to store, filter, read, list, and delete text objects.",
+            )
     }
 }
 
