@@ -18,3 +18,5 @@
 - [ADR 0005: Record Boundaries vs Chunks](adr/0005-record-boundaries-vs-transport-chunks.md)
 - [ADR 0006: Dev Attestation](adr/0006-dev-attestation-never-production.md)
 - [ADR 0007: Fresh Store Per Object](adr/0007-fresh-store-per-object.md)
+- [ADR 0008: Keyless AWS Credentials and Bootstrap](adr/0008-keyless-aws-credentials-and-bootstrap.md)
+- [ADR 0009: Durable Async Write Acknowledgements](adr/0009-durable-async-write-acknowledgements.md)
