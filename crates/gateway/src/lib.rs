@@ -6,6 +6,7 @@ pub mod binary_reductor;
 pub mod control;
 pub mod customer_headers;
 pub mod entity;
+pub mod file_store;
 pub mod format;
 pub mod hybrid;
 pub mod integrity;
