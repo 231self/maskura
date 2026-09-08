@@ -22,7 +22,8 @@ use crate::pipeline::{
 use crate::record::{OutputValidator, Record};
 
 /// Default per-session fuel budget for the plugin pipeline. Set high enough
-/// for crypto filters (one RSA-2048 OAEP wrap costs ~25M wasm instructions).
+/// for crypto filters (one hybrid X25519 + ML-KEM-768 envelope field costs
+/// ~34M wasm instructions).
 pub const DEFAULT_PIPELINE_FUEL: u64 = 1_000_000_000;
 
 /// Default bound for the digest-keyed compiled-component cache. Weight is the

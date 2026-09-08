@@ -1,13 +1,15 @@
 # Post-quantum encryption
 
-> **Status: planned.** This page describes an upcoming feature, not shipped
-> behavior. Current builds use RSA-OAEP key wrapping.
+> **Status: shipped.** Current builds wrap the data key with a hybrid X25519 +
+> ML-KEM-768 key encapsulation. See [Encryption](encryption.md) for the details
+> and [ADR 0011](adr/0011-post-quantum-hybrid-envelope.md) for the decision.
 
 ## What it is
 
 Maskura's encryption filters protect fields with envelope encryption: a fresh
 AES-256-GCM key per field, wrapped with a public key so only the key holder can
-decrypt. Today that wrap is RSA-OAEP, which a quantum computer can break.
+decrypt. Before this change that wrap was RSA-OAEP, which a quantum computer can
+break.
 
 The post-quantum feature replaces the RSA-OAEP wrap with a **hybrid X25519 +
 ML-KEM-768** key encapsulation:
@@ -34,5 +36,6 @@ The data cipher stays AES-256-GCM, which is already post-quantum-safe.
 
 ## See also
 
+- [Encryption](encryption.md)
 - [Plugins](plugins.md)
 - [Security](security.md)

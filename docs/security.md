@@ -142,10 +142,10 @@ persisted.
 Credential mutations are bounded before persistence. API-key and MCP labels are
 trimmed, non-empty, free of control characters, and at most 128 UTF-8 bytes.
 Non-zero API-key and MCP lifetimes are at most one year (`0` means no expiry).
-Encryption public keys are at most 16 KiB and must be an SPKI public-key PEM or
-X.509 certificate carrying an RSA key between 2048 and 4096 bits, matching the
-formats consumed by the envelope-encryption filter. Credential JSON endpoints
-also have route-specific body limits; oversized requests receive `413`.
+Encryption public keys are at most 16 KiB and must be a `MASKURA HYBRID PUBLIC
+KEY` PEM carrying an X25519 public key and an ML-KEM-768 encapsulation key,
+matching the format consumed by the envelope-encryption filter. Credential JSON
+endpoints also have route-specific body limits; oversized requests receive `413`.
 
 Credential creation returns plaintext only after the repository has committed
 the new credential. File-backed mutations remain hidden from concurrent readers
@@ -209,8 +209,9 @@ signatures — regenerate them if you need native S3 tools.
   a capped queue and a guest-memory budget (`MemoryAdmission`); admission
   failure surfaces as `SlowDown` rather than unbounded parallelism.
 - The pipeline is deterministic and runs **before** data reaches storage on
-  the write path: redaction replaces PII, encryption (per-field RSA-OAEP /
-  AES-256-GCM) keeps the decryption key solely with the client. `stable-encrypt`
+  the write path: redaction replaces PII, encryption (per-field hybrid X25519 +
+  ML-KEM-768 / AES-256-GCM) keeps the decryption key solely with the client.
+  `stable-encrypt`
   (AES-SIV) is opt-in for JOIN keys and derives from the API key secret, never
   the raw secret.
 - Every authenticated request resolves its user through the

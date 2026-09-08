@@ -51,14 +51,17 @@ Detection/redaction scans every byte; cost is linear in size:
 | ssn-detect | 45.5 | 3.23 | 295 |
 | card-detect | 45.5 | 3.14 | 303 |
 
-### 3. Envelope encryption (RSA-2048 OAEP + AES-256-GCM)
+### 3. Envelope encryption (hybrid X25519 + ML-KEM-768 + AES-256-GCM)
 
-Cost is dominated by one RSA-OAEP wrap per detected field, ~52M fuel per field:
+Cost is dominated by one hybrid key encapsulation per detected field, ~35M fuel
+per field (down from ~52M for the RSA-2048 OAEP wrap it replaced). The
+encapsulation is larger — 1120 B per field vs 256 B — so expansion grows for
+dense records:
 
 | record | fields | fuel | ms/object | MiB/s | expansion |
 |--------|-------:|-----:|----------:|------:|----------:|
-| 1 KB | 1 | 52.3M | 2.27 | 0.4 | 2.38x |
-| 1 MB | 100 | 5.24G | 178.6 | 5.3 | 1.14x |
+| 1 KB | 1 | 35.1M | 0.97 | 1.0 | 5.86x |
+| 1 MB | 100 | 3.42G | 89.6 | 10.6 | 1.49x |
 
 ### 4. Stable (deterministic) encryption (AES-SIV)
 
@@ -77,7 +80,7 @@ scales with record size, plus ~170K fuel per encrypted field:
 |--------|----------:|---------------:|------:|
 | noop | ~0.02 | 1x | 1236 |
 | stable-encrypt (0 fields) | ~1.0 | ~55x | 1023 |
-| envelope-encrypt (0 fields) | 27.7 | ~1490x | 275 |
+| envelope-encrypt (0 fields) | 28.6 | ~1540x | 520 |
 | email-detect | 41.5 | ~2230x | 346 |
 | ssn-detect | 45.5 | ~2450x | 295 |
 | card-detect | 45.5 | ~2450x | 303 |
@@ -92,10 +95,10 @@ marginal per-byte figure (`fuel/byte`) is the number to plan capacity against.
   A speed-optimized profile would lower wall-clock times; fuel is unaffected.
 - Fuel budget for this sweep was raised to 1e10 to measure crypto work rather
   than the production 1e9 ceiling. At the default budget, `envelope-encrypt`
-  exhausts fuel at roughly 19 encrypted fields per object.
+  exhausts fuel at roughly 27 encrypted fields per object.
 - A text record is padded/truncated to the target size; a small record with a
   high requested PII count therefore carries fewer actual tokens (see the CSV
   for exact input bytes).
-- `envelope-encrypt` numbers assume a valid RSA-2048 public key in the session
-  context and host-generated entropy; `stable-encrypt` uses a fixed 64-byte key
-  and tagged fields.
+- `envelope-encrypt` numbers assume a valid hybrid X25519 + ML-KEM-768 public
+  key in the session context and host-generated entropy; `stable-encrypt` uses a
+  fixed 64-byte key and tagged fields.

@@ -11,15 +11,7 @@ use std::time::{Duration, Instant};
 
 use s4_wasm_runtime::{FilterEngine, Operation, RuntimeLimits, Session, TransformOutcome};
 
-const PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmO5zDMFH3Ka2TpgJ1NSr\n\
-yOYHyn4l7r+yTnOc5AGe4bEQmErHrAmalqYbSJkO8yHH3M0TKojjCIK0v0zxJHdW\n\
-uFXLIwD9XpPBUAGPhDrcG1ljvEystFX/kIqJp8mUXLb5oLBkTJa7s7J0DO+P6lNb\n\
-hl0YNUajEQTqFpXvRG/sFeVyvIte6K+dsLCw3JBVnfNG7dJyRXuT6y0McoWdq2Wg\n\
-Nw5XL4h23bp2dvZjljUxJ3I43BZLQpymQjcvY2gCxFPb+n9Gix6x98WG3LzD8lwG\n\
-G/PyrV2DNfpRmgm2z62yoorRnZie7XC47Q1ecIyWEIVuVEzHIMMOwlfjFALVlZn/\n\
-MwIDAQAB\n\
------END PUBLIC KEY-----";
+const PUBLIC_KEY_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/hybrid-public.pem");
 
 const PII_EMAIL: &str = "alice@example.com";
 const PII_SSN: &str = "123-45-6789";

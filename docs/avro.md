@@ -46,7 +46,7 @@ bytes and cannot declare an output schema.
 
 `x-maskura-encrypt-fields` selects comma-separated string schema paths, for example
 `email` or `contacts[*].email`. With an authenticated public key, selected
-fields become `RSA-OAEP/AES-256-GCM` envelope records and the Avro schema is
+fields become `X25519+ML-KEM-768/AES-256-GCM` envelope records and the Avro schema is
 evolved before encoding. Without a public key, selected fields are redacted to
 `[REDACTED]` while the string schema is preserved. Overlapping or invalid paths
 are rejected. Multipart completion uses identity processing; field selection
