@@ -6,7 +6,7 @@ use md5::{Digest as Md5Digest, Md5};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter, SeekFrom, Take};
 use tokio::sync::Mutex;
 use tracing::warn;
 use uuid::Uuid;
@@ -36,6 +36,30 @@ struct FileObjectMetadata {
     etag: String,
     size: u64,
     data_file: String,
+}
+
+#[derive(Debug)]
+pub struct FileObjectReader<R> {
+    pub reader: R,
+    pub object_length: u64,
+    pub content_type: String,
+    pub etag: String,
+}
+
+impl FileObjectReader<File> {
+    pub async fn into_range(
+        mut self,
+        start: u64,
+        length: u64,
+    ) -> Result<FileObjectReader<Take<File>>, FileStoreError> {
+        self.reader.seek(SeekFrom::Start(start)).await?;
+        Ok(FileObjectReader {
+            reader: self.reader.take(length),
+            object_length: self.object_length,
+            content_type: self.content_type,
+            etag: self.etag,
+        })
+    }
 }
 
 /// Durable, single-node object storage rooted at a local directory.
@@ -116,32 +140,32 @@ impl FileStore {
         })
     }
 
+    pub async fn open(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<FileObjectReader<File>>, FileStoreError> {
+        let Some(metadata) = self.load_metadata(bucket, key).await? else {
+            return Ok(None);
+        };
+        self.open_metadata(bucket, key, metadata).await
+    }
+
+    #[cfg(test)]
     pub async fn get(
         &self,
         bucket: &str,
         key: &str,
     ) -> Result<Option<StoredObject>, FileStoreError> {
-        let Some(metadata) = self.load_metadata(bucket, key).await? else {
+        let Some(mut object) = self.open(bucket, key).await? else {
             return Ok(None);
         };
-        let data = match fs::read(self.data_path(bucket, &metadata.data_file)?).await {
-            Ok(data) => data,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(FileStoreError::CorruptMetadata(format!(
-                    "metadata for {bucket}/{key} points to missing content"
-                )));
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if data.len() as u64 != metadata.size {
-            return Err(FileStoreError::CorruptMetadata(format!(
-                "metadata size mismatch for {bucket}/{key}"
-            )));
-        }
+        let mut data = Vec::new();
+        object.reader.read_to_end(&mut data).await?;
         Ok(Some(StoredObject {
             data: Bytes::from(data),
-            content_type: metadata.content_type,
-            etag: metadata.etag,
+            content_type: object.content_type,
+            etag: object.etag,
         }))
     }
 
@@ -408,6 +432,44 @@ impl FileStore {
         }
     }
 
+    async fn open_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        mut metadata: FileObjectMetadata,
+    ) -> Result<Option<FileObjectReader<File>>, FileStoreError> {
+        for attempt in 0..=1 {
+            let file = match File::open(self.data_path(bucket, &metadata.data_file)?).await {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let Some(refreshed) = self.load_metadata(bucket, key).await? else {
+                        return Ok(None);
+                    };
+                    if attempt == 0 && refreshed.data_file != metadata.data_file {
+                        metadata = refreshed;
+                        continue;
+                    }
+                    return Err(FileStoreError::CorruptMetadata(format!(
+                        "metadata for {bucket}/{key} points to missing content"
+                    )));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if file.metadata().await?.len() != metadata.size {
+                return Err(FileStoreError::CorruptMetadata(format!(
+                    "metadata size mismatch for {bucket}/{key}"
+                )));
+            }
+            return Ok(Some(FileObjectReader {
+                reader: file,
+                object_length: metadata.size,
+                content_type: metadata.content_type,
+                etag: metadata.etag,
+            }));
+        }
+        unreachable!("file open retry loop always returns")
+    }
+
     async fn remove_stale_temps(&self) -> Result<(), FileStoreError> {
         let mut buckets = fs::read_dir(self.buckets_root()).await?;
         while let Some(bucket) = buckets.next_entry().await? {
@@ -512,6 +574,27 @@ async fn sync_directory(path: PathBuf) -> Result<(), FileStoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::io::ReaderStream;
+
+    async fn read_object<R>(reader: R, frame_bytes: usize) -> (Bytes, Vec<usize>)
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    {
+        use http_body_util::BodyExt as _;
+
+        let mut body =
+            axum::body::Body::from_stream(ReaderStream::with_capacity(reader, frame_bytes));
+        let mut data = Vec::new();
+        let mut frames = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.unwrap();
+            if let Ok(frame) = frame.into_data() {
+                frames.push(frame.len());
+                data.extend_from_slice(&frame);
+            }
+        }
+        (Bytes::from(data), frames)
+    }
 
     fn test_root() -> PathBuf {
         std::env::temp_dir().join(format!("maskura-file-store-{}", Uuid::now_v7()))
@@ -533,13 +616,16 @@ mod tests {
         assert_eq!(stored.etag, "\"5d41402abc4b2a76b9719d911017c592\"");
 
         let object = store
-            .get("bucket", "nested/object.txt")
+            .open("bucket", "nested/object.txt")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(object.data, Bytes::from_static(b"hello"));
+        assert_eq!(object.object_length, 5);
         assert_eq!(object.content_type, "text/plain");
         assert_eq!(object.etag, stored.etag);
+        let (data, frames) = read_object(object.reader, 2).await;
+        assert_eq!(data, Bytes::from_static(b"hello"));
+        assert!(frames.iter().all(|length| *length <= 2));
         assert_eq!(
             store.metadata("bucket", "nested/object.txt").await.unwrap(),
             Some((5, "text/plain".to_string(), stored.etag))
@@ -575,8 +661,9 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(first.etag, second.etag);
+        let object = store.open("bucket", "object").await.unwrap().unwrap();
         assert_eq!(
-            store.get("bucket", "object").await.unwrap().unwrap().data,
+            read_object(object.reader, 64).await.0,
             Bytes::from_static(b"second")
         );
         assert_eq!(store.list_keys().await.unwrap(), vec!["bucket/object"]);
@@ -644,6 +731,247 @@ mod tests {
 
         let _reopened = FileStore::new(root.clone()).await.unwrap();
         assert!(!temporary.exists());
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn range_reader_stops_at_selected_length() {
+        let root = test_root();
+        let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+        store
+            .put(
+                "bucket",
+                "object",
+                Bytes::from_static(b"0123456789"),
+                "text/plain",
+            )
+            .await
+            .unwrap();
+
+        let object = store.open("bucket", "object").await.unwrap().unwrap();
+        let object = object.into_range(3, 4).await.unwrap();
+        let (data, frames) = read_object(object.reader, 2).await;
+        assert_eq!(data, Bytes::from_static(b"3456"));
+        assert!(frames.iter().all(|length| *length <= 2));
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_sparse_object_range_does_not_buffer_or_overread() {
+        const OBJECT_LENGTH: u64 = 1024 * 1024 * 1024;
+        const MARKER: &[u8] = b"range-end";
+        const RANGE_START: u64 = OBJECT_LENGTH - MARKER.len() as u64;
+
+        let root = test_root();
+        let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+        let (temp_path, mut file) = store.create_temp_file("bucket", "large").await.unwrap();
+        file.set_len(OBJECT_LENGTH).await.unwrap();
+        file.seek(SeekFrom::Start(RANGE_START)).await.unwrap();
+        file.write_all(MARKER).await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+        store
+            .commit_temp(
+                "bucket",
+                "large",
+                &temp_path,
+                "application/octet-stream",
+                OBJECT_LENGTH,
+                "\"sparse-test\"",
+            )
+            .await
+            .unwrap();
+
+        let object = store.open("bucket", "large").await.unwrap().unwrap();
+        let object = object
+            .into_range(RANGE_START, MARKER.len() as u64)
+            .await
+            .unwrap();
+        let mut reader = object.reader;
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).await.unwrap();
+        assert_eq!(data, MARKER);
+
+        let mut file = reader.into_inner();
+        assert_eq!(
+            file.stream_position().await.unwrap(),
+            RANGE_START + MARKER.len() as u64
+        );
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raced_overwrite_revalidates_and_opens_the_published_generation() {
+        let root = test_root();
+        let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+        store
+            .put("bucket", "object", Bytes::from_static(b"old"), "text/plain")
+            .await
+            .unwrap();
+        let stale = store
+            .load_metadata("bucket", "object")
+            .await
+            .unwrap()
+            .unwrap();
+        let published = store
+            .put(
+                "bucket",
+                "object",
+                Bytes::from_static(b"new generation"),
+                "text/plain",
+            )
+            .await
+            .unwrap();
+
+        let object = store
+            .open_metadata("bucket", "object", stale)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(object.etag, published.etag);
+        assert_eq!(
+            read_object(object.reader, 4).await.0,
+            Bytes::from_static(b"new generation")
+        );
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raced_delete_revalidation_returns_missing() {
+        let root = test_root();
+        let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+        store
+            .put("bucket", "object", Bytes::from_static(b"old"), "text/plain")
+            .await
+            .unwrap();
+        let stale = store
+            .load_metadata("bucket", "object")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store.delete("bucket", "object").await.unwrap());
+
+        assert!(
+            store
+                .open_metadata("bucket", "object", stale)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revalidation_is_bounded_when_the_published_generation_is_corrupt() {
+        let root = test_root();
+        let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+        store
+            .put("bucket", "object", Bytes::from_static(b"old"), "text/plain")
+            .await
+            .unwrap();
+        let stale = store
+            .load_metadata("bucket", "object")
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .put("bucket", "object", Bytes::from_static(b"new"), "text/plain")
+            .await
+            .unwrap();
+        let published = store
+            .load_metadata("bucket", "object")
+            .await
+            .unwrap()
+            .unwrap();
+        fs::remove_file(store.data_path("bucket", &published.data_file).unwrap())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store.open_metadata("bucket", "object", stale).await,
+            Err(FileStoreError::CorruptMetadata(_))
+        ));
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_survives_missing_content_but_open_reports_corruption() {
+        let root = test_root();
+        let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+        store
+            .put(
+                "bucket",
+                "object",
+                Bytes::from_static(b"data"),
+                "text/plain",
+            )
+            .await
+            .unwrap();
+        let metadata = store
+            .load_metadata("bucket", "object")
+            .await
+            .unwrap()
+            .unwrap();
+        fs::remove_file(store.data_path("bucket", &metadata.data_file).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.metadata("bucket", "object").await.unwrap(),
+            Some((4, "text/plain".to_string(), metadata.etag))
+        );
+        assert!(matches!(
+            store.open("bucket", "object").await,
+            Err(FileStoreError::CorruptMetadata(_))
+        ));
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streamed_reader_uses_opened_object_limits_and_cancellation() {
+        use crate::object::{BodyLimits, ObjectMetadata, OpenedObject};
+        use http_body_util::BodyExt as _;
+
+        let root = test_root();
+        let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+        store
+            .put(
+                "bucket",
+                "object",
+                Bytes::from_static(b"123456789"),
+                "text/plain",
+            )
+            .await
+            .unwrap();
+        let object = store.open("bucket", "object").await.unwrap().unwrap();
+        let object_length = object.object_length;
+        let object = object.into_range(0, object_length).await.unwrap();
+        let body = axum::body::Body::from_stream(ReaderStream::with_capacity(object.reader, 4));
+        let opened = OpenedObject::new(
+            axum::http::StatusCode::OK,
+            ObjectMetadata::default(),
+            body,
+            BodyLimits {
+                max_frame_bytes: 4,
+                max_bytes: 7,
+            },
+        );
+        let cancellation = opened.cancellation.clone();
+
+        let error = opened.body.collect().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("source body is at least 8 bytes")
+        );
+        assert!(cancellation.is_cancelled());
+
         fs::remove_dir_all(root).await.unwrap();
     }
 }

@@ -31,6 +31,7 @@ use md5::Md5;
 use rand::{RngCore, rngs::OsRng};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::{OpenApi, ToSchema};
@@ -1575,47 +1576,63 @@ async fn open_http_object(
     ))
 }
 
-fn memory_range(
-    data: &bytes::Bytes,
-    range: Option<&str>,
-) -> Result<(bytes::Bytes, Option<String>), OpenObjectError> {
-    let length = data.len();
-    let invalid_range = || OpenObjectError::InvalidRange {
-        object_length: length as u64,
-    };
+#[derive(Debug, Eq, PartialEq)]
+struct ByteRange {
+    start: u64,
+    length: u64,
+    content_range: Option<String>,
+}
+
+fn parse_byte_range(object_length: u64, range: Option<&str>) -> Result<ByteRange, OpenObjectError> {
+    let invalid_range = || OpenObjectError::InvalidRange { object_length };
     let Some(range) = range else {
-        return Ok((data.clone(), None));
+        return Ok(ByteRange {
+            start: 0,
+            length: object_length,
+            content_range: None,
+        });
     };
     let spec = range
         .strip_prefix("bytes=")
         .filter(|spec| !spec.contains(','))
         .ok_or_else(invalid_range)?;
     let (start, end) = spec.split_once('-').ok_or_else(invalid_range)?;
-    if length == 0 {
+    if object_length == 0 {
         return Err(invalid_range());
     }
     let (start, end) = if start.is_empty() {
-        let suffix = end.parse::<usize>().map_err(|_| invalid_range())?;
+        let suffix = end.parse::<u64>().map_err(|_| invalid_range())?;
         if suffix == 0 {
             return Err(invalid_range());
         }
-        (length.saturating_sub(suffix), length - 1)
+        (object_length.saturating_sub(suffix), object_length - 1)
     } else {
-        let start = start.parse::<usize>().map_err(|_| invalid_range())?;
+        let start = start.parse::<u64>().map_err(|_| invalid_range())?;
         let end = if end.is_empty() {
-            length - 1
+            object_length - 1
         } else {
-            end.parse::<usize>().map_err(|_| invalid_range())?
+            end.parse::<u64>().map_err(|_| invalid_range())?
         };
-        if start >= length || start > end {
+        if start >= object_length || start > end {
             return Err(invalid_range());
         }
-        (start, end.min(length - 1))
+        (start, end.min(object_length - 1))
     };
-    Ok((
-        data.slice(start..=end),
-        Some(format!("bytes {start}-{end}/{length}")),
-    ))
+    Ok(ByteRange {
+        start,
+        length: end - start + 1,
+        content_range: Some(format!("bytes {start}-{end}/{object_length}")),
+    })
+}
+
+fn memory_range(
+    data: &bytes::Bytes,
+    range: Option<&str>,
+) -> Result<(bytes::Bytes, Option<String>), OpenObjectError> {
+    let selected = parse_byte_range(data.len() as u64, range)?;
+    let start = usize::try_from(selected.start).expect("byte range start fits memory object");
+    let length = usize::try_from(selected.length).expect("byte range length fits memory object");
+    Ok((data.slice(start..start + length), selected.content_range))
 }
 
 async fn open_backend_object(
@@ -1771,17 +1788,21 @@ async fn open_backend_object(
                 ));
             }
             let object = store
-                .get(bucket, key)
+                .open(bucket, key)
                 .await
                 .map_err(|error| OpenObjectError::Backend(error.to_string()))?
                 .ok_or(OpenObjectError::NotFound)?;
-            let (data, content_range) = memory_range(&object.data, range)?;
+            let selected = parse_byte_range(object.object_length, range)?;
+            let object = object
+                .into_range(selected.start, selected.length)
+                .await
+                .map_err(|error| OpenObjectError::Backend(error.to_string()))?;
             let mut metadata = ObjectMetadata::default();
-            metadata.insert(header::CONTENT_LENGTH, data.len().to_string());
+            metadata.insert(header::CONTENT_LENGTH, selected.length.to_string());
             metadata.insert(header::CONTENT_TYPE, object.content_type);
             metadata.insert(header::ETAG, object.etag);
             metadata.insert(header::ACCEPT_RANGES, "bytes");
-            if let Some(content_range) = content_range {
+            if let Some(content_range) = selected.content_range {
                 metadata.insert(header::CONTENT_RANGE, content_range);
             }
             let status = if range.is_some() {
@@ -1789,9 +1810,9 @@ async fn open_backend_object(
             } else {
                 StatusCode::OK
             };
-            let body = axum::body::Body::new(ChunkedBytesBody::new(
-                data,
-                state.source_body_limits.max_frame_bytes,
+            let body = axum::body::Body::from_stream(ReaderStream::with_capacity(
+                object.reader,
+                state.source_body_limits.max_frame_bytes.max(1),
             ));
             Ok(OpenedObject::new(
                 status,
@@ -7281,6 +7302,91 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn byte_range_parser_preserves_single_range_semantics_with_u64_offsets() {
+        for (range, expected) in [
+            (
+                None,
+                ByteRange {
+                    start: 0,
+                    length: 10,
+                    content_range: None,
+                },
+            ),
+            (
+                Some("bytes=0-3"),
+                ByteRange {
+                    start: 0,
+                    length: 4,
+                    content_range: Some("bytes 0-3/10".to_string()),
+                },
+            ),
+            (
+                Some("bytes=4-"),
+                ByteRange {
+                    start: 4,
+                    length: 6,
+                    content_range: Some("bytes 4-9/10".to_string()),
+                },
+            ),
+            (
+                Some("bytes=-3"),
+                ByteRange {
+                    start: 7,
+                    length: 3,
+                    content_range: Some("bytes 7-9/10".to_string()),
+                },
+            ),
+            (
+                Some("bytes=7-30"),
+                ByteRange {
+                    start: 7,
+                    length: 3,
+                    content_range: Some("bytes 7-9/10".to_string()),
+                },
+            ),
+        ] {
+            assert_eq!(parse_byte_range(10, range).unwrap(), expected);
+        }
+
+        assert_eq!(
+            parse_byte_range(u64::MAX, Some("bytes=4294967296-4294967297")).unwrap(),
+            ByteRange {
+                start: 4_294_967_296,
+                length: 2,
+                content_range: Some(format!("bytes 4294967296-4294967297/{}", u64::MAX)),
+            }
+        );
+        assert_eq!(
+            parse_byte_range(0, None).unwrap(),
+            ByteRange {
+                start: 0,
+                length: 0,
+                content_range: None,
+            }
+        );
+    }
+
+    #[test]
+    fn byte_range_parser_rejects_malformed_and_unsatisfiable_ranges() {
+        for (object_length, range) in [
+            (10, "bytes=1-2,4-5"),
+            (10, "items=1-2"),
+            (10, "bytes=-0"),
+            (10, "bytes=8-7"),
+            (10, "bytes=10-"),
+            (10, "bytes=x-2"),
+            (0, "bytes=0-0"),
+        ] {
+            assert!(matches!(
+                parse_byte_range(object_length, Some(range)),
+                Err(OpenObjectError::InvalidRange {
+                    object_length: actual
+                }) if actual == object_length
+            ));
+        }
+    }
+
     fn test_grant(authorization: &UsageAuthorization) -> AuthorizationGrant {
         AuthorizationGrant::new(
             authorization,
@@ -9933,6 +10039,9 @@ async fn list_from_managed(
     xml.push_str(&format!("<KeyCount>{}</KeyCount>", page.objects.len()));
     xml.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
     xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
+    if encoding {
+        xml.push_str("<EncodingType>url</EncodingType>");
+    }
     if let Some(token) = params.continuation_token.as_deref() {
         xml.push_str(&format!(
             "<ContinuationToken>{}</ContinuationToken>",
@@ -10014,6 +10123,17 @@ fn list_from_local_objects(
     params: &S3Query,
     continuation_key: &[u8; 32],
 ) -> Result<String, String> {
+    let is_v2 = params.list_type.as_deref() == Some("2");
+    if params.continuation_token.is_some() && !is_v2 {
+        return Err("continuation-token requires list-type=2".to_string());
+    }
+    if params
+        .encoding_type
+        .as_deref()
+        .is_some_and(|encoding| encoding != "url")
+    {
+        return Err("encoding-type must be url".to_string());
+    }
     let prefix = params.prefix.as_deref().unwrap_or("");
     let delimiter = params.delimiter.as_deref();
     let max_keys = params.max_keys.unwrap_or(1000).min(1000) as usize;
@@ -10100,13 +10220,15 @@ fn list_from_local_objects(
     if let Some(d) = delimiter {
         xml.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(d)));
     }
-    let is_v2 = params.list_type.as_deref() == Some("2");
     xml.push_str(&format!(
         "<KeyCount>{}</KeyCount>",
         contents.len() + commons.len()
     ));
     xml.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
     xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
+    if encoding {
+        xml.push_str("<EncodingType>url</EncodingType>");
+    }
     if let Some(t) = params.continuation_token.as_deref() {
         let elem = if is_v2 {
             format!("<ContinuationToken>{}</ContinuationToken>", xml_escape(t))
