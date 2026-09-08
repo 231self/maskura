@@ -105,9 +105,25 @@ schema (via serde flatten) and extends it with SaaS-only fields.
   (`MASKURA_*` for customer settings, the operator name for operator-only settings).
 - Implement `Config::resolve(path, env) -> Result<Config>` returning
   defaults → file → env with validation.
+- Add a typed validation layer (`Config::validate()`) that rejects, with a
+  field-specific error:
+  - malformed input (bad TOML, wrong value types, out-of-range integers);
+  - missing required fields (only where a table is present but a mandatory
+    member is absent, e.g. a storage backend that names a bucket without a
+    region/endpoint);
+  - field-schema violations — URLs must parse, presigned/workspace allowlists
+    must be valid host/DNS-suffix entries, key material must be correct
+    length/encoding (e.g. `bootstrap_key`/`bootstrap_secret` shapes), byte
+    quotas must be positive, modes must be known enum values;
+  - illogical value combinations — e.g. `managed_streaming_mode=observe` without
+    a managed backend, `multipart_mode=staged` without durable staging, HTTP
+    presign without an explicit HTTP allowlist entry.
 
 **Verify:** table-driven unit tests for parse, defaults, precedence
 (default < file < env), `deny_unknown_fields`, and hard-error on invalid values.
+A dedicated validation test matrix covers, per field: malformed, missing,
+schema-invalid (URL/key-length/encoding), and contradictory-combination inputs,
+each asserting a specific error and that the config is rejected.
 
 ### 2. Abandon the `S4_*` env aliases
 
@@ -185,6 +201,9 @@ invalid file and exit 0 for a valid one.
   file value; precedence default < file < env holds under test.
 - A secret key in the TOML fails startup (structural rejection).
 - An invalid value (e.g. unknown `multipart_mode`) fails startup.
+- Validation test matrix is exhaustive per field: malformed input, missing
+  required, schema-invalid (bad URL / key length / encoding), and contradictory
+  combinations each produce a specific error and reject the config.
 - No customer-setting `S4_*` alias remains in the repo (sweep is exhaustive).
 - `maskura config --check` exits 0 on a valid file and non-zero on an invalid one.
 - Private binary boots from `maskura-control.toml` with `base` fields honoured.
@@ -202,9 +221,6 @@ invalid file and exit 0 for a valid one.
 
 ## Open Decisions
 
-- Whether the `x-s4-*` HTTP header aliases are also abandoned in the same sweep
-  or deferred to a separate change (they are headers, not env vars, and were
-  not part of this survey).
 - Whether `maskura config --check` also validates the private
   `maskura-control.toml` schema (requires the private crate to expose its schema
   to `s4ctl`, likely out of scope for the OSS binary).

@@ -9,8 +9,8 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 const DEFAULT_GATEWAY: &str = "http://localhost:9000";
-const HOSTED_WORKSPACE_ID_ENV: EnvAlias = EnvAlias::new("MASKURA_WORKSPACE_ID", "S4_WORKSPACE_ID");
-const HOSTED_ACCESS_TOKEN_ENV: EnvAlias = EnvAlias::new("MASKURA_ACCESS_TOKEN", "S4_ACCESS_TOKEN");
+const HOSTED_WORKSPACE_ID_ENV: EnvAlias = EnvAlias::new("MASKURA_WORKSPACE_ID");
+const HOSTED_ACCESS_TOKEN_ENV: EnvAlias = EnvAlias::new("MASKURA_ACCESS_TOKEN");
 
 /// Map a destination key's file extension to the streaming Content-Type the
 /// gateway needs to select a format. Falls back to `text/plain` (raw text),
@@ -2209,7 +2209,6 @@ mod tests {
             "Bearer secret-token"
         );
         assert!(headers.get("x-maskura-access-key").is_none());
-        assert!(headers.get("x-s4-access-key").is_none());
     }
 
     #[test]
@@ -2309,10 +2308,8 @@ mod tests {
     }
 
     #[test]
-    fn hosted_env_names_are_canonical_with_permanent_legacy_aliases() {
-        assert_eq!(HOSTED_WORKSPACE_ID_ENV.canonical, "MASKURA_WORKSPACE_ID");
-        assert_eq!(HOSTED_WORKSPACE_ID_ENV.legacy, "S4_WORKSPACE_ID");
-        assert_eq!(HOSTED_ACCESS_TOKEN_ENV.canonical, "MASKURA_ACCESS_TOKEN");
-        assert_eq!(HOSTED_ACCESS_TOKEN_ENV.legacy, "S4_ACCESS_TOKEN");
+    fn hosted_env_names_are_canonical() {
+        assert_eq!(HOSTED_WORKSPACE_ID_ENV.name(), "MASKURA_WORKSPACE_ID");
+        assert_eq!(HOSTED_ACCESS_TOKEN_ENV.name(), "MASKURA_ACCESS_TOKEN");
     }
 }

@@ -178,7 +178,7 @@ pub trait ComponentSource: Send + Sync {
 
 /// OSS/self-hosted resolver: the catalog's enabled plugins in order.
 ///
-/// `MASKURA_PLUGINS_DIR` (legacy `S4_PLUGINS_DIR`) and the bundled default
+/// `MASKURA_PLUGINS_DIR` and the bundled default
 /// component remain a *catalog* of available artifacts; this resolver decides
 /// the pipeline from that catalog exactly as the historical global chain did.
 /// An empty enabled set is the operator's explicit pass-through choice.

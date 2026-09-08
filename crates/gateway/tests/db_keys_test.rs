@@ -2668,8 +2668,8 @@ fn postgres_mcp_creation_returns_persisted_metadata() {
 
 fn auth_headers(ak: &str, sk: &str) -> Vec<(&'static str, String)> {
     vec![
-        ("x-s4-access-key", ak.to_string()),
-        ("x-s4-secret-key", sk.to_string()),
+        ("x-maskura-access-key", ak.to_string()),
+        ("x-maskura-secret-key", sk.to_string()),
     ]
 }
 
@@ -3032,21 +3032,21 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         // these values concurrently.
         unsafe {
             std::env::set_var("AUTH_DISABLED", "0");
-            std::env::set_var("S4_SINGLE_TENANT", "1");
-            std::env::remove_var("S4_KEYS_FILE");
+            std::env::set_var("MASKURA_SINGLE_TENANT", "1");
+            std::env::remove_var("MASKURA_KEYS_FILE");
             std::env::set_var("S3_ENDPOINT", &endpoint);
             std::env::set_var("S3_ACCESS_KEY_ID", "destination-access");
             std::env::set_var("S3_SECRET_ACCESS_KEY", "destination-secret");
             std::env::remove_var("S4_SERVICE_BUCKETS");
             std::env::remove_var("S4_SECRET_KEK");
-            std::env::set_var("S4_STREAMING_S3_PROVIDER", "minio");
-            std::env::remove_var("S4_PLUGINS_DIR");
-            std::env::remove_var("S4_FILTER_COMPONENT");
+            std::env::set_var("MASKURA_STREAMING_S3_PROVIDER", "minio");
+            std::env::remove_var("MASKURA_PLUGINS_DIR");
+            std::env::remove_var("MASKURA_FILTER_COMPONENT");
             std::env::remove_var("S4_MANAGED_STREAMING_MODE");
             std::env::remove_var("S4_MANAGED_STREAMING_TRANSACTIONAL");
-            std::env::set_var("S4_STREAMING_READ_MODE", "passthrough");
-            std::env::set_var("S4_DEV_MEMORY_STREAMING", "1");
-            std::env::set_var("S4_MULTIPART_MODE", "staged");
+            std::env::set_var("MASKURA_STREAMING_READ_MODE", "passthrough");
+            std::env::set_var("MASKURA_DEV_MEMORY_STREAMING", "1");
+            std::env::set_var("MASKURA_MULTIPART_MODE", "staged");
             std::env::set_var("S4_MULTIPART_STAGING_DIR", staging_dir.to_str().unwrap());
             std::env::set_var("S4_MULTIPART_STAGING_ENDPOINT", &endpoint);
             std::env::set_var("S4_MULTIPART_STAGING_BUCKET", MOCK_STAGING_BUCKET);

@@ -289,9 +289,6 @@ fn client_metering_id_rejection(
         "x-maskura-metering-id",
         "x-maskura-operation-id",
         "x-maskura-usage-id",
-        "x-s4-metering-id",
-        "x-s4-operation-id",
-        "x-s4-usage-id",
     ]
     .into_iter()
     .any(|name| headers.contains_key(name))
@@ -10057,8 +10054,7 @@ async fn root(
         .and_then(|v| v.to_str().ok())
         .map(|a| a.starts_with("AWS4-"))
         .unwrap_or(false)
-        || headers.contains_key(customer_headers::ACCESS_KEY.canonical)
-        || headers.contains_key(customer_headers::ACCESS_KEY.legacy)
+        || headers.contains_key(customer_headers::ACCESS_KEY.as_str())
         || uri.query().is_some_and(|query| {
             query
                 .split('&')
@@ -12120,7 +12116,7 @@ mod s3_provider_capability_tests {
     #[test]
     fn provider_selection_is_exact_and_fail_closed() {
         for provider in ["aws", "minio", "r2", "b2"] {
-            unsafe { std::env::set_var("S4_STREAMING_S3_PROVIDER", provider) }
+            unsafe { std::env::set_var("MASKURA_STREAMING_S3_PROVIDER", provider) }
             let capabilities = configured_s3_streaming_capabilities().unwrap();
             assert!(
                 capabilities.is_some(),
@@ -12130,9 +12126,9 @@ mod s3_provider_capability_tests {
             assert!(capabilities.supports_conditional_reads());
             assert!(capabilities.supports_response_checksums());
         }
-        unsafe { std::env::set_var("S4_STREAMING_S3_PROVIDER", "wasabi") }
+        unsafe { std::env::set_var("MASKURA_STREAMING_S3_PROVIDER", "wasabi") }
         assert!(configured_s3_streaming_capabilities().unwrap().is_none());
-        unsafe { std::env::remove_var("S4_STREAMING_S3_PROVIDER") }
+        unsafe { std::env::remove_var("MASKURA_STREAMING_S3_PROVIDER") }
         assert!(configured_s3_streaming_capabilities().unwrap().is_none());
     }
 }

@@ -1493,10 +1493,10 @@ mod tests {
         // redirect the workspace into managed storage; unknown values are also
         // ignored.
         let mut managed_override = HeaderMap::new();
-        managed_override.insert("x-s4-storage-mode", "managed".parse().unwrap());
+        managed_override.insert("x-maskura-storage-mode", "managed".parse().unwrap());
         assert_operations_resolve_to(&resolver, &managed_override, BackendKind::PerUserS3).await;
         let mut unknown_mode = HeaderMap::new();
-        unknown_mode.insert("x-s4-storage-mode", "archive".parse().unwrap());
+        unknown_mode.insert("x-maskura-storage-mode", "archive".parse().unwrap());
         assert_operations_resolve_to(&resolver, &unknown_mode, BackendKind::PerUserS3).await;
 
         // Preserve the request-level shortcut only in explicit single-tenant
@@ -1511,7 +1511,7 @@ mod tests {
         );
         assert_operations_resolve_to(&development, &managed_override, BackendKind::Managed).await;
 
-        // x-s4-storage-mode: managed errors when no managed backend is configured.
+        // x-maskura-storage-mode: managed errors when no managed backend is configured.
         let no_managed = BackendResolver::new(
             Arc::new(InMemoryWorkspaceStorageRepository::new()),
             Arc::new(ServiceStorage::new(Vec::new())),
@@ -1529,7 +1529,7 @@ mod tests {
 
         let mut presigned = HeaderMap::new();
         presigned.insert(
-            "x-s4-backend-url",
+            "x-maskura-backend-url",
             "https://objects.example/object?Expires=9999999999"
                 .parse()
                 .unwrap(),
@@ -1745,7 +1745,7 @@ mod tests {
         );
         let workspace = WorkspaceId::new("workspace").unwrap();
         let mut headers = HeaderMap::new();
-        headers.insert("x-s4-storage-mode", "managed".parse().unwrap());
+        headers.insert("x-maskura-storage-mode", "managed".parse().unwrap());
         let Err(error) = resolver
             .resolve(&workspace, &headers, StorageOperation::Get)
             .await
@@ -1795,7 +1795,7 @@ mod tests {
             workspace_policy_with(false, &["*.storage.example"], &[], &["93.184.216.34:443"]),
         );
         let mut headers = HeaderMap::new();
-        headers.insert("x-s4-storage-mode", "managed".parse().unwrap());
+        headers.insert("x-maskura-storage-mode", "managed".parse().unwrap());
 
         let selection = resolver
             .resolve_with_routing(
@@ -2084,7 +2084,7 @@ mod tests {
                 workspace_policy(false),
             );
             let mut headers = HeaderMap::new();
-            headers.insert("x-s4-storage-mode", "managed".parse().unwrap());
+            headers.insert("x-maskura-storage-mode", "managed".parse().unwrap());
 
             let Err(error) = resolver
                 .resolve(

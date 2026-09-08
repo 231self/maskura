@@ -136,10 +136,7 @@ storage (MinIO), clone the repo and use `just dev-up`.
 ## Compatibility
 
 New integrations should use `MASKURA_*` environment variables and
-`x-maskura-*` headers. Every shipped customer `S4_*` setting and `x-s4-*`
-header remains a permanent alias. Equal dual values are accepted; differing
-values fail closed, and an empty value is treated as a real value for conflict
-checks. The `s4ctl` and `s4-mcp` binaries, `s4_*` MCP tools, `s4_client` Python
+`x-maskura-*` headers. The `s4ctl` and `s4-mcp` binaries, `s4_*` MCP tools, `s4_client` Python
 module, and `S4Client` SDK exports remain available.
 
 Persistent and security-sensitive identifiers do not change: credentials still

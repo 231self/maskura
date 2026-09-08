@@ -66,11 +66,9 @@ A Maskura API key is a pair `s4_<32-hex>` (access key ID) + `s4s_<32-hex>`
    using its Maskura key. The gateway recomputes the signature and rejects requests
 whose signature does not match the stored secret.
 
-Legacy `x-s4-*` customer headers remain permanent aliases. When both canonical
-and legacy forms are present they must have byte-identical values; differing
-values fail closed before the request body is polled. Reserved metering,
-operation, and usage headers are rejected under both namespaces. Credential
-prefixes remain `s4_`, `s4s_`, and `s4m_` so existing credentials do not change.
+The `x-maskura-*` customer headers are the only supported names. Reserved
+metering, operation, and usage headers are rejected. Credential prefixes remain
+`s4_`, `s4s_`, and `s4m_` so existing credentials do not change.
 
 ### SigV4 verification
 
@@ -527,13 +525,10 @@ that do not embed the above.
 These are **operator responsibilities**; Maskura will not and cannot enforce them
 from inside a container:
 
-Customer-configurable gateway settings use `MASKURA_*`. The corresponding
-shipped `S4_*` names are permanent aliases; startup resolves them without
-mutating the process environment and rejects differing dual values. Empty
-values are still values, so an empty canonical value conflicts with a non-empty
-legacy value. Internal/operator controls such as `S4_SECRET_KEK`,
+Customer-configurable gateway settings use `MASKURA_*` environment variables.
+Internal/operator controls such as `S4_SECRET_KEK`,
 `S4_SERVICE_BUCKETS`, `S4_WORKSPACE_ENDPOINT_*`, `S4_PRESIGNED_HTTP_*`,
-`S4_SIGV4_*`, `S4_MANAGED_*`, and `S4_MULTIPART_STAGING_*` intentionally keep their existing
+`S4_SIGV4_*`, `S4_MANAGED_*`, and `S4_MULTIPART_STAGING_*` keep their existing
 names and are not exposed through customer aliases.
 
 - **TLS termination** — place the gateway behind a TLS-terminating proxy
