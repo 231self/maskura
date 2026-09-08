@@ -112,8 +112,6 @@ fn serve(expectations: Vec<Expected>) -> (String, thread::JoinHandle<()>) {
             );
             assert!(!request.headers.contains_key("x-maskura-access-key"));
             assert!(!request.headers.contains_key("x-maskura-secret-key"));
-            assert!(!request.headers.contains_key("x-s4-access-key"));
-            assert!(!request.headers.contains_key("x-s4-secret-key"));
             assert!(!request.target.contains(TOKEN));
             assert!(!String::from_utf8_lossy(&request.body).contains(TOKEN));
             if let Some(content_type) = expected.content_type {
@@ -145,21 +143,13 @@ fn serve(expectations: Vec<Expected>) -> (String, thread::JoinHandle<()>) {
     (format!("http://{address}"), task)
 }
 
-fn run_hosted(binary: &str, gateway: &str, args: &[&str], legacy_env: bool) -> Output {
+fn run_hosted(binary: &str, gateway: &str, args: &[&str]) -> Output {
     let mut command = Command::new(binary);
     command
         .args(["--gateway", gateway, "hosted"])
         .env_remove("MASKURA_WORKSPACE_ID")
         .env_remove("MASKURA_ACCESS_TOKEN")
-        .env_remove("S4_WORKSPACE_ID")
-        .env_remove("S4_ACCESS_TOKEN");
-    if legacy_env {
-        command
-            .env("S4_WORKSPACE_ID", WORKSPACE)
-            .env("S4_ACCESS_TOKEN", TOKEN);
-    } else {
-        command.args(["--workspace", WORKSPACE, "--token", TOKEN]);
-    }
+        .args(["--workspace", WORKSPACE, "--token", TOKEN]);
     let output = command.args(args).output().unwrap();
     assert!(
         output.status.success(),
@@ -360,12 +350,12 @@ fn hosted_cli_contract_walkthrough() {
     let maskura = env!("CARGO_BIN_EXE_maskura");
     let s4ctl = env!("CARGO_BIN_EXE_s4ctl");
 
-    let catalog = run_hosted(maskura, &gateway, &["catalog"], false);
+    let catalog = run_hosted(maskura, &gateway, &["catalog"]);
     assert!(output_text(&catalog).contains("version 1.2.3"));
     assert!(output_text(&catalog).contains("digest=abcdef012345"));
     assert!(output_text(&catalog).contains("state=validated"));
 
-    let stage = run_hosted(maskura, &gateway, &["stage", artifact_arg], false);
+    let stage = run_hosted(maskura, &gateway, &["stage", artifact_arg]);
     assert!(output_text(&stage).contains("Digest:    artifact-digest"));
 
     let upload = run_hosted(
@@ -383,11 +373,10 @@ fn hosted_cli_contract_walkthrough() {
             "--capability",
             "stable_fields",
         ],
-        true,
     );
     assert!(output_text(&upload).contains("validation_run=run/1"));
 
-    let validation = run_hosted(maskura, &gateway, &["validation", "version/1"], false);
+    let validation = run_hosted(maskura, &gateway, &["validation", "version/1"]);
     assert!(output_text(&validation).contains("Version 1.2.3"));
     assert!(output_text(&validation).contains("run run/1  state=succeeded"));
 
@@ -403,13 +392,11 @@ fn hosted_cli_contract_walkthrough() {
             "--version-id",
             "version/1",
         ],
-        false,
     );
     run_hosted(
         maskura,
         &gateway,
         &["pipelines", "create", "write", "redact"],
-        false,
     );
     run_hosted(
         maskura,
@@ -421,14 +408,8 @@ fn hosted_cli_contract_walkthrough() {
             "--step",
             "install/1:version/1",
         ],
-        false,
     );
-    run_hosted(
-        maskura,
-        &gateway,
-        &["pipelines", "publish", "pipeline/1"],
-        false,
-    );
+    run_hosted(maskura, &gateway, &["pipelines", "publish", "pipeline/1"]);
     let assignment_args = [
         "assign-bucket",
         "write",
@@ -436,21 +417,19 @@ fn hosted_cli_contract_walkthrough() {
         "--pipeline-id",
         "pipeline/1",
     ];
-    run_hosted(maskura, &gateway, &assignment_args, false);
-    run_hosted(maskura, &gateway, &assignment_args, false);
+    run_hosted(maskura, &gateway, &assignment_args);
+    run_hosted(maskura, &gateway, &assignment_args);
     run_hosted(
         maskura,
         &gateway,
         &["unassign-bucket", "write", "bucket name/2026"],
-        false,
     );
     run_hosted(
         maskura,
         &gateway,
         &["pipelines", "rollback", "pipeline/1", "revision/old"],
-        false,
     );
-    let audit = run_hosted(maskura, &gateway, &["audit", "--limit", "25"], false);
+    let audit = run_hosted(maskura, &gateway, &["audit", "--limit", "25"]);
     assert!(output_text(&audit).contains("filter.pipeline.rollback"));
 
     std::fs::remove_file(artifact).unwrap();

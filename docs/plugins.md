@@ -123,8 +123,8 @@ available on hosted Maskura. Hosted management is available only when the hosted
 enables filter pipelines (and separately enables custom uploads). It authenticates with a
 **Supabase access token** (`MASKURA_ACCESS_TOKEN` or `--token`) and a workspace ID
 (`MASKURA_WORKSPACE_ID` or `--workspace`); a Maskura data-plane API key is never accepted
-for hosted mutations. The legacy `s4ctl` binary and `S4_ACCESS_TOKEN` /
-`S4_WORKSPACE_ID` environment names remain permanent aliases.
+for hosted mutations. The `s4ctl` binary name remains available as an alias for
+`maskura`.
 
 ```bash
 export MASKURA_ACCESS_TOKEN=<supabase-jwt>

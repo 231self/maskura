@@ -1,29 +1,27 @@
 use axum::http::{HeaderMap, HeaderValue};
 
-#[derive(Clone, Copy, Debug)]
-pub struct HeaderAlias {
-    pub canonical: &'static str,
-    pub legacy: &'static str,
-}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeaderAlias(&'static str);
 
 impl HeaderAlias {
-    const fn new(canonical: &'static str, legacy: &'static str) -> Self {
-        Self { canonical, legacy }
+    const fn new(name: &'static str) -> Self {
+        Self(name)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
     }
 }
 
-pub const ACCESS_KEY: HeaderAlias = HeaderAlias::new("x-maskura-access-key", "x-s4-access-key");
-pub const SECRET_KEY: HeaderAlias = HeaderAlias::new("x-maskura-secret-key", "x-s4-secret-key");
-pub const MCP_TOKEN: HeaderAlias = HeaderAlias::new("x-maskura-mcp-token", "x-s4-mcp-token");
-pub const STORAGE_MODE: HeaderAlias =
-    HeaderAlias::new("x-maskura-storage-mode", "x-s4-storage-mode");
-pub const BACKEND_URL: HeaderAlias = HeaderAlias::new("x-maskura-backend-url", "x-s4-backend-url");
-pub const PROCESS: HeaderAlias = HeaderAlias::new("x-maskura-process", "x-s4-process");
-pub const STABLE_FIELDS: HeaderAlias =
-    HeaderAlias::new("x-maskura-stable-fields", "x-s4-stable-fields");
-pub const ENCRYPT_FIELDS: HeaderAlias =
-    HeaderAlias::new("x-maskura-encrypt-fields", "x-s4-encrypt-fields");
-pub const PLUGIN_NAME: HeaderAlias = HeaderAlias::new("x-maskura-plugin-name", "x-s4-plugin-name");
+pub const ACCESS_KEY: HeaderAlias = HeaderAlias::new("x-maskura-access-key");
+pub const SECRET_KEY: HeaderAlias = HeaderAlias::new("x-maskura-secret-key");
+pub const MCP_TOKEN: HeaderAlias = HeaderAlias::new("x-maskura-mcp-token");
+pub const STORAGE_MODE: HeaderAlias = HeaderAlias::new("x-maskura-storage-mode");
+pub const BACKEND_URL: HeaderAlias = HeaderAlias::new("x-maskura-backend-url");
+pub const PROCESS: HeaderAlias = HeaderAlias::new("x-maskura-process");
+pub const STABLE_FIELDS: HeaderAlias = HeaderAlias::new("x-maskura-stable-fields");
+pub const ENCRYPT_FIELDS: HeaderAlias = HeaderAlias::new("x-maskura-encrypt-fields");
+pub const PLUGIN_NAME: HeaderAlias = HeaderAlias::new("x-maskura-plugin-name");
 
 pub const ALL: &[HeaderAlias] = &[
     ACCESS_KEY,
@@ -40,10 +38,6 @@ pub const ALL: &[HeaderAlias] = &[
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HeaderAliasError {
     Duplicate(&'static str),
-    Conflict {
-        canonical: &'static str,
-        legacy: &'static str,
-    },
 }
 
 fn unique<'a>(
@@ -62,39 +56,18 @@ pub fn aliased(
     headers: &HeaderMap,
     alias: HeaderAlias,
 ) -> Result<Option<&HeaderValue>, HeaderAliasError> {
-    aliased_unique(headers, alias)
+    unique(headers, alias.as_str())
 }
 
 pub fn aliased_unique(
     headers: &HeaderMap,
     alias: HeaderAlias,
 ) -> Result<Option<&HeaderValue>, HeaderAliasError> {
-    resolve_pair(
-        unique(headers, alias.canonical)?,
-        unique(headers, alias.legacy)?,
-        alias,
-    )
-}
-
-fn resolve_pair<'a>(
-    canonical: Option<&'a HeaderValue>,
-    legacy: Option<&'a HeaderValue>,
-    alias: HeaderAlias,
-) -> Result<Option<&'a HeaderValue>, HeaderAliasError> {
-    match (canonical, legacy) {
-        (Some(canonical), Some(legacy)) if canonical.as_bytes() != legacy.as_bytes() => {
-            Err(HeaderAliasError::Conflict {
-                canonical: alias.canonical,
-                legacy: alias.legacy,
-            })
-        }
-        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
-        (None, None) => Ok(None),
-    }
+    unique(headers, alias.as_str())
 }
 
 pub fn validated(headers: &HeaderMap, alias: HeaderAlias) -> Option<&HeaderValue> {
-    aliased(headers, alias).expect("customer header aliases were validated before use")
+    aliased(headers, alias).expect("customer headers were validated before use")
 }
 
 pub fn validate_all(headers: &HeaderMap) -> Result<(), HeaderAliasError> {
@@ -109,53 +82,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_canonical_legacy_and_equal_dual_headers() {
-        for names in [
-            vec![(ACCESS_KEY.canonical, "value")],
-            vec![(ACCESS_KEY.legacy, "value")],
-            vec![
-                (ACCESS_KEY.canonical, "value"),
-                (ACCESS_KEY.legacy, "value"),
-            ],
-        ] {
-            let mut headers = HeaderMap::new();
-            for (name, value) in names {
-                headers.insert(name, value.parse().unwrap());
-            }
-            assert_eq!(
-                aliased(&headers, ACCESS_KEY)
-                    .unwrap()
-                    .unwrap()
-                    .to_str()
-                    .unwrap(),
-                "value"
-            );
-        }
+    fn accepts_canonical_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCESS_KEY.as_str(), "value".parse().unwrap());
+        assert_eq!(
+            aliased(&headers, ACCESS_KEY)
+                .unwrap()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "value"
+        );
     }
 
     #[test]
-    fn rejects_conflicting_aliases_and_duplicate_names() {
-        let mut conflicting = HeaderMap::new();
-        conflicting.insert(ACCESS_KEY.canonical, "new".parse().unwrap());
-        conflicting.insert(ACCESS_KEY.legacy, "old".parse().unwrap());
-        assert_eq!(
-            aliased(&conflicting, ACCESS_KEY),
-            Err(HeaderAliasError::Conflict {
-                canonical: ACCESS_KEY.canonical,
-                legacy: ACCESS_KEY.legacy,
-            })
-        );
-
+    fn rejects_duplicate_names() {
         let mut duplicate = HeaderMap::new();
-        duplicate.append(PROCESS.canonical, "read".parse().unwrap());
-        duplicate.append(PROCESS.canonical, "read".parse().unwrap());
+        duplicate.append(PROCESS.as_str(), "read".parse().unwrap());
+        duplicate.append(PROCESS.as_str(), "read".parse().unwrap());
         assert_eq!(
             aliased_unique(&duplicate, PROCESS),
-            Err(HeaderAliasError::Duplicate(PROCESS.canonical))
+            Err(HeaderAliasError::Duplicate(PROCESS.as_str()))
         );
         assert_eq!(
             validate_all(&duplicate),
-            Err(HeaderAliasError::Duplicate(PROCESS.canonical))
+            Err(HeaderAliasError::Duplicate(PROCESS.as_str()))
         );
     }
 }

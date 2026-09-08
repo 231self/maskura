@@ -573,38 +573,38 @@ fn test_pipeline_template() -> &'static StatePipelineTemplate {
         // before any test state reads it.
         unsafe {
             std::env::set_var("AUTH_DISABLED", "0");
-            std::env::set_var("S4_SINGLE_TENANT", "1");
+            std::env::set_var("MASKURA_SINGLE_TENANT", "1");
             std::env::set_var("S4_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST", "127.0.0.1");
             std::env::remove_var("S4_WORKSPACE_ENDPOINT_ALLOWLIST");
             std::env::remove_var("DATABASE_URL");
-            std::env::remove_var("S4_KEYS_FILE");
+            std::env::remove_var("MASKURA_KEYS_FILE");
             std::env::remove_var("S3_ENDPOINT");
             std::env::remove_var("S4_SECRET_KEK");
             std::env::remove_var("S4_SERVICE_BUCKETS");
-            std::env::remove_var("S4_LEGACY_MAX_OBJECT_BYTES");
-            std::env::remove_var("S4_MAX_OBJECT_BYTES");
-            std::env::remove_var("S4_MAX_PIPELINE_OUTPUT_BYTES");
-            std::env::remove_var("S4_STREAMING_READ_MODE");
-            std::env::remove_var("S4_TRANSFORMED_READ_SPOOL");
-            std::env::remove_var("S4_PREFIX_SAFE_COMPONENT_HASHES");
-            std::env::remove_var("S4_SPOOL_DIR");
-            std::env::remove_var("S4_SPOOL_MAX_OBJECT_BYTES");
-            std::env::remove_var("S4_SPOOL_QUOTA_BYTES");
-            std::env::remove_var("S4_STREAMING_S3_PROVIDER");
+            std::env::remove_var("MASKURA_LEGACY_MAX_OBJECT_BYTES");
+            std::env::remove_var("MASKURA_MAX_OBJECT_BYTES");
+            std::env::remove_var("MASKURA_MAX_PIPELINE_OUTPUT_BYTES");
+            std::env::remove_var("MASKURA_STREAMING_READ_MODE");
+            std::env::remove_var("MASKURA_TRANSFORMED_READ_SPOOL");
+            std::env::remove_var("MASKURA_PREFIX_SAFE_COMPONENT_HASHES");
+            std::env::remove_var("MASKURA_SPOOL_DIR");
+            std::env::remove_var("MASKURA_SPOOL_MAX_OBJECT_BYTES");
+            std::env::remove_var("MASKURA_SPOOL_QUOTA_BYTES");
+            std::env::remove_var("MASKURA_STREAMING_S3_PROVIDER");
             std::env::remove_var("S4_MANAGED_STREAMING_MODE");
             std::env::remove_var("S4_MANAGED_STREAMING_TRANSACTIONAL");
             std::env::remove_var("S4_MANAGED_PLACEMENT_VERSION");
-            std::env::remove_var("S4_DEV_MEMORY_STREAMING");
-            std::env::remove_var("S4_MULTIPART_MODE");
+            std::env::remove_var("MASKURA_DEV_MEMORY_STREAMING");
+            std::env::remove_var("MASKURA_MULTIPART_MODE");
             // Phase 12 removed the legacy buffered PUT/GET path entirely; the
             // streaming in-memory dev backend is the only write/read path left.
-            std::env::set_var("S4_STREAMING_READ_MODE", "passthrough");
-            std::env::set_var("S4_DEV_MEMORY_STREAMING", "1");
+            std::env::set_var("MASKURA_STREAMING_READ_MODE", "passthrough");
+            std::env::set_var("MASKURA_DEV_MEMORY_STREAMING", "1");
             // Load the built filter components so the full pipeline (including
             // stable-encrypt) is available for joinable-read tests.
             let components =
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/components");
-            std::env::set_var("S4_PLUGINS_DIR", components);
+            std::env::set_var("MASKURA_PLUGINS_DIR", components);
         }
         StatePipelineTemplate::from_env().expect("compile test pipeline components")
     })
@@ -1126,13 +1126,6 @@ fn read_component(name: &str) -> Vec<u8> {
 
 fn auth_headers(ak: &str, sk: &str) -> Vec<(&'static str, String)> {
     vec![
-        ("x-s4-access-key", ak.to_string()),
-        ("x-s4-secret-key", sk.to_string()),
-    ]
-}
-
-fn canonical_auth_headers(ak: &str, sk: &str) -> Vec<(&'static str, String)> {
-    vec![
         ("x-maskura-access-key", ak.to_string()),
         ("x-maskura-secret-key", sk.to_string()),
     ]
@@ -1208,57 +1201,40 @@ async fn public_key_mutation_rejects_unauthenticated_requests_in_production_and_
 }
 
 #[tokio::test]
-async fn auth_header_aliases_accept_old_new_and_equal_dual_but_reject_conflicts() {
+async fn auth_headers_accept_canonical_and_reject_legacy_s4_names() {
     let (app, state) = router().await;
     let (access_key, secret_key) = make_key(&state).await;
-    let cases = [
-        (
-            "legacy",
-            auth_headers(&access_key, &secret_key),
-            StatusCode::OK,
-        ),
-        (
-            "canonical",
-            canonical_auth_headers(&access_key, &secret_key),
-            StatusCode::OK,
-        ),
-        (
-            "equal-dual",
-            vec![
-                ("x-maskura-access-key", access_key.clone()),
-                ("x-s4-access-key", access_key.clone()),
-                ("x-maskura-secret-key", secret_key.clone()),
-                ("x-s4-secret-key", secret_key.clone()),
-            ],
-            StatusCode::OK,
-        ),
-        (
-            "conflicting-dual",
-            vec![
-                ("x-maskura-access-key", access_key.clone()),
-                ("x-s4-access-key", "s4_conflict".to_string()),
-                ("x-maskura-secret-key", secret_key.clone()),
-                ("x-s4-secret-key", secret_key.clone()),
-            ],
-            StatusCode::FORBIDDEN,
-        ),
-    ];
 
-    for (name, headers, expected) in cases {
-        let request = add_headers(
-            Request::builder()
-                .method("PUT")
-                .uri(format!("/aliases/{name}.txt"))
-                .header(header::CONTENT_TYPE, "text/plain")
-                .body(Body::from(name))
-                .unwrap(),
-            &headers,
-        );
-        assert_eq!(
-            app.clone().oneshot(request).await.unwrap().status(),
-            expected
-        );
-    }
+    let canonical = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/aliases/canonical.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("canonical"))
+            .unwrap(),
+        &auth_headers(&access_key, &secret_key),
+    );
+    assert_eq!(
+        app.clone().oneshot(canonical).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let legacy = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/aliases/legacy.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("legacy"))
+            .unwrap(),
+        &[
+            ("x-s4-access-key", access_key),
+            ("x-s4-secret-key", secret_key),
+        ],
+    );
+    assert_eq!(
+        app.clone().oneshot(legacy).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
 }
 
 #[tokio::test]
@@ -1269,11 +1245,11 @@ async fn public_key_mutation_rejects_incomplete_or_invalid_api_key_credentials()
     let requests = [
         add_headers(
             public_key_request(&key_id, "rejected-pem"),
-            &[("x-s4-access-key", key_id.clone())],
+            &[("x-maskura-access-key", key_id.clone())],
         ),
         add_headers(
             public_key_request(&key_id, "rejected-pem"),
-            &[("x-s4-secret-key", secret_key.clone())],
+            &[("x-maskura-secret-key", secret_key.clone())],
         ),
         add_headers(
             public_key_request(&key_id, "rejected-pem"),
@@ -1332,24 +1308,24 @@ async fn public_key_mutation_rejects_duplicate_security_headers_without_mutation
         append_headers(
             public_key_request(&key_id, "rejected-pem"),
             &[
-                ("x-s4-access-key", key_id.clone()),
-                ("x-s4-access-key", key_id.clone()),
-                ("x-s4-secret-key", secret_key.clone()),
+                ("x-maskura-access-key", key_id.clone()),
+                ("x-maskura-access-key", key_id.clone()),
+                ("x-maskura-secret-key", secret_key.clone()),
             ],
         ),
         append_headers(
             public_key_request(&key_id, "rejected-pem"),
             &[
-                ("x-s4-access-key", key_id.clone()),
-                ("x-s4-secret-key", secret_key.clone()),
-                ("x-s4-secret-key", secret_key.clone()),
+                ("x-maskura-access-key", key_id.clone()),
+                ("x-maskura-secret-key", secret_key.clone()),
+                ("x-maskura-secret-key", secret_key.clone()),
             ],
         ),
         append_headers(
             public_key_request(&key_id, "rejected-pem"),
             &[
-                ("x-s4-mcp-token", mcp_token.clone()),
-                ("x-s4-mcp-token", mcp_token.clone()),
+                ("x-maskura-mcp-token", mcp_token.clone()),
+                ("x-maskura-mcp-token", mcp_token.clone()),
             ],
         ),
     ];
@@ -1395,37 +1371,40 @@ async fn public_key_mutation_rejects_mixed_credential_classes_without_mutation()
         append_headers(
             public_key_request(&key_id, "rejected-pem"),
             &[
-                ("x-s4-access-key", key_id.clone()),
-                ("x-s4-secret-key", secret_key.clone()),
+                ("x-maskura-access-key", key_id.clone()),
+                ("x-maskura-secret-key", secret_key.clone()),
                 ("authorization", api_bearer.clone()),
             ],
         ),
         append_headers(
             public_key_request(&key_id, "rejected-pem"),
             &[
-                ("x-s4-access-key", key_id.clone()),
-                ("x-s4-secret-key", secret_key.clone()),
+                ("x-maskura-access-key", key_id.clone()),
+                ("x-maskura-secret-key", secret_key.clone()),
                 ("authorization", format!("Bearer {jwt}")),
             ],
         ),
         append_headers(
             public_key_request(&key_id, "rejected-pem"),
             &[
-                ("x-s4-mcp-token", mcp_token.clone()),
-                ("x-s4-access-key", key_id.clone()),
-                ("x-s4-secret-key", secret_key.clone()),
+                ("x-maskura-mcp-token", mcp_token.clone()),
+                ("x-maskura-access-key", key_id.clone()),
+                ("x-maskura-secret-key", secret_key.clone()),
             ],
         ),
         append_headers(
             public_key_request(&key_id, "rejected-pem"),
             &[
-                ("x-s4-mcp-token", mcp_token.clone()),
+                ("x-maskura-mcp-token", mcp_token.clone()),
                 ("authorization", format!("Bearer {jwt}")),
             ],
         ),
         append_headers(
             public_key_request(&key_id, "rejected-pem"),
-            &[("x-s4-mcp-token", mcp_token), ("authorization", api_bearer)],
+            &[
+                ("x-maskura-mcp-token", mcp_token),
+                ("authorization", api_bearer),
+            ],
         ),
     ];
 
@@ -1457,7 +1436,7 @@ async fn public_key_mutation_accepts_own_key_via_headers_and_bearer() {
 
     let header_request = add_headers(
         public_key_request(&header_key, TEST_PUBLIC_KEY_PEM),
-        &canonical_auth_headers(&header_key, &header_secret),
+        &auth_headers(&header_key, &header_secret),
     );
     assert_eq!(
         app.clone().oneshot(header_request).await.unwrap().status(),
@@ -1687,7 +1666,7 @@ async fn mcp_tokens_cannot_mutate_public_keys() {
         ),
         add_headers(
             public_key_request(&key_id, "rejected-pem"),
-            &[("x-s4-mcp-token", token)],
+            &[("x-maskura-mcp-token", token)],
         ),
     ];
 
@@ -2798,9 +2777,9 @@ async fn launch_contract_supplied_metering_id_is_rejected_generically_before_mut
         "x-maskura-metering-id",
         "x-maskura-operation-id",
         "x-maskura-usage-id",
-        "x-s4-metering-id",
-        "x-s4-operation-id",
-        "x-s4-usage-id",
+        "x-maskura-metering-id",
+        "x-maskura-operation-id",
+        "x-maskura-usage-id",
     ]
     .into_iter()
     .enumerate()
@@ -3077,7 +3056,7 @@ async fn invalid_range_failed_head_and_failed_delete_release_exact_reservations(
         Request::builder()
             .method("DELETE")
             .uri("/failed/object.txt")
-            .header("x-s4-storage-mode", "managed")
+            .header("x-maskura-storage-mode", "managed")
             .body(Body::empty())
             .unwrap(),
         &headers,
@@ -3277,7 +3256,7 @@ async fn unsupported_multipart_destination_is_rejected_before_body_polling() {
         Request::builder()
             .method("POST")
             .uri("/bucket/object?uploads")
-            .header("x-s4-backend-url", "https://example.com/signed")
+            .header("x-maskura-backend-url", "https://example.com/signed")
             .body(Body::empty())
             .unwrap(),
         &headers,
@@ -3296,7 +3275,7 @@ async fn unsupported_multipart_destination_is_rejected_before_body_polling() {
         Request::builder()
             .method("PUT")
             .uri("/bucket/object?partNumber=1&uploadId=legacy")
-            .header("x-s4-backend-url", "https://example.com/signed")
+            .header("x-maskura-backend-url", "https://example.com/signed")
             .header(header::CONTENT_LENGTH, "7")
             .body(Body::new(PollTrackingBody {
                 polls: polls.clone(),
@@ -3751,7 +3730,7 @@ async fn presigned_transport_failure_never_discloses_signed_url_material() {
             Request::builder()
                 .method("GET")
                 .uri("/proxy/transport-failure")
-                .header("x-s4-backend-url", &signed_url)
+                .header("x-maskura-backend-url", &signed_url)
                 .body(Body::empty())
                 .unwrap(),
             &auth_headers(&ak, &sk),
@@ -3789,7 +3768,7 @@ async fn presigned_transport_failure_never_discloses_signed_url_material() {
             Request::builder()
                 .method("DELETE")
                 .uri("/proxy/transport-failure")
-                .header("x-s4-backend-url", &signed_url)
+                .header("x-maskura-backend-url", &signed_url)
                 .body(Body::empty())
                 .unwrap(),
             &auth_headers(&ak, &sk),
@@ -3837,7 +3816,7 @@ async fn presigned_http_responses_are_hardened_without_losing_object_semantics()
             .header(header::RANGE, "bytes=2-5")
             .header("x-amz-checksum-mode", "ENABLED")
             .header(
-                "x-s4-backend-url",
+                "x-maskura-backend-url",
                 format!("{upstream}/object?Expires={expires}"),
             )
             .body(Body::empty())
@@ -3915,7 +3894,7 @@ async fn presigned_http_responses_are_hardened_without_losing_object_semantics()
             .method("HEAD")
             .uri("/proxy/object")
             .header(
-                "x-s4-backend-url",
+                "x-maskura-backend-url",
                 format!("{upstream}/object?Expires={expires}"),
             )
             .body(Body::empty())
@@ -3939,7 +3918,7 @@ async fn presigned_http_responses_are_hardened_without_losing_object_semantics()
             .method("GET")
             .uri("/proxy?list-type=2")
             .header(
-                "x-s4-backend-url",
+                "x-maskura-backend-url",
                 format!("{upstream}/object?Expires={expires}"),
             )
             .body(Body::empty())
@@ -3961,7 +3940,7 @@ async fn presigned_http_responses_are_hardened_without_losing_object_semantics()
             .method("GET")
             .uri("/proxy/missing")
             .header(
-                "x-s4-backend-url",
+                "x-maskura-backend-url",
                 format!("{upstream}/not-found?Expires={expires}"),
             )
             .body(Body::empty())
@@ -3985,7 +3964,7 @@ async fn presigned_http_responses_are_hardened_without_losing_object_semantics()
             .method("GET")
             .uri("/proxy/redirect")
             .header(
-                "x-s4-backend-url",
+                "x-maskura-backend-url",
                 format!("{upstream}/redirect?Expires={expires}"),
             )
             .body(Body::empty())
@@ -4286,7 +4265,7 @@ async fn sigv4_signed_semantic_headers_accept_and_detect_mutation_or_removal() {
         ),
         (
             "removed legacy semantic header",
-            HeaderChange::Remove("x-s4-process"),
+            HeaderChange::Remove("x-maskura-process"),
             StatusCode::FORBIDDEN,
         ),
     ]
@@ -4302,7 +4281,7 @@ async fn sigv4_signed_semantic_headers_accept_and_detect_mutation_or_removal() {
             b"semantic body",
             &[
                 ("content-type", "text/plain"),
-                ("x-s4-process", "write"),
+                ("x-maskura-process", "write"),
                 ("x-amz-meta-dynamic-name", "one"),
             ],
         );
@@ -4336,14 +4315,12 @@ async fn sigv4_signed_semantic_headers_accept_and_detect_mutation_or_removal() {
 }
 
 #[tokio::test]
-async fn sigv4_signs_the_exact_old_or_new_semantic_header_names() {
+async fn sigv4_signs_the_exact_canonical_semantic_header_names() {
     let (app, state) = router().await;
     let (access_key, secret_key) = make_key(&state).await;
 
     for (index, (name, value)) in [
-        ("x-s4-process", "write"),
         ("x-maskura-process", "write"),
-        ("x-s4-encrypt-fields", "email"),
         ("x-maskura-encrypt-fields", "email"),
     ]
     .into_iter()
@@ -4353,8 +4330,8 @@ async fn sigv4_signs_the_exact_old_or_new_semantic_header_names() {
             &access_key,
             &secret_key,
             "PUT",
-            &format!("http://maskura.local/sigv4-aliases/{index}.txt"),
-            b"signed alias",
+            &format!("http://maskura.local/sigv4-canonical/{index}.txt"),
+            b"signed canonical",
             &[("content-type", "text/plain"), (name, value)],
         );
         assert_eq!(
@@ -4364,37 +4341,20 @@ async fn sigv4_signs_the_exact_old_or_new_semantic_header_names() {
         );
     }
 
-    let equal_dual = signed_request(
+    let duplicate = signed_request(
         &access_key,
         &secret_key,
         "PUT",
-        "http://maskura.local/sigv4-aliases/equal.txt",
-        b"equal aliases",
+        "http://maskura.local/sigv4-canonical/duplicate.txt",
+        b"duplicate semantic header",
         &[
             ("content-type", "text/plain"),
             ("x-maskura-process", "write"),
-            ("x-s4-process", "write"),
+            ("x-maskura-process", "read"),
         ],
     );
     assert_eq!(
-        app.clone().oneshot(equal_dual).await.unwrap().status(),
-        StatusCode::OK
-    );
-
-    let conflicting = signed_request(
-        &access_key,
-        &secret_key,
-        "PUT",
-        "http://maskura.local/sigv4-aliases/conflict.txt",
-        b"conflicting aliases",
-        &[
-            ("content-type", "text/plain"),
-            ("x-maskura-process", "write"),
-            ("x-s4-process", "read"),
-        ],
-    );
-    assert_eq!(
-        app.oneshot(conflicting).await.unwrap().status(),
+        app.oneshot(duplicate).await.unwrap().status(),
         StatusCode::FORBIDDEN
     );
 }
@@ -4414,7 +4374,7 @@ async fn sigv4_rejects_ambiguous_or_noncanonical_integrity_headers_before_body_p
     let (access_key, secret_key) = make_key(&state).await;
     for (index, (name, shape)) in [
         (
-            "x-s4-stable-fields",
+            "x-maskura-stable-fields",
             HeaderShape::Duplicate {
                 signed: "email,account_id",
                 first: "email",
@@ -4422,7 +4382,7 @@ async fn sigv4_rejects_ambiguous_or_noncanonical_integrity_headers_before_body_p
             },
         ),
         (
-            "x-s4-backend-url",
+            "x-maskura-backend-url",
             HeaderShape::Duplicate {
                 signed: "https://storage.example/one,https://storage.example/two",
                 first: "https://storage.example/one",
@@ -4445,10 +4405,16 @@ async fn sigv4_rejects_ambiguous_or_noncanonical_integrity_headers_before_body_p
                 second: "two",
             },
         ),
-        ("x-s4-stable-fields", HeaderShape::Raw(" email, account_id")),
-        ("x-s4-stable-fields", HeaderShape::Raw("email, account_id ")),
         (
-            "x-s4-backend-url",
+            "x-maskura-stable-fields",
+            HeaderShape::Raw(" email, account_id"),
+        ),
+        (
+            "x-maskura-stable-fields",
+            HeaderShape::Raw("email, account_id "),
+        ),
+        (
+            "x-maskura-backend-url",
             HeaderShape::Raw("\thttps://storage.example/object"),
         ),
         (
@@ -4516,10 +4482,10 @@ async fn sigv4_rejects_unsigned_integrity_header_injection_before_polling_the_bo
     let (app, state) = router().await;
     let (access_key, secret_key) = make_key(&state).await;
     for (index, (name, value)) in [
-        ("x-s4-storage-mode", "managed"),
-        ("x-s4-backend-url", "https://storage.example/object"),
-        ("x-s4-process", "read"),
-        ("x-s4-stable-fields", "email"),
+        ("x-maskura-storage-mode", "managed"),
+        ("x-maskura-backend-url", "https://storage.example/object"),
+        ("x-maskura-process", "read"),
+        ("x-maskura-stable-fields", "email"),
         ("content-type", "text/plain"),
         ("content-encoding", "gzip"),
         ("content-md5", "CY9rzUYh03PK3k6DJie09g=="),
@@ -4630,7 +4596,7 @@ async fn presigned_host_only_get_accepts_but_appended_protected_headers_are_reje
     assert_eq!(response.status(), StatusCode::OK);
 
     for (name, value) in [
-        ("x-s4-process", "read"),
+        ("x-maskura-process", "read"),
         ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
         ("x-amz-meta-dynamic-name", "appended"),
         ("x-amz-tagging", "project=appended"),
@@ -4671,8 +4637,8 @@ async fn non_sigv4_api_key_auth_rejects_duplicate_semantic_headers() {
             &auth_headers(&access_key, &secret_key),
         ),
         &[
-            ("x-s4-process", " write ".to_string()),
-            ("x-s4-process", "read".to_string()),
+            ("x-maskura-process", " write ".to_string()),
+            ("x-maskura-process", "read".to_string()),
         ],
     );
 
@@ -4894,8 +4860,8 @@ async fn managed_storage_isolates_users() {
             .body(Body::from("evil"))
             .unwrap(),
         &[
-            ("x-s4-access-key", ak2.clone()),
-            ("x-s4-secret-key", sk1.clone()),
+            ("x-maskura-access-key", ak2.clone()),
+            ("x-maskura-secret-key", sk1.clone()),
         ],
     );
     let resp = app.clone().oneshot(cross).await.unwrap();
@@ -4913,8 +4879,8 @@ async fn managed_storage_isolates_users() {
             .body(Body::from("evil"))
             .unwrap(),
         &[
-            ("x-s4-access-key", ak1.clone()),
-            ("x-s4-secret-key", sk2.clone()),
+            ("x-maskura-access-key", ak1.clone()),
+            ("x-maskura-secret-key", sk2.clone()),
         ],
     );
     let resp = app.oneshot(cross2).await.unwrap();
@@ -5940,7 +5906,7 @@ async fn transformed_read_is_rejected_without_exposing_raw_data() {
         Request::builder()
             .method("GET")
             .uri("/rawbkt/doc.json")
-            .header("x-s4-process", "read")
+            .header("x-maskura-process", "read")
             .body(Body::empty())
             .unwrap(),
         &hdrs,
@@ -5971,7 +5937,7 @@ async fn transformed_read_is_rejected_before_object_lookup() {
         Request::builder()
             .method("GET")
             .uri("/rawbkt/does-not-exist.json")
-            .header("x-s4-process", "true")
+            .header("x-maskura-process", "true")
             .body(Body::empty())
             .unwrap(),
         &hdrs,
@@ -6090,8 +6056,8 @@ async fn stable_transformed_reads_are_rejected_without_disclosure() {
             Request::builder()
                 .method("GET")
                 .uri(format!("/j1/{key}"))
-                .header("x-s4-process", "read")
-                .header("x-s4-stable-fields", "email")
+                .header("x-maskura-process", "read")
+                .header("x-maskura-stable-fields", "email")
                 .body(Body::empty())
                 .unwrap(),
             &hdrs,
@@ -6149,7 +6115,7 @@ async fn unsafe_transformed_read_stages_then_sanitizes_source_headers() {
             Request::builder()
                 .method("GET")
                 .uri("/read/raw.txt")
-                .header("x-s4-process", "read")
+                .header("x-maskura-process", "read")
                 .body(Body::empty())
                 .unwrap(),
             &auth_headers(&ak, &sk),
@@ -6218,7 +6184,7 @@ async fn transformed_read_rejects_range_part_head_encoding_and_unknown_format() 
         let mut request = Request::builder()
             .method(method)
             .uri(uri)
-            .header("x-s4-process", "read");
+            .header("x-maskura-process", "read");
         if let Some((name, value)) = extra_header {
             request = request.header(name, value);
         }
@@ -6298,7 +6264,7 @@ async fn resolver_precedes_authorization_and_isolates_workspace_bucket_and_direc
             Request::builder()
                 .method("GET")
                 .uri("/same-bucket/a.txt")
-                .header("x-s4-process", "read")
+                .header("x-maskura-process", "read")
                 .body(Body::empty())
                 .unwrap(),
             &auth_headers(&first.0, &first.1),
@@ -6497,7 +6463,7 @@ async fn unsafe_transformed_read_refuses_unavailable_staging_without_disclosure(
             Request::builder()
                 .method("GET")
                 .uri("/read/large.txt")
-                .header("x-s4-process", "read")
+                .header("x-maskura-process", "read")
                 .body(Body::empty())
                 .unwrap(),
             &auth_headers(&ak, &sk),
@@ -6552,9 +6518,9 @@ async fn unsafe_transformed_failures_never_disclose_early_late_or_finish_output(
         let mut request = Request::builder()
             .method("GET")
             .uri("/read/failure.txt")
-            .header("x-s4-process", "read");
+            .header("x-maskura-process", "read");
         if let Some(stable_fields) = stable_fields {
-            request = request.header("x-s4-stable-fields", stable_fields);
+            request = request.header("x-maskura-stable-fields", stable_fields);
         }
         let response = build_router(state)
             .oneshot(add_headers(
@@ -6591,7 +6557,7 @@ async fn unsafe_transformed_source_limit_has_no_disclosure() {
             Request::builder()
                 .method("GET")
                 .uri("/read/limit.txt")
-                .header("x-s4-process", "read")
+                .header("x-maskura-process", "read")
                 .body(Body::empty())
                 .unwrap(),
             &auth_headers(&ak, &sk),
@@ -6677,7 +6643,7 @@ async fn nonempty_prefix_safe_reads_stream_and_settle_without_spool() {
             Request::builder()
                 .method("GET")
                 .uri("/read/empty.txt")
-                .header("x-s4-process", "read")
+                .header("x-maskura-process", "read")
                 .body(Body::empty())
                 .unwrap(),
             &auth_headers(&ak, &sk),
@@ -6702,7 +6668,7 @@ async fn nonempty_prefix_safe_reads_stream_and_settle_without_spool() {
             Request::builder()
                 .method("GET")
                 .uri("/read/nonempty.txt")
-                .header("x-s4-process", "read")
+                .header("x-maskura-process", "read")
                 .body(Body::empty())
                 .unwrap(),
             &auth_headers(&ak, &sk),
@@ -6773,7 +6739,7 @@ async fn direct_read_retries_the_exact_terminal_event_before_eof() {
             Request::builder()
                 .method("GET")
                 .uri("/direct/records.txt")
-                .header("x-s4-process", "read")
+                .header("x-maskura-process", "read")
                 .body(Body::empty())
                 .unwrap(),
             &auth_headers(&credentials.0, &credentials.1),
@@ -6814,7 +6780,7 @@ async fn direct_read_settlement_exhaustion_errors_after_disclosure_and_preserves
             Request::builder()
                 .method("GET")
                 .uri("/direct/records.txt")
-                .header("x-s4-process", "read")
+                .header("x-maskura-process", "read")
                 .body(Body::empty())
                 .unwrap(),
             &auth_headers(&credentials.0, &credentials.1),
@@ -6857,7 +6823,7 @@ async fn direct_read_client_cancellation_after_disclosure_preserves_recoverable_
             Request::builder()
                 .method("GET")
                 .uri("/direct/records.txt")
-                .header("x-s4-process", "read")
+                .header("x-maskura-process", "read")
                 .body(Body::empty())
                 .unwrap(),
             &auth_headers(&credentials.0, &credentials.1),
@@ -6882,7 +6848,7 @@ async fn direct_read_client_cancellation_after_disclosure_preserves_recoverable_
             Request::builder()
                 .method("GET")
                 .uri("/direct/empty.txt")
-                .header("x-s4-process", "read")
+                .header("x-maskura-process", "read")
                 .body(Body::empty())
                 .unwrap(),
             &auth_headers(&credentials.0, &credentials.1),
@@ -6941,7 +6907,7 @@ async fn direct_read_terminal_plugin_error_never_settles_customer_usage() {
             Request::builder()
                 .method("GET")
                 .uri("/direct/failure.txt")
-                .header("x-s4-process", "read")
+                .header("x-maskura-process", "read")
                 .body(Body::empty())
                 .unwrap(),
             &auth_headers(&credentials.0, &credentials.1),

@@ -91,11 +91,6 @@ async fn stdio_client_round_trips_through_the_real_gateway() -> anyhow::Result<(
         ),
         ("MASKURA_DEV_MEMORY_STREAMING", Some("true")),
         ("MASKURA_STREAMING_READ_MODE", Some("passthrough")),
-        ("S4_FILTER_COMPONENT", None),
-        ("S4_KEYS_FILE", None),
-        ("S4_SINGLE_TENANT", None),
-        ("S4_DEV_MEMORY_STREAMING", None),
-        ("S4_STREAMING_READ_MODE", None),
         ("DATABASE_URL", None),
         ("S3_ENDPOINT", None),
         ("S4_SERVICE_BUCKETS", None),
@@ -124,12 +119,8 @@ async fn stdio_client_round_trips_through_the_real_gateway() -> anyhow::Result<(
             command
                 .env("MASKURA_GATEWAY_URL", &gateway_url)
                 .env("MASKURA_MCP_TOKEN", &token)
-                .env_remove("S4_GATEWAY_URL")
-                .env_remove("S4_MCP_TOKEN")
                 .env_remove("MASKURA_ACCESS_KEY")
-                .env_remove("MASKURA_SECRET_KEY")
-                .env_remove("S4_ACCESS_KEY")
-                .env_remove("S4_SECRET_KEY");
+                .env_remove("MASKURA_SECRET_KEY");
         }),
     )
     .stderr(Stdio::null())

@@ -80,7 +80,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 - **Supabase Auth (GoTrue)** for user signup, login, magic-link emails, and session management.
 - Supabase JS client in the dashboard browser app; `jsonwebtoken` crate in the gateway validates JWTs.
 - API keys (S3 access key + secret) and MCP tokens are separate from user sessions. Each stores immutable `workspace_id` execution scope plus `user_id` dashboard ownership. Legacy unbound credentials fail authentication rather than resolving a current/default workspace.
-- Gateway verifies API keys on S3 routes via `x-maskura-access-key` / `x-maskura-secret-key` headers (with permanent `x-s4-*` aliases) or `Authorization: Bearer <access_key>:<secret>`.
+- Gateway verifies API keys on S3 routes via `x-maskura-access-key` / `x-maskura-secret-key` headers or `Authorization: Bearer <access_key>:<secret>`.
 
 ### Database
 

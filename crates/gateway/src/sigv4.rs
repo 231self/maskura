@@ -27,11 +27,6 @@ const SEMANTIC_HEADERS: &[&str] = &[
     "x-maskura-process",
     "x-maskura-stable-fields",
     "x-maskura-encrypt-fields",
-    "x-s4-storage-mode",
-    "x-s4-backend-url",
-    "x-s4-process",
-    "x-s4-stable-fields",
-    "x-s4-encrypt-fields",
     "content-type",
     "content-encoding",
     "content-md5",
@@ -1006,11 +1001,6 @@ mod tests {
             ("x-maskura-process", "read"),
             ("x-maskura-stable-fields", "email"),
             ("x-maskura-encrypt-fields", "email"),
-            ("x-s4-storage-mode", "managed"),
-            ("x-s4-backend-url", "https://storage.example/object"),
-            ("x-s4-process", "read"),
-            ("x-s4-stable-fields", "email"),
-            ("x-s4-encrypt-fields", "email"),
             ("content-type", "text/plain"),
             ("content-encoding", "identity"),
             ("content-md5", "CY9rzUYh03PK3k6DJie09g=="),
@@ -1089,11 +1079,6 @@ mod tests {
             ("x-maskura-process", "read"),
             ("x-maskura-stable-fields", "email, account_id"),
             ("x-maskura-encrypt-fields", "email"),
-            ("x-s4-storage-mode", "managed"),
-            ("x-s4-backend-url", "https://storage.example/object"),
-            ("x-s4-process", "read"),
-            ("x-s4-stable-fields", "email, account_id"),
-            ("x-s4-encrypt-fields", "email"),
             ("content-type", "text/plain; charset=utf-8"),
             ("content-encoding", "aws-chunked"),
             ("content-md5", "CY9rzUYh03PK3k6DJie09g=="),
@@ -1184,13 +1169,13 @@ mod tests {
     fn rejects_duplicate_integrity_headers_even_when_joined_value_matches_the_signature() {
         for (name, combined, first, second) in [
             (
-                "x-s4-stable-fields",
+                "x-maskura-stable-fields",
                 "email,account_id",
                 "email",
                 "account_id",
             ),
             (
-                "x-s4-backend-url",
+                "x-maskura-backend-url",
                 "https://storage.example/one,https://storage.example/two",
                 "https://storage.example/one",
                 "https://storage.example/two",
@@ -1249,9 +1234,9 @@ mod tests {
     #[test]
     fn rejects_signed_trim_all_variants_and_accepts_canonical_single_spaces() {
         for (name, raw) in [
-            ("x-s4-stable-fields", " email"),
-            ("x-s4-stable-fields", "email "),
-            ("x-s4-backend-url", "\thttps://storage.example/object"),
+            ("x-maskura-stable-fields", " email"),
+            ("x-maskura-stable-fields", "email "),
+            ("x-maskura-backend-url", "\thttps://storage.example/object"),
             ("content-type", "text/plain;  charset=utf-8"),
             ("content-md5", "CY9rzUYh03PK3k6DJie09g==\t"),
             ("x-amz-tagging", " project=one&owner=two"),
@@ -1283,8 +1268,8 @@ mod tests {
         }
 
         for (name, canonical) in [
-            ("x-s4-stable-fields", "email, account_id"),
-            ("x-s4-backend-url", "https://storage.example/object"),
+            ("x-maskura-stable-fields", "email, account_id"),
+            ("x-maskura-backend-url", "https://storage.example/object"),
             ("content-type", "text/plain; charset=utf-8"),
             ("content-md5", "CY9rzUYh03PK3k6DJie09g=="),
             ("x-amz-meta-project", "project one"),
@@ -1314,11 +1299,11 @@ mod tests {
     fn signed_integrity_values_are_cryptographically_bound_and_required() {
         for (name, value, mutation) in [
             (
-                "x-s4-backend-url",
+                "x-maskura-backend-url",
                 "https://one.example/object",
                 "https://two.example/object",
             ),
-            ("x-s4-stable-fields", "email", "account_id"),
+            ("x-maskura-stable-fields", "email", "account_id"),
             ("content-type", "text/plain", "application/json"),
             (
                 "content-md5",
@@ -1459,7 +1444,7 @@ mod tests {
             .unwrap()
             .unwrap();
         for (name, value) in [
-            ("x-s4-process", "read"),
+            ("x-maskura-process", "read"),
             ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
             ("x-amz-meta-dynamic-name", "metadata"),
         ] {
