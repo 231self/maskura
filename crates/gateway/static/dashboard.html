@@ -608,7 +608,7 @@ client.send(httpReq, HttpResponse.BodyHandlers.ofString());</div>
 <div class="section">
   <div class="section-label">Client SDKs</div>
   <div class="section-title">Envelope encryption built in</div>
-  <div class="section-subtitle">Python and TypeScript SDKs ship a high-level client. Generate a keypair, hand Maskura the public half once, and every PUT is envelope-encrypted server-side (RSA-OAEP + AES-256-GCM). Read back and decrypt with your private key; Maskura never sees it.</div>
+  <div class="section-subtitle">Python and TypeScript SDKs ship a high-level client. Generate a keypair, hand Maskura the public half once, and every PUT is envelope-encrypted server-side (hybrid X25519 + ML-KEM-768 + AES-256-GCM). Read back and decrypt with your private key; Maskura never sees it.</div>
 
   <div class="tab-bar">
     <button class="tab-btn active" onclick="switchTab('sdk-python', this)">Python</button>
@@ -629,7 +629,7 @@ client = MaskuraClient("http://localhost:9000", "s4_KEY_ID", "s4s_SECRET")
 private_pem, public_pem = MaskuraClient.generate_keypair()
 client.attach_public_key(public_pem)
 
-# Write — PII envelope-encrypted server-side (RSA-OAEP + AES-256-GCM)
+# Write — PII envelope-encrypted server-side (hybrid X25519 + ML-KEM-768 + AES-256-GCM)
 client.put_object("my-bucket", "ingest/data.jsonl", open("data.jsonl", "rb").read())
 
 # Read — decrypt the envelopes back to plaintext with your private key
@@ -655,7 +655,7 @@ const client = new MaskuraClient({
 const { privateKeyPem, publicKeyPem } = await MaskuraClient.generateKeypair();
 await client.attachPublicKey(publicKeyPem);
 
-// Write — PII encrypted server-side (RSA-OAEP + AES-256-GCM)
+// Write — PII encrypted server-side (hybrid X25519 + ML-KEM-768 + AES-256-GCM)
 await client.putObject("my-bucket", "ingest/data.jsonl",
   new TextEncoder().encode(JSON.stringify(records)));
 

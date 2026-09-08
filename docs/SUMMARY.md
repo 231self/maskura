@@ -3,15 +3,13 @@
 - [Home](index.md)
 - [Demo](demo.md)
 - [Plugins](plugins.md)
+- [Encryption](encryption.md)
+- [Post-quantum encryption](post-quantum-crypto.md)
 - [Avro gate](avro.md)
 - [Binary adapters](binary-adapters.md)
 - [MCP](mcp.md)
 - [End-to-end suite](e2e.md)
 - [Security](security.md)
-
-# Roadmap (planned, not shipped)
-
-- [Post-quantum encryption](post-quantum-crypto.md)
 
 # Architecture Decision Records
 
