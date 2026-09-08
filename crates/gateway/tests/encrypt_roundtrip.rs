@@ -6,13 +6,9 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use rsa::Oaep;
-use rsa::RsaPrivateKey;
-use rsa::RsaPublicKey;
-use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
 use s4_gateway::Format;
+use s4_gateway::hybrid::{HybridPrivateKey, HybridPublicKey};
 use s4_gateway::plugin_registry::PluginRegistry;
-use sha2::Sha256;
 use std::fs;
 use std::path::PathBuf;
 
@@ -74,10 +70,10 @@ struct Envelope {
     tag: String,
 }
 
-fn decrypt_envelope(env: &Envelope, key: &RsaPrivateKey) -> Vec<u8> {
+fn decrypt_envelope(env: &Envelope, key: &HybridPrivateKey) -> Vec<u8> {
     let dek = key
-        .decrypt(Oaep::new::<Sha256>(), &B64.decode(&env.enc_dek).unwrap())
-        .expect("RSA-OAEP unwrap failed");
+        .decapsulate_dek(&B64.decode(&env.enc_dek).unwrap())
+        .expect("hybrid decapsulation failed");
     let cipher = Aes256Gcm::new_from_slice(&dek).expect("bad dek");
     let iv_bytes = B64.decode(&env.iv).unwrap();
     let iv = Nonce::from_slice(&iv_bytes);
@@ -90,10 +86,10 @@ fn decrypt_envelope(env: &Envelope, key: &RsaPrivateKey) -> Vec<u8> {
 
 fn extract_envelopes(output: &str) -> Vec<Envelope> {
     // Envelopes are JSON objects embedded in the output; naive scan for
-    // "alg":"RSA-OAEP/AES-256-GCM" objects.
+    // "alg":"X25519+ML-KEM-768/AES-256-GCM" objects.
     let mut envelopes = Vec::new();
     let mut rest = output;
-    while let Some(idx) = rest.find("\"alg\":\"RSA-OAEP/AES-256-GCM\"") {
+    while let Some(idx) = rest.find("\"alg\":\"X25519+ML-KEM-768/AES-256-GCM\"") {
         let start = rest[..idx].rfind('{').expect("envelope start");
         let mut depth = 0i32;
         let mut end = start;
@@ -118,15 +114,15 @@ fn extract_envelopes(output: &str) -> Vec<Envelope> {
 }
 
 #[test]
-fn encrypts_pii_with_cert_and_roundtrips() {
-    let cert = fs::read_to_string(fixture("cert.pem")).unwrap();
-    let priv_key = fs::read_to_string(fixture("key.pem")).unwrap();
-    let key = RsaPrivateKey::from_pkcs8_pem(&priv_key).expect("parse private key");
+fn encrypts_pii_with_hybrid_key_and_roundtrips() {
+    let public_pem = fs::read_to_string(fixture("hybrid-public.pem")).unwrap();
+    let priv_pem = fs::read_to_string(fixture("hybrid-private.pem")).unwrap();
+    let key = HybridPrivateKey::parse_pem(&priv_pem).expect("parse private key");
 
     let registry = encrypt_registry();
     let input = b"alice@example.com SSN 123-45-6789 card 4111111111111111";
 
-    let output = process(&registry, input, Some(&cert));
+    let output = process(&registry, input, Some(&public_pem));
     let out_str = String::from_utf8_lossy(&output);
 
     assert!(
@@ -153,15 +149,15 @@ fn encrypts_pii_with_cert_and_roundtrips() {
 }
 
 #[test]
-fn encrypts_with_spki_public_key_pem() {
-    let pub_pem = fs::read_to_string(fixture("pub.pem")).unwrap();
-    let priv_key = fs::read_to_string(fixture("key.pem")).unwrap();
-    let key = RsaPrivateKey::from_pkcs8_pem(&priv_key).expect("parse private key");
-    // sanity: the SPKI PEM parses
-    RsaPublicKey::from_public_key_pem(&pub_pem).expect("SPKI should parse");
+fn encrypts_with_hybrid_public_key_pem() {
+    let public_pem = fs::read_to_string(fixture("hybrid-public.pem")).unwrap();
+    let priv_pem = fs::read_to_string(fixture("hybrid-private.pem")).unwrap();
+    let key = HybridPrivateKey::parse_pem(&priv_pem).expect("parse private key");
+    // sanity: the hybrid public PEM parses
+    HybridPublicKey::parse_pem(&public_pem).expect("hybrid public key should parse");
 
     let registry = encrypt_registry();
-    let output = process(&registry, b"bob@x.io 078-05-1120", Some(&pub_pem));
+    let output = process(&registry, b"bob@x.io 078-05-1120", Some(&public_pem));
     let out_str = String::from_utf8_lossy(&output);
     assert!(!out_str.contains("bob@x.io"), "plaintext leaked");
     let envelopes = extract_envelopes(&out_str);
@@ -182,7 +178,7 @@ fn redacts_when_no_public_key() {
     let output = process(&registry, input, None);
     let out_str = String::from_utf8_lossy(&output);
     assert_eq!(out_str, "[REDACTED_EMAIL] [REDACTED_SSN]");
-    assert!(!out_str.contains("RSA-OAEP"), "no encryption without a key");
+    assert!(!out_str.contains("X25519"), "no encryption without a key");
 }
 
 #[test]

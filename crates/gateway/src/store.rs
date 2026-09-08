@@ -1,9 +1,6 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
-use rsa::RsaPublicKey;
-use rsa::pkcs8::DecodePublicKey;
-use rsa::traits::PublicKeyParts;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
@@ -18,14 +15,13 @@ use uuid::Uuid;
 
 use crate::entity::api_key;
 use crate::entity::mcp_token;
+use crate::hybrid::HybridPublicKey;
 use crate::key_cipher::SecretCipher;
 use crate::workspace_storage::WorkspaceId;
 
 pub const MAX_CREDENTIAL_LABEL_BYTES: usize = 128;
 pub const MAX_CREDENTIAL_TTL_SECONDS: u64 = 365 * 24 * 60 * 60;
 pub const MAX_PUBLIC_KEY_PEM_BYTES: usize = 16 * 1024;
-const MIN_RSA_PUBLIC_KEY_BITS: usize = 2048;
-const MAX_RSA_PUBLIC_KEY_BITS: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct StoredObject {
@@ -330,28 +326,10 @@ pub fn canonicalize_public_key_pem(public_key_pem: &str) -> anyhow::Result<Strin
         anyhow::bail!("public key PEM must not be empty");
     }
 
-    let key = match RsaPublicKey::from_public_key_pem(public_key_pem) {
-        Ok(key) => key,
-        Err(_) => {
-            let (_, pem) =
-                x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes()).map_err(|_| {
-                    anyhow::anyhow!(
-                        "public key PEM must contain an RSA public key or X.509 certificate"
-                    )
-                })?;
-            let certificate = pem.parse_x509().map_err(|_| {
-                anyhow::anyhow!("public key PEM must contain a valid X.509 certificate")
-            })?;
-            RsaPublicKey::from_public_key_der(certificate.public_key().raw)
-                .map_err(|_| anyhow::anyhow!("X.509 certificate must contain an RSA public key"))?
-        }
-    };
-    let bits = key.n().bits();
-    if !(MIN_RSA_PUBLIC_KEY_BITS..=MAX_RSA_PUBLIC_KEY_BITS).contains(&bits) {
-        anyhow::bail!(
-            "RSA public key must be between {MIN_RSA_PUBLIC_KEY_BITS} and {MAX_RSA_PUBLIC_KEY_BITS} bits"
-        );
-    }
+    HybridPublicKey::parse_pem(public_key_pem).map_err(|e| {
+        anyhow::anyhow!("public key PEM must contain a hybrid X25519 + ML-KEM-768 key: {e}")
+    })?;
+
     Ok(public_key_pem.to_string())
 }
 
@@ -1890,8 +1868,10 @@ mod tests {
     use super::*;
     use crate::key_cipher::{KeyWrapping, LocalKeyWrapping};
 
-    const TEST_PUBLIC_KEY_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/pub.pem");
-    const TEST_CERTIFICATE_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/cert.pem");
+    const TEST_PUBLIC_KEY_PEM: &str =
+        include_str!("../../../tests/fixtures/pii/crypto/hybrid-public.pem");
+    const TEST_PUBLIC_KEY_2_PEM: &str =
+        include_str!("../../../tests/fixtures/pii/crypto/hybrid-public-2.pem");
     const TEST_RSA_1024_PUBLIC_KEY_PEM: &str =
         include_str!("../../../tests/fixtures/pii/crypto/rsa-1024-public.pem");
     const TEST_RSA_4096_PUBLIC_KEY_PEM: &str =
@@ -1980,13 +1960,18 @@ mod tests {
             TEST_PUBLIC_KEY_PEM.trim()
         );
         assert_eq!(
-            canonicalize_public_key_pem(TEST_CERTIFICATE_PEM).unwrap(),
-            TEST_CERTIFICATE_PEM.trim()
+            canonicalize_public_key_pem(TEST_PUBLIC_KEY_2_PEM).unwrap(),
+            TEST_PUBLIC_KEY_2_PEM.trim()
         );
         assert!(canonicalize_public_key_pem("not a PEM").is_err());
+        // Legacy RSA public keys are no longer accepted for new writes.
         assert!(canonicalize_public_key_pem(TEST_RSA_1024_PUBLIC_KEY_PEM).is_err());
-        assert!(canonicalize_public_key_pem(TEST_RSA_4096_PUBLIC_KEY_PEM).is_ok());
+        assert!(canonicalize_public_key_pem(TEST_RSA_4096_PUBLIC_KEY_PEM).is_err());
         assert!(canonicalize_public_key_pem(&"x".repeat(MAX_PUBLIC_KEY_PEM_BYTES + 1)).is_err());
+        assert!(canonicalize_public_key_pem(
+            "-----BEGIN MASKURA HYBRID PUBLIC KEY-----\nAAAA\n-----END MASKURA HYBRID PUBLIC KEY-----"
+        )
+        .is_err());
     }
 
     #[test]
@@ -2005,7 +1990,7 @@ mod tests {
                     &workspace("u1"),
                     "  bounded  ",
                     MAX_CREDENTIAL_TTL_SECONDS,
-                    Some(TEST_CERTIFICATE_PEM.to_string()),
+                    Some(TEST_PUBLIC_KEY_2_PEM.to_string()),
                 )
                 .await
                 .is_ok()
@@ -2014,7 +1999,7 @@ mod tests {
         assert_eq!(stored[0].label, "bounded");
         assert_eq!(
             stored[0].public_key_pem.as_deref(),
-            Some(TEST_CERTIFICATE_PEM.trim())
+            Some(TEST_PUBLIC_KEY_2_PEM.trim())
         );
         assert!(
             store
@@ -2555,7 +2540,7 @@ mod tests {
         );
         assert!(
             !store
-                .set_public_key(&key_id, "u2", TEST_CERTIFICATE_PEM)
+                .set_public_key(&key_id, "u2", TEST_PUBLIC_KEY_2_PEM)
                 .await
                 .unwrap()
         );
@@ -2955,7 +2940,7 @@ mod tests {
         std::fs::write(&parent, "not a directory").unwrap();
 
         let error = store
-            .set_public_key(&key_id, "u1", TEST_CERTIFICATE_PEM)
+            .set_public_key(&key_id, "u1", TEST_PUBLIC_KEY_2_PEM)
             .await
             .unwrap_err();
 
@@ -3456,7 +3441,7 @@ mod tests {
         );
         assert!(
             !store
-                .set_public_key(&key_id, "u2", TEST_CERTIFICATE_PEM)
+                .set_public_key(&key_id, "u2", TEST_PUBLIC_KEY_2_PEM)
                 .await
                 .unwrap()
         );

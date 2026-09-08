@@ -8,12 +8,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rand::RngCore;
 use rand::rngs::OsRng;
-use rsa::Oaep;
-use rsa::RsaPublicKey;
-use rsa::pkcs8::DecodePublicKey;
 use s4_error::{S4Error, codes};
-use sha2::Sha256;
 use zeroize::Zeroize;
+
+use crate::hybrid::{ENVELOPE_ALG, HybridPublicKey};
 
 use crate::binary_ir::{
     BinaryIrLimits, SchemaField, SchemaIr, SchemaKind, SchemaNode, SchemaPath, SchemaPathSegment,
@@ -62,7 +60,7 @@ impl BinaryTransform for IdentityBinaryTransform {
 #[derive(Debug)]
 pub struct EnvelopeBinaryTransform {
     targets: Vec<SchemaPath>,
-    public_key: Option<RsaPublicKey>,
+    public_key: Option<HybridPublicKey>,
 }
 
 impl EnvelopeBinaryTransform {
@@ -208,7 +206,7 @@ fn transform_values_at_path(
     value: &mut Value,
     segments: &[SchemaPathSegment],
     target: &SchemaPath,
-    public_key: &Option<RsaPublicKey>,
+    public_key: &Option<HybridPublicKey>,
 ) -> Result<(), S4Error> {
     let Some((segment, remaining)) = segments.split_first() else {
         let Value::String { value: plaintext } = value else {
@@ -260,15 +258,19 @@ fn transform_values_at_path(
     }
 }
 
-fn encrypt_string(plaintext: &str, public_key: &RsaPublicKey) -> Result<Value, S4Error> {
-    let mut dek = [0_u8; 32];
+fn encrypt_string(plaintext: &str, public_key: &HybridPublicKey) -> Result<Value, S4Error> {
     let mut iv = [0_u8; 12];
-    OsRng.fill_bytes(&mut dek);
+    let mut x25519_eph = [0_u8; 32];
+    let mut m = [0_u8; 32];
     OsRng.fill_bytes(&mut iv);
+    OsRng.fill_bytes(&mut x25519_eph);
+    OsRng.fill_bytes(&mut m);
+    let mut dek = [0_u8; 32];
     let result = (|| {
-        let encrypted_dek = public_key
-            .encrypt(&mut OsRng, Oaep::new::<Sha256>(), &dek)
+        let (derived_dek, encrypted_dek) = public_key
+            .encapsulate_dek(x25519_eph, m)
             .map_err(|_| transform_error("envelope DEK wrapping failed"))?;
+        dek = derived_dek;
         let cipher = Aes256Gcm::new_from_slice(&dek)
             .map_err(|_| transform_error("envelope cipher initialization failed"))?;
         let ciphertext = cipher
@@ -279,7 +281,7 @@ fn encrypt_string(plaintext: &str, public_key: &RsaPublicKey) -> Result<Value, S
         })?;
         Ok(Value::Record {
             fields: vec![
-                string_field("alg", "RSA-OAEP/AES-256-GCM".to_string()),
+                string_field("alg", ENVELOPE_ALG.to_string()),
                 string_field("iv", BASE64.encode(iv)),
                 string_field("enc_dek", BASE64.encode(encrypted_dek)),
                 string_field("ct", BASE64.encode(&ciphertext[..tag_start])),
@@ -298,21 +300,13 @@ fn string_field(name: &str, value: String) -> ValueField {
     }
 }
 
-fn parse_public_key(pem: &str) -> Result<RsaPublicKey, S4Error> {
+fn parse_public_key(pem: &str) -> Result<HybridPublicKey, S4Error> {
     let pem = pem.trim();
     if pem.is_empty() {
         return Err(transform_error("envelope public key must not be empty"));
     }
-    if let Ok(key) = RsaPublicKey::from_public_key_pem(pem) {
-        return Ok(key);
-    }
-    let (_, certificate) = x509_parser::pem::parse_x509_pem(pem.as_bytes())
-        .map_err(|_| transform_error("envelope public key must be RSA SPKI or X.509 PEM"))?;
-    let certificate = certificate
-        .parse_x509()
-        .map_err(|_| transform_error("envelope public key must be RSA SPKI or X.509 PEM"))?;
-    RsaPublicKey::from_public_key_der(certificate.public_key().raw)
-        .map_err(|_| transform_error("envelope public key must be RSA SPKI or X.509 PEM"))
+    HybridPublicKey::parse_pem(pem)
+        .map_err(|e| transform_error(format!("envelope public key must be a hybrid key PEM: {e}")))
 }
 
 fn canonicalize_targets(mut targets: Vec<SchemaPath>) -> Result<Vec<SchemaPath>, S4Error> {
@@ -433,15 +427,11 @@ mod tests {
     use super::*;
     use crate::binary_ir::{SchemaKind, SchemaNode, Value};
     use crate::binary_reductor::CommonTypeBinaryReductor;
+    use crate::hybrid::{ENVELOPE_ALG, generate_keypair};
     use aes_gcm::aead::Aead;
     use aes_gcm::{Aes256Gcm, Nonce};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use rand::rngs::OsRng;
-    use rsa::Oaep;
-    use rsa::RsaPrivateKey;
-    use rsa::pkcs8::EncodePublicKey;
-    use sha2::Sha256;
 
     fn string_schema() -> SchemaIr {
         SchemaIr::new(SchemaNode::required(SchemaKind::String))
@@ -594,11 +584,8 @@ mod tests {
 
     #[test]
     fn envelope_with_a_public_key_changes_schema_and_round_trips_cryptographically() {
-        let private_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
-        let public_pem = private_key
-            .to_public_key()
-            .to_public_key_pem(Default::default())
-            .unwrap();
+        let (public, private) = generate_keypair([0x11; 32], [0x22; 64]);
+        let public_pem = public.to_pem();
         let schema = email_schema();
         let mut pump = BinaryPump::new(
             CommonTypeBinaryReductor::default(),
@@ -627,14 +614,11 @@ mod tests {
                 (field.name.as_str(), value.as_str())
             })
             .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(contents["alg"], "RSA-OAEP/AES-256-GCM");
+        assert_eq!(contents["alg"], ENVELOPE_ALG);
         assert!(!contents["ct"].contains("ada@example.com"));
 
-        let dek = private_key
-            .decrypt(
-                Oaep::new::<Sha256>(),
-                &BASE64.decode(contents["enc_dek"]).unwrap(),
-            )
+        let dek = private
+            .decapsulate_dek(&BASE64.decode(contents["enc_dek"]).unwrap())
             .unwrap();
         let mut ciphertext = BASE64.decode(contents["ct"]).unwrap();
         ciphertext.extend(BASE64.decode(contents["tag"]).unwrap());

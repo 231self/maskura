@@ -7,6 +7,7 @@ pub mod control;
 pub mod customer_headers;
 pub mod entity;
 pub mod format;
+pub mod hybrid;
 pub mod integrity;
 pub mod key_cipher;
 pub mod managed;
