@@ -64,8 +64,10 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 use tower::ServiceExt;
 
-const TEST_PUBLIC_KEY_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/pub.pem");
-const TEST_CERTIFICATE_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/cert.pem");
+const TEST_PUBLIC_KEY_PEM: &str =
+    include_str!("../../../tests/fixtures/pii/crypto/hybrid-public.pem");
+const TEST_PUBLIC_KEY_2_PEM: &str =
+    include_str!("../../../tests/fixtures/pii/crypto/hybrid-public-2.pem");
 const TEST_RATE_VERSION: i32 = 7;
 
 fn test_occurred_at() -> chrono::DateTime<chrono::Utc> {
@@ -1463,7 +1465,7 @@ async fn public_key_mutation_accepts_own_key_via_headers_and_bearer() {
     );
 
     let bearer_request = add_headers(
-        public_key_request(&bearer_key, TEST_CERTIFICATE_PEM),
+        public_key_request(&bearer_key, TEST_PUBLIC_KEY_2_PEM),
         &[(
             "authorization",
             format!("Bearer {bearer_key}:{bearer_secret}"),
@@ -1494,7 +1496,7 @@ async fn public_key_mutation_accepts_own_key_via_headers_and_bearer() {
             .unwrap()
             .public_key_pem
             .as_deref(),
-        Some(TEST_CERTIFICATE_PEM.trim())
+        Some(TEST_PUBLIC_KEY_2_PEM.trim())
     );
 }
 
@@ -1606,7 +1608,7 @@ async fn jwt_public_key_mutation_is_scoped_to_dashboard_user_ownership() {
 
     for (key_id, pem) in [
         (&owned_key, TEST_PUBLIC_KEY_PEM),
-        (&second_owned_key, TEST_CERTIFICATE_PEM),
+        (&second_owned_key, TEST_PUBLIC_KEY_2_PEM),
     ] {
         let request = add_headers(
             public_key_request(key_id, pem),
@@ -1647,7 +1649,7 @@ async fn jwt_public_key_mutation_is_scoped_to_dashboard_user_ownership() {
             .unwrap()
             .public_key_pem
             .as_deref(),
-        Some(TEST_CERTIFICATE_PEM.trim())
+        Some(TEST_PUBLIC_KEY_2_PEM.trim())
     );
     assert!(
         state
@@ -1722,7 +1724,7 @@ async fn create_key_still_accepts_an_initial_public_key() {
         .body(Body::from(
             serde_json::json!({
                 "label": "created-with-public-key",
-                "public_key_pem": TEST_CERTIFICATE_PEM,
+                "public_key_pem": TEST_PUBLIC_KEY_2_PEM,
             })
             .to_string(),
         ))
@@ -1737,7 +1739,7 @@ async fn create_key_still_accepts_an_initial_public_key() {
     )
     .unwrap();
     let key_id = body["key_id"].as_str().unwrap();
-    assert_eq!(body["public_key_pem"], TEST_CERTIFICATE_PEM.trim());
+    assert_eq!(body["public_key_pem"], TEST_PUBLIC_KEY_2_PEM.trim());
     assert_eq!(
         state
             .keys
@@ -1747,7 +1749,7 @@ async fn create_key_still_accepts_an_initial_public_key() {
             .unwrap()
             .public_key_pem
             .as_deref(),
-        Some(TEST_CERTIFICATE_PEM.trim())
+        Some(TEST_PUBLIC_KEY_2_PEM.trim())
     );
 }
 

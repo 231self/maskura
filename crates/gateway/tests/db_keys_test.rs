@@ -69,8 +69,10 @@ use s4_gateway::server::{build_router, build_state};
 use tower::ServiceExt;
 
 const TEST_KEK: [u8; 32] = [7; 32];
-const TEST_PUBLIC_KEY_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/pub.pem");
-const TEST_CERTIFICATE_PEM: &str = include_str!("../../../tests/fixtures/pii/crypto/cert.pem");
+const TEST_PUBLIC_KEY_PEM: &str =
+    include_str!("../../../tests/fixtures/pii/crypto/hybrid-public.pem");
+const TEST_PUBLIC_KEY_2_PEM: &str =
+    include_str!("../../../tests/fixtures/pii/crypto/hybrid-public-2.pem");
 static DB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Default)]
@@ -2569,7 +2571,7 @@ fn postgres_public_key_binding() {
         );
         assert!(
             !store
-                .set_public_key(&key_id, "someone-else", TEST_CERTIFICATE_PEM)
+                .set_public_key(&key_id, "someone-else", TEST_PUBLIC_KEY_2_PEM)
                 .await
                 .unwrap()
         );

@@ -667,9 +667,7 @@ mod tests {
     use super::*;
     use crate::binary_pump::{BinaryTransform, EnvelopeBinaryTransform};
     use crate::binary_reductor::CommonTypeBinaryReductor;
-    use rand::rngs::OsRng;
-    use rsa::RsaPrivateKey;
-    use rsa::pkcs8::EncodePublicKey;
+    use crate::hybrid::generate_keypair;
 
     const SCHEMA: &str = r#"{
         "type":"record","name":"customer","fields":[
@@ -963,11 +961,8 @@ mod tests {
 
     #[test]
     fn process_ocf_emits_the_typed_envelope_schema() {
-        let private_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
-        let public_pem = private_key
-            .to_public_key()
-            .to_public_key_pem(Default::default())
-            .unwrap();
+        let (public, _private) = generate_keypair([0x11; 32], [0x22; 64]);
+        let public_pem = public.to_pem();
         let target =
             crate::binary_ir::SchemaPath(vec![crate::binary_ir::SchemaPathSegment::Field(
                 "email".to_string(),

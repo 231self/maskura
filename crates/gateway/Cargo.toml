@@ -33,8 +33,9 @@ md-5.workspace = true
 aes-gcm.workspace = true
 rand.workspace = true
 zeroize.workspace = true
-rsa = { version = "0.9", default-features = false, features = ["pem", "sha2"] }
-x509-parser = "0.16"
+ml-kem.workspace = true
+x25519-dalek.workspace = true
+hkdf.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tracing.workspace = true
