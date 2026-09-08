@@ -7,6 +7,9 @@ pub mod control;
 pub mod customer_headers;
 pub mod entity;
 pub mod file_store;
+// Removed once the Phase 2 repositories consume every persistence primitive.
+#[allow(dead_code, reason = "introduced before its ordered Phase 2 consumers")]
+pub(crate) mod filesystem_persistence;
 pub mod format;
 pub mod hybrid;
 pub mod integrity;
