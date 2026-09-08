@@ -25,3 +25,5 @@
 - [ADR 0009: Durable Async Write Acknowledgements](adr/0009-durable-async-write-acknowledgements.md)
 - [ADR 0010: Workspace-bound Hosted MCP](adr/0010-workspace-bound-hosted-mcp.md)
 - [ADR 0011: Post-quantum hybrid envelope](adr/0011-post-quantum-hybrid-envelope.md)
+- [ADR 0012: Local filesystem object storage](adr/0012-local-filesystem-object-storage.md)
+- [ADR 0013: Durable local multipart storage](adr/0013-durable-local-multipart-storage.md)
