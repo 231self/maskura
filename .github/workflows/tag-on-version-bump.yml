@@ -38,6 +38,10 @@ jobs:
           # Full history (and tags) so we can diff the previous commit's
           # Cargo.toml and check whether the tag already exists.
           fetch-depth: 0
+          # Don't persist the GITHUB_TOKEN credential helper: it would override
+          # the PAT URL below and push the tag as github-actions[bot], which
+          # cannot trigger release.yml.
+          persist-credentials: false
 
       - name: Detect version bump
         id: version
@@ -68,5 +72,6 @@ jobs:
             exit 0
           fi
           git tag "$tag"
+          git config --unset-all http.https://github.com/.extraheader || true
           git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push origin "refs/tags/$tag"
