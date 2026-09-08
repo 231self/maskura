@@ -48,6 +48,7 @@ use crate::control::{
     UsageRoute,
 };
 use crate::customer_headers;
+use crate::file_store::FileStore;
 use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
 use crate::managed::{
@@ -83,9 +84,9 @@ use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, BackendError, BackendErrorKind,
     CompatibilitySpoolConfig, CompatibilitySpoolTransaction, CompletionReconciliation,
     ConditionalReadCapability, DirectOperationScope, DirectS3Sink, EvidenceRecord, ExpectedObject,
-    IncompleteUploadDiscovery, JournalError, ListCapability, MemorySinkTransaction,
-    MultipartResponseCapability, ObjectDestination, ObjectSinkTransaction, OperationJournal,
-    OperationReconciler, OperationRecord, OperationState, ProviderMutationFence,
+    FileSinkTransaction, IncompleteUploadDiscovery, JournalError, ListCapability,
+    MemorySinkTransaction, MultipartResponseCapability, ObjectDestination, ObjectSinkTransaction,
+    OperationJournal, OperationReconciler, OperationRecord, OperationState, ProviderMutationFence,
     ResponseChecksumCapability, SpoolQuota, StoredObjectMeta, TransactionError,
     VersioningCapability, WorkspaceDestinationBinding,
 };
@@ -99,6 +100,7 @@ use crate::{Format, Gateway};
 pub struct AppState {
     pub gateway: Arc<Gateway>,
     pub store: Arc<MemoryStore>,
+    pub file_store: Option<Arc<FileStore>>,
     pub keys: Arc<dyn KeyRepository>,
     pub workspace_storage: Arc<dyn WorkspaceStorageRepository>,
     pub plugins: Arc<PluginRegistry>,
@@ -1216,6 +1218,7 @@ fn backend_resolver(state: &AppState) -> BackendResolver {
         state.explicit_single_tenant,
         state.workspace_endpoint_policy.clone(),
     )
+    .with_file_store(state.file_store.clone())
 }
 
 async fn resolve_backend(
@@ -1741,6 +1744,55 @@ async fn open_backend_object(
             };
             let metadata = s3_get_metadata(&output);
             let body = s3_response_body(output.body, "managed_get_object_body");
+            Ok(OpenedObject::new(
+                status,
+                metadata,
+                body,
+                state.source_body_limits,
+            ))
+        }
+        ResolvedBackend::File(store) => {
+            if head_only {
+                let (size, content_type, etag) = store
+                    .metadata(bucket, key)
+                    .await
+                    .map_err(|error| OpenObjectError::Backend(error.to_string()))?
+                    .ok_or(OpenObjectError::NotFound)?;
+                let mut metadata = ObjectMetadata::default();
+                metadata.insert(header::CONTENT_LENGTH, size.to_string());
+                metadata.insert(header::CONTENT_TYPE, content_type);
+                metadata.insert(header::ETAG, etag);
+                metadata.insert(header::ACCEPT_RANGES, "bytes");
+                return Ok(OpenedObject::new(
+                    StatusCode::OK,
+                    metadata,
+                    axum::body::Body::empty(),
+                    state.source_body_limits,
+                ));
+            }
+            let object = store
+                .get(bucket, key)
+                .await
+                .map_err(|error| OpenObjectError::Backend(error.to_string()))?
+                .ok_or(OpenObjectError::NotFound)?;
+            let (data, content_range) = memory_range(&object.data, range)?;
+            let mut metadata = ObjectMetadata::default();
+            metadata.insert(header::CONTENT_LENGTH, data.len().to_string());
+            metadata.insert(header::CONTENT_TYPE, object.content_type);
+            metadata.insert(header::ETAG, object.etag);
+            metadata.insert(header::ACCEPT_RANGES, "bytes");
+            if let Some(content_range) = content_range {
+                metadata.insert(header::CONTENT_RANGE, content_range);
+            }
+            let status = if range.is_some() {
+                StatusCode::PARTIAL_CONTENT
+            } else {
+                StatusCode::OK
+            };
+            let body = axum::body::Body::new(ChunkedBytesBody::new(
+                data,
+                state.source_body_limits.max_frame_bytes,
+            ));
             Ok(OpenedObject::new(
                 status,
                 metadata,
@@ -3394,6 +3446,16 @@ async fn begin_streaming_sink(
             "presigned streaming cannot durably align the authorization and transaction journals"
                 .to_string(),
         )),
+        ResolvedBackend::File(store) => Ok(Box::new(
+            FileSinkTransaction::new(
+                store,
+                bucket,
+                key,
+                content_type,
+                state.max_pipeline_output_bytes,
+            )
+            .await?,
+        )),
         ResolvedBackend::Memory(store) if state.dev_memory_streaming_enabled => {
             Ok(Box::new(MemorySinkTransaction::new(
                 store,
@@ -3519,6 +3581,7 @@ fn validate_streaming_backend(
             "direct global S3 streaming needs configured capabilities and a durable operation journal"
                 .to_string(),
         )),
+        ResolvedBackend::File(_) => Ok(()),
         ResolvedBackend::Memory(_) if state.dev_memory_streaming_enabled => Ok(()),
         ResolvedBackend::Memory(_) => Err(StreamingPutError::Unsupported(
             "development memory streaming is not enabled".to_string(),
@@ -4122,6 +4185,7 @@ fn multipart_snapshot(
     let destination = match backend {
         ResolvedBackend::S3 { .. } => serde_json::json!({"kind":"s3"}),
         ResolvedBackend::Managed(_) => serde_json::json!({"kind":"managed"}),
+        ResolvedBackend::File(_) => serde_json::json!({"kind":"file"}),
         ResolvedBackend::Memory(_) => serde_json::json!({"kind":"memory"}),
         ResolvedBackend::PresignedHttp(_) => serde_json::json!({"kind":"presigned-http"}),
     };
@@ -4498,6 +4562,7 @@ async fn complete_staged_multipart(
     let destination_kind = match &backend {
         ResolvedBackend::S3 { .. } => "s3",
         ResolvedBackend::Managed(_) => "managed",
+        ResolvedBackend::File(_) => "file",
         ResolvedBackend::Memory(_) => "memory",
         ResolvedBackend::PresignedHttp(_) => "presigned-http",
     };
@@ -8895,6 +8960,26 @@ async fn s3_delete(
             }
             StatusCode::NO_CONTENT.into_response()
         }
+        ResolvedBackend::File(store) => {
+            if let Err(error) = store.delete(&bucket, &key).await {
+                return s3_error::internal_error(&key, &error.to_string());
+            }
+            if let Err(response) = record_operation(
+                state.control.clone(),
+                &auth.context,
+                OperationUsage {
+                    grant: &grant,
+                    source_bytes: 0,
+                    output_bytes: 0,
+                },
+                &key,
+            )
+            .await
+            {
+                return response;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         ResolvedBackend::Memory(store) => {
             store.delete(&bucket, &key);
             if let Err(response) = record_operation(
@@ -9438,6 +9523,12 @@ async fn s3_list_objects(
                 Err(error) => s3_error::invalid_request(&bucket, &error),
             }
         }
+        ResolvedBackend::File(store) => {
+            match list_from_file(&store, &bucket, &params, &state.continuation_token_key).await {
+                Ok(xml) => s3_xml_ok(xml),
+                Err(error) => s3_error::invalid_request(&bucket, &error),
+            }
+        }
         ResolvedBackend::Managed(storage) => match list_from_managed(
             &storage,
             auth.workspace_id().as_str(),
@@ -9891,6 +9982,38 @@ fn list_from_memory(
     params: &S3Query,
     continuation_key: &[u8; 32],
 ) -> Result<String, String> {
+    let bucket_prefix = format!("{bucket}/");
+    let objects = store
+        .list_keys()
+        .into_iter()
+        .filter_map(|full| full.strip_prefix(&bucket_prefix).map(|key| key.to_string()))
+        .map(|key| {
+            let (size, _, etag) = store.metadata(bucket, &key).unwrap_or_default();
+            (key, etag, size as u64)
+        })
+        .collect();
+    list_from_local_objects(objects, bucket, params, continuation_key)
+}
+
+async fn list_from_file(
+    store: &FileStore,
+    bucket: &str,
+    params: &S3Query,
+    continuation_key: &[u8; 32],
+) -> Result<String, String> {
+    let objects = store
+        .list_objects(bucket)
+        .await
+        .map_err(|error| error.to_string())?;
+    list_from_local_objects(objects, bucket, params, continuation_key)
+}
+
+fn list_from_local_objects(
+    objects: Vec<(String, String, u64)>,
+    bucket: &str,
+    params: &S3Query,
+    continuation_key: &[u8; 32],
+) -> Result<String, String> {
     let prefix = params.prefix.as_deref().unwrap_or("");
     let delimiter = params.delimiter.as_deref();
     let max_keys = params.max_keys.unwrap_or(1000).min(1000) as usize;
@@ -9910,21 +10033,18 @@ fn list_from_memory(
             .map(ToOwned::to_owned),
     };
 
-    let bucket_prefix = format!("{bucket}/");
-    let mut keys: Vec<String> = store
-        .list_keys()
+    let mut objects: Vec<(String, String, u64)> = objects
         .into_iter()
-        .filter_map(|full| full.strip_prefix(&bucket_prefix).map(|k| k.to_string()))
-        .filter(|k| k.starts_with(prefix))
+        .filter(|(key, _, _)| key.starts_with(prefix))
         .collect();
-    keys.sort();
+    objects.sort_by(|left, right| left.0.cmp(&right.0));
     enum Output {
         Content((String, String, u64)),
         Common(String),
     }
     let mut outputs: Vec<Output> = Vec::new();
     let mut prev_common: Option<String> = None;
-    for k in keys {
+    for (k, etag, size) in objects {
         if let Some(delim) = delimiter.filter(|d| !d.is_empty())
             && let Some(rel) = k.strip_prefix(prefix)
             && let Some(idx) = rel.find(delim)
@@ -9937,10 +10057,6 @@ fn list_from_memory(
             continue;
         }
         prev_common = None;
-        let (etag, size) = store
-            .metadata(bucket, &k)
-            .map(|(size, _, etag)| (etag, size as u64))
-            .unwrap_or_default();
         outputs.push(Output::Content((k, etag, size)));
     }
 
@@ -10104,6 +10220,14 @@ async fn list_buckets(
             }
             names.extend(set);
         }
+        ResolvedBackend::File(store) => {
+            names.extend(
+                store
+                    .list_buckets()
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+            );
+        }
         ResolvedBackend::Managed(_) | ResolvedBackend::PresignedHttp(_) => {}
     }
     names.sort();
@@ -10128,12 +10252,18 @@ async fn s3_bucket_put(
     uri: Uri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(error) =
-        authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await
-    {
-        return authentication_error_response(&bucket, error);
+    let auth = match authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await {
+        Ok(auth) => auth,
+        Err(error) => return authentication_error_response(&bucket, error),
+    };
+    match resolve_backend(&state, &auth, &headers, StorageOperation::Put).await {
+        Ok(ResolvedBackend::File(store)) => match store.create_bucket(&bucket).await {
+            Ok(()) => StatusCode::OK.into_response(),
+            Err(error) => s3_error::invalid_request(&bucket, &error.to_string()),
+        },
+        Ok(_) => s3_error::bucket_not_allowed(&bucket),
+        Err(_) => backend_resolution_error_response(&bucket),
     }
-    s3_error::bucket_not_allowed(&bucket)
 }
 
 /// DeleteBucket is not allowed for the same reason as CreateBucket.
@@ -10144,12 +10274,21 @@ async fn s3_bucket_delete(
     uri: Uri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(error) =
-        authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await
-    {
-        return authentication_error_response(&bucket, error);
+    let auth = match authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await {
+        Ok(auth) => auth,
+        Err(error) => return authentication_error_response(&bucket, error),
+    };
+    match resolve_backend(&state, &auth, &headers, StorageOperation::Delete).await {
+        Ok(ResolvedBackend::File(store)) => match store.delete_bucket(&bucket).await {
+            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Err(crate::file_store::FileStoreError::BucketNotEmpty) => {
+                s3_error::bucket_not_empty(&bucket)
+            }
+            Err(error) => s3_error::invalid_request(&bucket, &error.to_string()),
+        },
+        Ok(_) => s3_error::bucket_not_allowed(&bucket),
+        Err(_) => backend_resolution_error_response(&bucket),
     }
-    s3_error::bucket_not_allowed(&bucket)
 }
 
 fn dashboard_html() -> String {
@@ -11012,6 +11151,23 @@ pub async fn build_state_with_pipeline_template(
         .transpose()
         .map_err(anyhow::Error::msg)?
         .unwrap_or_default();
+    let file_store = match resolve_customer_env(customer_env::LOCAL_STORAGE_DIR)? {
+        Some(directory) => {
+            let directory = PathBuf::from(directory);
+            if !explicit_single_tenant {
+                anyhow::bail!("MASKURA_LOCAL_STORAGE_DIR requires single-tenant mode");
+            }
+            if s3_endpoint.is_some() || !service_backends.is_empty() {
+                anyhow::bail!(
+                    "MASKURA_LOCAL_STORAGE_DIR is mutually exclusive with S3_ENDPOINT and S4_SERVICE_BUCKETS"
+                );
+            }
+            let store = Arc::new(FileStore::new(directory.clone()).await?);
+            info!(path = %directory.display(), "Storage: local filesystem");
+            Some(store)
+        }
+        None => None,
+    };
     validate_storage_boundary_startup(
         explicit_single_tenant,
         s3_endpoint.is_some(),
@@ -11405,6 +11561,7 @@ pub async fn build_state_with_pipeline_template(
     let state = Arc::new(AppState {
         gateway: Arc::new(gateway),
         store: Arc::new(MemoryStore::new()),
+        file_store,
         keys,
         workspace_storage,
         plugins,

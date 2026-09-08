@@ -204,29 +204,59 @@ impl FileStore {
             if validate_bucket(&bucket).is_err() {
                 continue;
             }
-            let mut metadata = match fs::read_dir(bucket_entry.path().join("metadata")).await {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            while let Some(entry) = metadata.next_entry().await? {
-                if !entry.file_type().await?.is_file() {
-                    continue;
-                }
-                if entry
-                    .path()
-                    .extension()
-                    .is_none_or(|extension| extension != "json")
-                {
-                    continue;
-                }
-                let metadata = read_metadata_file(&entry.path()).await?;
-                validate_key(&metadata.key)?;
-                keys.push(format!("{bucket}/{}", metadata.key));
+            for (key, _, _) in self.list_objects(&bucket).await? {
+                keys.push(format!("{bucket}/{key}"));
             }
         }
         keys.sort();
         Ok(keys)
+    }
+
+    pub async fn list_buckets(&self) -> Result<Vec<String>, FileStoreError> {
+        let mut entries = match fs::read_dir(self.buckets_root()).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut buckets = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
+                let bucket = entry.file_name().to_string_lossy().into_owned();
+                if validate_bucket(&bucket).is_ok() {
+                    buckets.push(bucket);
+                }
+            }
+        }
+        buckets.sort();
+        Ok(buckets)
+    }
+
+    pub async fn list_objects(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<(String, String, u64)>, FileStoreError> {
+        validate_bucket(bucket)?;
+        let mut metadata = match fs::read_dir(self.metadata_dir(bucket)?).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut objects = Vec::new();
+        while let Some(entry) = metadata.next_entry().await? {
+            if !entry.file_type().await?.is_file()
+                || entry
+                    .path()
+                    .extension()
+                    .is_none_or(|extension| extension != "json")
+            {
+                continue;
+            }
+            let metadata = read_metadata_file(&entry.path()).await?;
+            validate_key(&metadata.key)?;
+            objects.push((metadata.key, metadata.etag, metadata.size));
+        }
+        objects.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(objects)
     }
 
     pub async fn create_bucket(&self, bucket: &str) -> Result<(), FileStoreError> {
@@ -559,6 +589,7 @@ mod tests {
         let root = test_root();
         let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
         store.create_bucket("bucket").await.unwrap();
+        assert_eq!(store.list_buckets().await.unwrap(), vec!["bucket"]);
         store
             .put(
                 "bucket",

@@ -214,6 +214,15 @@ pub fn bucket_not_allowed(bucket: &str) -> axum::response::Response {
     )
 }
 
+pub fn bucket_not_empty(bucket: &str) -> axum::response::Response {
+    s3_error_xml(
+        "BucketNotEmpty",
+        "The bucket you tried to delete is not empty.",
+        bucket,
+        StatusCode::CONFLICT,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MAX_S3_ERROR_FIELD_BYTES, internal_error, s3_error_body};

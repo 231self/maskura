@@ -137,6 +137,25 @@ persisted on a volume, in-memory storage); it picks a free port (8080+) and only
 listens on localhost. `maskura local down` stops it. For durable local
 storage (MinIO), clone the repo and use `just dev-up`.
 
+### Standalone durable local storage
+
+The gateway can persist objects directly to a mounted filesystem volume without
+MinIO or cloud credentials. This is a single-node S3-compatible deployment;
+multipart upload remains unavailable until the durable local multipart journal
+lands.
+
+```bash
+docker run --rm -p 8080:8080 -v maskura-data:/data \
+  -e AUTH_DISABLED=true \
+  -e MASKURA_LOCAL_STORAGE_DIR=/data \
+  ghcr.io/231self/maskura/maskura:<release-tag>
+```
+
+The local-mode startup output prints `MASKURA_ACCESS_KEY` and
+`MASKURA_SECRET_KEY`. Use them with the CLI or `aws --endpoint-url
+http://localhost:8080 s3 ...`. Objects and local API keys survive container
+restarts through the mounted volume.
+
 ## Compatibility
 
 New integrations should use `MASKURA_*` environment variables and
