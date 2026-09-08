@@ -3,12 +3,14 @@
 //! This module deliberately has no handler integration. Phase 5 establishes the
 //! persistence, backend, and recovery contracts without changing write routing.
 
+mod file;
 mod journal;
 mod memory;
 mod presign;
 mod s3;
 mod spool;
 
+pub use file::FileSinkTransaction;
 #[cfg(any(test, debug_assertions))]
 pub use journal::InMemoryOperationJournal;
 pub use journal::PostgresOperationJournal;
