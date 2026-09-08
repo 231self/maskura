@@ -147,6 +147,7 @@ lands.
 ```bash
 docker run --rm -p 8080:8080 -v maskura-data:/data \
   -e AUTH_DISABLED=true \
+  -e MASKURA_STORAGE_MODE=local \
   -e MASKURA_LOCAL_STORAGE_DIR=/data \
   ghcr.io/231self/maskura/maskura:<release-tag>
 ```

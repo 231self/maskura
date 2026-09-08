@@ -53,6 +53,7 @@ pub struct AuthConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
+    pub mode: Option<String>,
     pub s3_endpoint: Option<String>,
     pub s3_region: Option<String>,
     pub service_buckets: Vec<String>,
@@ -240,6 +241,9 @@ impl Config {
         if let Some(value) = resolve(aliases::LOCAL_STORAGE_DIR)? {
             self.storage.local_dir = Some(value);
         }
+        if let Some(value) = resolve(aliases::STORAGE_MODE)? {
+            self.storage.mode = Some(value);
+        }
         if let Some(value) = std::env::var("SUPABASE_URL").ok().filter(|v| !v.is_empty()) {
             self.supabase.url = Some(value);
         }
@@ -393,6 +397,11 @@ impl Config {
             && directory.is_empty()
         {
             return Err(invalid("storage.local_dir", "must not be empty"));
+        }
+        if let Some(mode) = self.storage.mode.as_deref()
+            && mode != "local"
+        {
+            return Err(invalid("storage.mode", "must be local when configured"));
         }
         for (index, bucket) in self.storage.service_buckets.iter().enumerate() {
             if bucket.trim().is_empty() {
@@ -551,7 +560,7 @@ impl Config {
     fn validate_combinations(&self) -> Result<(), ConfigError> {
         let configured = usize::from(self.storage.s3_endpoint.is_some())
             + usize::from(!self.storage.service_buckets.is_empty())
-            + usize::from(self.storage.local_dir.is_some());
+            + usize::from(self.storage.local_dir.is_some() || self.storage.mode.is_some());
         if configured > 1 {
             return Err(invalid(
                 "storage",

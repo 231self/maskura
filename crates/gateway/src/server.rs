@@ -11151,8 +11151,24 @@ pub async fn build_state_with_pipeline_template(
         .transpose()
         .map_err(anyhow::Error::msg)?
         .unwrap_or_default();
-    let file_store = match resolve_customer_env(customer_env::LOCAL_STORAGE_DIR)? {
-        Some(directory) => {
+    let local_storage_mode = resolve_customer_env(customer_env::STORAGE_MODE)?;
+    let local_storage_dir = resolve_customer_env(customer_env::LOCAL_STORAGE_DIR)?;
+    let file_store = match (local_storage_mode.as_deref(), local_storage_dir) {
+        (Some("local"), directory) => {
+            let directory = PathBuf::from(directory.unwrap_or_else(|| "./data".to_string()));
+            if !explicit_single_tenant {
+                anyhow::bail!("MASKURA_LOCAL_STORAGE_DIR requires single-tenant mode");
+            }
+            if s3_endpoint.is_some() || !service_backends.is_empty() {
+                anyhow::bail!(
+                    "MASKURA_LOCAL_STORAGE_DIR is mutually exclusive with S3_ENDPOINT and S4_SERVICE_BUCKETS"
+                );
+            }
+            let store = Arc::new(FileStore::new(directory.clone()).await?);
+            info!(path = %directory.display(), "Storage: local filesystem");
+            Some(store)
+        }
+        (None, Some(directory)) => {
             let directory = PathBuf::from(directory);
             if !explicit_single_tenant {
                 anyhow::bail!("MASKURA_LOCAL_STORAGE_DIR requires single-tenant mode");
@@ -11166,7 +11182,8 @@ pub async fn build_state_with_pipeline_template(
             info!(path = %directory.display(), "Storage: local filesystem");
             Some(store)
         }
-        None => None,
+        (Some(_), _) => anyhow::bail!("MASKURA_STORAGE_MODE must be local when configured"),
+        (None, None) => None,
     };
     validate_storage_boundary_startup(
         explicit_single_tenant,
