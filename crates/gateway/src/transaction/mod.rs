@@ -139,6 +139,7 @@ pub struct OperationRecord {
     pub namespace_epoch: Option<u64>,
     pub expected: ExpectedObject,
     pub upload_id: Option<String>,
+    pub client_multipart_upload_id: Option<String>,
     pub committed: Option<StoredObjectMeta>,
     pub lease_owner: Option<String>,
     pub lease_expires_at_ms: Option<i64>,
@@ -223,6 +224,7 @@ impl OperationRecord {
             namespace_epoch: None,
             expected,
             upload_id: None,
+            client_multipart_upload_id: None,
             committed: None,
             lease_owner: None,
             lease_expires_at_ms: None,
@@ -320,6 +322,12 @@ pub trait OperationJournal: Send + Sync {
         operation_id: Uuid,
         upload_id: Option<&str>,
     ) -> Result<(), JournalError>;
+    async fn compare_and_set_client_multipart_upload_reference(
+        &self,
+        operation_id: Uuid,
+        expected: Option<&str>,
+        next: Option<&str>,
+    ) -> Result<(), JournalError>;
     async fn set_expected(
         &self,
         operation_id: Uuid,
@@ -366,6 +374,12 @@ pub trait OperationJournal: Send + Sync {
         stale_before_ms: i64,
         lease_until_ms: i64,
     ) -> Result<Option<OperationRecord>, JournalError>;
+    async fn retire_terminal(
+        &self,
+        operation_id: Uuid,
+        expected_state: OperationState,
+        expected_client_multipart_upload_id: Option<&str>,
+    ) -> Result<(), JournalError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

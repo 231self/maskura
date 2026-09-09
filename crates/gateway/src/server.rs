@@ -64,7 +64,8 @@ use crate::multipart_staging::{
     MAX_ACTIVE_UPLOADS, MultipartCompletionResult, MultipartIdentity, MultipartLifecycle,
     MultipartPart, MultipartRepository, MultipartSnapshot, MultipartUpload,
     PostgresMultipartRepository, S3StagingArtifactStore, StagedArtifact, StagingArtifactStore,
-    StagingError, StagingQuotaLimits, completion_fingerprint, now_ms,
+    StagingError, StagingQuotaLimits, complete_completion_from_lease_compatibility,
+    completion_fingerprint, now_ms,
 };
 use crate::object::{
     BodyLimits, ChunkedBytesBody, ObjectMetadata, OpenedObject, filter_presigned_response_headers,
@@ -4833,10 +4834,23 @@ async fn complete_staged_multipart(
             pipeline_evidence,
         };
         renew_and_fence_completion(staging, identity, lease).await?;
-        staging
-            .repository
-            .complete_completion(identity, lease.fencing_token, result.clone(), now_ms())
-            .await?;
+        let fingerprint = upload
+            .complete_request_fingerprint
+            .as_deref()
+            .ok_or_else(|| {
+                MultipartCompletionError::Invalid(
+                    "multipart completion fingerprint is missing".to_string(),
+                )
+            })?;
+        complete_completion_from_lease_compatibility(
+            staging.repository.as_ref(),
+            identity,
+            fingerprint,
+            lease.fencing_token,
+            result.clone(),
+            now_ms(),
+        )
+        .await?;
         Ok(result)
     }
     .await;
@@ -5453,10 +5467,23 @@ async fn complete_staged_avro_multipart(
             pipeline_evidence: None,
         };
         renew_and_fence_completion(staging, identity, lease).await?;
-        staging
-            .repository
-            .complete_completion(identity, lease.fencing_token, result.clone(), now_ms())
-            .await?;
+        let fingerprint = upload
+            .complete_request_fingerprint
+            .as_deref()
+            .ok_or_else(|| {
+                MultipartCompletionError::Invalid(
+                    "multipart completion fingerprint is missing".to_string(),
+                )
+            })?;
+        complete_completion_from_lease_compatibility(
+            staging.repository.as_ref(),
+            identity,
+            fingerprint,
+            lease.fencing_token,
+            result.clone(),
+            now_ms(),
+        )
+        .await?;
         Ok(result)
     }
     .await;
@@ -9372,10 +9399,19 @@ async fn s3_post(
                 Ok(result) => result,
                 Err(error) => return multipart_completion_error_response(&key, error),
             };
-            if let Err(error) = staging
-                .repository
-                .complete_completion(&identity, lease.fencing_token, result.clone(), now_ms())
-                .await
+            let fingerprint = upload
+                .complete_request_fingerprint
+                .as_deref()
+                .unwrap_or(&fingerprint);
+            if let Err(error) = complete_completion_from_lease_compatibility(
+                staging.repository.as_ref(),
+                &identity,
+                fingerprint,
+                lease.fencing_token,
+                result.clone(),
+                now_ms(),
+            )
+            .await
             {
                 return multipart_completion_error_response(
                     &key,
@@ -9546,6 +9582,9 @@ async fn s3_post(
             completion_lease_owner: None,
             completion_lease_expires_at_ms: None,
             completion_fencing_token: 0,
+            destination_operation_id: None,
+            publishing_started_at_ms: None,
+            destination_commit: None,
             completion_result: None,
         };
         return match staging.repository.create(upload).await {

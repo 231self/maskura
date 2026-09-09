@@ -113,6 +113,7 @@ fn operation_from_model(model: object_operation::Model) -> Result<OperationRecor
             metadata,
         },
         upload_id: model.upload_id,
+        client_multipart_upload_id: model.client_multipart_upload_id,
         committed,
         lease_owner: model.lease_owner,
         lease_expires_at_ms: model.lease_expires_at_ms,
@@ -210,7 +211,8 @@ impl OperationJournal for PostgresOperationJournal {
             expected_digest: Set(operation.expected.digest),
             expected_size: Set(expected_size),
             expected_metadata: Set(expected_metadata),
-            upload_id: Set(None),
+            upload_id: Set(operation.upload_id),
+            client_multipart_upload_id: Set(operation.client_multipart_upload_id),
             committed_etag: Set(None),
             committed_version_id: Set(None),
             committed_superseded_version_ids: Set(serde_json::json!([])),
@@ -261,6 +263,38 @@ impl OperationJournal for PostgresOperationJournal {
         if result.rows_affected != 1 {
             return Err(JournalError::Conflict(format!(
                 "operation {operation_id} did not transition INTENT -> OPEN"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn compare_and_set_client_multipart_upload_reference(
+        &self,
+        operation_id: Uuid,
+        expected: Option<&str>,
+        next: Option<&str>,
+    ) -> Result<(), JournalError> {
+        let expected_filter = match expected {
+            Some(value) => object_operation::Column::ClientMultipartUploadId.eq(value),
+            None => object_operation::Column::ClientMultipartUploadId.is_null(),
+        };
+        let result = object_operation::Entity::update_many()
+            .col_expr(
+                object_operation::Column::ClientMultipartUploadId,
+                Expr::value(next.map(ToOwned::to_owned)),
+            )
+            .col_expr(
+                object_operation::Column::UpdatedAtMs,
+                Expr::value(unix_time_ms()),
+            )
+            .filter(object_operation::Column::Id.eq(operation_id))
+            .filter(expected_filter)
+            .exec(&self.db)
+            .await
+            .map_err(persistence)?;
+        if result.rows_affected != 1 {
+            return Err(JournalError::Conflict(format!(
+                "operation {operation_id} client multipart reference changed"
             )));
         }
         Ok(())
@@ -624,6 +658,36 @@ impl OperationJournal for PostgresOperationJournal {
         operation.lease_expires_at_ms = Some(lease_until_ms);
         Ok(Some(operation))
     }
+
+    async fn retire_terminal(
+        &self,
+        operation_id: Uuid,
+        expected_state: OperationState,
+        expected_client_multipart_upload_id: Option<&str>,
+    ) -> Result<(), JournalError> {
+        if !expected_state.is_terminal() {
+            return Err(JournalError::Conflict(
+                "journal retirement requires a terminal state".to_string(),
+            ));
+        }
+        let reference_filter = match expected_client_multipart_upload_id {
+            Some(value) => object_operation::Column::ClientMultipartUploadId.eq(value),
+            None => object_operation::Column::ClientMultipartUploadId.is_null(),
+        };
+        let result = object_operation::Entity::delete_many()
+            .filter(object_operation::Column::Id.eq(operation_id))
+            .filter(object_operation::Column::State.eq(expected_state.as_str()))
+            .filter(reference_filter)
+            .exec(&self.db)
+            .await
+            .map_err(persistence)?;
+        if result.rows_affected != 1 {
+            return Err(JournalError::Conflict(format!(
+                "operation {operation_id} terminal state or multipart reference changed"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -715,6 +779,27 @@ impl OperationJournal for InMemoryOperationJournal {
         }
         operation.state = OperationState::Open;
         operation.upload_id = upload_id.map(ToOwned::to_owned);
+        operation.updated_at_ms = unix_time_ms();
+        Ok(())
+    }
+
+    async fn compare_and_set_client_multipart_upload_reference(
+        &self,
+        operation_id: Uuid,
+        expected: Option<&str>,
+        next: Option<&str>,
+    ) -> Result<(), JournalError> {
+        let mut state = self.state.lock().await;
+        let operation = state
+            .operations
+            .get_mut(&operation_id)
+            .ok_or(JournalError::NotFound(operation_id))?;
+        if operation.client_multipart_upload_id.as_deref() != expected {
+            return Err(JournalError::Conflict(format!(
+                "operation {operation_id} client multipart reference changed"
+            )));
+        }
+        operation.client_multipart_upload_id = next.map(ToOwned::to_owned);
         operation.updated_at_ms = unix_time_ms();
         Ok(())
     }
@@ -978,6 +1063,38 @@ impl OperationJournal for InMemoryOperationJournal {
         operation.lease_expires_at_ms = Some(lease_until_ms);
         Ok(Some(operation.clone()))
     }
+
+    async fn retire_terminal(
+        &self,
+        operation_id: Uuid,
+        expected_state: OperationState,
+        expected_client_multipart_upload_id: Option<&str>,
+    ) -> Result<(), JournalError> {
+        if !expected_state.is_terminal() {
+            return Err(JournalError::Conflict(
+                "journal retirement requires a terminal state".to_string(),
+            ));
+        }
+        let mut state = self.state.lock().await;
+        let operation = state
+            .operations
+            .get(&operation_id)
+            .ok_or(JournalError::NotFound(operation_id))?;
+        if operation.state != expected_state
+            || operation.client_multipart_upload_id.as_deref()
+                != expected_client_multipart_upload_id
+        {
+            return Err(JournalError::Conflict(format!(
+                "operation {operation_id} terminal state or multipart reference changed"
+            )));
+        }
+        state.operations.remove(&operation_id);
+        state.parts.retain(|(id, _), _| *id != operation_id);
+        state
+            .evidence
+            .retain(|item| item.operation_id != operation_id);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1043,5 +1160,101 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn client_multipart_reference_is_cas_bound_and_terminal_retirement_is_exact() {
+        let journal = InMemoryOperationJournal::new();
+        let operation = operation();
+        journal.insert_intent(operation.clone()).await.unwrap();
+        journal
+            .compare_and_set_client_multipart_upload_reference(
+                operation.id,
+                None,
+                Some("client-upload"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            journal
+                .compare_and_set_client_multipart_upload_reference(
+                    operation.id,
+                    None,
+                    Some("stale"),
+                )
+                .await
+                .is_err()
+        );
+        journal.set_open(operation.id, None).await.unwrap();
+        journal
+            .transition(
+                operation.id,
+                OperationState::Open,
+                OperationState::Completing,
+                None,
+            )
+            .await
+            .unwrap();
+        journal
+            .transition(
+                operation.id,
+                OperationState::Completing,
+                OperationState::Committed,
+                Some(&StoredObjectMeta::default()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            journal
+                .retire_terminal(operation.id, OperationState::Committed, None)
+                .await
+                .is_err()
+        );
+        journal
+            .retire_terminal(
+                operation.id,
+                OperationState::Committed,
+                Some("client-upload"),
+            )
+            .await
+            .unwrap();
+        assert!(journal.get(operation.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_null_client_reference_remains_retirable() {
+        let journal = InMemoryOperationJournal::new();
+        let mut operation = operation();
+        operation.state = OperationState::ProvenAborted;
+        journal
+            .insert_intent(OperationRecord {
+                state: OperationState::Intent,
+                ..operation.clone()
+            })
+            .await
+            .unwrap();
+        journal.set_open(operation.id, None).await.unwrap();
+        journal
+            .transition(
+                operation.id,
+                OperationState::Open,
+                OperationState::Aborting,
+                None,
+            )
+            .await
+            .unwrap();
+        journal
+            .transition(
+                operation.id,
+                OperationState::Aborting,
+                OperationState::ProvenAborted,
+                None,
+            )
+            .await
+            .unwrap();
+        journal
+            .retire_terminal(operation.id, OperationState::ProvenAborted, None)
+            .await
+            .unwrap();
     }
 }

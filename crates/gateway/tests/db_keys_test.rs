@@ -33,9 +33,9 @@ use s4_gateway::managed::{
     PostgresManagedRepository, ProviderStorageIdentity, generation_physical_key,
 };
 use s4_gateway::multipart_staging::{
-    ARTIFACT_PREFIX, CompletePart, CompletionAcquire, MultipartCompletionResult, MultipartIdentity,
-    MultipartLifecycle, MultipartPart, MultipartRepository, MultipartSnapshot, MultipartUpload,
-    PostgresMultipartRepository,
+    ARTIFACT_PREFIX, CompletePart, CompletionAcquire, DestinationCommitPermit,
+    MultipartCompletionResult, MultipartIdentity, MultipartLifecycle, MultipartPart,
+    MultipartRepository, MultipartSnapshot, MultipartUpload, PostgresMultipartRepository,
 };
 use s4_gateway::store::{KeyRepository, PostgresKeyStore, sha256_hash};
 use s4_gateway::transaction::{
@@ -909,6 +909,84 @@ fn postgres_operation_journal_persists_canonical_ambiguous_completion() {
 }
 
 #[test]
+fn postgres_operation_journal_client_reference_cas_and_retirement_are_durable() {
+    with_pool(|pool| async move {
+        let journal = PostgresOperationJournal::new(pool);
+        let operation = OperationRecord::intent(
+            ObjectDestination {
+                backend_id: "db-test".to_string(),
+                bucket: "bucket".to_string(),
+                logical_key: "logical".to_string(),
+                physical_key: format!("physical-{}", uuid::Uuid::new_v4()),
+                workspace_binding: None,
+            },
+            ExpectedObject::default(),
+        );
+        journal.insert_intent(operation.clone()).await.unwrap();
+        assert_eq!(
+            journal
+                .get(operation.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .client_multipart_upload_id,
+            None
+        );
+        journal
+            .compare_and_set_client_multipart_upload_reference(
+                operation.id,
+                None,
+                Some("client-upload"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            journal
+                .compare_and_set_client_multipart_upload_reference(
+                    operation.id,
+                    None,
+                    Some("stale"),
+                )
+                .await
+                .is_err()
+        );
+        journal.set_open(operation.id, None).await.unwrap();
+        journal
+            .transition(
+                operation.id,
+                OperationState::Open,
+                OperationState::Aborting,
+                None,
+            )
+            .await
+            .unwrap();
+        journal
+            .transition(
+                operation.id,
+                OperationState::Aborting,
+                OperationState::ProvenAborted,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            journal
+                .retire_terminal(operation.id, OperationState::ProvenAborted, None)
+                .await
+                .is_err()
+        );
+        journal
+            .retire_terminal(
+                operation.id,
+                OperationState::ProvenAborted,
+                Some("client-upload"),
+            )
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
 fn postgres_workspace_destination_survives_restart_in_every_recovery_state() {
     with_pool(|pool| async move {
         for target_state in [
@@ -1038,6 +1116,9 @@ fn postgres_multipart_completion_cas_replay_and_fencing_are_durable() {
                 completion_lease_owner: None,
                 completion_lease_expires_at_ms: None,
                 completion_fencing_token: 0,
+                destination_operation_id: None,
+                publishing_started_at_ms: None,
+                destination_commit: None,
                 completion_result: None,
             })
             .await
@@ -1093,25 +1174,99 @@ fn postgres_multipart_completion_cas_replay_and_fencing_are_durable() {
                 .await
                 .is_err()
         );
-        repository
-            .complete_completion(
+        let operation_id =
+            DestinationCommitPermit::deterministic_operation_id(&identity, "request");
+        let permit = repository
+            .begin_destination_commit(
                 &identity,
+                "request",
                 second.fencing_token,
-                MultipartCompletionResult {
-                    etag: Some("\"result\"".to_string()),
-                    checksum_sha256: "result-sha".to_string(),
-                    version_id: Some("version".to_string()),
-                    source_bytes: 24,
-                    size_bytes: 42,
-                    pipeline_evidence: None,
-                },
+                operation_id,
                 now + 12,
             )
+            .await
+            .expect("begin destination commit");
+        assert!(matches!(
+            repository
+                .acquire_completion(
+                    &identity,
+                    "request",
+                    &selected,
+                    "worker-c",
+                    now + 100,
+                    now + 50,
+                )
+                .await,
+            Ok(CompletionAcquire::Busy)
+        ));
+        let mut stale = permit.clone();
+        stale.fencing_token += 1;
+        assert!(
+            repository
+                .validate_destination_commit_permit(&stale)
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .publishing_uploads(100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|upload| upload.permit == permit)
+        );
+        repository
+            .release_destination_commit_after_proven_absence(&permit, now + 51)
+            .await
+            .expect("release publication after proven absence");
+        let third = match repository
+            .acquire_completion(
+                &identity,
+                "request",
+                &selected,
+                "worker-c",
+                now + 100,
+                now + 52,
+            )
+            .await
+            .expect("take over released publication")
+        {
+            CompletionAcquire::Acquired(lease) => lease,
+            _ => panic!("expected completion takeover"),
+        };
+        let permit = repository
+            .begin_destination_commit(
+                &identity,
+                "request",
+                third.fencing_token,
+                operation_id,
+                now + 53,
+            )
+            .await
+            .expect("begin replacement destination commit");
+        let result = MultipartCompletionResult {
+            etag: Some("\"result\"".to_string()),
+            checksum_sha256: "result-sha".to_string(),
+            version_id: Some("version".to_string()),
+            source_bytes: 24,
+            size_bytes: 42,
+            pipeline_evidence: None,
+        };
+        repository
+            .record_destination_commit(&permit, result.clone(), now + 54)
+            .await
+            .expect("record exact destination commit");
+        repository
+            .record_destination_commit(&permit, result.clone(), now + 55)
+            .await
+            .expect("replay exact destination commit");
+        repository
+            .complete_completion(&identity, &permit, result, now + 56)
             .await
             .expect("persist immutable result");
         assert!(matches!(
             repository
-                .acquire_completion(&identity, "request", &selected, "retry", now + 40, now + 13)
+                .acquire_completion(&identity, "request", &selected, "retry", now + 80, now + 57)
                 .await,
             Ok(CompletionAcquire::Replayed(_))
         ));
@@ -1122,8 +1277,8 @@ fn postgres_multipart_completion_cas_replay_and_fencing_are_durable() {
                     "conflict",
                     &selected,
                     "retry",
-                    now + 40,
-                    now + 13
+                    now + 80,
+                    now + 57
                 )
                 .await
                 .is_err()
