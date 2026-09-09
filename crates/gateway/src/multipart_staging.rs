@@ -71,7 +71,7 @@ impl StagingQuotaLimits {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingPart {
     pub upload_id: String,
     pub part_number: u32,
