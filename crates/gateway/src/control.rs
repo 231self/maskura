@@ -373,6 +373,13 @@ impl UsageEvent {
         self
     }
 
+    /// Re-key the event to the deterministic destination operation identity a
+    /// durable multipart publication is recorded under.
+    pub fn with_operation_id(mut self, operation_id: Uuid) -> Self {
+        self.operation_id = operation_id;
+        self
+    }
+
     pub fn receipt_id(&self) -> Uuid {
         self.receipt_id
     }

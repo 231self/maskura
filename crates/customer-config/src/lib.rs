@@ -47,6 +47,8 @@ pub mod aliases {
     pub const ENABLE_AVRO: EnvAlias = EnvAlias::new("MASKURA_ENABLE_AVRO");
     pub const LEGACY_MAX_OBJECT_BYTES: EnvAlias = EnvAlias::new("MASKURA_LEGACY_MAX_OBJECT_BYTES");
     pub const SINGLE_TENANT: EnvAlias = EnvAlias::new("MASKURA_SINGLE_TENANT");
+    pub const LOCAL_STORAGE_DIR: EnvAlias = EnvAlias::new("MASKURA_LOCAL_STORAGE_DIR");
+    pub const STORAGE_MODE: EnvAlias = EnvAlias::new("MASKURA_STORAGE_MODE");
     pub const MULTIPART_MODE: EnvAlias = EnvAlias::new("MASKURA_MULTIPART_MODE");
     pub const SPOOL_DIR: EnvAlias = EnvAlias::new("MASKURA_SPOOL_DIR");
     pub const SPOOL_MAX_OBJECT_BYTES: EnvAlias = EnvAlias::new("MASKURA_SPOOL_MAX_OBJECT_BYTES");
@@ -72,6 +74,8 @@ pub mod aliases {
         ENABLE_AVRO,
         LEGACY_MAX_OBJECT_BYTES,
         SINGLE_TENANT,
+        LOCAL_STORAGE_DIR,
+        STORAGE_MODE,
         MULTIPART_MODE,
         SPOOL_DIR,
         SPOOL_MAX_OBJECT_BYTES,

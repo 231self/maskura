@@ -46,7 +46,7 @@ so agents get the view you allow and the raw object never leaves your bucket.
 
 Filters shipped in-tree (as examples to learn from): `noop`, `pii-default` (redact
 emails / SSNs / credit cards), `email-detect`, `ssn-detect`, `card-detect`,
-`envelope-encrypt` (per-field hybrid X25519 + ML-KEM-768 / AES-256-GCM), `stable-encrypt`
+`envelope-encrypt` (per-field RSA-OAEP / AES-256-GCM), `stable-encrypt`
 (deterministic encryption).
 
 ## Contents
@@ -60,7 +60,6 @@ emails / SSNs / credit cards), `email-detect`, `ssn-detect`, `card-detect`,
 - [How it works](#how-it-works)
 - [Development](#development)
 - [Security](#security)
-- [Open source and hosted Maskura](#open-source-and-hosted-maskura)
 - [Documentation](#documentation)
 - [LLM agents](#llm-agents)
 - [License](#license)
@@ -76,9 +75,6 @@ docker run --rm -p 127.0.0.1:8791:8080 \
   ghcr.io/231self/maskura/maskura:latest
 # open http://localhost:8791 → demo dashboard (no sign-up)
 ```
-
-This local path needs no Maskura account. The hosted browser preview requires
-login so the public processing endpoint can bound automated abuse.
 
 The gateway speaks SigV4, so your existing `aws s3` CLI works as-is:
 
@@ -131,11 +127,35 @@ maskura get ingest/data.csv --bucket s4-local
 ```
 
 `maskura local init` pulls the gateway image tagged with the CLI version
-(`ghcr.io/231self/maskura/maskura:v0.5.3` for `maskura` 0.5.3; CLI and gateway always
-match, never `:latest`) and runs it in local mode (`AUTH_DISABLED=true`, keys
-persisted on a volume, in-memory storage); it picks a free port (8080+) and only
-listens on localhost. `maskura local down` stops it. For durable local
-storage (MinIO), clone the repo and use `just dev-up`.
+(`ghcr.io/231self/maskura/maskura:v0.4.1` for `maskura` 0.4.1; CLI and gateway always
+match, never `:latest`) and runs a durable single-node local FileStore
+(`AUTH_DISABLED=true`, staged multipart enabled, all state on one volume). It picks
+a free port (8080+) and only listens on localhost. `maskura local down` stops it.
+Use `just dev-up` when you specifically need the MinIO-backed cloud-storage path.
+
+### Standalone durable local storage
+
+The gateway can persist objects and restart-safe multipart state directly to a
+mounted filesystem volume without MinIO, Postgres, or cloud credentials. This is
+a single-node S3-compatible deployment. The same volume contains objects, API
+keys, encrypted multipart artifacts, event logs, commit proofs, and the local
+wrapping key.
+
+```bash
+docker run --rm -p 8080:8080 -v maskura-data:/data \
+  -e AUTH_DISABLED=true \
+  -e MASKURA_STORAGE_MODE=local \
+  -e MASKURA_LOCAL_STORAGE_DIR=/data \
+  -e MASKURA_MULTIPART_MODE=staged \
+  ghcr.io/231self/maskura/maskura:<release-tag>
+```
+
+The local-mode startup output prints `MASKURA_ACCESS_KEY` and
+`MASKURA_SECRET_KEY`. Use them with the CLI or `aws --endpoint-url
+http://localhost:8080 s3 ...`. Objects, local API keys, and in-progress staged
+multipart uploads survive container restarts through the mounted volume. Keep
+the `.maskura/wrapping.key` file with the volume backup; losing it makes
+encrypted incomplete uploads unrecoverable.
 
 ## Compatibility
 
@@ -238,14 +258,18 @@ its source body is consumed. Set `MASKURA_SPOOL_DIR`, `MASKURA_SPOOL_MAX_OBJECT_
 and `MASKURA_SPOOL_QUOTA_BYTES` to a private, capacity-reserved volume; the quota
 must cover encrypted framing overhead as well as plaintext output.
 
-**Encryption — hybrid envelopes for supported PII fields**
+**Encryption — per-field envelope encryption, decryptable only by you**
 
-New writes use hybrid X25519 + ML-KEM-768 key encapsulation with AES-256-GCM.
-The current gateway accepts only Maskura hybrid public keys for new encrypted
-writes. The released Python and TypeScript high-level encryption helpers still
-implement the legacy RSA envelope and must not be used to provision a key on a
-current gateway. See [Encryption](docs/encryption.md#client-tooling-status) for
-the exact compatibility boundary.
+```bash
+# Round-trip against any S3-compatible bucket: pre-encrypt fixture →
+# encrypted bytes fetched straight from the bucket → decrypted through Maskura:
+export B2_S3_ENDPOINT=https://s3.us-east-005.backblazeb2.com
+export B2_REGION=us-east-005
+export B2_BUCKET=your-bucket
+export B2_ACCESS_KEY_ID=your-key-id
+export B2_SECRET_ACCESS_KEY=your-application-key
+bash examples/b2-encrypt-demo.sh
+```
 
 **Plugins — bring your own transform**
 
@@ -256,14 +280,17 @@ maskura plugin enable <id>
 maskura plugin reorder pii-default my-filter     # output of one feeds the next
 ```
 
-**SDKs — Python object operations**
+**SDKs — Python**
 
 ```python
 from maskura_client import MaskuraClient
 client = MaskuraClient("http://localhost:8080", "s4_access_key", "s4s_secret_key")
+priv, pub = client.generate_keypair()                  # RSA-2048
+client.attach_public_key(pub)                          # bind to your API key
 client.put_object("bucket", "key", b"jane@example.com 4111111111111111")
 blob = client.get_object("bucket", "key")
-print(blob.decode())
+assert "jane@example.com" not in blob.decode()          # stored encrypted
+print(client.decrypt_payload(blob, priv))              # you hold the key
 ```
 
 Full details: [examples/README.md](examples/README.md) and
@@ -323,21 +350,11 @@ or security@231self.com — and never through a
 [SECURITY.md](SECURITY.md) for the supported-version policy,
 response timeline, and what to include in a report.
 
-## Open source and hosted Maskura
-
-The Apache-2.0 repository contains the self-hosted gateway data plane, Wasm
-runtime and filters, CLI, local MCP server, generated SDKs, and storage
-adapters. Hosted Maskura adds the operated multi-tenant control plane, billing,
-and Maskura Store. The hosted control-plane services are not part of this
-repository. See [Open source and hosted boundaries](docs/open-source.md) for
-the complete split, including what data each deployment processes.
-
 ## Documentation
 
 - **Docs site** — the same docs, rendered:
   <https://231self.github.io/maskura/>.
-- `docs/open-source.md` — the exact Apache-2.0 versus hosted product boundary.
-- `examples/` — runnable local and B2 redaction demos.
+- `examples/` — runnable end-to-end demos (B2 encryption round-trip).
 - `docs/plugins.md` — create and consume your own plugins.
 - `docs/security.md` — the security model of the gateway.
 - `docs/adr/` — architecture decision records.

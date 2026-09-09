@@ -3,12 +3,16 @@
 //! This module deliberately has no handler integration. Phase 5 establishes the
 //! persistence, backend, and recovery contracts without changing write routing.
 
+mod file;
+mod file_journal;
 mod journal;
 mod memory;
 mod presign;
 mod s3;
 mod spool;
 
+pub use file::{FileSinkTransaction, MultipartStoredMetadata};
+pub(crate) use file_journal::FileOperationJournal;
 #[cfg(any(test, debug_assertions))]
 pub use journal::InMemoryOperationJournal;
 pub use journal::PostgresOperationJournal;
@@ -128,7 +132,7 @@ pub struct ExpectedObject {
     pub metadata: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OperationRecord {
     pub id: Uuid,
     pub state: OperationState,
@@ -137,6 +141,7 @@ pub struct OperationRecord {
     pub namespace_epoch: Option<u64>,
     pub expected: ExpectedObject,
     pub upload_id: Option<String>,
+    pub client_multipart_upload_id: Option<String>,
     pub committed: Option<StoredObjectMeta>,
     pub lease_owner: Option<String>,
     pub lease_expires_at_ms: Option<i64>,
@@ -221,6 +226,7 @@ impl OperationRecord {
             namespace_epoch: None,
             expected,
             upload_id: None,
+            client_multipart_upload_id: None,
             committed: None,
             lease_owner: None,
             lease_expires_at_ms: None,
@@ -257,7 +263,7 @@ impl OperationRecord {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PartRecord {
     pub operation_id: Uuid,
     pub part_number: i32,
@@ -267,7 +273,7 @@ pub struct PartRecord {
     pub created_at_ms: i64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceRecord {
     pub id: Uuid,
     pub operation_id: Uuid,
@@ -288,7 +294,7 @@ impl EvidenceRecord {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StoredObjectMeta {
     pub etag: Option<String>,
     pub version_id: Option<String>,
@@ -317,6 +323,12 @@ pub trait OperationJournal: Send + Sync {
         &self,
         operation_id: Uuid,
         upload_id: Option<&str>,
+    ) -> Result<(), JournalError>;
+    async fn compare_and_set_client_multipart_upload_reference(
+        &self,
+        operation_id: Uuid,
+        expected: Option<&str>,
+        next: Option<&str>,
     ) -> Result<(), JournalError>;
     async fn set_expected(
         &self,
@@ -364,6 +376,12 @@ pub trait OperationJournal: Send + Sync {
         stale_before_ms: i64,
         lease_until_ms: i64,
     ) -> Result<Option<OperationRecord>, JournalError>;
+    async fn retire_terminal(
+        &self,
+        operation_id: Uuid,
+        expected_state: OperationState,
+        expected_client_multipart_upload_id: Option<&str>,
+    ) -> Result<(), JournalError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -640,6 +658,8 @@ pub enum TransactionError {
     CapacityExceeded,
     #[error("managed authority publication failed: {0}")]
     Publication(String),
+    #[error("destination commit authority rejected: {0}")]
+    CommitAuthority(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -647,6 +667,70 @@ pub enum SinkCommitState {
     PreCommit,
     CommitUnknown,
     Committed,
+}
+
+#[derive(Clone)]
+pub enum DestinationCommitAuthority {
+    SinglePut,
+    ClientMultipart(Box<ClientMultipartCommitAuthority>),
+}
+
+#[derive(Clone)]
+pub struct ClientMultipartCommitAuthority {
+    pub repository: Arc<dyn crate::multipart_staging::MultipartRepository>,
+    pub identity: crate::multipart_staging::MultipartIdentity,
+    pub permit: crate::multipart_staging::DestinationCommitPermit,
+}
+
+impl DestinationCommitAuthority {
+    pub fn client_multipart(
+        repository: Arc<dyn crate::multipart_staging::MultipartRepository>,
+        identity: crate::multipart_staging::MultipartIdentity,
+        permit: crate::multipart_staging::DestinationCommitPermit,
+    ) -> Self {
+        Self::ClientMultipart(Box::new(ClientMultipartCommitAuthority {
+            repository,
+            identity,
+            permit,
+        }))
+    }
+
+    pub fn permit(&self) -> Option<&crate::multipart_staging::DestinationCommitPermit> {
+        match self {
+            Self::SinglePut => None,
+            Self::ClientMultipart(authority) => Some(&authority.permit),
+        }
+    }
+
+    pub async fn validate(
+        &self,
+        durable_operation_id: Option<Uuid>,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), TransactionError> {
+        let Self::ClientMultipart(authority) = self else {
+            return Ok(());
+        };
+        let ClientMultipartCommitAuthority {
+            repository,
+            identity,
+            permit,
+        } = authority.as_ref();
+        if !repository.is_durable()
+            || identity.upload_id != permit.upload_id
+            || identity.bucket != bucket
+            || identity.key != key
+            || durable_operation_id.is_some_and(|operation_id| operation_id != permit.operation_id)
+        {
+            return Err(TransactionError::CommitAuthority(
+                "multipart destination commit authority does not match the sink".to_string(),
+            ));
+        }
+        repository
+            .validate_destination_commit_permit(permit)
+            .await
+            .map_err(|error| TransactionError::CommitAuthority(error.to_string()))
+    }
 }
 
 impl SinkCommitState {
@@ -679,7 +763,10 @@ pub trait ObjectSinkTransaction: Send {
     ) -> Result<(), TransactionError> {
         Ok(())
     }
-    async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError>;
+    async fn complete(
+        &mut self,
+        authority: DestinationCommitAuthority,
+    ) -> Result<StoredObjectMeta, TransactionError>;
     async fn abort(&mut self) -> Result<(), TransactionError>;
 }
 

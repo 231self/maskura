@@ -93,9 +93,11 @@ are deliberately not part of this suite yet. Each is a natural future
 - **Managed service storage** — needs a multi-backend boot with
   `S4_SERVICE_BUCKETS` and no `S3_ENDPOINT` (the two are mutually exclusive at
   startup).
-- **Staged multipart** — needs Postgres and a durable KEK
-  (`MULTIPART_MODE=staged` + `DATABASE_URL`); covered today by the
-  Postgres-gated `db_keys_test` CI job.
+- **Staged multipart** — local mode is covered without Postgres or MinIO by the
+  standalone filesystem multipart tests and AWS SDK conformance suite. Hosted
+  staged multipart still needs Postgres, a durable KEK, and the configured
+  staging backend (`MULTIPART_MODE=staged` + `DATABASE_URL`); it remains covered
+  by the Postgres-gated `db_keys_test` CI job.
 - **Key expiry/revocation rejection on the data plane** — needs an
   auth-enabled boot that can create keys (with `AUTH_DISABLED` unset, the
   dashboard key API requires a real user session).

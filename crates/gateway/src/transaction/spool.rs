@@ -10,7 +10,10 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use super::{ObjectSinkTransaction, SinkCommitState, StoredObjectMeta, TransactionError};
+use super::{
+    DestinationCommitAuthority, ObjectSinkTransaction, SinkCommitState, StoredObjectMeta,
+    TransactionError,
+};
 
 const FILE_PREFIX: &str = "maskura-spool-";
 /// Encrypted transformed-read staging shares the compatibility spool directory.
@@ -238,12 +241,20 @@ impl ObjectSinkTransaction for CompatibilitySpoolTransaction {
         Ok(())
     }
 
-    async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError> {
+    async fn complete(
+        &mut self,
+        authority: DestinationCommitAuthority,
+    ) -> Result<StoredObjectMeta, TransactionError> {
         if self.finished {
             return Err(TransactionError::Finished);
         }
         if !self.output_verified {
             return Err(TransactionError::OutputMismatch);
+        }
+        if let DestinationCommitAuthority::ClientMultipart(multipart) = &authority {
+            authority
+                .validate(None, &multipart.identity.bucket, &multipart.identity.key)
+                .await?;
         }
         let file = self.file.as_mut().ok_or(TransactionError::Finished)?;
         file.flush().await.map_err(spool_error)?;
@@ -387,9 +398,17 @@ mod tests {
             .verify_output(transaction.bytes, &digest)
             .await
             .unwrap();
-        assert!(transaction.complete().await.is_err());
+        assert!(
+            transaction
+                .complete(DestinationCommitAuthority::SinglePut)
+                .await
+                .is_err()
+        );
         assert!(transaction.path().exists());
-        transaction.complete().await.unwrap();
+        transaction
+            .complete(DestinationCommitAuthority::SinglePut)
+            .await
+            .unwrap();
         let attempts = uploader.attempts.lock().unwrap();
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0], attempts[1]);

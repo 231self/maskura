@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(any(test, debug_assertions))]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +40,7 @@ use crate::s3_safety::{record_s3_body_failure, record_s3_failure};
 
 pub const MAX_ACTIVE_UPLOADS: usize = 16;
 pub const MAX_PARTS: u32 = 10_000;
+pub const MAX_MULTIPART_UPLOADS_PAGE: usize = 1_000;
 pub const DEFAULT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const MAGIC: &[u8] = b"S4MP10\0";
 const NONCE_LEN: usize = 12;
@@ -69,7 +71,7 @@ impl StagingQuotaLimits {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingPart {
     pub upload_id: String,
     pub part_number: u32,
@@ -89,6 +91,8 @@ pub struct StagedArtifact {
     pub key: String,
     pub modified_at_ms: i64,
 }
+
+pub type StagingArtifactReader = Pin<Box<dyn AsyncRead + Send>>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MultipartIdentity {
@@ -114,15 +118,10 @@ pub struct MultipartSnapshot {
 pub enum MultipartLifecycle {
     Open,
     Completing,
+    Publishing,
     Completed,
     Aborted,
     Expired,
-}
-
-impl MultipartLifecycle {
-    fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Aborted | Self::Expired)
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -142,6 +141,12 @@ pub struct MultipartUpload {
     pub completion_lease_owner: Option<String>,
     pub completion_lease_expires_at_ms: Option<i64>,
     pub completion_fencing_token: u64,
+    #[serde(default)]
+    pub destination_operation_id: Option<Uuid>,
+    #[serde(default)]
+    pub publishing_started_at_ms: Option<i64>,
+    #[serde(default)]
+    pub destination_commit: Option<DestinationCommitRecord>,
     pub completion_result: Option<MultipartCompletionResult>,
 }
 
@@ -197,6 +202,63 @@ pub enum CompletionAcquire {
     Busy,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ListMultipartUploadsRequest {
+    pub tenant_id: String,
+    pub credential_policy_id: String,
+    pub bucket: String,
+    #[serde(default)]
+    pub prefix: String,
+    pub delimiter: Option<String>,
+    pub key_marker: Option<String>,
+    pub upload_id_marker: Option<String>,
+    pub max_uploads: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ListMultipartUploadsPage {
+    pub uploads: Vec<MultipartUpload>,
+    pub common_prefixes: Vec<String>,
+    pub is_truncated: bool,
+    pub next_key_marker: Option<String>,
+    pub next_upload_id_marker: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DestinationCommitPermit {
+    pub upload_id: String,
+    pub completion_fingerprint: String,
+    pub fencing_token: u64,
+    pub operation_id: Uuid,
+}
+
+impl DestinationCommitPermit {
+    pub fn deterministic_operation_id(identity: &MultipartIdentity, fingerprint: &str) -> Uuid {
+        const NAMESPACE: Uuid = Uuid::from_bytes([
+            0x96, 0xa0, 0x29, 0xa7, 0x7f, 0x85, 0x4d, 0xef, 0xa5, 0x3d, 0x34, 0xca, 0x58, 0xe9,
+            0x31, 0xad,
+        ]);
+        let encoded = serde_json::to_vec(&(identity, fingerprint))
+            .expect("multipart permit identity serialization cannot fail");
+        Uuid::new_v5(&NAMESPACE, &encoded)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DestinationCommitRecord {
+    pub operation_id: Uuid,
+    pub result: MultipartCompletionResult,
+    pub committed_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PublishingMultipartUpload {
+    pub identity: MultipartIdentity,
+    pub permit: DestinationCommitPermit,
+    pub publishing_started_at_ms: i64,
+    pub destination_commit: Option<DestinationCommitRecord>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CleanupAudit {
     pub id: Uuid,
@@ -225,6 +287,8 @@ pub enum StagingError {
     QuotaExceeded,
     #[error("invalid multipart part")]
     InvalidPart,
+    #[error("invalid multipart upload listing request")]
+    InvalidListing,
     #[error("multipart completion request conflicts with the existing request")]
     CompletionConflict,
     #[error("multipart completion lease is fenced")]
@@ -251,6 +315,10 @@ pub trait MultipartRepository: Send + Sync {
         &self,
         identity: &MultipartIdentity,
     ) -> Result<MultipartUpload, StagingError>;
+    async fn list_authorized_uploads(
+        &self,
+        request: &ListMultipartUploadsRequest,
+    ) -> Result<ListMultipartUploadsPage, StagingError>;
     async fn replace_part(
         &self,
         identity: &MultipartIdentity,
@@ -318,12 +386,44 @@ pub trait MultipartRepository: Send + Sync {
         fencing_token: u64,
         now_ms: i64,
     ) -> Result<(), StagingError>;
+    async fn begin_destination_commit(
+        &self,
+        identity: &MultipartIdentity,
+        fingerprint: &str,
+        fencing_token: u64,
+        operation_id: Uuid,
+        now_ms: i64,
+    ) -> Result<DestinationCommitPermit, StagingError>;
+    async fn validate_destination_commit_permit(
+        &self,
+        permit: &DestinationCommitPermit,
+    ) -> Result<(), StagingError>;
+    async fn record_destination_commit(
+        &self,
+        permit: &DestinationCommitPermit,
+        result: MultipartCompletionResult,
+        now_ms: i64,
+    ) -> Result<(), StagingError>;
+    async fn release_destination_commit_after_proven_absence(
+        &self,
+        permit: &DestinationCommitPermit,
+        now_ms: i64,
+    ) -> Result<(), StagingError>;
+    async fn publishing_uploads(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PublishingMultipartUpload>, StagingError>;
     async fn complete_completion(
         &self,
         identity: &MultipartIdentity,
-        fencing_token: u64,
+        permit: &DestinationCommitPermit,
         result: MultipartCompletionResult,
         now_ms: i64,
+    ) -> Result<(), StagingError>;
+    async fn clear_destination_commit_reference(
+        &self,
+        identity: &MultipartIdentity,
+        expected_operation_id: Uuid,
     ) -> Result<(), StagingError>;
     async fn abort(
         &self,
@@ -334,6 +434,11 @@ pub trait MultipartRepository: Send + Sync {
         &self,
         identity: &MultipartIdentity,
     ) -> Result<(), StagingError>;
+    async fn terminal_upload_candidates(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<MultipartIdentity>, StagingError>;
     async fn retire_terminal_uploads(
         &self,
         now_ms: i64,
@@ -550,6 +655,14 @@ fn upload_model(upload: &MultipartUpload) -> Result<multipart_upload::ActiveMode
         completion_fencing_token: Set(i64::try_from(upload.completion_fencing_token).map_err(
             |_| StagingError::Persistence("invalid completion fencing token".to_string()),
         )?),
+        destination_operation_id: Set(upload.destination_operation_id),
+        publishing_started_at_ms: Set(upload.publishing_started_at_ms),
+        destination_commit: Set(upload
+            .destination_commit
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(json_error)?),
         completion_result: Set(upload
             .completion_result
             .as_ref()
@@ -565,6 +678,7 @@ fn lifecycle_name(lifecycle: MultipartLifecycle) -> &'static str {
     match lifecycle {
         MultipartLifecycle::Open => "OPEN",
         MultipartLifecycle::Completing => "COMPLETING",
+        MultipartLifecycle::Publishing => "PUBLISHING",
         MultipartLifecycle::Completed => "COMPLETED",
         MultipartLifecycle::Aborted => "ABORTED",
         MultipartLifecycle::Expired => "EXPIRED",
@@ -574,6 +688,7 @@ fn lifecycle(value: &str) -> Result<MultipartLifecycle, StagingError> {
     match value {
         "OPEN" => Ok(MultipartLifecycle::Open),
         "COMPLETING" => Ok(MultipartLifecycle::Completing),
+        "PUBLISHING" => Ok(MultipartLifecycle::Publishing),
         "COMPLETED" => Ok(MultipartLifecycle::Completed),
         "ABORTED" => Ok(MultipartLifecycle::Aborted),
         "EXPIRED" => Ok(MultipartLifecycle::Expired),
@@ -629,6 +744,13 @@ fn upload_from_model(model: multipart_upload::Model) -> Result<MultipartUpload, 
         completion_fencing_token: u64::try_from(model.completion_fencing_token).map_err(|_| {
             StagingError::Persistence("negative completion fencing token".to_string())
         })?,
+        destination_operation_id: model.destination_operation_id,
+        publishing_started_at_ms: model.publishing_started_at_ms,
+        destination_commit: model
+            .destination_commit
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(json_error)?,
         completion_result: model
             .completion_result
             .map(serde_json::from_value)
@@ -814,6 +936,26 @@ impl MultipartRepository for PostgresMultipartRepository {
             .ok_or(StagingError::NotFound)
             .and_then(upload_from_model)
     }
+    async fn list_authorized_uploads(
+        &self,
+        request: &ListMultipartUploadsRequest,
+    ) -> Result<ListMultipartUploadsPage, StagingError> {
+        let uploads = multipart_upload::Entity::find()
+            .filter(multipart_upload::Column::TenantId.eq(&request.tenant_id))
+            .filter(multipart_upload::Column::CredentialPolicyId.eq(&request.credential_policy_id))
+            .filter(multipart_upload::Column::Bucket.eq(&request.bucket))
+            .filter(multipart_upload::Column::Lifecycle.is_in(["OPEN", "COMPLETING", "PUBLISHING"]))
+            .filter(multipart_upload::Column::ObjectKey.starts_with(&request.prefix))
+            .order_by_asc(multipart_upload::Column::ObjectKey)
+            .order_by_asc(multipart_upload::Column::UploadId)
+            .all(&self.db)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?
+            .into_iter()
+            .map(upload_from_model)
+            .collect::<Result<Vec<_>, _>>()?;
+        paginate_multipart_uploads(uploads, request)
+    }
     async fn replace_part(
         &self,
         identity: &MultipartIdentity,
@@ -922,7 +1064,7 @@ impl MultipartRepository for PostgresMultipartRepository {
         reserved_bytes: u64,
         now: i64,
     ) -> Result<PendingPart, StagingError> {
-        if part_number == 0 || part_number > MAX_PARTS || reserved_bytes == 0 {
+        if part_number == 0 || part_number > MAX_PARTS {
             return Err(StagingError::InvalidPart);
         }
         let reserved = as_i64(reserved_bytes)?;
@@ -1240,8 +1382,10 @@ impl MultipartRepository for PostgresMultipartRepository {
             let Some(upload) = upload else { continue };
             let pending_is_old = attempt.lifecycle == "PENDING"
                 && attempt.created_at_ms <= now - RECONCILIATION_GRACE.as_millis() as i64;
-            if lifecycle(&upload.lifecycle)?.is_terminal()
-                || attempt.lifecycle == "RETIRED"
+            if matches!(
+                upload.lifecycle.as_str(),
+                "COMPLETED" | "ABORTED" | "EXPIRED"
+            ) || attempt.lifecycle == "RETIRED"
                 || pending_is_old
             {
                 result.push(CleanupCandidate {
@@ -1336,6 +1480,13 @@ impl MultipartRepository for PostgresMultipartRepository {
                 .map_err(|error| StagingError::Persistence(error.to_string()))?;
             return if upload.complete_request_fingerprint.as_deref() == Some(fingerprint) {
                 Ok(CompletionAcquire::Replayed(result))
+            } else {
+                Err(StagingError::CompletionConflict)
+            };
+        }
+        if upload.lifecycle == MultipartLifecycle::Publishing {
+            return if upload.complete_request_fingerprint.as_deref() == Some(fingerprint) {
+                Ok(CompletionAcquire::Busy)
             } else {
                 Err(StagingError::CompletionConflict)
             };
@@ -1443,15 +1594,210 @@ impl MultipartRepository for PostgresMultipartRepository {
         .then_some(())
         .ok_or(StagingError::Fenced)
     }
-    async fn complete_completion(
+    async fn begin_destination_commit(
         &self,
         identity: &MultipartIdentity,
+        fingerprint: &str,
         fencing_token: u64,
+        operation_id: Uuid,
+        now: i64,
+    ) -> Result<DestinationCommitPermit, StagingError> {
+        if operation_id
+            != DestinationCommitPermit::deterministic_operation_id(identity, fingerprint)
+        {
+            return Err(StagingError::Fenced);
+        }
+        let tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        let model = multipart_upload::Entity::find()
+            .filter(multipart_upload::Column::UploadId.eq(&identity.upload_id))
+            .filter(multipart_upload::Column::TenantId.eq(&identity.tenant_id))
+            .filter(multipart_upload::Column::CredentialPolicyId.eq(&identity.credential_policy_id))
+            .filter(multipart_upload::Column::Bucket.eq(&identity.bucket))
+            .filter(multipart_upload::Column::ObjectKey.eq(&identity.key))
+            .lock_exclusive()
+            .one(&tx)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?
+            .ok_or(StagingError::NotFound)?;
+        let upload = upload_from_model(model.clone())?;
+        if upload.lifecycle != MultipartLifecycle::Completing
+            || upload.complete_request_fingerprint.as_deref() != Some(fingerprint)
+            || upload.completion_fencing_token != fencing_token
+            || upload
+                .completion_lease_expires_at_ms
+                .is_none_or(|expiry| expiry <= now)
+        {
+            return Err(StagingError::Fenced);
+        }
+        let mut active: multipart_upload::ActiveModel = model.into();
+        active.lifecycle = Set("PUBLISHING".to_string());
+        active.destination_operation_id = Set(Some(operation_id));
+        active.publishing_started_at_ms = Set(Some(now));
+        active.destination_commit = Set(None);
+        active.completion_lease_owner = Set(None);
+        active.completion_lease_expires_at_ms = Set(None);
+        active.updated_at_ms = Set(now);
+        active
+            .update(&tx)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        Ok(DestinationCommitPermit {
+            upload_id: identity.upload_id.clone(),
+            completion_fingerprint: fingerprint.to_string(),
+            fencing_token,
+            operation_id,
+        })
+    }
+    async fn validate_destination_commit_permit(
+        &self,
+        permit: &DestinationCommitPermit,
+    ) -> Result<(), StagingError> {
+        let upload = multipart_upload::Entity::find()
+            .filter(multipart_upload::Column::UploadId.eq(&permit.upload_id))
+            .one(&self.db)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?
+            .ok_or(StagingError::Fenced)
+            .and_then(upload_from_model)?;
+        permit_matches(&upload, permit)
+            .then_some(())
+            .ok_or(StagingError::Fenced)
+    }
+    async fn record_destination_commit(
+        &self,
+        permit: &DestinationCommitPermit,
         result: MultipartCompletionResult,
         now: i64,
     ) -> Result<(), StagingError> {
-        self.check_completion_lease(identity, fencing_token, now)
-            .await?;
+        let tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        let model = multipart_upload::Entity::find()
+            .filter(multipart_upload::Column::UploadId.eq(&permit.upload_id))
+            .lock_exclusive()
+            .one(&tx)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?
+            .ok_or(StagingError::Fenced)?;
+        let upload = upload_from_model(model.clone())?;
+        if !permit_matches(&upload, permit) {
+            return Err(StagingError::Fenced);
+        }
+        let record = DestinationCommitRecord {
+            operation_id: permit.operation_id,
+            result,
+            committed_at_ms: now,
+        };
+        if let Some(existing) = upload.destination_commit {
+            return if existing.operation_id == record.operation_id
+                && existing.result == record.result
+            {
+                Ok(())
+            } else {
+                Err(StagingError::CompletionConflict)
+            };
+        }
+        let mut active: multipart_upload::ActiveModel = model.into();
+        active.destination_commit = Set(Some(serde_json::to_value(record).map_err(json_error)?));
+        active.updated_at_ms = Set(now);
+        active
+            .update(&tx)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        Ok(())
+    }
+    async fn release_destination_commit_after_proven_absence(
+        &self,
+        permit: &DestinationCommitPermit,
+        now: i64,
+    ) -> Result<(), StagingError> {
+        let updated = multipart_upload::Entity::update_many()
+            .col_expr(
+                multipart_upload::Column::Lifecycle,
+                Expr::value("COMPLETING"),
+            )
+            .col_expr(
+                multipart_upload::Column::DestinationOperationId,
+                Expr::value(Option::<Uuid>::None),
+            )
+            .col_expr(
+                multipart_upload::Column::PublishingStartedAtMs,
+                Expr::value(Option::<i64>::None),
+            )
+            .col_expr(
+                multipart_upload::Column::CompletionLeaseOwner,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                multipart_upload::Column::CompletionLeaseExpiresAtMs,
+                Expr::value(Some(now)),
+            )
+            .col_expr(multipart_upload::Column::UpdatedAtMs, Expr::value(now))
+            .filter(multipart_upload::Column::UploadId.eq(&permit.upload_id))
+            .filter(multipart_upload::Column::Lifecycle.eq("PUBLISHING"))
+            .filter(
+                multipart_upload::Column::CompleteRequestFingerprint
+                    .eq(&permit.completion_fingerprint),
+            )
+            .filter(
+                multipart_upload::Column::CompletionFencingToken
+                    .eq(i64::try_from(permit.fencing_token).map_err(|_| StagingError::Fenced)?),
+            )
+            .filter(multipart_upload::Column::DestinationOperationId.eq(permit.operation_id))
+            .filter(multipart_upload::Column::DestinationCommit.is_null())
+            .exec(&self.db)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        (updated.rows_affected == 1)
+            .then_some(())
+            .ok_or(StagingError::Fenced)
+    }
+    async fn publishing_uploads(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PublishingMultipartUpload>, StagingError> {
+        multipart_upload::Entity::find()
+            .filter(multipart_upload::Column::Lifecycle.eq("PUBLISHING"))
+            .order_by_asc(multipart_upload::Column::PublishingStartedAtMs)
+            .order_by_asc(multipart_upload::Column::UploadId)
+            .limit(limit as u64)
+            .all(&self.db)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?
+            .into_iter()
+            .map(upload_from_model)
+            .map(|upload| upload.and_then(publishing_upload))
+            .collect()
+    }
+    async fn complete_completion(
+        &self,
+        identity: &MultipartIdentity,
+        permit: &DestinationCommitPermit,
+        result: MultipartCompletionResult,
+        now: i64,
+    ) -> Result<(), StagingError> {
+        let upload = self.get_authorized(identity).await?;
+        if !permit_matches(&upload, permit)
+            || upload
+                .destination_commit
+                .as_ref()
+                .map(|commit| &commit.result)
+                != Some(&result)
+        {
+            return Err(StagingError::Fenced);
+        }
         let result_json = serde_json::to_value(&result).map_err(json_error)?;
         let updated = multipart_upload::Entity::update_many()
             .col_expr(
@@ -1476,11 +1822,44 @@ impl MultipartRepository for PostgresMultipartRepository {
             )
             .col_expr(multipart_upload::Column::UpdatedAtMs, Expr::value(now))
             .filter(multipart_upload::Column::UploadId.eq(identity.upload_id.clone()))
-            .filter(multipart_upload::Column::Lifecycle.eq("COMPLETING"))
+            .filter(multipart_upload::Column::Lifecycle.eq("PUBLISHING"))
             .filter(
                 multipart_upload::Column::CompletionFencingToken
-                    .eq(i64::try_from(fencing_token).map_err(|_| StagingError::Fenced)?),
+                    .eq(i64::try_from(permit.fencing_token).map_err(|_| StagingError::Fenced)?),
             )
+            .filter(multipart_upload::Column::DestinationOperationId.eq(permit.operation_id))
+            .exec(&self.db)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?;
+        (updated.rows_affected == 1)
+            .then_some(())
+            .ok_or(StagingError::Fenced)
+    }
+    async fn clear_destination_commit_reference(
+        &self,
+        identity: &MultipartIdentity,
+        expected_operation_id: Uuid,
+    ) -> Result<(), StagingError> {
+        let updated = multipart_upload::Entity::update_many()
+            .col_expr(
+                multipart_upload::Column::DestinationOperationId,
+                Expr::value(Option::<Uuid>::None),
+            )
+            .col_expr(
+                multipart_upload::Column::DestinationCommit,
+                Expr::value(Option::<serde_json::Value>::None),
+            )
+            .col_expr(
+                multipart_upload::Column::PublishingStartedAtMs,
+                Expr::value(Option::<i64>::None),
+            )
+            .filter(multipart_upload::Column::UploadId.eq(&identity.upload_id))
+            .filter(multipart_upload::Column::TenantId.eq(&identity.tenant_id))
+            .filter(multipart_upload::Column::CredentialPolicyId.eq(&identity.credential_policy_id))
+            .filter(multipart_upload::Column::Bucket.eq(&identity.bucket))
+            .filter(multipart_upload::Column::ObjectKey.eq(&identity.key))
+            .filter(multipart_upload::Column::Lifecycle.is_in(["COMPLETED", "ABORTED", "EXPIRED"]))
+            .filter(multipart_upload::Column::DestinationOperationId.eq(expected_operation_id))
             .exec(&self.db)
             .await
             .map_err(|error| StagingError::Persistence(error.to_string()))?;
@@ -1550,6 +1929,9 @@ impl MultipartRepository for PostgresMultipartRepository {
         if !matches!(upload.lifecycle.as_str(), "ABORTED" | "EXPIRED") {
             return Err(StagingError::NotOpen);
         }
+        if upload.destination_operation_id.is_some() {
+            return Err(StagingError::Fenced);
+        }
         let attempts = multipart_part_attempt::Entity::find()
             .filter(multipart_part_attempt::Column::UploadId.eq(&identity.upload_id))
             .count(&self.db)
@@ -1565,6 +1947,24 @@ impl MultipartRepository for PostgresMultipartRepository {
             .await
             .map_err(|error| StagingError::Persistence(error.to_string()))?;
         Ok(())
+    }
+    async fn terminal_upload_candidates(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<MultipartIdentity>, StagingError> {
+        multipart_upload::Entity::find()
+            .filter(multipart_upload::Column::Lifecycle.is_in(["COMPLETED", "ABORTED", "EXPIRED"]))
+            .filter(multipart_upload::Column::TombstoneUntilMs.lte(now_ms))
+            .order_by_asc(multipart_upload::Column::UpdatedAtMs)
+            .limit(limit as u64)
+            .all(&self.db)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?
+            .into_iter()
+            .map(upload_from_model)
+            .map(|upload| upload.map(|upload| upload.identity))
+            .collect()
     }
     async fn retire_terminal_uploads(
         &self,
@@ -1586,7 +1986,7 @@ impl MultipartRepository for PostgresMultipartRepository {
                 .count(&self.db)
                 .await
                 .map_err(|error| StagingError::Persistence(error.to_string()))?;
-            if attempts > 0 {
+            if attempts > 0 || upload.destination_operation_id.is_some() {
                 continue;
             }
             multipart_upload::Entity::delete_by_id(upload.id)
@@ -1687,12 +2087,131 @@ impl Default for InMemoryMultipartRepository {
     }
 }
 
-fn same_identity(upload: &MultipartUpload, identity: &MultipartIdentity) -> bool {
+pub(crate) fn same_identity(upload: &MultipartUpload, identity: &MultipartIdentity) -> bool {
     upload.identity.tenant_id == identity.tenant_id
         && upload.identity.credential_policy_id == identity.credential_policy_id
         && upload.identity.bucket == identity.bucket
         && upload.identity.key == identity.key
         && upload.identity.upload_id == identity.upload_id
+}
+
+#[derive(Clone)]
+enum MultipartListingEntry {
+    Upload(Box<MultipartUpload>),
+    CommonPrefix(String),
+}
+
+pub(crate) fn paginate_multipart_uploads(
+    mut uploads: Vec<MultipartUpload>,
+    request: &ListMultipartUploadsRequest,
+) -> Result<ListMultipartUploadsPage, StagingError> {
+    if request.max_uploads > MAX_MULTIPART_UPLOADS_PAGE
+        || request.upload_id_marker.is_some() && request.key_marker.is_none()
+        || request.delimiter.as_deref() == Some("")
+    {
+        return Err(StagingError::InvalidListing);
+    }
+    uploads.sort_by(|left, right| {
+        (&left.identity.key, &left.identity.upload_id)
+            .cmp(&(&right.identity.key, &right.identity.upload_id))
+    });
+    let after_marker = |key: &str, upload_id: Option<&str>| match &request.key_marker {
+        None => true,
+        Some(marker) if key > marker.as_str() => true,
+        Some(marker) if key == marker => match &request.upload_id_marker {
+            Some(upload_marker) => upload_id.is_some_and(|id| id > upload_marker.as_str()),
+            None => false,
+        },
+        Some(_) => false,
+    };
+
+    let mut entries = BTreeMap::<(String, Option<String>), MultipartListingEntry>::new();
+    for upload in uploads {
+        if !upload.identity.key.starts_with(&request.prefix) {
+            continue;
+        }
+        if let Some(delimiter) = &request.delimiter {
+            let suffix = &upload.identity.key[request.prefix.len()..];
+            if let Some(index) = suffix.find(delimiter) {
+                let prefix = upload.identity.key[..request.prefix.len() + index + delimiter.len()]
+                    .to_string();
+                if after_marker(&prefix, None) {
+                    entries
+                        .entry((prefix.clone(), None))
+                        .or_insert(MultipartListingEntry::CommonPrefix(prefix));
+                }
+                continue;
+            }
+        }
+        if after_marker(&upload.identity.key, Some(&upload.identity.upload_id)) {
+            entries.insert(
+                (
+                    upload.identity.key.clone(),
+                    Some(upload.identity.upload_id.clone()),
+                ),
+                MultipartListingEntry::Upload(Box::new(upload)),
+            );
+        }
+    }
+
+    let is_truncated = entries.len() > request.max_uploads;
+    let selected: Vec<_> = entries.into_iter().take(request.max_uploads).collect();
+    let (next_key_marker, next_upload_id_marker) = if is_truncated {
+        selected
+            .last()
+            .map(|((key, upload_id), _)| (Some(key.clone()), upload_id.clone()))
+            .unwrap_or((request.key_marker.clone(), request.upload_id_marker.clone()))
+    } else {
+        (None, None)
+    };
+    let mut page = ListMultipartUploadsPage {
+        uploads: Vec::new(),
+        common_prefixes: Vec::new(),
+        is_truncated,
+        next_key_marker,
+        next_upload_id_marker,
+    };
+    for (_, entry) in selected {
+        match entry {
+            MultipartListingEntry::Upload(upload) => page.uploads.push(*upload),
+            MultipartListingEntry::CommonPrefix(prefix) => page.common_prefixes.push(prefix),
+        }
+    }
+    Ok(page)
+}
+
+pub(crate) fn permit_matches(upload: &MultipartUpload, permit: &DestinationCommitPermit) -> bool {
+    upload.lifecycle == MultipartLifecycle::Publishing
+        && upload.identity.upload_id == permit.upload_id
+        && upload.complete_request_fingerprint.as_deref()
+            == Some(permit.completion_fingerprint.as_str())
+        && upload.completion_fencing_token == permit.fencing_token
+        && upload.destination_operation_id == Some(permit.operation_id)
+}
+
+pub(crate) fn publishing_upload(
+    upload: MultipartUpload,
+) -> Result<PublishingMultipartUpload, StagingError> {
+    let fingerprint = upload.complete_request_fingerprint.clone().ok_or_else(|| {
+        StagingError::Persistence("publishing upload is missing its fingerprint".to_string())
+    })?;
+    let operation_id = upload.destination_operation_id.ok_or_else(|| {
+        StagingError::Persistence("publishing upload is missing its operation id".to_string())
+    })?;
+    let publishing_started_at_ms = upload.publishing_started_at_ms.ok_or_else(|| {
+        StagingError::Persistence("publishing upload is missing its start time".to_string())
+    })?;
+    Ok(PublishingMultipartUpload {
+        identity: upload.identity.clone(),
+        permit: DestinationCommitPermit {
+            upload_id: upload.identity.upload_id,
+            completion_fingerprint: fingerprint,
+            fencing_token: upload.completion_fencing_token,
+            operation_id,
+        },
+        publishing_started_at_ms,
+        destination_commit: upload.destination_commit,
+    })
 }
 
 #[async_trait]
@@ -1736,6 +2255,32 @@ impl MultipartRepository for InMemoryMultipartRepository {
             .filter(|upload| same_identity(upload, identity))
             .cloned()
             .ok_or(StagingError::NotFound)
+    }
+
+    async fn list_authorized_uploads(
+        &self,
+        request: &ListMultipartUploadsRequest,
+    ) -> Result<ListMultipartUploadsPage, StagingError> {
+        let uploads = self
+            .state
+            .lock()
+            .await
+            .uploads
+            .values()
+            .filter(|upload| {
+                upload.identity.tenant_id == request.tenant_id
+                    && upload.identity.credential_policy_id == request.credential_policy_id
+                    && upload.identity.bucket == request.bucket
+                    && matches!(
+                        upload.lifecycle,
+                        MultipartLifecycle::Open
+                            | MultipartLifecycle::Completing
+                            | MultipartLifecycle::Publishing
+                    )
+            })
+            .cloned()
+            .collect();
+        paginate_multipart_uploads(uploads, request)
     }
 
     async fn replace_part(
@@ -1788,7 +2333,7 @@ impl MultipartRepository for InMemoryMultipartRepository {
         reserved_bytes: u64,
         now: i64,
     ) -> Result<PendingPart, StagingError> {
-        if part_number == 0 || part_number > MAX_PARTS || reserved_bytes == 0 {
+        if part_number == 0 || part_number > MAX_PARTS {
             return Err(StagingError::InvalidPart);
         }
         let mut state = self.state.lock().await;
@@ -1982,7 +2527,13 @@ impl MultipartRepository for InMemoryMultipartRepository {
                 let upload = state.uploads.get(&attempt.part.upload_id)?;
                 let old_pending = attempt.lifecycle == "PENDING"
                     && attempt.part.created_at_ms <= now - RECONCILIATION_GRACE.as_millis() as i64;
-                (upload.lifecycle.is_terminal() || attempt.lifecycle == "RETIRED" || old_pending)
+                (matches!(
+                    upload.lifecycle,
+                    MultipartLifecycle::Completed
+                        | MultipartLifecycle::Aborted
+                        | MultipartLifecycle::Expired
+                ) || attempt.lifecycle == "RETIRED"
+                    || old_pending)
                     .then(|| CleanupCandidate {
                         upload_id: attempt.part.upload_id.clone(),
                         artifact_key: key.clone(),
@@ -2083,6 +2634,13 @@ impl MultipartRepository for InMemoryMultipartRepository {
                 Err(StagingError::CompletionConflict)
             };
         }
+        if upload.lifecycle == MultipartLifecycle::Publishing {
+            return if upload.complete_request_fingerprint.as_deref() == Some(fingerprint) {
+                Ok(CompletionAcquire::Busy)
+            } else {
+                Err(StagingError::CompletionConflict)
+            };
+        }
         if upload.lifecycle == MultipartLifecycle::Aborted
             || upload.lifecycle == MultipartLifecycle::Expired
         {
@@ -2172,10 +2730,148 @@ impl MultipartRepository for InMemoryMultipartRepository {
         .ok_or(StagingError::Fenced)
     }
 
+    async fn begin_destination_commit(
+        &self,
+        identity: &MultipartIdentity,
+        fingerprint: &str,
+        fencing_token: u64,
+        operation_id: Uuid,
+        now: i64,
+    ) -> Result<DestinationCommitPermit, StagingError> {
+        if operation_id
+            != DestinationCommitPermit::deterministic_operation_id(identity, fingerprint)
+        {
+            return Err(StagingError::Fenced);
+        }
+        let mut state = self.state.lock().await;
+        let upload = state
+            .uploads
+            .get_mut(&identity.upload_id)
+            .filter(|upload| same_identity(upload, identity))
+            .ok_or(StagingError::NotFound)?;
+        if upload.lifecycle != MultipartLifecycle::Completing
+            || upload.complete_request_fingerprint.as_deref() != Some(fingerprint)
+            || upload.completion_fencing_token != fencing_token
+            || upload
+                .completion_lease_expires_at_ms
+                .is_none_or(|expiry| expiry <= now)
+        {
+            return Err(StagingError::Fenced);
+        }
+        upload.lifecycle = MultipartLifecycle::Publishing;
+        upload.destination_operation_id = Some(operation_id);
+        upload.publishing_started_at_ms = Some(now);
+        upload.destination_commit = None;
+        upload.completion_lease_owner = None;
+        upload.completion_lease_expires_at_ms = None;
+        upload.updated_at_ms = now;
+        Ok(DestinationCommitPermit {
+            upload_id: identity.upload_id.clone(),
+            completion_fingerprint: fingerprint.to_string(),
+            fencing_token,
+            operation_id,
+        })
+    }
+
+    async fn validate_destination_commit_permit(
+        &self,
+        permit: &DestinationCommitPermit,
+    ) -> Result<(), StagingError> {
+        let state = self.state.lock().await;
+        let upload = state
+            .uploads
+            .get(&permit.upload_id)
+            .ok_or(StagingError::Fenced)?;
+        permit_matches(upload, permit)
+            .then_some(())
+            .ok_or(StagingError::Fenced)
+    }
+
+    async fn record_destination_commit(
+        &self,
+        permit: &DestinationCommitPermit,
+        result: MultipartCompletionResult,
+        now: i64,
+    ) -> Result<(), StagingError> {
+        let mut state = self.state.lock().await;
+        let upload = state
+            .uploads
+            .get_mut(&permit.upload_id)
+            .ok_or(StagingError::Fenced)?;
+        if !permit_matches(upload, permit) {
+            return Err(StagingError::Fenced);
+        }
+        let record = DestinationCommitRecord {
+            operation_id: permit.operation_id,
+            result,
+            committed_at_ms: now,
+        };
+        if let Some(existing) = &upload.destination_commit {
+            return if existing.operation_id == record.operation_id
+                && existing.result == record.result
+            {
+                Ok(())
+            } else {
+                Err(StagingError::CompletionConflict)
+            };
+        }
+        upload.destination_commit = Some(record);
+        upload.updated_at_ms = now;
+        Ok(())
+    }
+
+    async fn release_destination_commit_after_proven_absence(
+        &self,
+        permit: &DestinationCommitPermit,
+        now: i64,
+    ) -> Result<(), StagingError> {
+        let mut state = self.state.lock().await;
+        let upload = state
+            .uploads
+            .get_mut(&permit.upload_id)
+            .ok_or(StagingError::Fenced)?;
+        if !permit_matches(upload, permit) || upload.destination_commit.is_some() {
+            return Err(StagingError::Fenced);
+        }
+        upload.lifecycle = MultipartLifecycle::Completing;
+        upload.destination_operation_id = None;
+        upload.publishing_started_at_ms = None;
+        upload.completion_lease_owner = None;
+        upload.completion_lease_expires_at_ms = Some(now);
+        upload.updated_at_ms = now;
+        Ok(())
+    }
+
+    async fn publishing_uploads(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PublishingMultipartUpload>, StagingError> {
+        let mut uploads: Vec<_> = self
+            .state
+            .lock()
+            .await
+            .uploads
+            .values()
+            .filter(|upload| upload.lifecycle == MultipartLifecycle::Publishing)
+            .cloned()
+            .collect();
+        uploads.sort_by_key(|upload| {
+            (
+                upload.publishing_started_at_ms.unwrap_or(i64::MIN),
+                upload.identity.upload_id.clone(),
+            )
+        });
+        uploads
+            .into_iter()
+            .take(limit)
+            .map(publishing_upload)
+            .collect()
+    }
+
     async fn complete_completion(
         &self,
         identity: &MultipartIdentity,
-        fencing_token: u64,
+        permit: &DestinationCommitPermit,
         result: MultipartCompletionResult,
         now: i64,
     ) -> Result<(), StagingError> {
@@ -2185,11 +2881,12 @@ impl MultipartRepository for InMemoryMultipartRepository {
             .get_mut(&identity.upload_id)
             .filter(|upload| same_identity(upload, identity))
             .ok_or(StagingError::NotFound)?;
-        if upload.lifecycle != MultipartLifecycle::Completing
-            || upload.completion_fencing_token != fencing_token
+        if !permit_matches(upload, permit)
             || upload
-                .completion_lease_expires_at_ms
-                .is_none_or(|expires| expires <= now)
+                .destination_commit
+                .as_ref()
+                .map(|commit| &commit.result)
+                != Some(&result)
         {
             return Err(StagingError::Fenced);
         }
@@ -2199,6 +2896,32 @@ impl MultipartRepository for InMemoryMultipartRepository {
         upload.completion_lease_expires_at_ms = None;
         upload.tombstone_until_ms = Some(now + DEFAULT_EXPIRY.as_millis() as i64);
         upload.updated_at_ms = now;
+        Ok(())
+    }
+
+    async fn clear_destination_commit_reference(
+        &self,
+        identity: &MultipartIdentity,
+        expected_operation_id: Uuid,
+    ) -> Result<(), StagingError> {
+        let mut state = self.state.lock().await;
+        let upload = state
+            .uploads
+            .get_mut(&identity.upload_id)
+            .filter(|upload| same_identity(upload, identity))
+            .ok_or(StagingError::NotFound)?;
+        if !matches!(
+            upload.lifecycle,
+            MultipartLifecycle::Completed
+                | MultipartLifecycle::Aborted
+                | MultipartLifecycle::Expired
+        ) || upload.destination_operation_id != Some(expected_operation_id)
+        {
+            return Err(StagingError::Fenced);
+        }
+        upload.destination_operation_id = None;
+        upload.destination_commit = None;
+        upload.publishing_started_at_ms = None;
         Ok(())
     }
 
@@ -2242,10 +2965,15 @@ impl MultipartRepository for InMemoryMultipartRepository {
         if !matches!(
             upload.lifecycle,
             MultipartLifecycle::Aborted | MultipartLifecycle::Expired
-        ) || state
-            .attempts
-            .values()
-            .any(|attempt| attempt.part.upload_id == identity.upload_id)
+        ) || upload.destination_operation_id.is_some()
+            || state
+                .attempts
+                .values()
+                .any(|attempt| attempt.part.upload_id == identity.upload_id)
+            || state
+                .parts
+                .values()
+                .any(|part| part.upload_id == identity.upload_id)
             || state
                 .pending
                 .values()
@@ -2257,6 +2985,33 @@ impl MultipartRepository for InMemoryMultipartRepository {
         }
         state.uploads.remove(&identity.upload_id);
         Ok(())
+    }
+    async fn terminal_upload_candidates(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<MultipartIdentity>, StagingError> {
+        let state = self.state.lock().await;
+        let mut uploads = state
+            .uploads
+            .values()
+            .filter(|upload| {
+                matches!(
+                    upload.lifecycle,
+                    MultipartLifecycle::Completed
+                        | MultipartLifecycle::Aborted
+                        | MultipartLifecycle::Expired
+                ) && upload
+                    .tombstone_until_ms
+                    .is_some_and(|until| until <= now_ms)
+            })
+            .collect::<Vec<_>>();
+        uploads.sort_by_key(|upload| (upload.updated_at_ms, upload.identity.upload_id.clone()));
+        Ok(uploads
+            .into_iter()
+            .take(limit)
+            .map(|upload| upload.identity.clone())
+            .collect())
     }
     async fn retire_terminal_uploads(
         &self,
@@ -2284,6 +3039,11 @@ impl MultipartRepository for InMemoryMultipartRepository {
                         .pending
                         .values()
                         .any(|pending| pending.upload_id == upload.identity.upload_id)
+                    && !state
+                        .parts
+                        .values()
+                        .any(|part| part.upload_id == upload.identity.upload_id)
+                    && upload.destination_operation_id.is_none()
             })
             .take(limit)
             .map(|upload| upload.identity.upload_id.clone())
@@ -2337,11 +3097,67 @@ pub trait StagingArtifactStore: Send + Sync {
     async fn put_file(&self, key: &str, path: &Path) -> Result<(), StagingError>;
     /// Returns an incremental encrypted artifact body. Callers decrypt frame by
     /// frame and must hold a valid completion fence for every read.
-    async fn get(&self, key: &str) -> Result<aws_sdk_s3::primitives::ByteStream, StagingError>;
+    async fn get(&self, key: &str) -> Result<StagingArtifactReader, StagingError>;
     async fn delete(&self, key: &str) -> Result<(), StagingError>;
     /// Discovery is required for startup reconciliation. Implementations must
     /// return every object below the supplied prefix, not an arbitrary page.
     async fn list(&self, prefix: &str) -> Result<Vec<StagedArtifact>, StagingError>;
+}
+
+#[cfg(test)]
+pub(crate) async fn assert_artifact_store_contract(
+    store: &dyn StagingArtifactStore,
+    source_root: &Path,
+) {
+    let upload_id = Uuid::nil();
+    let first = format!("{ARTIFACT_PREFIX}tenant-a/{upload_id}/2/1");
+    let second = format!("{ARTIFACT_PREFIX}tenant-a/{upload_id}/1/1");
+    let write_source = |name: &str, bytes: &[u8]| {
+        let path = source_root.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+
+    store
+        .put_file(&first, &write_source("contract-first.tmp", b"first"))
+        .await
+        .unwrap();
+    store
+        .put_file(&second, &write_source("contract-second.tmp", b"second"))
+        .await
+        .unwrap();
+    store
+        .put_file(
+            &first,
+            &write_source("contract-replacement.tmp", b"replacement"),
+        )
+        .await
+        .unwrap();
+
+    let mut reader = store.get(&first).await.unwrap();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes, b"replacement");
+    let listed = store.list(ARTIFACT_PREFIX).await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|artifact| artifact.key.as_str())
+            .collect::<Vec<_>>(),
+        vec![second.as_str(), first.as_str()]
+    );
+    assert!(listed.iter().all(|artifact| artifact.modified_at_ms > 0));
+
+    store.delete(&first).await.unwrap();
+    store.delete(&first).await.unwrap();
+    assert!(matches!(
+        store.get(&first).await,
+        Err(StagingError::NotFound)
+    ));
+    store.delete(&second).await.unwrap();
+    let _ = std::fs::remove_file(source_root.join("contract-first.tmp"));
+    let _ = std::fs::remove_file(source_root.join("contract-second.tmp"));
+    let _ = std::fs::remove_file(source_root.join("contract-replacement.tmp"));
 }
 
 pub struct S3StagingArtifactStore {
@@ -2373,17 +3189,21 @@ impl StagingArtifactStore for S3StagingArtifactStore {
             })?;
         Ok(())
     }
-    async fn get(&self, key: &str) -> Result<aws_sdk_s3::primitives::ByteStream, StagingError> {
-        self.client
+    async fn get(&self, key: &str) -> Result<StagingArtifactReader, StagingError> {
+        let output = self
+            .client
             .get_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
             .await
-            .map(|output| output.body)
             .map_err(|error| {
                 StagingError::Persistence(record_s3_failure("staging_get", &error).to_string())
-            })
+            })?;
+        let length = u64::try_from(output.content_length().unwrap_or_default()).map_err(|_| {
+            StagingError::Persistence("staging artifact has a negative content length".to_string())
+        })?;
+        Ok(Box::pin(output.body.into_async_read().take(length)))
     }
     async fn delete(&self, key: &str) -> Result<(), StagingError> {
         self.client
@@ -2428,6 +3248,7 @@ impl StagingArtifactStore for S3StagingArtifactStore {
                 ));
             }
         }
+        artifacts.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(artifacts)
     }
 }
@@ -2453,20 +3274,23 @@ impl StagingArtifactStore for MemoryStagingArtifactStore {
         );
         Ok(())
     }
-    async fn get(&self, key: &str) -> Result<aws_sdk_s3::primitives::ByteStream, StagingError> {
-        self.objects
+    async fn get(&self, key: &str) -> Result<StagingArtifactReader, StagingError> {
+        let bytes = self
+            .objects
             .lock()
             .await
             .get(key)
-            .map(|(bytes, _)| aws_sdk_s3::primitives::ByteStream::from(bytes.clone()))
-            .ok_or(StagingError::NotFound)
+            .map(|(bytes, _)| bytes.clone())
+            .ok_or(StagingError::NotFound)?;
+        let length = bytes.len() as u64;
+        Ok(Box::pin(std::io::Cursor::new(bytes).take(length)))
     }
     async fn delete(&self, key: &str) -> Result<(), StagingError> {
         self.objects.lock().await.remove(key);
         Ok(())
     }
     async fn list(&self, prefix: &str) -> Result<Vec<StagedArtifact>, StagingError> {
-        Ok(self
+        let mut artifacts = self
             .objects
             .lock()
             .await
@@ -2476,7 +3300,9 @@ impl StagingArtifactStore for MemoryStagingArtifactStore {
                 key: key.clone(),
                 modified_at_ms: *modified_at_ms,
             })
-            .collect())
+            .collect::<Vec<_>>();
+        artifacts.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(artifacts)
     }
 }
 
@@ -2644,7 +3470,15 @@ impl EncryptedPartWriter {
         let mut removed = 0;
         while let Some(entry) = entries.next_entry().await.map_err(io_error)? {
             let name = entry.file_name();
-            if !name.to_string_lossy().starts_with(FILE_PREFIX) {
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let owned = name
+                .strip_prefix(FILE_PREFIX)
+                .and_then(|name| name.strip_suffix(".enc"))
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .is_some();
+            if !owned {
                 continue;
             }
             let metadata = entry.metadata().await.map_err(io_error)?;
@@ -2813,6 +3647,54 @@ pub fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::key_cipher::LocalKeyWrapping;
+    use crate::local_storage::LocalStorageRuntime;
+
+    #[tokio::test]
+    async fn memory_artifact_store_matches_shared_contract() {
+        let directory =
+            std::env::temp_dir().join(format!("maskura-memory-artifacts-{}", Uuid::now_v7()));
+        std::fs::create_dir(&directory).unwrap();
+        assert_artifact_store_contract(&MemoryStagingArtifactStore::default(), &directory).await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn s3_artifact_get_adapts_to_provider_neutral_reader() {
+        use aws_config::Region;
+        use aws_credential_types::Credentials;
+        use axum::Router;
+        use axum::body::Body;
+
+        let app = Router::new().fallback(|| async {
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header(axum::http::header::CONTENT_LENGTH, "10")
+                .body(Body::from("ciphertext"))
+                .unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .credentials_provider(Credentials::new("key", "secret", None, None, "test"))
+            .retry_config(crate::s3_safety::s3_retry_config())
+            .load()
+            .await;
+        let client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::from(&config)
+                .force_path_style(true)
+                .build(),
+        );
+        let store = S3StagingArtifactStore::new(client, "staging".to_string());
+
+        let mut reader = store.get("multipart/artifact").await.unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"ciphertext");
+        server.abort();
+    }
 
     #[test]
     fn legacy_completion_result_json_defaults_new_accounting_fields() {
@@ -2864,13 +3746,16 @@ mod tests {
             completion_lease_owner: None,
             completion_lease_expires_at_ms: None,
             completion_fencing_token: 0,
+            destination_operation_id: None,
+            publishing_started_at_ms: None,
+            destination_commit: None,
             completion_result: None,
         }
     }
 
     #[tokio::test]
     async fn ownership_replacement_pagination_and_expiry_are_fenced() {
-        let repo = InMemoryMultipartRepository::new();
+        let repo = Arc::new(InMemoryMultipartRepository::new());
         repo.create(upload()).await.unwrap();
         let mut thief = identity();
         thief.tenant_id = "tenant-b".to_string();
@@ -2926,7 +3811,7 @@ mod tests {
 
     #[tokio::test]
     async fn replacement_race_keeps_one_current_attempt_across_restartable_repository_state() {
-        let repo = InMemoryMultipartRepository::new();
+        let repo = Arc::new(InMemoryMultipartRepository::new());
         repo.create(upload()).await.unwrap();
         let first = MultipartPart {
             upload_id: "upload".to_string(),
@@ -3131,6 +4016,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encrypted_part_decrypts_after_local_runtime_restart() {
+        let root = std::env::temp_dir().join(format!("maskura-stage-restart-{}", Uuid::now_v7()));
+        std::fs::create_dir(&root).unwrap();
+        let runtime = LocalStorageRuntime::new(root.clone()).await.unwrap();
+        let staging = runtime.multipart_root().join("tmp");
+        let snapshot = snapshot();
+        let mut restart_identity = identity();
+        restart_identity.upload_id = Uuid::now_v7().to_string();
+        let mut writer = EncryptedPartWriter::begin(
+            &staging,
+            &restart_identity,
+            1,
+            1,
+            &snapshot,
+            1024,
+            runtime.wrapping(),
+        )
+        .await
+        .unwrap();
+        writer
+            .write(Bytes::from_static(b"survives-a-runtime-restart"))
+            .await
+            .unwrap();
+        let finished = writer.finish().await.unwrap();
+        let part = MultipartPart {
+            upload_id: restart_identity.upload_id.clone(),
+            part_number: 1,
+            attempt: 1,
+            artifact_key: format!(
+                "{ARTIFACT_PREFIX}{}/{}/1/1",
+                restart_identity.tenant_id, restart_identity.upload_id
+            ),
+            etag: finished.etag.clone(),
+            checksum_sha256: finished.checksum_sha256.clone(),
+            size_bytes: finished.size_bytes,
+            created_at_ms: now_ms(),
+        };
+        runtime
+            .staging_artifacts()
+            .put_file(&part.artifact_key, &finished.path)
+            .await
+            .unwrap();
+        drop(runtime);
+
+        let restarted = LocalStorageRuntime::new(root.clone()).await.unwrap();
+        let body = restarted
+            .staging_artifacts()
+            .get(&part.artifact_key)
+            .await
+            .unwrap();
+        let mut reader = EncryptedPartReader::open(
+            body,
+            &restart_identity,
+            &part,
+            &snapshot,
+            restarted.wrapping(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reader.next_chunk().await.unwrap().unwrap(),
+            Bytes::from_static(b"survives-a-runtime-restart")
+        );
+        assert!(reader.next_chunk().await.unwrap().is_none());
+        restarted
+            .staging_artifacts()
+            .delete(&part.artifact_key)
+            .await
+            .unwrap();
+        drop(restarted);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn concurrent_reservations_cannot_overcommit_global_quota() {
         let repo = Arc::new(InMemoryMultipartRepository::with_quotas(
             StagingQuotaLimits::new(10, 10).unwrap(),
@@ -3211,14 +4171,19 @@ mod tests {
         number: u32,
         etag: &str,
         checksum: &str,
-    ) {
-        repo.replace_part(
+    ) -> String {
+        let pending = repo
+            .begin_part(&identity(), number, 3, now_ms())
+            .await
+            .unwrap();
+        repo.commit_part(
             &identity(),
+            &pending,
             MultipartPart {
                 upload_id: "upload".to_string(),
                 part_number: number,
-                attempt: 1,
-                artifact_key: format!("artifact-{number}"),
+                attempt: pending.attempt,
+                artifact_key: pending.artifact_key.clone(),
                 etag: etag.to_string(),
                 checksum_sha256: checksum.to_string(),
                 size_bytes: 3,
@@ -3227,32 +4192,12 @@ mod tests {
         )
         .await
         .unwrap();
-    }
-
-    #[tokio::test]
-    async fn completing_upload_parts_are_not_cleanup_candidates() {
-        let repo = InMemoryMultipartRepository::new();
-        repo.create(upload()).await.unwrap();
-        current_part(&repo, 1, "\"one\"", "sha-one").await;
-        let request = vec![complete_part(1, "\"one\"", Some("sha-one"))];
-        assert!(matches!(
-            repo.acquire_completion(&identity(), "fingerprint", &request, "worker-a", 100, 0)
-                .await
-                .unwrap(),
-            CompletionAcquire::Acquired(_)
-        ));
-
-        assert!(
-            repo.cleanup_candidates(now_ms(), 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        pending.artifact_key
     }
 
     #[tokio::test]
     async fn completion_replays_only_the_identical_durable_request() {
-        let repo = InMemoryMultipartRepository::new();
+        let repo = Arc::new(InMemoryMultipartRepository::new());
         repo.create(upload()).await.unwrap();
         current_part(&repo, 1, "\"one\"", "sha-one").await;
         let request = vec![complete_part(1, "\"one\"", Some("sha-one"))];
@@ -3264,21 +4209,30 @@ mod tests {
             CompletionAcquire::Acquired(lease) => lease,
             _ => panic!("expected completion lease"),
         };
-        repo.complete_completion(
-            &identity(),
-            lease.fencing_token,
-            MultipartCompletionResult {
-                etag: Some("\"output\"".to_string()),
-                checksum_sha256: "output-sha".to_string(),
-                version_id: Some("version-a".to_string()),
-                source_bytes: 24,
-                size_bytes: 42,
-                pipeline_evidence: None,
-            },
-            1,
-        )
-        .await
-        .unwrap();
+        let permit = repo
+            .begin_destination_commit(
+                &identity(),
+                "fingerprint",
+                lease.fencing_token,
+                DestinationCommitPermit::deterministic_operation_id(&identity(), "fingerprint"),
+                1,
+            )
+            .await
+            .unwrap();
+        let result = MultipartCompletionResult {
+            etag: Some("\"output\"".to_string()),
+            checksum_sha256: "output-sha".to_string(),
+            version_id: Some("version-a".to_string()),
+            source_bytes: 24,
+            size_bytes: 42,
+            pipeline_evidence: None,
+        };
+        repo.record_destination_commit(&permit, result.clone(), 1)
+            .await
+            .unwrap();
+        repo.complete_completion(&identity(), &permit, result, 1)
+            .await
+            .unwrap();
         assert!(matches!(
             repo.acquire_completion(&identity(), "fingerprint", &request, "worker-b", 200, 2)
                 .await,
@@ -3292,6 +4246,200 @@ mod tests {
                 .await,
             Err(StagingError::CompletionConflict)
         ));
+    }
+
+    #[tokio::test]
+    async fn authorized_upload_listing_is_stable_and_marker_paginated() {
+        let repo = InMemoryMultipartRepository::new();
+        for (key, upload_id) in [("b", "3"), ("a", "2"), ("dir/x", "4"), ("a", "1")] {
+            let mut candidate = upload();
+            candidate.identity.key = key.to_string();
+            candidate.identity.upload_id = upload_id.to_string();
+            repo.create(candidate).await.unwrap();
+        }
+        let request = ListMultipartUploadsRequest {
+            tenant_id: "tenant-a".to_string(),
+            credential_policy_id: "key-a".to_string(),
+            bucket: "bucket".to_string(),
+            prefix: String::new(),
+            delimiter: None,
+            key_marker: None,
+            upload_id_marker: None,
+            max_uploads: 2,
+        };
+        let first = repo.list_authorized_uploads(&request).await.unwrap();
+        assert_eq!(
+            first
+                .uploads
+                .iter()
+                .map(|upload| (
+                    upload.identity.key.as_str(),
+                    upload.identity.upload_id.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [("a", "1"), ("a", "2")]
+        );
+        assert!(first.is_truncated);
+        let second = repo
+            .list_authorized_uploads(&ListMultipartUploadsRequest {
+                key_marker: first.next_key_marker,
+                upload_id_marker: first.next_upload_id_marker,
+                ..request.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .uploads
+                .iter()
+                .map(|upload| upload.identity.key.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "dir/x"]
+        );
+        let delimited = repo
+            .list_authorized_uploads(&ListMultipartUploadsRequest {
+                delimiter: Some("/".to_string()),
+                max_uploads: 10,
+                ..request.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(delimited.common_prefixes, ["dir/"]);
+        let unauthorized = repo
+            .list_authorized_uploads(&ListMultipartUploadsRequest {
+                tenant_id: "tenant-b".to_string(),
+                max_uploads: 10,
+                ..request
+            })
+            .await
+            .unwrap();
+        assert!(unauthorized.uploads.is_empty());
+        assert!(unauthorized.common_prefixes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn publishing_permits_fence_takeover_recovery_commit_and_retirement() {
+        let repo = InMemoryMultipartRepository::new();
+        repo.create(upload()).await.unwrap();
+        let artifact_key = current_part(&repo, 1, "\"one\"", "sha-one").await;
+        let selected = [complete_part(1, "\"one\"", Some("sha-one"))];
+        let lease = match repo
+            .acquire_completion(&identity(), "fingerprint", &selected, "worker-a", 100, 0)
+            .await
+            .unwrap()
+        {
+            CompletionAcquire::Acquired(lease) => lease,
+            _ => panic!("expected completion lease"),
+        };
+        let operation_id =
+            DestinationCommitPermit::deterministic_operation_id(&identity(), "fingerprint");
+        let permit = repo
+            .begin_destination_commit(
+                &identity(),
+                "fingerprint",
+                lease.fencing_token,
+                operation_id,
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.acquire_completion(
+                &identity(),
+                "fingerprint",
+                &selected,
+                "worker-b",
+                2000,
+                1000
+            )
+            .await,
+            Ok(CompletionAcquire::Busy)
+        ));
+        let mut stale = permit.clone();
+        stale.fencing_token += 1;
+        assert!(
+            repo.validate_destination_commit_permit(&stale)
+                .await
+                .is_err()
+        );
+        assert_eq!(repo.publishing_uploads(10).await.unwrap()[0].permit, permit);
+        assert!(
+            repo.cleanup_candidates(i64::MAX, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repo.release_destination_commit_after_proven_absence(&stale, 2)
+                .await
+                .is_err()
+        );
+        repo.release_destination_commit_after_proven_absence(&permit, 2)
+            .await
+            .unwrap();
+        assert!(
+            repo.validate_destination_commit_permit(&permit)
+                .await
+                .is_err()
+        );
+
+        let lease = match repo
+            .acquire_completion(&identity(), "fingerprint", &selected, "worker-b", 200, 3)
+            .await
+            .unwrap()
+        {
+            CompletionAcquire::Acquired(lease) => lease,
+            _ => panic!("expected completion takeover"),
+        };
+        let permit = repo
+            .begin_destination_commit(
+                &identity(),
+                "fingerprint",
+                lease.fencing_token,
+                operation_id,
+                4,
+            )
+            .await
+            .unwrap();
+        let result = MultipartCompletionResult {
+            etag: Some("\"output\"".to_string()),
+            checksum_sha256: "output-sha".to_string(),
+            version_id: Some("version".to_string()),
+            source_bytes: 3,
+            size_bytes: 4,
+            pipeline_evidence: None,
+        };
+        repo.record_destination_commit(&permit, result.clone(), 5)
+            .await
+            .unwrap();
+        repo.record_destination_commit(&permit, result.clone(), 6)
+            .await
+            .unwrap();
+        assert!(
+            repo.release_destination_commit_after_proven_absence(&permit, 7)
+                .await
+                .is_err()
+        );
+        repo.complete_completion(&identity(), &permit, result, 7)
+            .await
+            .unwrap();
+        repo.confirm_artifact_deleted(&artifact_key).await.unwrap();
+        assert!(
+            repo.retire_terminal_uploads(i64::MAX, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        repo.clear_destination_commit_reference(&identity(), operation_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.retire_terminal_uploads(i64::MAX, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -3410,5 +4558,49 @@ mod tests {
             .await,
             Err(StagingError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn zero_byte_part_can_be_uploaded_listed_and_selected_as_the_final_part() {
+        let repo = InMemoryMultipartRepository::new();
+        repo.create(upload()).await.unwrap();
+        let pending = repo
+            .begin_part(&identity(), 1, 0, now_ms())
+            .await
+            .expect("a zero-byte reservation is a valid final part");
+        let zero = MultipartPart {
+            upload_id: "upload".to_string(),
+            part_number: 1,
+            attempt: pending.attempt,
+            artifact_key: pending.artifact_key.clone(),
+            etag: "\"empty\"".to_string(),
+            checksum_sha256: "empty-sha".to_string(),
+            size_bytes: 0,
+            created_at_ms: now_ms(),
+        };
+        repo.commit_part(&identity(), &pending, zero.clone())
+            .await
+            .unwrap();
+        let (parts, truncated) = repo.list_parts(&identity(), 0, 1000).await.unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].size_bytes, 0);
+        assert!(!truncated);
+        let lease = match repo
+            .acquire_completion(
+                &identity(),
+                "zero-final",
+                &[complete_part(1, "\"empty\"", Some("empty-sha"))],
+                "worker",
+                100,
+                now_ms(),
+            )
+            .await
+            .unwrap()
+        {
+            CompletionAcquire::Acquired(lease) => lease,
+            _ => panic!("expected completion lease for a zero-byte final part"),
+        };
+        assert_eq!(lease.selected_parts.len(), 1);
+        assert_eq!(lease.selected_parts[0].size_bytes, 0);
     }
 }

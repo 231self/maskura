@@ -14,6 +14,7 @@ use axum::http::HeaderMap;
 use reqwest::Url;
 
 use crate::customer_headers;
+use crate::file_store::FileStore;
 use crate::s3_safety::{s3_retry_config, s3_timeout_config};
 use crate::service_storage::ServiceStorage;
 use crate::store::MemoryStore;
@@ -42,6 +43,7 @@ pub enum BackendKind {
     PerUserS3,
     Managed,
     GlobalS3,
+    File,
     Memory,
 }
 
@@ -164,6 +166,7 @@ pub enum ResolvedBackend {
         workspace_streaming: Option<WorkspaceS3Streaming>,
     },
     Managed(Arc<ServiceStorage>),
+    File(Arc<FileStore>),
     Memory(Arc<MemoryStore>),
 }
 
@@ -173,6 +176,7 @@ impl ResolvedBackend {
             Self::PresignedHttp(_) => BackendKind::PresignedHttp,
             Self::S3 { kind, .. } => *kind,
             Self::Managed(_) => BackendKind::Managed,
+            Self::File(_) => BackendKind::File,
             Self::Memory(_) => BackendKind::Memory,
         }
     }
@@ -207,6 +211,7 @@ pub struct BackendResolver {
     workspace_storage: Arc<dyn WorkspaceStorageRepository>,
     managed: Arc<ServiceStorage>,
     global_s3: Option<Client>,
+    file: Option<Arc<FileStore>>,
     memory: Arc<MemoryStore>,
     explicit_single_tenant: bool,
     workspace_endpoint_policy: WorkspaceEndpointPolicy,
@@ -225,10 +230,16 @@ impl BackendResolver {
             workspace_storage,
             managed,
             global_s3,
+            file: None,
             memory,
             explicit_single_tenant,
             workspace_endpoint_policy,
         }
+    }
+
+    pub fn with_file_store(mut self, file: Option<Arc<FileStore>>) -> Self {
+        self.file = file;
+        self
     }
 
     pub async fn resolve(
@@ -428,6 +439,12 @@ impl BackendResolver {
                     client: client.clone(),
                     workspace_streaming: None,
                 },
+                workspace_routing,
+            });
+        }
+        if let Some(store) = &self.file {
+            return Ok(ResolvedBackendSelection {
+                backend: ResolvedBackend::File(store.clone()),
                 workspace_routing,
             });
         }
@@ -1717,6 +1734,31 @@ mod tests {
             workspace_policy(true),
         );
         assert_operations_resolve_to(&local, &HeaderMap::new(), BackendKind::Memory).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_single_tenant_mode_prefers_configured_file_storage() {
+        use crate::workspace_storage::InMemoryWorkspaceStorageRepository;
+
+        let root =
+            std::env::temp_dir().join(format!("maskura-backend-file-{}", uuid::Uuid::now_v7()));
+        let file = Arc::new(
+            crate::file_store::FileStore::new(root.clone())
+                .await
+                .unwrap(),
+        );
+        let resolver = BackendResolver::new(
+            Arc::new(InMemoryWorkspaceStorageRepository::new()),
+            Arc::new(ServiceStorage::new(Vec::new())),
+            None,
+            Arc::new(MemoryStore::new()),
+            true,
+            workspace_policy(true),
+        )
+        .with_file_store(Some(file));
+
+        assert_operations_resolve_to(&resolver, &HeaderMap::new(), BackendKind::File).await;
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     #[tokio::test]

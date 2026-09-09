@@ -11,6 +11,8 @@ COPY dist/s4-gateway /usr/local/bin/s4-gateway
 COPY dist/components /app/components
 ENV MASKURA_FILTER_COMPONENT=/app/components/pii-default.component.wasm
 ENV MASKURA_PLUGINS_DIR=/app/components
+ENV MASKURA_KEYS_FILE=/data/keys.json
 ENV LISTEN_ADDR=0.0.0.0:8080
+VOLUME ["/data"]
 EXPOSE 8080
 ENTRYPOINT ["s4-gateway"]

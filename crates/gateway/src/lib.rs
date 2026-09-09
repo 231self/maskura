@@ -6,12 +6,20 @@ pub mod binary_reductor;
 pub mod control;
 pub mod customer_headers;
 pub mod entity;
+pub(crate) mod file_multipart_repository;
+pub(crate) mod file_staging_artifact;
+pub mod file_store;
+// Removed once the Phase 2 repositories consume every persistence primitive.
+#[allow(dead_code, reason = "introduced before its ordered Phase 2 consumers")]
+pub(crate) mod filesystem_persistence;
 pub mod format;
 pub mod hybrid;
 pub mod integrity;
 pub mod key_cipher;
+pub(crate) mod local_storage;
 pub mod managed;
 pub use maskura_mcp_protocol as mcp;
+pub(crate) mod multipart_completion;
 pub mod multipart_staging;
 pub mod object;
 pub mod pipeline;

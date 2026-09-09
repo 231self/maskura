@@ -23,6 +23,7 @@ pub struct Model {
     pub expected_size: Option<i64>,
     pub expected_metadata: Json,
     pub upload_id: Option<String>,
+    pub client_multipart_upload_id: Option<String>,
     pub committed_etag: Option<String>,
     pub committed_version_id: Option<String>,
     pub committed_superseded_version_ids: Json,

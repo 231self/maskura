@@ -6,7 +6,10 @@ use sha2::{Digest, Sha256};
 
 use crate::store::MemoryStore;
 
-use super::{ObjectSinkTransaction, SinkCommitState, StoredObjectMeta, TransactionError};
+use super::{
+    DestinationCommitAuthority, ObjectSinkTransaction, SinkCommitState, StoredObjectMeta,
+    TransactionError,
+};
 
 /// Development-only atomic sink. Its configured limit is a hard memory bound;
 /// bytes are published to MemoryStore only after complete validation.
@@ -84,13 +87,17 @@ impl ObjectSinkTransaction for MemorySinkTransaction {
         Ok(())
     }
 
-    async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError> {
+    async fn complete(
+        &mut self,
+        authority: DestinationCommitAuthority,
+    ) -> Result<StoredObjectMeta, TransactionError> {
         if self.finished {
             return Err(TransactionError::Finished);
         }
         if !self.output_verified {
             return Err(TransactionError::OutputMismatch);
         }
+        authority.validate(None, &self.bucket, &self.key).await?;
         let object = self.store.put(
             &self.bucket,
             &self.key,

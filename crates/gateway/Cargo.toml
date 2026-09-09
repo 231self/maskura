@@ -33,6 +33,7 @@ md-5.workspace = true
 aes-gcm.workspace = true
 rand.workspace = true
 zeroize.workspace = true
+libc = "0.2"
 ml-kem.workspace = true
 x25519-dalek.workspace = true
 hkdf.workspace = true
@@ -64,7 +65,6 @@ chrono = "0.4"
 num-bigint = "0.4"
 
 [dev-dependencies]
-libc = "0.2"
 proptest.workspace = true
 pollster = "0.4"
 tower = "0.5"

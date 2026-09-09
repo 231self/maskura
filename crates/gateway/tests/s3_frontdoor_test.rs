@@ -10,6 +10,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use http_body::{Frame, SizeHint};
+use http_body_util::BodyExt as _;
 use s4_gateway::Gateway;
 use s4_gateway::backend::{
     AddressResolver, PresignedHttpPolicy, TokioAddressResolver, WorkspaceEndpointPolicy,
@@ -19,6 +20,7 @@ use s4_gateway::control::{
     BlockReason, ControlPlane, MeteringError, NoopControlPlane, RequestKind, UsageAuthorization,
     UsageEvent, UsageRoute,
 };
+use s4_gateway::file_store::FileStore;
 use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher, default_wrapping};
 use s4_gateway::mcp::{
     DeleteObjectRequest, GetObjectRequest, ListObjectsRequest, PutObjectRequest, ToolRequest,
@@ -1137,6 +1139,19 @@ fn add_headers(req: Request<Body>, hdrs: &[(&'static str, String)]) -> Request<B
         parts.headers.insert(*k, v.parse().unwrap());
     }
     Request::from_parts(parts, body)
+}
+
+async fn collect_data_frames(mut body: Body) -> Result<(Bytes, Vec<usize>), axum::Error> {
+    let mut data = Vec::new();
+    let mut frame_lengths = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Ok(frame) = frame.into_data() {
+            frame_lengths.push(frame.len());
+            data.extend_from_slice(&frame);
+        }
+    }
+    Ok((Bytes::from(data), frame_lengths))
 }
 
 fn append_headers(req: Request<Body>, hdrs: &[(&'static str, String)]) -> Request<Body> {
@@ -3498,6 +3513,697 @@ async fn streaming_memory_get_preserves_range_and_head_metadata() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn streaming_file_get_preserves_frames_ranges_and_metadata_only_head() {
+    let root =
+        std::env::temp_dir().join(format!("maskura-file-frontdoor-{}", uuid::Uuid::now_v7()));
+    let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+    let payload = Bytes::from_static(b"0123456789abcdefghij");
+    let stored = store
+        .put("range", "object.txt", payload.clone(), "text/plain")
+        .await
+        .unwrap();
+    store
+        .put("range", "empty.txt", Bytes::new(), "text/plain")
+        .await
+        .unwrap();
+
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
+    state_mut.source_body_limits = BodyLimits {
+        max_frame_bytes: 4,
+        max_bytes: 1024,
+    };
+    state_mut.file_store = Some(store);
+    let (ak, sk) = make_key(&state).await;
+    let headers = auth_headers(&ak, &sk);
+    let app = build_router(state);
+
+    let full = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/range/object.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(full).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_LENGTH],
+        payload.len().to_string()
+    );
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
+    assert_eq!(response.headers()[header::ETAG], stored.etag);
+    assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+    assert_hardened_object_headers(response.headers());
+    let (body, frames) = collect_data_frames(response.into_body()).await.unwrap();
+    assert_eq!(body, payload);
+    assert!(frames.len() > 2);
+    assert!(frames.iter().all(|length| *length <= 4));
+
+    for (range, expected_range, expected_body) in [
+        ("bytes=0-3", "bytes 0-3/20", "0123"),
+        ("bytes=4-", "bytes 4-19/20", "456789abcdefghij"),
+        ("bytes=-3", "bytes 17-19/20", "hij"),
+        ("bytes=16-100", "bytes 16-19/20", "ghij"),
+    ] {
+        let request = add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/range/object.txt")
+                .header(header::RANGE, range)
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT, "{range}");
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH],
+            expected_body.len().to_string()
+        );
+        assert_eq!(response.headers()[header::CONTENT_RANGE], expected_range);
+        assert_eq!(response.headers()[header::ETAG], stored.etag);
+        let (body, frames) = collect_data_frames(response.into_body()).await.unwrap();
+        assert_eq!(body, expected_body, "{range}");
+        assert!(frames.iter().all(|length| *length <= 4), "{range}");
+    }
+
+    for (uri, range, object_length) in [
+        ("/range/object.txt", "not-a-byte-range", 20),
+        ("/range/object.txt", "bytes=0-1,4-5", 20),
+        ("/range/object.txt", "bytes=-0", 20),
+        ("/range/object.txt", "bytes=8-7", 20),
+        ("/range/empty.txt", "bytes=0-0", 0),
+    ] {
+        let request = add_headers(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header(header::RANGE, range)
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "{range}"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_RANGE],
+            format!("bytes */{object_length}")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("<Code>InvalidRange</Code>"));
+    }
+
+    let objects_dir = root.join("buckets/range/objects");
+    for entry in std::fs::read_dir(&objects_dir).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    let head = add_headers(
+        Request::builder()
+            .method("HEAD")
+            .uri("/range/object.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(head).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_LENGTH],
+        payload.len().to_string()
+    );
+    assert_eq!(response.headers()[header::ETAG], stored.etag);
+    assert!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let get = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/range/object.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    assert_eq!(
+        app.oneshot(get).await.unwrap().status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn streaming_file_get_enforces_source_limit_during_body_read() {
+    let root = std::env::temp_dir().join(format!("maskura-file-limit-{}", uuid::Uuid::now_v7()));
+    let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+    store
+        .put(
+            "limit",
+            "object.txt",
+            Bytes::from_static(b"123456789"),
+            "text/plain",
+        )
+        .await
+        .unwrap();
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
+    state_mut.source_body_limits = BodyLimits {
+        max_frame_bytes: 4,
+        max_bytes: 7,
+    };
+    state_mut.file_store = Some(store);
+    let (ak, sk) = make_key(&state).await;
+    let response = build_router(state)
+        .oneshot(add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/limit/object.txt")
+                .body(Body::empty())
+                .unwrap(),
+            &auth_headers(&ak, &sk),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let error = collect_data_frames(response.into_body()).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("source body is at least 8 bytes")
+    );
+    assert!(!error.to_string().contains("123456789"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// These are original Rust scenarios based on observable behavior covered by
+// LocalStack's Apache-2.0 S3 suite and MinIO Mint's cross-SDK compatibility suite.
+#[tokio::test]
+async fn filestore_conformance_bucket_object_lifecycle_survives_restart() {
+    let root =
+        std::env::temp_dir().join(format!("maskura-file-lifecycle-{}", uuid::Uuid::now_v7()));
+    let mut state = test_state().await;
+    let keys = state.keys.clone();
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
+    state_mut.file_store = Some(Arc::new(FileStore::new(root.clone()).await.unwrap()));
+    let (ak, sk) = make_key(&state).await;
+    let headers = auth_headers(&ak, &sk);
+    let app = build_router(state.clone());
+
+    let create = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/conformance")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    assert_eq!(
+        app.clone().oneshot(create).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    for body in ["first generation", "replacement generation"] {
+        let put = add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri("/conformance/object.txt")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from(body))
+                .unwrap(),
+            &headers,
+        );
+        assert_eq!(
+            app.clone().oneshot(put).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+    let zero = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/conformance/empty")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    assert_eq!(
+        app.clone().oneshot(zero).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let nonempty_delete = add_headers(
+        Request::builder()
+            .method("DELETE")
+            .uri("/conformance")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(nonempty_delete).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("<Code>BucketNotEmpty</Code>"));
+
+    drop(app);
+    drop(state);
+    let mut restarted = test_state().await;
+    let state_mut = Arc::get_mut(&mut restarted).expect("test state is uniquely owned");
+    state_mut.keys = keys;
+    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
+    state_mut.file_store = Some(Arc::new(FileStore::new(root.clone()).await.unwrap()));
+    let app = build_router(restarted);
+
+    let list_buckets = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(list_buckets).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("<Name>conformance</Name>"));
+
+    let list_objects = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/conformance?list-type=2")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let body = axum::body::to_bytes(
+        app.clone().oneshot(list_objects).await.unwrap().into_body(),
+        usize::MAX,
+    )
+    .await
+    .unwrap();
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<Key>empty</Key>"));
+    assert!(xml.contains("<Key>object.txt</Key>"));
+    assert!(xml.contains("<KeyCount>2</KeyCount>"));
+
+    for (key, expected) in [
+        ("object.txt", Bytes::from_static(b"replacement generation")),
+        ("empty", Bytes::new()),
+    ] {
+        let get = add_headers(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/conformance/{key}"))
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        );
+        let response = app.clone().oneshot(get).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_length = response.headers()[header::CONTENT_LENGTH].clone();
+        let etag = response.headers()[header::ETAG].clone();
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            expected
+        );
+
+        let head = add_headers(
+            Request::builder()
+                .method("HEAD")
+                .uri(format!("/conformance/{key}"))
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        );
+        let response = app.clone().oneshot(head).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], content_length);
+        assert_eq!(response.headers()[header::ETAG], etag);
+        assert!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        for _ in 0..2 {
+            let delete = add_headers(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/conformance/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+                &headers,
+            );
+            assert_eq!(
+                app.clone().oneshot(delete).await.unwrap().status(),
+                StatusCode::NO_CONTENT
+            );
+        }
+    }
+
+    let delete_bucket = add_headers(
+        Request::builder()
+            .method("DELETE")
+            .uri("/conformance")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    assert_eq!(
+        app.clone().oneshot(delete_bucket).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let list_buckets = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let body = axum::body::to_bytes(
+        app.oneshot(list_buckets).await.unwrap().into_body(),
+        usize::MAX,
+    )
+    .await
+    .unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains("<Name>conformance</Name>"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn filestore_conformance_lists_v1_v2_prefix_delimiter_and_pages() {
+    let root = std::env::temp_dir().join(format!("maskura-file-list-{}", uuid::Uuid::now_v7()));
+    let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+    store.create_bucket("listing").await.unwrap();
+    for key in ["a.txt", "b.txt", "logs/one.txt", "logs/two.txt"] {
+        store
+            .put("listing", key, Bytes::from_static(b"x"), "text/plain")
+            .await
+            .unwrap();
+    }
+    let mut state = test_state().await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .file_store = Some(store);
+    let (ak, sk) = make_key(&state).await;
+    let headers = auth_headers(&ak, &sk);
+    let app = build_router(state);
+
+    let first = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/listing?list-type=2&max-keys=1")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(first).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let xml = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(xml.contains("<Key>a.txt</Key>"));
+    assert!(xml.contains("<KeyCount>1</KeyCount>"));
+    assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+    let token = xml
+        .split("<NextContinuationToken>")
+        .nth(1)
+        .and_then(|value| value.split("</NextContinuationToken>").next())
+        .unwrap();
+
+    let second = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/listing?list-type=2&max-keys=1&continuation-token={token}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let body = axum::body::to_bytes(
+        app.clone().oneshot(second).await.unwrap().into_body(),
+        usize::MAX,
+    )
+    .await
+    .unwrap();
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<Key>b.txt</Key>"));
+    assert!(!xml.contains("<Key>a.txt</Key>"));
+
+    let grouped = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/listing?list-type=2&delimiter=%2F")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let body = axum::body::to_bytes(
+        app.clone().oneshot(grouped).await.unwrap().into_body(),
+        usize::MAX,
+    )
+    .await
+    .unwrap();
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<Key>a.txt</Key>"));
+    assert!(xml.contains("<Key>b.txt</Key>"));
+    assert!(xml.contains("<CommonPrefixes><Prefix>logs/</Prefix></CommonPrefixes>"));
+    assert!(xml.contains("<KeyCount>3</KeyCount>"));
+
+    let v1 = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/listing?max-keys=1&marker=a.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let body = axum::body::to_bytes(
+        app.clone().oneshot(v1).await.unwrap().into_body(),
+        usize::MAX,
+    )
+    .await
+    .unwrap();
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<Marker>a.txt</Marker>"));
+    assert!(xml.contains("<Key>b.txt</Key>"));
+    assert!(xml.contains("<NextMarker>b.txt</NextMarker>"));
+
+    for uri in [
+        "/listing?continuation-token=invalid",
+        "/listing?list-type=2&encoding-type=base64",
+    ] {
+        let request = add_headers(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        );
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn filestore_conformance_preserves_encoded_key_identity_and_list_encoding() {
+    let root = std::env::temp_dir().join(format!("maskura-file-keys-{}", uuid::Uuid::now_v7()));
+    let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+    store.create_bucket("keys").await.unwrap();
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
+    state_mut.file_store = Some(store);
+    let (ak, sk) = make_key(&state).await;
+    let headers = auth_headers(&ak, &sk);
+    let app = build_router(state);
+    let cases = [
+        ("space%20key", "space key", "space%20key"),
+        ("literal%252Fkey", "literal%2Fkey", "literal%252Fkey"),
+        ("xml%26%3Ckey", "xml&<key", "xml%26%3Ckey"),
+        ("caf%C3%A9", "café", "caf%C3%A9"),
+    ];
+
+    for (uri_key, _, _) in cases {
+        let put = add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/keys/{uri_key}"))
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from(uri_key.to_string()))
+                .unwrap(),
+            &headers,
+        );
+        assert_eq!(
+            app.clone().oneshot(put).await.unwrap().status(),
+            StatusCode::OK,
+            "{uri_key}"
+        );
+        let get = add_headers(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/keys/{uri_key}"))
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        );
+        let response = app.clone().oneshot(get).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri_key}");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            uri_key
+        );
+    }
+
+    let list = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/keys?list-type=2&encoding-type=url")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let body = axum::body::to_bytes(
+        app.clone().oneshot(list).await.unwrap().into_body(),
+        usize::MAX,
+    )
+    .await
+    .unwrap();
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<EncodingType>url</EncodingType>"));
+    for (_, logical_key, encoded_key) in cases {
+        assert!(xml.contains(encoded_key), "{logical_key}: {xml}");
+    }
+
+    let list = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/keys?list-type=2")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let body = axum::body::to_bytes(app.oneshot(list).await.unwrap().into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<Key>space key</Key>"));
+    assert!(xml.contains("<Key>literal%2Fkey</Key>"));
+    assert!(xml.contains("<Key>xml&amp;&lt;key</Key>"));
+    assert!(xml.contains("<Key>café</Key>"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn filestore_conformance_conditions_and_missing_key_precede_range() {
+    let root =
+        std::env::temp_dir().join(format!("maskura-file-conditions-{}", uuid::Uuid::now_v7()));
+    let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+    store.create_bucket("conditions").await.unwrap();
+    let stored = store
+        .put(
+            "conditions",
+            "object",
+            Bytes::from_static(b"abcdefgh"),
+            "text/plain",
+        )
+        .await
+        .unwrap();
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
+    state_mut.file_store = Some(store);
+    let (ak, sk) = make_key(&state).await;
+    let headers = auth_headers(&ak, &sk);
+    let app = build_router(state);
+
+    for (header_name, header_value, status) in [
+        (header::IF_MATCH, stored.etag.as_str(), StatusCode::OK),
+        (
+            header::IF_MATCH,
+            "\"wrong\"",
+            StatusCode::PRECONDITION_FAILED,
+        ),
+        (
+            header::IF_NONE_MATCH,
+            stored.etag.as_str(),
+            StatusCode::NOT_MODIFIED,
+        ),
+        (header::IF_NONE_MATCH, "\"wrong\"", StatusCode::OK),
+    ] {
+        let request = add_headers(
+            Request::builder()
+                .method("GET")
+                .uri("/conditions/object")
+                .header(&header_name, header_value)
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), status, "{header_name}: {header_value}");
+        if status != StatusCode::OK {
+            assert!(
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    let missing = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/conditions/missing")
+            .header(header::RANGE, "bytes=100-200")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.oneshot(missing).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<Code>NoSuchKey</Code>"));
+    assert!(!xml.contains("InvalidRange"));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]

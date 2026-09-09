@@ -1,0 +1,378 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::file_multipart_repository::FileMultipartRepository;
+use crate::file_staging_artifact::FileStagingArtifactStore;
+use crate::file_store::{FileStore, FileStoreError};
+use crate::filesystem_persistence::{FilesystemPersistence, PersistenceError, RootLock};
+use crate::key_cipher::{FileKeyWrapping, FileKeyWrappingError, KeyWrapping};
+use crate::multipart_staging::{StagingError, StagingQuotaLimits};
+use crate::transaction::{FileOperationJournal, JournalError, OperationJournal};
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum LocalStorageError {
+    #[error(transparent)]
+    Persistence(#[from] PersistenceError),
+    #[error(transparent)]
+    FileStore(#[from] FileStoreError),
+    #[error(transparent)]
+    FileKeyWrapping(#[from] FileKeyWrappingError),
+    #[error(transparent)]
+    Staging(#[from] StagingError),
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+}
+
+/// Owns all process-scoped resources for one local filesystem storage root.
+#[derive(Debug)]
+pub(crate) struct LocalStorageRuntime {
+    root: PathBuf,
+    file_store: Arc<FileStore>,
+    #[allow(
+        dead_code,
+        reason = "consumed by subsequent local multipart startup wiring"
+    )]
+    staging_artifacts: Arc<FileStagingArtifactStore>,
+    multipart_repository: Arc<FileMultipartRepository>,
+    operation_journal: Arc<FileOperationJournal>,
+    #[allow(
+        dead_code,
+        reason = "consumed by subsequent local multipart startup wiring"
+    )]
+    wrapping: Arc<FileKeyWrapping>,
+    _root_lock: RootLock,
+}
+
+impl LocalStorageRuntime {
+    #[cfg(test)]
+    pub(crate) async fn new(root: PathBuf) -> Result<Self, LocalStorageError> {
+        Self::with_quotas(
+            root,
+            StagingQuotaLimits::new(i64::MAX as u64, i64::MAX as u64)?,
+        )
+        .await
+    }
+
+    pub(crate) async fn with_quotas(
+        root: PathBuf,
+        quotas: StagingQuotaLimits,
+    ) -> Result<Self, LocalStorageError> {
+        let root_lock = FilesystemPersistence::default().acquire_root_lock(&root)?;
+        let wrapping = Arc::new(FileKeyWrapping::load_or_create(
+            &root.join(".maskura").join("wrapping.key"),
+        )?);
+        let file_store = Arc::new(FileStore::open_locked(root.clone()).await?);
+        let staging_artifacts = Arc::new(FileStagingArtifactStore::open(
+            root.join(".maskura").join("multipart"),
+        )?);
+        let multipart_repository = Arc::new(FileMultipartRepository::open(
+            root.join(".maskura").join("multipart"),
+            quotas,
+        )?);
+        let operation_journal = Arc::new(FileOperationJournal::open(
+            root.join(".maskura").join("journal"),
+        )?);
+        file_store.validate_commit_proofs().await?;
+        file_store.backfill_current_commit_proofs().await?;
+        Ok(Self {
+            root,
+            file_store,
+            staging_artifacts,
+            multipart_repository,
+            operation_journal,
+            wrapping,
+            _root_lock: root_lock,
+        })
+    }
+
+    pub(crate) fn file_store(&self) -> Arc<FileStore> {
+        self.file_store.clone()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by subsequent local multipart startup wiring"
+    )]
+    pub(crate) fn staging_artifacts(&self) -> Arc<FileStagingArtifactStore> {
+        self.staging_artifacts.clone()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by subsequent local multipart startup wiring"
+    )]
+    pub(crate) fn multipart_repository(&self) -> Arc<FileMultipartRepository> {
+        self.multipart_repository.clone()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by subsequent local multipart startup wiring"
+    )]
+    pub(crate) fn operation_journal(&self) -> Arc<dyn OperationJournal> {
+        self.operation_journal.clone()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by subsequent local multipart startup wiring"
+    )]
+    pub(crate) fn wrapping(&self) -> Arc<dyn KeyWrapping> {
+        self.wrapping.clone()
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[allow(dead_code, reason = "used by subsequent local Phase 2 components")]
+    pub(crate) fn internal_root(&self) -> PathBuf {
+        self.root.join(".maskura")
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by subsequent local multipart startup wiring"
+    )]
+    pub(crate) fn wrapping_key_path(&self) -> PathBuf {
+        self.internal_root().join("wrapping.key")
+    }
+
+    #[allow(dead_code, reason = "used by subsequent local Phase 2 components")]
+    pub(crate) fn multipart_root(&self) -> PathBuf {
+        self.internal_root().join("multipart")
+    }
+
+    #[allow(dead_code, reason = "used by subsequent local Phase 2 components")]
+    pub(crate) fn journal_root(&self) -> PathBuf {
+        self.internal_root().join("journal")
+    }
+
+    #[allow(dead_code, reason = "used by subsequent local Phase 2 components")]
+    pub(crate) fn commits_root(&self) -> PathBuf {
+        self.internal_root().join("commits")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::multipart_staging::{EncryptedPartWriter, MultipartRepository as _};
+    use uuid::Uuid;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("maskura-local-runtime-{}", Uuid::now_v7()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn second_runtime_for_same_root_fails() {
+        let directory = TempDir::new();
+        let first = LocalStorageRuntime::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let key_before = std::fs::read(first.wrapping_key_path()).unwrap();
+
+        let error = LocalStorageRuntime::new(directory.path().to_path_buf())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            LocalStorageError::Persistence(PersistenceError::RootAlreadyLocked)
+        ));
+        assert_eq!(
+            std::fs::read(first.wrapping_key_path()).unwrap(),
+            key_before
+        );
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn runtimes_for_distinct_roots_can_coexist() {
+        let first_directory = TempDir::new();
+        let second_directory = TempDir::new();
+
+        let first = LocalStorageRuntime::new(first_directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let second = LocalStorageRuntime::new(second_directory.path().to_path_buf())
+            .await
+            .unwrap();
+
+        assert_eq!(first.file_store().root(), first_directory.path());
+        assert_eq!(second.file_store().root(), second_directory.path());
+        assert!(first.multipart_repository().is_durable());
+        assert!(first.operation_journal().is_durable());
+    }
+
+    #[tokio::test]
+    async fn dropping_runtime_releases_root_lock() {
+        let directory = TempDir::new();
+        let runtime = LocalStorageRuntime::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        drop(runtime);
+
+        LocalStorageRuntime::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wrapping_key_is_private_and_stable_across_runtime_restart() {
+        let directory = TempDir::new();
+        let first = LocalStorageRuntime::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let path = first.wrapping_key_path();
+        let encoded = std::fs::read(&path).unwrap();
+        let wrapped = first.wrapping().wrap(b"durable-dek").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(first);
+
+        let second = LocalStorageRuntime::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), encoded);
+        assert_eq!(second.wrapping().unwrap(&wrapped).unwrap(), b"durable-dek");
+    }
+
+    #[tokio::test]
+    async fn stale_temp_cleanup_starts_only_after_lock_acquisition() {
+        let directory = TempDir::new();
+        let stale_temp = directory
+            .path()
+            .join("buckets")
+            .join("bucket")
+            .join("tmp")
+            .join("stale.tmp");
+        std::fs::create_dir_all(stale_temp.parent().unwrap()).unwrap();
+        std::fs::write(&stale_temp, b"stale").unwrap();
+        let held_lock = FilesystemPersistence::default()
+            .acquire_root_lock(directory.path())
+            .unwrap();
+
+        let error = LocalStorageRuntime::new(directory.path().to_path_buf())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            LocalStorageError::Persistence(PersistenceError::RootAlreadyLocked)
+        ));
+        assert!(stale_temp.exists());
+
+        drop(held_lock);
+        let runtime = LocalStorageRuntime::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        assert!(!stale_temp.exists());
+        assert_eq!(runtime.root(), directory.path());
+        assert_eq!(runtime.internal_root(), directory.path().join(".maskura"));
+        assert_eq!(
+            runtime.wrapping_key_path(),
+            directory.path().join(".maskura/wrapping.key")
+        );
+        assert_eq!(
+            runtime.multipart_root(),
+            directory.path().join(".maskura/multipart")
+        );
+        assert_eq!(
+            runtime.journal_root(),
+            directory.path().join(".maskura/journal")
+        );
+        assert_eq!(
+            runtime.commits_root(),
+            directory.path().join(".maskura/commits")
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_key_repository_journal_and_proof_fail_during_runtime_construction() {
+        let key = TempDir::new();
+        std::fs::create_dir_all(key.path().join(".maskura")).unwrap();
+        std::fs::write(key.path().join(".maskura/wrapping.key"), b"corrupt").unwrap();
+        assert!(matches!(
+            LocalStorageRuntime::new(key.path().to_path_buf()).await,
+            Err(LocalStorageError::FileKeyWrapping(_))
+        ));
+
+        let repository = TempDir::new();
+        std::fs::create_dir_all(repository.path().join(".maskura/multipart/uploads")).unwrap();
+        std::fs::write(
+            repository.path().join(".maskura/multipart/uploads/unknown"),
+            b"unknown",
+        )
+        .unwrap();
+        assert!(matches!(
+            LocalStorageRuntime::new(repository.path().to_path_buf()).await,
+            Err(LocalStorageError::Staging(_))
+        ));
+
+        let journal = TempDir::new();
+        std::fs::create_dir_all(journal.path().join(".maskura/journal")).unwrap();
+        std::fs::write(journal.path().join(".maskura/journal/unknown"), b"unknown").unwrap();
+        assert!(matches!(
+            LocalStorageRuntime::new(journal.path().to_path_buf()).await,
+            Err(LocalStorageError::Journal(_))
+        ));
+
+        let proof = TempDir::new();
+        std::fs::create_dir_all(proof.path().join(".maskura/commits")).unwrap();
+        std::fs::write(proof.path().join(".maskura/commits/unknown"), b"unknown").unwrap();
+        assert!(matches!(
+            LocalStorageRuntime::new(proof.path().to_path_buf()).await,
+            Err(LocalStorageError::FileStore(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_encrypted_cleanup_removes_only_owned_temporary_names() {
+        let directory = TempDir::new();
+        let runtime = LocalStorageRuntime::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let temporary = runtime.staging_artifacts().temporary_root().to_path_buf();
+        let owned = temporary.join(format!("s4-multipart-{}.enc", Uuid::now_v7()));
+        let prefix_only = temporary.join("s4-multipart-not-owned");
+        let unrelated = temporary.join("operator-file");
+        std::fs::write(&owned, b"owned").unwrap();
+        std::fs::write(&prefix_only, b"keep").unwrap();
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        assert_eq!(
+            EncryptedPartWriter::cleanup_stale(&temporary, std::time::Duration::ZERO)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!owned.exists());
+        assert!(prefix_only.exists());
+        assert!(unrelated.exists());
+    }
+}

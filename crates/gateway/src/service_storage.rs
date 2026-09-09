@@ -23,10 +23,10 @@ use crate::s3_safety::{
     record_s3_body_failure, record_s3_failure, s3_retry_config, s3_timeout_config,
 };
 use crate::transaction::{
-    AbortSignal, AwsS3TransactionBackend, BackendCapabilities, DirectS3Sink, ExpectedObject,
-    ManagedChildRole, ManagedOperationScope, ObjectDestination, ObjectSinkTransaction,
-    OperationJournal, OperationReconciler, OperationState, SinkCommitState, StoredObjectMeta,
-    TransactionBackend, TransactionError, VersioningCapability,
+    AbortSignal, AwsS3TransactionBackend, BackendCapabilities, DestinationCommitAuthority,
+    DirectS3Sink, ExpectedObject, ManagedChildRole, ManagedOperationScope, ObjectDestination,
+    ObjectSinkTransaction, OperationJournal, OperationReconciler, OperationState, SinkCommitState,
+    StoredObjectMeta, TransactionBackend, TransactionError, VersioningCapability,
 };
 
 /// Reservation headroom for physical versions a managed generation may accrue
@@ -1926,7 +1926,10 @@ impl ServiceStorage {
             .verify_output(repair.size, &repair.digest)
             .await
             .map_err(|error| error.to_string())?;
-        target.complete().await.map_err(|error| error.to_string())?;
+        target
+            .complete(&DestinationCommitAuthority::SinglePut)
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -2057,7 +2060,10 @@ trait ManagedDestination: Send {
         expected_size: u64,
         expected_sha256: &str,
     ) -> Result<(), TransactionError>;
-    async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError>;
+    async fn complete(
+        &mut self,
+        authority: &DestinationCommitAuthority,
+    ) -> Result<StoredObjectMeta, TransactionError>;
     async fn abort(&mut self) -> Result<(), TransactionError>;
 }
 
@@ -2093,7 +2099,10 @@ impl ManagedDestination for ManagedDirectSink {
             .await
     }
 
-    async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError> {
+    async fn complete(
+        &mut self,
+        _authority: &DestinationCommitAuthority,
+    ) -> Result<StoredObjectMeta, TransactionError> {
         self.repository
             .renew_physical_write_intent(
                 &self.lease,
@@ -2178,7 +2187,11 @@ async fn complete_reconciled(
     destination: &mut ManagedDirectSink,
     journal: &Arc<dyn OperationJournal>,
 ) -> Result<StoredObjectMeta, TransactionError> {
-    match destination.sink.complete().await {
+    match destination
+        .sink
+        .complete(DestinationCommitAuthority::SinglePut)
+        .await
+    {
         Ok(stored) => Ok(stored),
         Err(original) => {
             let operation = journal
@@ -2268,7 +2281,10 @@ impl ObjectSinkTransaction for ManagedReplicatedSink {
         Ok(())
     }
 
-    async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError> {
+    async fn complete(
+        &mut self,
+        authority: DestinationCommitAuthority,
+    ) -> Result<StoredObjectMeta, TransactionError> {
         if self.finished {
             return Err(TransactionError::Finished);
         }
@@ -2276,9 +2292,24 @@ impl ObjectSinkTransaction for ManagedReplicatedSink {
             .output
             .clone()
             .ok_or(TransactionError::OutputMismatch)?;
-        let primary = self.primary.complete().await?;
+        authority
+            .validate(
+                self.logical_operation_id,
+                &self.logical.bucket,
+                &self.logical.key,
+            )
+            .await?;
+        let primary = self.primary.complete(&authority).await?;
         let replica_status = if let Some(replica) = &mut self.replica {
-            match tokio::time::timeout(Duration::from_secs(30), replica.complete()).await {
+            authority
+                .validate(
+                    self.logical_operation_id,
+                    &self.logical.bucket,
+                    &self.logical.key,
+                )
+                .await?;
+            match tokio::time::timeout(Duration::from_secs(30), replica.complete(&authority)).await
+            {
                 Ok(Ok(_)) => CopyStatus::Ready,
                 _ => CopyStatus::RepairPending,
             }
@@ -2381,6 +2412,10 @@ impl ObjectSinkTransaction for ManagedLogicalSink {
         }
     }
 
+    fn durable_operation_id(&self) -> Option<uuid::Uuid> {
+        Some(self.operation_id)
+    }
+
     async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError> {
         if self.committed {
             return Err(TransactionError::Finished);
@@ -2465,7 +2500,10 @@ impl ObjectSinkTransaction for ManagedLogicalSink {
         Ok(())
     }
 
-    async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError> {
+    async fn complete(
+        &mut self,
+        authority: DestinationCommitAuthority,
+    ) -> Result<StoredObjectMeta, TransactionError> {
         if self.committed {
             return Err(TransactionError::Finished);
         }
@@ -2474,7 +2512,7 @@ impl ObjectSinkTransaction for ManagedLogicalSink {
                 "managed logical usage evidence was not recorded before commit".to_string(),
             ));
         }
-        let stored = self.inner.complete().await?;
+        let stored = self.inner.complete(authority).await?;
         self.committed = true;
         Ok(stored)
     }
@@ -2710,7 +2748,11 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_multipart_repository::FileMultipartRepository;
     use crate::managed::{InMemoryManagedRepository, PostgresManagedRepository};
+    use crate::multipart_staging::{
+        DestinationCommitPermit, MultipartIdentity, StagingQuotaLimits,
+    };
     use std::sync::Mutex;
 
     use axum::Router;
@@ -3519,6 +3561,7 @@ mod tests {
     #[derive(Default)]
     struct FakeDestinationState {
         pointers: Vec<usize>,
+        completion_authorities: Vec<&'static str>,
     }
 
     type SharedFakeState = Arc<Mutex<FakeDestinationState>>;
@@ -3594,11 +3637,22 @@ mod tests {
             self.fail(FailurePoint::Verify)
         }
 
-        async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError> {
+        async fn complete(
+            &mut self,
+            authority: &DestinationCommitAuthority,
+        ) -> Result<StoredObjectMeta, TransactionError> {
             self.events
                 .lock()
                 .unwrap()
                 .push(format!("{}-complete", self.label));
+            self.state
+                .lock()
+                .unwrap()
+                .completion_authorities
+                .push(match authority {
+                    DestinationCommitAuthority::SinglePut => "single-put",
+                    DestinationCommitAuthority::ClientMultipart(_) => "client-multipart",
+                });
             self.fail(FailurePoint::Complete)?;
             Ok(StoredObjectMeta::default())
         }
@@ -3672,7 +3726,20 @@ mod tests {
             )
             .await
             .unwrap();
-            sink.complete().await.unwrap();
+            sink.complete(DestinationCommitAuthority::SinglePut)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                primary.lock().unwrap().completion_authorities,
+                ["single-put"]
+            );
+            if failure != FailurePoint::Write && failure != FailurePoint::Verify {
+                assert_eq!(
+                    replica.lock().unwrap().completion_authorities,
+                    ["single-put"]
+                );
+            }
 
             let authority = repository.get(&logical).await.unwrap().unwrap();
             assert_eq!(authority.primary_status, CopyStatus::Ready);
@@ -3692,6 +3759,58 @@ mod tests {
                 assert!(primary < replica, "primary completes before replica");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn managed_sink_rejects_mismatched_multipart_operation_before_propagation() {
+        let repository = Arc::new(InMemoryManagedRepository::new());
+        let logical = LogicalObjectKey::new("tenant", "bucket", "key");
+        let (mut sink, primary, _, _) =
+            fake_managed_sink(repository, logical.clone(), None, None, None);
+        let expected_operation_id = uuid::Uuid::now_v7();
+        sink.logical_operation_id = Some(expected_operation_id);
+        sink.write(Bytes::from_static(b"abc")).await.unwrap();
+        sink.verify_output(
+            3,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        )
+        .await
+        .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "maskura-managed-authority-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let permit_repository = Arc::new(
+            FileMultipartRepository::open(
+                root.clone(),
+                StagingQuotaLimits::new(1024, 1024).unwrap(),
+            )
+            .unwrap(),
+        );
+        let identity = MultipartIdentity {
+            tenant_id: logical.tenant_id.clone(),
+            credential_policy_id: "policy".to_string(),
+            bucket: logical.bucket.clone(),
+            key: logical.key.clone(),
+            upload_id: uuid::Uuid::now_v7().to_string(),
+        };
+        let authority = DestinationCommitAuthority::client_multipart(
+            permit_repository,
+            identity.clone(),
+            DestinationCommitPermit {
+                upload_id: identity.upload_id,
+                completion_fingerprint: "fingerprint".to_string(),
+                fencing_token: 1,
+                operation_id: uuid::Uuid::now_v7(),
+            },
+        );
+
+        assert!(matches!(
+            sink.complete(authority).await,
+            Err(TransactionError::CommitAuthority(_))
+        ));
+        assert!(primary.lock().unwrap().completion_authorities.is_empty());
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     #[tokio::test]
@@ -3726,7 +3845,11 @@ mod tests {
                     assert!(verify.is_err());
                 } else {
                     verify.unwrap();
-                    assert!(sink.complete().await.is_err());
+                    assert!(
+                        sink.complete(DestinationCommitAuthority::SinglePut)
+                            .await
+                            .is_err()
+                    );
                 }
             }
             assert!(repository.get(&logical).await.unwrap().is_none());
@@ -3747,7 +3870,12 @@ mod tests {
         let mut winner = authority();
         winner.logical = logical.clone();
         repository.publish(winner.clone(), None).await.unwrap();
-        assert!(stale.complete().await.is_err());
+        assert!(
+            stale
+                .complete(DestinationCommitAuthority::SinglePut)
+                .await
+                .is_err()
+        );
         assert_eq!(
             repository.get(&logical).await.unwrap().unwrap().generation,
             winner.generation
