@@ -2786,13 +2786,14 @@ async fn mock_s3_handler(
             .cloned()
             .collect();
         keys.sort();
+        let last_modified = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let mut xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>{MOCK_STAGING_BUCKET}</Name><Prefix>{prefix}</Prefix><KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>"#,
             keys.len()
         );
         for object_key in keys {
             xml.push_str(&format!(
-                "<Contents><Key>{object_key}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><Size>{}</Size></Contents>",
+                "<Contents><Key>{object_key}</Key><LastModified>{last_modified}</LastModified><Size>{}</Size></Contents>",
                 objects.get(&object_key).map_or(0, Vec::len)
             ));
         }
@@ -3167,13 +3168,26 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
             .block_destination_put
             .store(true, Ordering::Release);
         let destination_puts_before = mock_state.destination_put_count.load(Ordering::Acquire);
-        let first_completion = tokio::spawn(restarted_app.clone().oneshot(complete));
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            mock_state.wait_for_destination_put_after(destination_puts_before),
-        )
-        .await
-        .expect("first completion reached the direct destination");
+        let mut first_completion = tokio::spawn(restarted_app.clone().oneshot(complete));
+        tokio::select! {
+            () = mock_state.wait_for_destination_put_after(destination_puts_before) => {}
+            result = &mut first_completion => {
+                let response = result
+                    .expect("first completion task")
+                    .expect("first completion response");
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("first completion error body");
+                panic!(
+                    "first completion returned {status} before reaching the direct destination: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+            () = tokio::time::sleep(Duration::from_secs(30)) => {
+                panic!("first completion did not reach the direct destination within 30 seconds");
+            }
+        }
         let busy = add_headers(
             Request::builder()
                 .method("POST")

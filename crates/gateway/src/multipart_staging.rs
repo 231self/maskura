@@ -119,6 +119,12 @@ pub enum MultipartLifecycle {
     Expired,
 }
 
+impl MultipartLifecycle {
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Aborted | Self::Expired)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MultipartUpload {
     pub identity: MultipartIdentity,
@@ -1234,7 +1240,10 @@ impl MultipartRepository for PostgresMultipartRepository {
             let Some(upload) = upload else { continue };
             let pending_is_old = attempt.lifecycle == "PENDING"
                 && attempt.created_at_ms <= now - RECONCILIATION_GRACE.as_millis() as i64;
-            if upload.lifecycle != "OPEN" || attempt.lifecycle == "RETIRED" || pending_is_old {
+            if lifecycle(&upload.lifecycle)?.is_terminal()
+                || attempt.lifecycle == "RETIRED"
+                || pending_is_old
+            {
                 result.push(CleanupCandidate {
                     upload_id: attempt.upload_id,
                     artifact_key: attempt.artifact_key,
@@ -1973,9 +1982,7 @@ impl MultipartRepository for InMemoryMultipartRepository {
                 let upload = state.uploads.get(&attempt.part.upload_id)?;
                 let old_pending = attempt.lifecycle == "PENDING"
                     && attempt.part.created_at_ms <= now - RECONCILIATION_GRACE.as_millis() as i64;
-                (upload.lifecycle != MultipartLifecycle::Open
-                    || attempt.lifecycle == "RETIRED"
-                    || old_pending)
+                (upload.lifecycle.is_terminal() || attempt.lifecycle == "RETIRED" || old_pending)
                     .then(|| CleanupCandidate {
                         upload_id: attempt.part.upload_id.clone(),
                         artifact_key: key.clone(),
@@ -3220,6 +3227,27 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn completing_upload_parts_are_not_cleanup_candidates() {
+        let repo = InMemoryMultipartRepository::new();
+        repo.create(upload()).await.unwrap();
+        current_part(&repo, 1, "\"one\"", "sha-one").await;
+        let request = vec![complete_part(1, "\"one\"", Some("sha-one"))];
+        assert!(matches!(
+            repo.acquire_completion(&identity(), "fingerprint", &request, "worker-a", 100, 0)
+                .await
+                .unwrap(),
+            CompletionAcquire::Acquired(_)
+        ));
+
+        assert!(
+            repo.cleanup_candidates(now_ms(), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
