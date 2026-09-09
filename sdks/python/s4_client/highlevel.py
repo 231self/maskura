@@ -1,4 +1,4 @@
-"""High-level Maskura client: object write/read + envelope encrypt/decrypt.
+"""High-level Maskura client: object I/O plus legacy envelope compatibility.
 
 The generated low-level client covers the dashboard API (keys, plugins,
 backends). This module adds the S3 data-plane operations the gateway exposes
@@ -7,22 +7,13 @@ plus the client side of the envelope-encryption scheme:
 * ``put_object`` / ``get_object`` — raw byte objects through the gateway,
   authenticated with the Maskura API key headers (``x-maskura-access-key`` /
   ``x-maskura-secret-key``).
-* ``generate_keypair`` — an RSA-2048 keypair (SPKI public key). Give the
-  public half to Maskura and keep the private half locally; Maskura never sees it.
-* ``attach_public_key`` — bind the public key to this API key. After this,
-  the gateway's ``envelope-encrypt`` plugin encrypts every detected PII
-  field server-side on PUT.
-* ``decrypt_payload`` — recover plaintext from a stored payload: scans for
+* ``generate_keypair`` / ``attach_public_key`` — legacy RSA provisioning for
+  pre-hybrid gateways. Current gateways reject these RSA public keys.
+* ``decrypt_payload`` — recover plaintext from legacy stored payloads: scans for
   ``RSA-OAEP/AES-256-GCM`` envelopes, unwraps each DEK with the client-held
   private key, and AES-256-GCM-decrypts the field back to plaintext.
 
-Write path (server-side encryption):
-    client = MaskuraClient(endpoint, access_key, secret_key)
-    private_pem, public_pem = MaskuraClient.generate_keypair()
-    client.attach_public_key(public_pem)          # once per key
-    client.put_object("my-bucket", "ingest/data.jsonl", payload)
-
-Read path (client-side decryption):
+Legacy read path (client-side decryption):
     raw = client.get_object("my-bucket", "ingest/data.jsonl")
     plaintext = MaskuraClient.decrypt_payload(raw, private_pem)
 
@@ -69,7 +60,10 @@ class MaskuraClient:
 
     @staticmethod
     def generate_keypair() -> Tuple[str, str]:
-        """Generate an RSA-2048 keypair for envelope encryption.
+        """Generate a legacy RSA-2048 envelope keypair.
+
+        Current gateways accept only Maskura hybrid public keys for new writes;
+        this helper exists to support pre-hybrid gateways and stored objects.
 
         Returns ``(private_key_pem, public_key_pem)`` — PKCS#8 private key
         and SPKI public key, both PEM. Store the private key somewhere safe;
@@ -88,10 +82,10 @@ class MaskuraClient:
         return private_pem, public_pem
 
     def attach_public_key(self, public_key_pem: str) -> None:
-        """Bind ``public_key_pem`` to this API key so the gateway encrypts PII.
+        """Bind a public key to this API key.
 
-        The gateway stores the public key with the API key and passes it to
-        the ``envelope-encrypt`` plugin on every PUT.
+        Current gateways reject the legacy RSA keys created by
+        ``generate_keypair``. This method remains for pre-hybrid gateways.
         """
         resp = requests.put(
             f"{self.endpoint}/dashboard/api/keys/public-key",

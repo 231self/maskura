@@ -156,8 +156,8 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 - `just build-sdks` extracts spec, runs `openapi-generator` (Docker) to produce Python and TypeScript SDKs in `sdks/python/` and `sdks/typescript/`.
 - Schema is the single source of truth — SDKs always in sync with server changes.
 - `scripts/generate-sdks.sh` re-applies the hand-written high-level client from `sdks/overlay/<lang>/` after each generation, so it survives regeneration:
-  - `s4_client/highlevel.py` / `highlevel.ts` — `MaskuraClient` with `S4Client` compatibility, `put_object`/`get_object` (S3 data plane, `x-maskura-*` auth), `generate_keypair` (RSA-2048 SPKI), `attach_public_key`, and `decrypt_payload` (RSA-OAEP unwrap + AES-256-GCM). Python extras: `requests`, `cryptography`. TypeScript uses Web Crypto + global fetch (Node 18+ or browser).
-  - Client flow: `generate_keypair()` → `attach_public_key(public_pem)` once → `put_object(...)` (gateway encrypts PII server-side) → `get_object(...)` + `decrypt_payload(bytes, private_pem)`.
+  - `s4_client/highlevel.py` / `highlevel.ts` — `MaskuraClient` with `S4Client` compatibility and `put_object`/`get_object` S3 data-plane helpers.
+  - The high-level `generate_keypair` / `generateKeypair` and decrypt helpers are legacy RSA compatibility code. Current gateways reject those RSA public keys for new writes; packaged hybrid client support is a known gap documented in `docs/encryption.md`.
 
 ### Web Dashboard
 
@@ -193,136 +193,24 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 - **Sandbox**: 64 MiB memory, 10K table entries, 512 KiB stack. No host imports; pure byte-in/byte-out. `MASKURA_WASM_FUEL` (default 1B) sets the per-session instruction budget. The baseline `FilterEngine::new` default is 10M; crypto filters require the larger pipeline budget.
 - **Default plugin**: `filters/pii-default/` — detects emails (via `@`), credit cards (Luhn check, 13-19 digits), SSNs (9 digits, SSA range validation). Redacts to `[REDACTED_EMAIL]`, `[REDACTED_CARD]`, `[REDACTED_SSN]`.
 
-### Envelope Encryption per Field (design doc)
+### Envelope encryption per field
 
-**Goal**: Encrypt PII fields so they are recoverable by authorized clients, without
-storing plaintext or requiring Maskura to hold decryption keys. Falls back to redaction
-when no public key is configured.
+- New encrypted writes use the `X25519+ML-KEM-768/AES-256-GCM` envelope in
+  `crates/gateway/src/hybrid.rs` and `filters/envelope-encrypt/`.
+- Public keys are `MASKURA HYBRID PUBLIC KEY` PEM blocks. Current gateways
+  reject legacy RSA public keys for new writes.
+- The client keeps the matching private key; Maskura never receives it.
+- The gateway sees plaintext transiently while the selected transform executes
+  inside the per-session Wasm sandbox. The encrypted output does not persist
+  that plaintext.
+- Each field uses fresh encapsulation material and AES-256-GCM authenticated
+  encryption. The `enc_dek` field carries an X25519 ephemeral public key plus
+  the ML-KEM-768 ciphertext.
+- Existing `RSA-OAEP/AES-256-GCM` objects remain a legacy read compatibility
+  case. The public high-level SDK helpers currently cover that legacy format,
+  not new hybrid provisioning.
+- `filters/stable-encrypt/` is a separate, opt-in AES-SIV transform for stable
+  matching keys.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      ENCRYPTION ARCHITECTURE                        │
-├───────────────┬───────────────────────┬─────────────────────────────┤
-│  Client SDK   │   Maskura Gateway     │       Storage               │
-├───────────────┼───────────────────────┼─────────────────────────────┤
-│               │                       │                             │
-│ 1. Generate   │                       │                             │
-│    keypair    │                       │                             │
-│    (priv+pub) │                       │                             │
-│               │                       │                             │
-│ 2. POST /keys │                       │                             │
-│    with X.509 │                       │                             │
-│    cert ─────→│ 3. Store cert with    │                             │
-│               │    API key in KeyStore│                             │
-│               │                       │                             │
-│ 4. PUT data   │                       │                             │
-│    + API key ─→                       │                             │
-│               │ 5. Authenticate       │                             │
-│               │ 6. Plugin pipeline:   │                             │
-│               │    a. Detect PII      │                             │
-│               │    b. For each field: │                             │
-│               │       • Gen DEK (AES) │                             │
-│               │       • Encrypt DEK   │                             │
-│               │         with cert     │                             │
-│               │       • Encrypt field │                             │
-│               │         with DEK      │                             │
-│               │       • Package:      │                             │
-│               │         {alg, iv,     │                             │
-│               │          enc_dek, ct} │                             │
-│               │ 7. Replace field ─────→ 8. Store                    │
-│               │                       │                             │
-│ 9. GET data  ←─ 10. Return encrypted  │                             │
-│    + API key    │     fields as-is    │                             │
-│               │                       │                             │
-│ 11. Decrypt:  │                       │                             │
-│     • Use priv│                       │                             │
-│       key to  │                       │                             │
-│       decrypt │                       │                             │
-│       enc_dek │                       │                             │
-│     • Use DEK │                       │                             │
-│       to      │                       │                             │
-│       decrypt │                       │                             │
-│       field   │                       │                             │
-└───────────────┴───────────────────────┴─────────────────────────────┘
-```
-
-**Envelope format** (each encrypted field):
-
-```json
-{
-  "alg": "RSA-OAEP/AES-256-GCM",
-  "iv": "<base64 12-byte IV>",
-  "enc_dek": "<base64 RSA-OAEP-encrypted DEK>",
-  "ct": "<base64 AES-256-GCM ciphertext>",
-  "tag": "<base64 16-byte auth tag>"
-}
-```
-
-**WIT interface extension** (to pass public key to plugin):
-
-```wit
-record context {
-  format: string,
-  content-type: string,
-  policy-version: u64,
-  public-key-pem: option<string>,    // NEW: X.509 cert for encryption
-}
-```
-
-**Plugin composition (pipeline)**:
-
-```
-PUT /bucket/data.jsonl + Maskura API key (with X.509 cert)
-  │
-  ▼
-[noop]          ← pass-through, baseline benchmark
-  │
-  ▼
-[pii-detect]    ← identifies PII fields (email, SSN, card)
-  │              ← returns Decision::Emit with metadata annotations
-  ▼
-[encrypt]       ← for each annotated PII field:
-  │              ←   if public_key_pem is set in context:
-  │              ←     envelope-encrypt (DEK + cert)
-  │              ←   else:
-  │              ←     redact to [REDACTED_*]
-  ▼
-Storage
-```
-
-**Stable (deterministic) encryption for JOIN keys**:
-
-Certain fields (e.g., `user_id`, `email`) need deterministic encryption —
-same input always produces same ciphertext. This enables JOINs and dedup
-across datasets. Implemented as a separate plugin that uses AES-SIV
-(deterministic AEAD) with a key derived from the API key secret.
-
-```
-field_value → HMAC(api_key_secret, field_value) → deterministic_ciphertext
-```
-
-NOT enabled by default — the user explicitly tags fields as "stable" in
-the API key configuration or request headers.
-
-**Client SDK flow**:
-
-```bash
-# 1. Initialize: generate keypair and send the certificate to Maskura
-maskura key create --label prod-encryption --generate-encryption-key
-
-# 2. Upload: Maskura encrypts PII fields with the certificate
-maskura put ./data.jsonl ingest/data.jsonl --bucket my-ingest
-
-# 3. Download — client decrypts fields with private key
-maskura get ingest/data.jsonl --bucket my-ingest --decrypt
-```
-
-**Security properties**:
-
-- Maskura never has access to the client's private key
-- Maskura never sees plaintext PII after encryption (only during the transform in the Wasm sandbox, which is ephemeral per-session)
-- Each field gets a unique DEK (even within the same record)
-- DEK is encrypted with RSA-OAEP (2048-bit minimum) — only the private key holder can recover it
-- AES-256-GCM provides authenticated encryption (confidentiality + integrity)
-- Compromise of one field's DEK doesn't compromise other fields
-- Public key rotation: generate a new API key with a new cert, re-upload data
+The normative construction, key sizes, client-tooling status, and security
+properties are in `docs/encryption.md` and ADR 0011.

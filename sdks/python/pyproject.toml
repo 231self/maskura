@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/231self/S4"
+Repository = "https://github.com/231self/maskura"
 
 [tool.poetry]
 requires-poetry = ">=2.0"

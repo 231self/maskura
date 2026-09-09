@@ -59,7 +59,7 @@ fn security_doc_offers_private_reporting_channels() {
         "SECURITY.md must reference GitHub private vulnerability reporting"
     );
     assert!(
-        content.contains("https://github.com/231self/s4/security/advisories/new"),
+        content.contains("https://github.com/231self/maskura/security/advisories/new"),
         "SECURITY.md must link to this repository's private reporting form"
     );
     assert!(

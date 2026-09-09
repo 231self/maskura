@@ -15,8 +15,10 @@ Encryption is **envelope encryption** with a fresh data key per field:
    of the matching private key can recover it.
 3. Both the ciphertext and the encapsulated DEK are written to storage.
 
-Maskura never sees a plaintext field, never sees the DEK after it is wrapped,
-and never holds your private key. Decryption happens entirely on the client.
+Maskura does see the plaintext field transiently while the selected transform
+runs inside the per-session Wasm sandbox. It does not persist that plaintext as
+part of the encrypted output and never holds your private key. Decryption
+happens entirely on the client.
 
 ## The primitives
 
@@ -107,6 +109,20 @@ base64( x25519_sk ‖ mlkem_seed )      # 32 + 64 = 96 bytes
 
 The gateway's `public-key-pem` config field is unchanged: it is still a string.
 The private key never touches the gateway.
+
+## Client tooling status
+
+Current gateway releases accept only `MASKURA HYBRID PUBLIC KEY` PEM blocks for
+new encrypted writes. The Python and TypeScript high-level SDK overlays still
+generate RSA-2048 keys and decrypt the legacy `RSA-OAEP/AES-256-GCM` envelope.
+They remain in the release for reading older data, but their key-generation and
+attach flow is not compatible with a current gateway. Do not use
+`generate_keypair` or `generateKeypair` to provision a new encryption key.
+
+The Rust implementation and round-trip tests are the current reference for the
+hybrid key format and decapsulation behavior. Packaged cross-language hybrid
+key generation and decryption are a known gap. Redaction and ordinary S3 object
+operations in the SDKs are unaffected.
 
 ## Security properties
 

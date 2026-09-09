@@ -10,16 +10,16 @@ Python 3.9+
 
 ## Installation
 
-Install directly from the current S4 repository:
+Install directly from the current Maskura repository:
 
 ```sh
-pip install "git+https://github.com/231self/S4.git#subdirectory=sdks/python"
+pip install "git+https://github.com/231self/maskura.git#subdirectory=sdks/python"
 ```
 
 Release downloads can be installed directly as well:
 
 ```sh
-pip install https://github.com/231self/S4/releases/latest/download/maskura-python-sdk.tar.gz
+pip install https://github.com/231self/maskura/releases/latest/download/maskura-python-sdk.tar.gz
 ```
 
 ## Usage
@@ -34,6 +34,13 @@ client = MaskuraClient(
     secret_key="s4s_example",
 )
 ```
+
+Object PUT/GET helpers work with current gateways. The high-level
+`generate_keypair` and `decrypt_payload` helpers implement the legacy RSA
+envelope for compatibility with older stored objects. Current gateways accept
+only Maskura hybrid X25519 + ML-KEM-768 public keys for new encrypted writes;
+see the [client tooling status](../../docs/encryption.md#client-tooling-status)
+before using envelope encryption.
 
 ## Tests
 

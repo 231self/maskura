@@ -74,10 +74,10 @@ generate() {
         python)
             # Keep the shipped s4_client module as a permanent facade target;
             # the overlay adds the canonical maskura_client namespace.
-            properties="packageName=s4_client,projectName=maskura-client,gitUserId=231self,gitRepoId=S4"
+            properties="packageName=s4_client,projectName=maskura-client,gitUserId=231self,gitRepoId=maskura"
             ;;
         typescript)
-            properties="npmName=maskura-client,npmVersion=1.0.0,gitUserId=231self,gitRepoId=S4"
+            properties="npmName=maskura-client,npmVersion=1.0.0,gitUserId=231self,gitRepoId=maskura"
             ;;
         *)
             echo "ERROR: unsupported SDK language: $lang" >&2
@@ -126,7 +126,7 @@ pyproject = root.joinpath("pyproject.toml").read_text()
 pyproject = pyproject.replace('name = "s4_client"', 'name = "maskura_client"', 1)
 pyproject = pyproject.replace(
     'Repository = "https://github.com/GIT_USER_ID/GIT_REPO_ID"',
-    'Repository = "https://github.com/231self/S4"',
+    'Repository = "https://github.com/231self/maskura"',
 )
 pyproject = pyproject.replace(
     '  "typing-extensions (>=4.7.1)"',
@@ -137,7 +137,7 @@ root.joinpath("pyproject.toml").write_text(pyproject)
 readme = root.joinpath("README.md").read_text().replace("s4_client", "maskura_client")
 readme = readme.replace(
     "https://github.com/GIT_USER_ID/GIT_REPO_ID.git",
-    "https://github.com/231self/S4.git",
+    "https://github.com/231self/maskura.git",
 )
 root.joinpath("README.md").write_text(readme)
 for doc in root.joinpath("docs").glob("*.md"):
@@ -145,7 +145,7 @@ for doc in root.joinpath("docs").glob("*.md"):
 
 setup = root.joinpath("setup.py").read_text()
 setup = setup.replace('NAME = "maskura-client"', 'NAME = "maskura_client"', 1)
-setup = setup.replace('    url="",', '    url="https://github.com/231self/S4",')
+setup = setup.replace('    url="",', '    url="https://github.com/231self/maskura",')
 setup = setup.replace(
     '    "typing-extensions >= 4.7.1",',
     '    "typing-extensions >= 4.7.1",\n    "requests >= 2.31",\n    "cryptography >= 42",',
@@ -161,7 +161,7 @@ requirements.write_text(requirements.read_text() + "requests >= 2.31\ncryptograp
 
 git_push = root.joinpath("git_push.sh").read_text()
 git_push = git_push.replace('git_user_id="GIT_USER_ID"', 'git_user_id="231self"')
-git_push = git_push.replace('git_repo_id="GIT_REPO_ID"', 'git_repo_id="S4"')
+git_push = git_push.replace('git_repo_id="GIT_REPO_ID"', 'git_repo_id="maskura"')
 root.joinpath("git_push.sh").write_text(git_push)
 PYTHON_PACKAGE
 generate typescript
@@ -177,7 +177,7 @@ package = json.loads(path.read_text())
 package["description"] = "OpenAPI client for the Maskura Gateway"
 package["repository"] = {
     "type": "git",
-    "url": "https://github.com/231self/S4.git",
+    "url": "https://github.com/231self/maskura.git",
 }
 package["license"] = "Apache-2.0"
 path.write_text(json.dumps(package, indent=2) + "\n")
@@ -185,7 +185,7 @@ path.write_text(json.dumps(package, indent=2) + "\n")
 git_push = path.with_name("git_push.sh")
 script = git_push.read_text()
 script = script.replace('git_user_id="GIT_USER_ID"', 'git_user_id="231self"')
-script = script.replace('git_repo_id="GIT_REPO_ID"', 'git_repo_id="S4"')
+script = script.replace('git_repo_id="GIT_REPO_ID"', 'git_repo_id="maskura"')
 git_push.write_text(script)
 TYPESCRIPT_PACKAGE
 

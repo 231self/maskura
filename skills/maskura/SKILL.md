@@ -5,9 +5,9 @@ description: Maskura is a pluggable processing gateway for S3-compatible object 
 
 # Maskura: pluggable processing gateway for object storage
 
-Maskura is an S3-compatible gateway that runs WebAssembly plugins over every object in
-transit. Point any S3 SDK/tool at Maskura; each object passes through an ordered plugin
-pipeline (filter, redact, encrypt, convert, validate, route) and the result is
+Maskura is an S3-compatible gateway that runs WebAssembly plugins over supported object
+content in transit. Point an S3 SDK/tool at Maskura; processed objects pass through an
+ordered plugin pipeline (filter, redact, encrypt, convert, validate, route) and the result is
 forwarded to any S3-compatible backend (MinIO, AWS, GCS, B2, R2, …).
 
 ## Core concepts
@@ -18,15 +18,16 @@ forwarded to any S3-compatible backend (MinIO, AWS, GCS, B2, R2, …).
   Decision variants: `Emit`, `Drop`, `Reject`.
 - **Sandbox** — wasmtime, 64 MiB memory, 10K table entries, 512 KiB stack, no host
   imports. Fuel: `MASKURA_WASM_FUEL` (default 1B; crypto filters need the pipeline
-  budget, ~25M per RSA-OAEP wrap).
+  budget, about 35M per hybrid-encrypted field in the current benchmark).
 - **Plugins are BYO** — write in any Wasm-capable language, `wasm-tools component
   new`, then runtime import via `maskura plugin upload` (no gateway rebuild/restart).
   `MASKURA_PLUGINS_DIR` auto-loads a directory at startup. Default filter:
   `filters/pii-default/` (redact emails / Luhn-valid cards / validated SSNs).
 - **Envelope encryption** — `filters/envelope-encrypt/` replaces each PII field
-  with `{"alg":"RSA-OAEP/AES-256-GCM","iv","enc_dek","ct","tag"}` using the API
-  key's bound X.509 public key. Maskura never holds the private key; clients decrypt
-  (`maskura_client.MaskuraClient.decrypt_payload`). Falls back to redaction without a key.
+  with a `X25519+ML-KEM-768/AES-256-GCM` envelope using the API key's bound
+  Maskura hybrid public key. Maskura never holds the private key and falls back
+  to redaction without a key. Packaged Python/TypeScript hybrid client support
+  is currently a known gap; their encryption helpers cover legacy RSA reads.
   `filters/stable-encrypt/` is AES-SIV deterministic encryption for JOIN keys
   (opt-in via stable-key/stable-fields context).
 - **Auth** — API keys (`x-maskura-access-key`/`x-maskura-secret-key` headers or
@@ -59,7 +60,7 @@ just image-local      # dagger: build the deploy image (cargo-cached)
 just publish-local TAG=x  # dagger: push canonical + legacy image tags
 maskura local init    # run the published gateway image standalone (Docker, in-memory)
 maskura put/get       # S3 data plane through the pipeline
-bash examples/b2-encrypt-demo.sh   # B2 encryption round-trip (needs B2_* env vars)
+bash examples/b2-redact-demo.sh    # B2 redaction round-trip (needs B2_* env vars)
 ```
 
 ## Layout
