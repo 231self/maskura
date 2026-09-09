@@ -108,6 +108,10 @@ These described jj changes are complete ancestors of the current work:
 | `vuqklvwt` | `feat(storage): persist the local operation journal` | Complete `FileOperationJournal`, claims, references, retirement |
 | `tsryppnw` | `refactor(storage): require explicit sink commit authority` | Typed sink authority; no parameterless completion bypass |
 | `nsllvqqu` | `feat(storage): coordinate fenced multipart publication` | Permit-first coordinator, exact local recovery, retirement ordering |
+| `ylymwosv` | `feat(s3): complete multipart listing and validation` | Multipart listing, pagination, validation, metadata, checksums, and S3 errors |
+| `lovwkuyx` | `test(storage): cover standalone local multipart lifecycle` | No-service local HTTP lifecycle, replay, abort, metadata, filtering, and restart |
+| `tlyuwlts` | `test(storage): cover local multipart crash recovery` | Deterministic restart and publication atomicity coverage |
+| `vypplnyo` | `test(s3): add local multipart conformance coverage` | Rust AWS SDK TCP flow, conformance scenarios, difficult keys, and optional external clients |
 
 Focused tests and all-target clippy passed at each completed boundary. The
 Postgres test wrappers compiled, but live database bodies were skipped because
@@ -115,7 +119,16 @@ Postgres test wrappers compiled, but live database bodies were skipped because
 `20260909000001_multipart_publishing_permits.sql` still requires a live
 `sqlx migrate info` and Postgres execution before final completion.
 
-## Current Working Change
+## Current Implementation Status
+
+Tasks 12 through 16 are complete. Task 17 is the current described change:
+`docs(storage): complete standalone multipart rollout`. Its focused gates are
+green: `just check`, `cargo test -p s4ctl`, `cargo clippy -p s4ctl --all-targets
+-- -D warnings`, `cargo fmt --check`, and `mdbook build docs`. The optional
+`cargo-deny` and `cargo-audit` tools are not installed in this environment, and
+live Postgres migration tests remain conditional on `DATABASE_URL`.
+
+## Historical Task 12 Resume Snapshot
 
 Current jj change:
 

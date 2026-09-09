@@ -302,26 +302,32 @@ durably and encrypted before any downstream processing (see §7).
 ## 7. Multipart staging — durable, encrypted, fenced
 
 `MASKURA_MULTIPART_MODE=staged` (default `reject`) enables client multipart uploads
-through a durable staging subsystem:
+through a durable staging subsystem. In standalone local mode, the repository,
+artifacts, journal, proofs, and wrapping key are all stored beneath the configured
+FileStore root. Hosted staged mode retains the Postgres and dedicated staging
+backend requirements described below.
 
-- **Durable encrypted staging.** Each part is written to a local artifact file
-  (`S4_MULTIPART_STAGING_DIR`) framed as `S4MP10` magic + JSON header
+- **Durable encrypted staging.** Each part is written to an encrypted artifact
+  (under local `.maskura/multipart/` in local mode, or
+  `S4_MULTIPART_STAGING_DIR` in hosted mode) framed as `S4MP10` magic + JSON header
   (containing the wrapped DEK, tenant/upload/part identity, and a digest of the
   multipart snapshot) followed by AES-256-GCM chunks whose AAD binds the header
-  and chunk number. The artifact is then copied to a dedicated Maskura-controlled
-  object store (`S4_MULTIPART_STAGING_BUCKET`/`ENDPOINT`/credentials). The
-  encryption key never exists in the gateway beyond the request lifetime, and
-  the DEK is wrapped by the configured `KeyWrapping`.
-- **`is_durable` requirement.** Staged multipart requires a durable wrapping
-  (KMS/Vault or a configured `S4_SECRET_KEK`); an ephemeral wrapping causes
-  staging to fail closed. It also requires `DATABASE_URL` (durable repository)
-  and the complete staging backend configuration.
-- **Durable quota reservations.** Per-tenant and global staging quotas
+  and chunk number. Hosted artifacts use the dedicated Maskura-controlled object
+  store (`S4_MULTIPART_STAGING_BUCKET`/`ENDPOINT`/credentials). Local artifacts
+  remain on the FileStore volume and use its persisted root wrapping key.
+- **Durability requirement.** Hosted staged multipart requires a durable wrapping
+  (KMS/Vault or a configured `S4_SECRET_KEK`), `DATABASE_URL`, and complete
+  staging backend configuration. Local staged multipart generates and persists a
+  mode-0600 wrapping key under `.maskura/` and uses file-backed repository and
+  journal implementations; it intentionally requires none of those hosted
+  dependencies.
+- **Durable quota reservations.** Per-workspace and global staging quotas
   (`S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES` / `_GLOBAL_QUOTA_BYTES`) are
-  reserved in Postgres with row locks *before* any body frame is consumed,
-  temp file opened, or artifact created. Crash-consistency is handled by a
-  pending-outbox (begin/commit/discard) state machine that reconciliation
-  replays.
+  reserved by the active multipart repository *before* any body frame is
+  consumed, temp file opened, or artifact created. Hosted reservations use
+  Postgres row locks; local reservations use the locked file-backed event log.
+  Crash-consistency is handled by a pending-outbox (begin/commit/discard) state
+  machine that reconciliation replays.
 - **Snapshot binding.** The multipart snapshot (metadata, tags, checksum mode,
   destination, plugin snapshot, limits) is recorded at initiation; completion
   replays each artifact through a reader that authenticates the envelope
@@ -543,10 +549,12 @@ names and are not exposed through customer aliases.
   for any non-local deployment. `S4_SECRET_KEK` is durable but operator-managed
   plaintext; the ephemeral wrapper loses all wrapped secrets on restart.
   Durable multipart staging fails closed without a durable wrapping.
-- **Durable journal / staging + Postgres** — set `DATABASE_URL`. Streaming
-  writes require the durable operation journal; staged multipart requires
-  Postgres plus the complete `S4_MULTIPART_STAGING_*` configuration; managed
-  observe/enforce requires Postgres and transactional capabilities.
+- **Durable journal / staging dependencies** — standalone local mode uses one
+  mounted `MASKURA_LOCAL_STORAGE_DIR` and automatically places its file-backed
+  repository, journal, proofs, artifacts, and wrapping key beneath that root;
+  it must run as one active process per root. Hosted staged mode requires
+  `DATABASE_URL` plus the complete `S4_MULTIPART_STAGING_*` configuration;
+  managed observe/enforce still requires Postgres and transactional capabilities.
 - **Backend lifecycle permissions** — the backend credentials Maskura uses for
   direct/managed streaming must be able to create, abort, and discover
   multipart uploads, complete uploads, and (for reconciliation) perform
@@ -557,10 +565,11 @@ names and are not exposed through customer aliases.
   **off/reject by default** and must be explicitly enabled:
   `MASKURA_STREAMING_READ_MODE=off`, `MASKURA_MULTIPART_MODE=reject`,
   `S4_MANAGED_STREAMING_MODE=off`. Single-part streaming writes are always
-  enabled; staged multipart additionally requires `MASKURA_MULTIPART_MODE=staged`
-  plus the durable staging dependencies. Enabling a gated feature without the
-  corresponding durable dependencies causes startup to refuse configuration
-  rather than silently degrade.
+  enabled; staged multipart additionally requires `MASKURA_MULTIPART_MODE=staged`.
+  Local mode supplies its durable file-backed dependencies from the mounted root;
+  hosted mode requires its Postgres, wrapping, and staging-backend dependencies.
+  Enabling a gated feature without the corresponding durable dependencies causes
+  startup to refuse configuration rather than silently degrade.
 - **Outbound credentials** — the global `S3_ENDPOINT` client accepts static
   `S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY` and, when those are absent, falls
   back to the AWS default credential provider chain (EC2 instance profile,

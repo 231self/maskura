@@ -4963,6 +4963,20 @@ async fn renew_and_fence_completion(
         .await
 }
 
+async fn renew_completion_if_due(
+    staging: &MultipartStaging,
+    identity: &MultipartIdentity,
+    lease: &CompletionLease,
+    last_renewal: &mut std::time::Instant,
+) -> Result<(), StagingError> {
+    if last_renewal.elapsed() < COMPLETION_LEASE / 3 {
+        return Ok(());
+    }
+    renew_and_fence_completion(staging, identity, lease).await?;
+    *last_renewal = std::time::Instant::now();
+    Ok(())
+}
+
 async fn write_completed_record(
     sink: &mut Box<dyn ObjectSinkTransaction>,
     record: crate::record::Record,
@@ -4971,11 +4985,11 @@ async fn write_completed_record(
 ) -> Result<(), MultipartCompletionError> {
     use sha2::Digest as _;
 
-    // The caller renews and fences the completion lease at each part/chunk
-    // boundary. Destination bytes only leave the transaction via the atomic
-    // publish below, which revalidates the fencing token, so a per-record
-    // renewal (a durable state rewrite on the file repository) would make
-    // many-record completions quadratically slow for no extra safety.
+    // The caller checks the completion lease at each part/chunk boundary and
+    // renews it at a bounded heartbeat interval. Destination bytes only leave
+    // the transaction via the atomic publish below, which revalidates the
+    // fencing token, so a per-record renewal would make many-record
+    // completions quadratically slow for no extra safety.
     for chunk in [record.payload, record.separator] {
         if chunk.is_empty() {
             continue;
@@ -5117,6 +5131,7 @@ async fn complete_staged_multipart(
             renew_and_fence_completion(staging, identity, lease).await?;
             let body = staging.artifacts.get(&part.artifact_key).await?;
             renew_and_fence_completion(staging, identity, lease).await?;
+            let mut last_renewal = std::time::Instant::now();
             let mut reader = EncryptedPartReader::open(
                 body,
                 identity,
@@ -5129,7 +5144,7 @@ async fn complete_staged_multipart(
             let mut part_sha256 = sha2::Sha256::new();
             let mut part_md5 = Md5::new();
             loop {
-                renew_and_fence_completion(staging, identity, lease).await?;
+                renew_completion_if_due(staging, identity, lease, &mut last_renewal).await?;
                 let Some(chunk) = reader.next_chunk().await? else {
                     break;
                 };
@@ -5149,6 +5164,7 @@ async fn complete_staged_multipart(
                 part_md5.update(&chunk);
                 decoder.push(&chunk)?;
                 while let Some(record) = decoder.next_record()? {
+                    renew_completion_if_due(staging, identity, lease, &mut last_renewal).await?;
                     if let Some(record) = pipeline
                         .as_mut()
                         .expect("pipeline is present until finish")

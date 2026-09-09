@@ -28,18 +28,18 @@ Add `FileStore`, enabled for explicit single-tenant deployments by
 - `FileSinkTransaction` streams transformed output to disk and commits through
   `FileStore`; single PUT does not use an operation journal because local rename
   gives crash-safe atomic object visibility.
-- FileStore supports core bucket and object operations. Durable multipart is a
+- FileStore supports core bucket and object operations. Durable multipart is the
   separate persistence and recovery architecture defined by
-  [ADR 0013](0013-durable-local-multipart-storage.md); it remains unavailable
-  until that implementation's gates pass.
+  [ADR 0013](0013-durable-local-multipart-storage.md), enabled explicitly with
+  `MASKURA_MULTIPART_MODE=staged`.
 
 ## Consequences
 
 - A gateway can be a standalone local S3 endpoint with a mounted volume and no
   MinIO, Postgres, or cloud credentials.
 - This is a single-node backend. It has no replication, versioning, lifecycle
-  rules, or bucket IAM. ADR 0013 adds an exclusive process lock and defines
-  future multipart support without changing the single-node boundary.
+  rules, or bucket IAM. ADR 0013 adds durable multipart, an exclusive process
+  lock, encrypted staging, and crash recovery without changing that boundary.
 - Orphaned temp files are removed at FileStore startup. A crash after a data-file
   rename but before its metadata commit can leave unreferenced data, but cannot
   make a partial object visible.

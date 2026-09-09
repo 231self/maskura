@@ -1887,9 +1887,9 @@ async fn main() -> anyhow::Result<()> {
             match cmd {
                 LocalCmd::Init => {
                     // Runs the published gateway image standalone (no repo
-                    // clone, no Postgres): in-memory storage, keys persisted
-                    // on a named volume. Durable MinIO storage is available
-                    // via `just dev-up` in the repo.
+                    // clone, no Postgres or MinIO): durable FileStore data,
+                    // multipart state, wrapping key, and keys share one
+                    // named volume.
                     let docker_ok = std::process::Command::new("docker")
                         .args(["version", "--format", "{{.Server.Version}}"])
                         .output()
@@ -1919,11 +1919,17 @@ async fn main() -> anyhow::Result<()> {
                             "-p",
                             &format!("127.0.0.1:{port}:8080"),
                             "-v",
-                            "s4-local-keys:/app/data",
+                            "s4-local-keys:/data",
                             "-e",
                             "AUTH_DISABLED=true",
                             "-e",
-                            "MASKURA_KEYS_FILE=/app/data/keys.json",
+                            "MASKURA_KEYS_FILE=/data/keys.json",
+                            "-e",
+                            "MASKURA_STORAGE_MODE=local",
+                            "-e",
+                            "MASKURA_LOCAL_STORAGE_DIR=/data",
+                            "-e",
+                            "MASKURA_MULTIPART_MODE=staged",
                             "-e",
                             "MASKURA_STREAMING_READ_MODE=passthrough",
                             &local_gateway_image,
@@ -1975,8 +1981,9 @@ async fn main() -> anyhow::Result<()> {
 
                     println!("Maskura Gateway is running locally (published image).");
                     println!("  Gateway: {url}");
-                    println!("  Storage: in-memory (durable MinIO via `just dev-up` in the repo)");
-                    println!("  Keys:    persisted in the s4-local-keys volume");
+                    println!("  Storage: durable local filesystem (/data)");
+                    println!("  Multipart: durable staged uploads enabled");
+                    println!("  Volume:  s4-local-keys (keys and object state)");
                     println!();
                     println!("Quickstart:");
                     println!(

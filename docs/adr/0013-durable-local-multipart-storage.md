@@ -50,6 +50,18 @@ local-storage runtime with an OS exclusive lock held for the runtime lifetime,
 whether multipart is enabled or not. Multi-process and distributed filesystem
 coordination are outside this backend's contract.
 
+## Implementation status
+
+Implemented for standalone local mode. Set `MASKURA_STORAGE_MODE=local`,
+`MASKURA_LOCAL_STORAGE_DIR` (default `./data`), and
+`MASKURA_MULTIPART_MODE=staged` to enable it. The local repository, encrypted
+artifacts, operation journal, commit proofs, API key file, and generated wrapping
+key share the FileStore root. Hosted Postgres/S3 multipart remains unchanged.
+
+The implementation is covered by unit recovery and fencing tests, standalone
+HTTP lifecycle and restart tests, deterministic crash-boundary tests, and
+unmodified Rust AWS SDK multipart tests over a real TCP listener.
+
 The repository durably changes an owned completion lease to a fencing-bound
 `PUBLISHING` permit before destination mutation; publishing completions cannot
 be taken over by ordinary lease expiry. Serialize FileStore multipart

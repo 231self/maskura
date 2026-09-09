@@ -1,6 +1,6 @@
 # Local filesystem storage (FileStore) — Maskura as an open-source MinIO replacement
 
-Status: planned
+Status: implemented (Phase 1 and Phase 2)
 Scope: self-hosted OSS gateway, durable local object storage, S3 data plane
 Repositories: public `231self/maskura` (gateway)
 Synced against: `main` @ `6407b629` (PR #113) and `s4-private` @ `9992d6cd` (PR #93)
@@ -21,7 +21,7 @@ redaction, envelope encryption — now hybrid X25519 + ML-KEM-768 per PR #108 �
 per-field stable encryption) sits on the data path, so the S3 endpoint both
 stores objects *and* scrubs/encrypts them.
 
-## Current-State Findings
+## Historical findings before implementation
 
 - The release image (`Dockerfile.release`) contains only the gateway binary and
   Wasm components — MinIO is **not** part of the runtime. MinIO appears only in
@@ -110,23 +110,25 @@ stores objects *and* scrubs/encrypts them.
    `Memory` arm at `server.rs:3522`), and `begin_streaming_sink`
    (`server.rs:3185`) constructs the `FileSinkTransaction` for it without touching
    `operation_journal`.
-8. **Out of scope for v1** (tracked as a parity matrix in docs, not implemented):
+8. **Out of scope for the single-node backend** (tracked as a parity matrix in
+   docs, not implemented):
    object versioning, SSE-S3/SSE-C, lifecycle rules, bucket policy/IAM, object
-   tagging, event notifications, replication, and WORM/locking. Multipart upload
-   to `FileStore` is Phase 2 (below), not v1.
+   tagging, event notifications, replication, and WORM/locking. Durable multipart
+   is implemented separately under ADR 0013 and is enabled explicitly with
+   `MASKURA_MULTIPART_MODE=staged`.
 
 ## Sequencing (Phases)
 
-**Phase 1 — single-PUT FileStore (this plan).** PUT/GET/HEAD/DELETE/LIST and
+**Phase 1 — single-PUT FileStore (implemented).** PUT/GET/HEAD/DELETE/LIST and
 bucket Create/Delete on local disk, via `FileStore` + `FileSinkTransaction`, with
 a `File` streaming arm that needs no durable journal (rename atomicity). This
 ships the standalone MinIO-replacement shape for ordinary objects.
 
-**Phase 2 — multipart FileStore (full parity).** `CreateMultipartUpload` /
-`UploadPart` / `CompleteMultipartUpload` staged as temp files in `FileStore`,
-composed atomically on complete. This requires the `FileOperationJournal`
-(`docs/plans/2026-09-07-byo-streaming-write.md`) to land first so a crash between
-parts and completion is reconciled; it is a follow-up plan, not part of v1.
+**Phase 2 — multipart FileStore (implemented).** `CreateMultipartUpload` /
+`UploadPart` / `CompleteMultipartUpload` use encrypted local artifacts,
+file-backed repository state, fenced publication, exact replay, and atomic
+FileStore visibility. The `FileOperationJournal` and local multipart repository
+reconcile crashes before serving traffic and through bounded recurring cleanup.
 
 ## Ordered Implementation
 
@@ -244,7 +246,7 @@ a PUT/GET/HEAD/DELETE/LIST round-trip through the HTTP frontdoor against `FileSt
 - The existing transform pipeline still runs on every PUT/GET, so the endpoint is
   a "self-cleaning" object store (the MinIO-replacement differentiator).
 - The MinIO-parity matrix is documented, and the deferred items (versioning, SSE,
-  lifecycle, policy, tagging, notifications, replication, multipart-to-local) are
+  lifecycle, policy, tagging, notifications, replication, and object locking) are
   explicitly listed with owners/tracking.
 
 ## Open Decisions
