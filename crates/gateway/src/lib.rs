@@ -6,11 +6,6 @@ pub mod binary_reductor;
 pub mod control;
 pub mod customer_headers;
 pub mod entity;
-// Removed once Task 8 consumes the complete reducer surface.
-#[allow(
-    dead_code,
-    reason = "Task 7 foundation for the file repository adapter"
-)]
 pub(crate) mod file_multipart_repository;
 pub(crate) mod file_staging_artifact;
 pub mod file_store;

@@ -2091,7 +2091,7 @@ impl Default for InMemoryMultipartRepository {
     }
 }
 
-fn same_identity(upload: &MultipartUpload, identity: &MultipartIdentity) -> bool {
+pub(crate) fn same_identity(upload: &MultipartUpload, identity: &MultipartIdentity) -> bool {
     upload.identity.tenant_id == identity.tenant_id
         && upload.identity.credential_policy_id == identity.credential_policy_id
         && upload.identity.bucket == identity.bucket
@@ -2105,7 +2105,7 @@ enum MultipartListingEntry {
     CommonPrefix(String),
 }
 
-fn paginate_multipart_uploads(
+pub(crate) fn paginate_multipart_uploads(
     mut uploads: Vec<MultipartUpload>,
     request: &ListMultipartUploadsRequest,
 ) -> Result<ListMultipartUploadsPage, StagingError> {
@@ -2184,7 +2184,7 @@ fn paginate_multipart_uploads(
     Ok(page)
 }
 
-fn permit_matches(upload: &MultipartUpload, permit: &DestinationCommitPermit) -> bool {
+pub(crate) fn permit_matches(upload: &MultipartUpload, permit: &DestinationCommitPermit) -> bool {
     upload.lifecycle == MultipartLifecycle::Publishing
         && upload.identity.upload_id == permit.upload_id
         && upload.complete_request_fingerprint.as_deref()
@@ -2193,7 +2193,9 @@ fn permit_matches(upload: &MultipartUpload, permit: &DestinationCommitPermit) ->
         && upload.destination_operation_id == Some(permit.operation_id)
 }
 
-fn publishing_upload(upload: MultipartUpload) -> Result<PublishingMultipartUpload, StagingError> {
+pub(crate) fn publishing_upload(
+    upload: MultipartUpload,
+) -> Result<PublishingMultipartUpload, StagingError> {
     let fingerprint = upload.complete_request_fingerprint.clone().ok_or_else(|| {
         StagingError::Persistence("publishing upload is missing its fingerprint".to_string())
     })?;

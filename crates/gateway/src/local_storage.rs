@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::file_multipart_repository::FileMultipartRepository;
 use crate::file_staging_artifact::FileStagingArtifactStore;
 use crate::file_store::{FileStore, FileStoreError};
 use crate::filesystem_persistence::{FilesystemPersistence, PersistenceError, RootLock};
 use crate::key_cipher::{FileKeyWrapping, FileKeyWrappingError, KeyWrapping};
-use crate::multipart_staging::StagingError;
+use crate::multipart_staging::{StagingError, StagingQuotaLimits};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LocalStorageError {
@@ -29,6 +30,7 @@ pub(crate) struct LocalStorageRuntime {
         reason = "consumed by subsequent local multipart startup wiring"
     )]
     staging_artifacts: Arc<FileStagingArtifactStore>,
+    multipart_repository: Arc<FileMultipartRepository>,
     #[allow(
         dead_code,
         reason = "consumed by subsequent local multipart startup wiring"
@@ -47,10 +49,15 @@ impl LocalStorageRuntime {
         let staging_artifacts = Arc::new(FileStagingArtifactStore::open(
             root.join(".maskura").join("multipart"),
         )?);
+        let multipart_repository = Arc::new(FileMultipartRepository::open(
+            root.join(".maskura").join("multipart"),
+            StagingQuotaLimits::new(i64::MAX as u64, i64::MAX as u64)?,
+        )?);
         Ok(Self {
             root,
             file_store,
             staging_artifacts,
+            multipart_repository,
             wrapping,
             _root_lock: root_lock,
         })
@@ -66,6 +73,14 @@ impl LocalStorageRuntime {
     )]
     pub(crate) fn staging_artifacts(&self) -> Arc<FileStagingArtifactStore> {
         self.staging_artifacts.clone()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by subsequent local multipart startup wiring"
+    )]
+    pub(crate) fn multipart_repository(&self) -> Arc<FileMultipartRepository> {
+        self.multipart_repository.clone()
     }
 
     #[allow(
@@ -112,6 +127,7 @@ impl LocalStorageRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::multipart_staging::MultipartRepository as _;
     use uuid::Uuid;
 
     struct TempDir(PathBuf);
@@ -172,6 +188,7 @@ mod tests {
 
         assert_eq!(first.file_store().root(), first_directory.path());
         assert_eq!(second.file_store().root(), second_directory.path());
+        assert!(first.multipart_repository().is_durable());
     }
 
     #[tokio::test]
