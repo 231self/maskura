@@ -33,7 +33,10 @@ contracts in `maskura-mcp-protocol` (re-exported as `s4_gateway::mcp`) and trust
 
 ## Run locally
 
-Start the published gateway image and copy the loopback URL printed by the CLI:
+Start the published Maskura gateway image through the CLI and copy the loopback
+URL it prints. The CLI calls the local Docker API directly; this starts one
+Maskura container with its own durable FileStore and S3-compatible API, not a
+MinIO sidecar:
 
 ```bash
 maskura local init

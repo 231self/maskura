@@ -3,7 +3,7 @@
 Status: implemented (Phase 1 and Phase 2)
 Scope: self-hosted OSS gateway, durable local object storage, S3 data plane
 Repositories: public `231self/maskura` (gateway)
-Synced against: `main` @ `6407b629` (PR #113) and `s4-private` @ `9992d6cd` (PR #93)
+Synced against: public `main` after PR #116 and `s4-private` @ `9992d6cd` (PR #93)
 
 ## Objective
 
@@ -20,6 +20,22 @@ Maskura's differentiator over MinIO is unchanged: the transform pipeline (PII
 redaction, envelope encryption — now hybrid X25519 + ML-KEM-768 per PR #108 —
 per-field stable encryption) sits on the data path, so the S3 endpoint both
 stores objects *and* scrubs/encrypts them.
+
+## TODO: advanced MinIO parity
+
+The standalone Docker path is complete for the basic S3 object, bucket, listing,
+and multipart operations documented below. Full MinIO feature parity remains a
+separate follow-up and must not be implied by the local replacement quickstart.
+Track implementation and conformance coverage for:
+
+- object versioning and delete markers;
+- ACLs, bucket policies, and IAM-equivalent authorization;
+- SSE-S3/SSE-KMS and customer-managed encryption headers;
+- lifecycle rules, retention, WORM, and object locking;
+- event notifications, replication, and remaining advanced copy/tagging APIs.
+
+Each item needs an explicit compatibility test against a pinned MinIO release
+before it is advertised as supported.
 
 ## Historical findings before implementation
 

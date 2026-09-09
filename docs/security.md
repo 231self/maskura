@@ -350,7 +350,9 @@ backend requirements described below.
 Streaming writes (single-part `PUT`, and staged multipart when
 `MASKURA_MULTIPART_MODE=staged`) run through a durable transaction layer:
 
-- **Operation journal.** A Postgres-backed `OperationJournal`
+- **Operation journal.** Hosted deployments use the Postgres-backed
+  `OperationJournal`; standalone local deployments use the file-backed journal
+  under the FileStore root.
   (`DATABASE_URL`) records each operation's state machine:
   `INTENT → OPEN → COMPLETING → COMMITTED`, with `COMMIT_UNKNOWN` and
   `PROVEN_ABORTED` for crash recovery. Streaming writes in a non-development

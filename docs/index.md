@@ -7,8 +7,10 @@ and the result is forwarded to any S3-compatible storage backend.
 
 The quickest way to see it working is the README's
 [60-second Docker demo](https://github.com/231self/maskura#try-it-in-60-seconds):
-run the published image with `AUTH_DISABLED=true`, open the demo dashboard, and
-push a file through the pipeline. This site is the deeper documentation:
+run the published Maskura image with `AUTH_DISABLED=true` and a durable local
+volume, open the demo dashboard, and push a file through Maskura's own
+S3-compatible API. No MinIO service is involved in this path. This site is the
+deeper documentation:
 
 - **[Plugins](plugins.md)** — write, load, and compose your own Wasm filters.
 - **[Avro gate](avro.md)** — the typed Avro OCF processing path.

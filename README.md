@@ -66,14 +66,20 @@ emails / SSNs / credit cards), `email-detect`, `ssn-detect`, `card-detect`,
 
 ## Quickstart
 
-No cloud account, no database, no repo clone — run the published image:
+No cloud account, database, MinIO service, or repo clone is needed. Run the
+published Maskura gateway image with its own local S3-compatible API and one
+durable Docker volume:
 
 ```bash
-docker run --rm -p 127.0.0.1:8791:8080 \
+docker run --rm -p 127.0.0.1:8791:8080 -v s4-local-keys:/data \
   -e AUTH_DISABLED=true \
+  -e MASKURA_KEYS_FILE=/data/keys.json \
+  -e MASKURA_STORAGE_MODE=local \
+  -e MASKURA_LOCAL_STORAGE_DIR=/data \
+  -e MASKURA_MULTIPART_MODE=staged \
   -e MASKURA_STREAMING_READ_MODE=passthrough \
   ghcr.io/231self/maskura/maskura:latest
-# open http://localhost:8791 → demo dashboard (no sign-up)
+# open http://localhost:8791 -> demo dashboard (no sign-up)
 ```
 
 The gateway speaks SigV4, so your existing `aws s3` CLI works as-is:
@@ -127,7 +133,7 @@ maskura get ingest/data.csv --bucket s4-local
 ```
 
 `maskura local init` pulls the gateway image tagged with the CLI version
-(`ghcr.io/231self/maskura/maskura:v0.4.1` for `maskura` 0.4.1; CLI and gateway always
+(`ghcr.io/231self/maskura/maskura:v0.5.3` for `maskura` 0.5.3; CLI and gateway always
 match, never `:latest`) and runs a durable single-node local FileStore
 (`AUTH_DISABLED=true`, staged multipart enabled, all state on one volume). It picks
 a free port (8080+) and only listens on localhost. `maskura local down` stops it.
@@ -206,12 +212,12 @@ Everything below is copy-paste runnable.
 **Redaction — PII filtered on write**
 
 ```bash
-# Local gateway (published image, Docker, in-memory storage):
+# Local gateway (Maskura-managed Docker container, durable FileStore):
 maskura local init
 maskura put ./data.csv ingest/data.csv --bucket s4-local
 maskura get ingest/data.csv --bucket s4-local     # emails/SSNs/cards redacted
 
-# Durable local storage (MinIO) from a repo clone:
+# Optional external-backend validation path (MinIO + Docker Compose):
 just dev-up
 maskura put ./data.csv ingest/data.csv --bucket s4-local
 
