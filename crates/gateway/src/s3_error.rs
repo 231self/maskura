@@ -157,6 +157,18 @@ pub fn invalid_part_order(key: &str) -> axum::response::Response {
     )
 }
 
+pub fn invalid_argument(key: &str, detail: &str) -> axum::response::Response {
+    s3_error_xml("InvalidArgument", detail, key, StatusCode::BAD_REQUEST)
+}
+
+pub fn malformed_xml(key: &str, detail: &str) -> axum::response::Response {
+    s3_error_xml("MalformedXML", detail, key, StatusCode::BAD_REQUEST)
+}
+
+pub fn entity_too_small(key: &str, detail: &str) -> axum::response::Response {
+    s3_error_xml("EntityTooSmall", detail, key, StatusCode::BAD_REQUEST)
+}
+
 pub fn signature_mismatch(key: &str) -> axum::response::Response {
     s3_error_xml(
         "SignatureDoesNotMatch",

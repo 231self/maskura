@@ -71,6 +71,21 @@ pub struct LocalChecksumState {
     pub value: String,
 }
 
+/// The object headers FileStore can echo back to S3 GET/HEAD clients. Content
+/// length, content type, and ETag stay on the response body path; everything
+/// else is carried here so server handlers can reproduce the initiation
+/// metadata without reopening the metadata file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileStoredMeta {
+    pub size: u64,
+    pub content_type: String,
+    pub etag: String,
+    pub representation_headers: BTreeMap<String, String>,
+    pub user_metadata: BTreeMap<String, String>,
+    pub tags: BTreeMap<String, String>,
+    pub checksum: Option<LocalChecksumState>,
+}
+
 /// Backend-owned publication identity. A later fenced coordinator supplies
 /// this only after obtaining its durable publishing permit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,6 +151,10 @@ pub struct FileObjectReader<R> {
     pub object_length: u64,
     pub content_type: String,
     pub etag: String,
+    pub representation_headers: BTreeMap<String, String>,
+    pub user_metadata: BTreeMap<String, String>,
+    pub tags: BTreeMap<String, String>,
+    pub checksum: Option<LocalChecksumState>,
 }
 
 impl FileObjectReader<File> {
@@ -150,6 +169,10 @@ impl FileObjectReader<File> {
             object_length: self.object_length,
             content_type: self.content_type,
             etag: self.etag,
+            representation_headers: self.representation_headers,
+            user_metadata: self.user_metadata,
+            tags: self.tags,
+            checksum: self.checksum,
         })
     }
 }
@@ -300,6 +323,25 @@ impl FileStore {
             .load_metadata(bucket, key)
             .await?
             .map(|metadata| (metadata.size, metadata.content_type, metadata.etag)))
+    }
+
+    pub async fn stored_meta(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<FileStoredMeta>, FileStoreError> {
+        Ok(self
+            .load_metadata(bucket, key)
+            .await?
+            .map(|metadata| FileStoredMeta {
+                size: metadata.size,
+                content_type: metadata.content_type,
+                etag: metadata.etag,
+                representation_headers: metadata.representation_headers,
+                user_metadata: metadata.user_metadata,
+                tags: metadata.tags,
+                checksum: metadata.checksum,
+            }))
     }
 
     pub async fn delete(&self, bucket: &str, key: &str) -> Result<bool, FileStoreError> {
@@ -828,6 +870,10 @@ impl FileStore {
                 object_length: metadata.size,
                 content_type: metadata.content_type,
                 etag: metadata.etag,
+                representation_headers: metadata.representation_headers,
+                user_metadata: metadata.user_metadata,
+                tags: metadata.tags,
+                checksum: metadata.checksum,
             }));
         }
         unreachable!("file open retry loop always returns")

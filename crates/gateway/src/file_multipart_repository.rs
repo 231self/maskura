@@ -395,7 +395,6 @@ fn reduce_transition(
                 || pending.upload_id != event.identity.upload_id
                 || pending.part_number == 0
                 || pending.part_number > MAX_PARTS
-                || pending.reserved_bytes == 0
                 || snapshot.attempts.len() >= MAX_PARTS as usize
             {
                 return Err(FileMultipartReducerError::InvalidPart);
@@ -814,8 +813,7 @@ fn validate_snapshot(snapshot: &FileMultipartSnapshotV1) -> Result<(), FileMulti
         }
         match attempt.lifecycle {
             FilePartAttemptLifecycleV1::Pending => {
-                if attempt.reserved_bytes == 0
-                    || attempt.part.size_bytes != 0
+                if attempt.part.size_bytes != 0
                     || !attempt.part.etag.is_empty()
                     || !attempt.part.checksum_sha256.is_empty()
                 {
@@ -1580,7 +1578,7 @@ impl MultipartRepository for FileMultipartRepository {
         reserved_bytes: u64,
         now: i64,
     ) -> Result<PendingPart, StagingError> {
-        if part_number == 0 || part_number > MAX_PARTS || reserved_bytes == 0 {
+        if part_number == 0 || part_number > MAX_PARTS {
             return Err(StagingError::InvalidPart);
         }
         let mut state = self.state.lock().await;
@@ -1605,10 +1603,8 @@ impl MultipartRepository for FileMultipartRepository {
             part_number,
             attempt,
             artifact_key: format!(
-                "multipart/{}/{}/{part_number}/{}",
-                identity.tenant_id,
-                identity.upload_id,
-                Uuid::now_v7()
+                "multipart/{}/{}/{part_number}/{attempt}",
+                identity.tenant_id, identity.upload_id
             ),
             reserved_bytes,
         };
@@ -3847,6 +3843,60 @@ mod tests {
             .await,
             Err(StagingError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn adapter_zero_byte_final_part_survives_replay() {
+        let directory = TempDir::new();
+        let repo = open_adapter(directory.path(), 10_000);
+        let identity = adapter_identity("tenant", "key");
+        repo.create(adapter_upload(identity.clone(), 100))
+            .await
+            .unwrap();
+        let started = now_ms();
+        let pending = repo
+            .begin_part(&identity, 1, 0, started)
+            .await
+            .expect("a zero-byte reservation is a valid final part");
+        let zero = MultipartPart {
+            upload_id: identity.upload_id.clone(),
+            part_number: 1,
+            attempt: pending.attempt,
+            artifact_key: pending.artifact_key.clone(),
+            etag: "\"empty\"".to_string(),
+            checksum_sha256: "empty-sha".to_string(),
+            size_bytes: 0,
+            created_at_ms: started,
+        };
+        repo.commit_part(&identity, &pending, zero.clone())
+            .await
+            .unwrap();
+        let acquired_at = now_ms();
+        let lease = match repo
+            .acquire_completion(
+                &identity,
+                "zero-final",
+                &[selected(&zero)],
+                "worker",
+                acquired_at + 10_000,
+                acquired_at,
+            )
+            .await
+            .unwrap()
+        {
+            CompletionAcquire::Acquired(lease) => lease,
+            _ => panic!("expected a completion lease for a zero-byte final part"),
+        };
+        assert_eq!(lease.selected_parts.len(), 1);
+        assert_eq!(lease.selected_parts[0].size_bytes, 0);
+        drop(repo);
+
+        let reopened = open_adapter(directory.path(), 10_000);
+        let (parts, truncated) = reopened.list_parts(&identity, 0, 10).await.unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].size_bytes, 0);
+        assert_eq!(parts[0].etag, "\"empty\"");
+        assert!(!truncated);
     }
 
     #[tokio::test]

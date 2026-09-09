@@ -1064,7 +1064,7 @@ impl MultipartRepository for PostgresMultipartRepository {
         reserved_bytes: u64,
         now: i64,
     ) -> Result<PendingPart, StagingError> {
-        if part_number == 0 || part_number > MAX_PARTS || reserved_bytes == 0 {
+        if part_number == 0 || part_number > MAX_PARTS {
             return Err(StagingError::InvalidPart);
         }
         let reserved = as_i64(reserved_bytes)?;
@@ -2333,7 +2333,7 @@ impl MultipartRepository for InMemoryMultipartRepository {
         reserved_bytes: u64,
         now: i64,
     ) -> Result<PendingPart, StagingError> {
-        if part_number == 0 || part_number > MAX_PARTS || reserved_bytes == 0 {
+        if part_number == 0 || part_number > MAX_PARTS {
             return Err(StagingError::InvalidPart);
         }
         let mut state = self.state.lock().await;
@@ -4558,5 +4558,49 @@ mod tests {
             .await,
             Err(StagingError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn zero_byte_part_can_be_uploaded_listed_and_selected_as_the_final_part() {
+        let repo = InMemoryMultipartRepository::new();
+        repo.create(upload()).await.unwrap();
+        let pending = repo
+            .begin_part(&identity(), 1, 0, now_ms())
+            .await
+            .expect("a zero-byte reservation is a valid final part");
+        let zero = MultipartPart {
+            upload_id: "upload".to_string(),
+            part_number: 1,
+            attempt: pending.attempt,
+            artifact_key: pending.artifact_key.clone(),
+            etag: "\"empty\"".to_string(),
+            checksum_sha256: "empty-sha".to_string(),
+            size_bytes: 0,
+            created_at_ms: now_ms(),
+        };
+        repo.commit_part(&identity(), &pending, zero.clone())
+            .await
+            .unwrap();
+        let (parts, truncated) = repo.list_parts(&identity(), 0, 1000).await.unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].size_bytes, 0);
+        assert!(!truncated);
+        let lease = match repo
+            .acquire_completion(
+                &identity(),
+                "zero-final",
+                &[complete_part(1, "\"empty\"", Some("empty-sha"))],
+                "worker",
+                100,
+                now_ms(),
+            )
+            .await
+            .unwrap()
+        {
+            CompletionAcquire::Acquired(lease) => lease,
+            _ => panic!("expected completion lease for a zero-byte final part"),
+        };
+        assert_eq!(lease.selected_parts.len(), 1);
+        assert_eq!(lease.selected_parts[0].size_bytes, 0);
     }
 }

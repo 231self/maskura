@@ -11,7 +11,7 @@ mod presign;
 mod s3;
 mod spool;
 
-pub use file::FileSinkTransaction;
+pub use file::{FileSinkTransaction, MultipartStoredMetadata};
 pub(crate) use file_journal::FileOperationJournal;
 #[cfg(any(test, debug_assertions))]
 pub use journal::InMemoryOperationJournal;

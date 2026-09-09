@@ -9,7 +9,7 @@ use sha2::Sha256;
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 
-use crate::file_store::{FileStore, LocalCommitContext};
+use crate::file_store::{FileStore, LocalChecksumState, LocalCommitContext};
 
 use super::{
     DestinationCommitAuthority, ObjectSinkTransaction, SinkCommitState, StoredObjectMeta,
@@ -32,6 +32,20 @@ pub struct FileSinkTransaction {
     output_verified: bool,
     finished: bool,
     operation_id: Option<uuid::Uuid>,
+    representation_headers: BTreeMap<String, String>,
+    user_metadata: BTreeMap<String, String>,
+    tags: BTreeMap<String, String>,
+    checksum_algorithm: Option<String>,
+}
+
+/// Metadata captured at multipart initiation that must survive completion into
+/// FileStore metadata and later GET/HEAD responses.
+#[derive(Clone, Debug, Default)]
+pub struct MultipartStoredMetadata {
+    pub representation_headers: BTreeMap<String, String>,
+    pub user_metadata: BTreeMap<String, String>,
+    pub tags: BTreeMap<String, String>,
+    pub checksum_algorithm: Option<String>,
 }
 
 impl FileSinkTransaction {
@@ -65,6 +79,10 @@ impl FileSinkTransaction {
             output_verified: false,
             finished: false,
             operation_id: None,
+            representation_headers: BTreeMap::new(),
+            user_metadata: BTreeMap::new(),
+            tags: BTreeMap::new(),
+            checksum_algorithm: None,
         })
     }
 
@@ -78,6 +96,26 @@ impl FileSinkTransaction {
     ) -> Result<Self, TransactionError> {
         let mut sink = Self::new(store, bucket, key, content_type, max_bytes).await?;
         sink.operation_id = Some(operation_id);
+        Ok(sink)
+    }
+
+    /// Multipart completion carries the initiation metadata into the durable
+    /// commit so GET/HEAD can reproduce it after publication.
+    pub async fn new_for_multipart_operation(
+        store: Arc<FileStore>,
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+        content_type: impl Into<String>,
+        max_bytes: u64,
+        operation_id: uuid::Uuid,
+        metadata: MultipartStoredMetadata,
+    ) -> Result<Self, TransactionError> {
+        let mut sink = Self::new(store, bucket, key, content_type, max_bytes).await?;
+        sink.operation_id = Some(operation_id);
+        sink.representation_headers = metadata.representation_headers;
+        sink.user_metadata = metadata.user_metadata;
+        sink.tags = metadata.tags;
+        sink.checksum_algorithm = metadata.checksum_algorithm;
         Ok(sink)
     }
 }
@@ -164,6 +202,14 @@ impl ObjectSinkTransaction for FileSinkTransaction {
             }
             DestinationCommitAuthority::ClientMultipart(multipart) => {
                 let permit = &multipart.permit;
+                let expected_sha256 = hex::encode(self.sha256.clone().finalize());
+                let checksum =
+                    self.checksum_algorithm
+                        .as_ref()
+                        .map(|algorithm| LocalChecksumState {
+                            algorithm: algorithm.to_ascii_lowercase(),
+                            value: expected_sha256.clone(),
+                        });
                 let context = LocalCommitContext {
                     operation_id: permit.operation_id,
                     generation_id: permit.operation_id,
@@ -172,11 +218,11 @@ impl ObjectSinkTransaction for FileSinkTransaction {
                     key: self.key.clone(),
                     content_type: self.content_type.clone(),
                     expected_size: self.bytes,
-                    expected_sha256: hex::encode(self.sha256.clone().finalize()),
-                    representation_headers: BTreeMap::new(),
-                    user_metadata: BTreeMap::new(),
-                    tags: BTreeMap::new(),
-                    checksum: None,
+                    expected_sha256,
+                    representation_headers: self.representation_headers.clone(),
+                    user_metadata: self.user_metadata.clone(),
+                    tags: self.tags.clone(),
+                    checksum,
                 };
                 self.store
                     .prepare_transaction(&context)

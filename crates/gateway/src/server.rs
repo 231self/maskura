@@ -49,7 +49,7 @@ use crate::control::{
     UsageRoute,
 };
 use crate::customer_headers;
-use crate::file_store::FileStore;
+use crate::file_store::{FileStore, LocalChecksumState};
 use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
 use crate::local_storage::LocalStorageRuntime;
@@ -65,10 +65,11 @@ use crate::multipart_completion::{
 use crate::multipart_staging::{
     ARTIFACT_PREFIX, AbortMutationError, COMPLETION_LEASE, CleanupAudit, CompletePart,
     CompletionAcquire, CompletionLease, EncryptedPartReader, EncryptedPartWriter,
-    MAX_ACTIVE_UPLOADS, MultipartCompletionResult, MultipartIdentity, MultipartLifecycle,
-    MultipartPart, MultipartRepository, MultipartSnapshot, MultipartUpload,
-    PostgresMultipartRepository, S3StagingArtifactStore, StagedArtifact, StagingArtifactStore,
-    StagingError, StagingQuotaLimits, completion_fingerprint, now_ms,
+    ListMultipartUploadsPage, ListMultipartUploadsRequest, MAX_ACTIVE_UPLOADS,
+    MultipartCompletionResult, MultipartIdentity, MultipartLifecycle, MultipartPart,
+    MultipartRepository, MultipartSnapshot, MultipartUpload, PostgresMultipartRepository,
+    S3StagingArtifactStore, StagedArtifact, StagingArtifactStore, StagingError, StagingQuotaLimits,
+    completion_fingerprint, now_ms,
 };
 use crate::object::{
     BodyLimits, ChunkedBytesBody, ObjectMetadata, OpenedObject, filter_presigned_response_headers,
@@ -91,10 +92,10 @@ use crate::transaction::{
     CompatibilitySpoolConfig, CompatibilitySpoolTransaction, CompletionReconciliation,
     ConditionalReadCapability, DestinationCommitAuthority, DirectOperationScope, DirectS3Sink,
     ExpectedObject, FileSinkTransaction, IncompleteUploadDiscovery, JournalError, ListCapability,
-    MemorySinkTransaction, MultipartResponseCapability, ObjectDestination, ObjectSinkTransaction,
-    OperationJournal, OperationReconciler, OperationRecord, OperationState, ProviderMutationFence,
-    ResponseChecksumCapability, SpoolQuota, StoredObjectMeta, TransactionError,
-    VersioningCapability, WorkspaceDestinationBinding,
+    MemorySinkTransaction, MultipartResponseCapability, MultipartStoredMetadata, ObjectDestination,
+    ObjectSinkTransaction, OperationJournal, OperationReconciler, OperationRecord, OperationState,
+    ProviderMutationFence, ResponseChecksumCapability, SpoolQuota, StoredObjectMeta,
+    TransactionError, VersioningCapability, WorkspaceDestinationBinding,
 };
 use crate::workspace_storage::{
     BackendConfigRequest, BackendConfigResponse, BackendType, WorkspaceId, WorkspaceOperationLease,
@@ -1134,8 +1135,13 @@ struct S3Query {
     max_keys: Option<u32>,
     #[serde(rename = "encoding-type")]
     encoding_type: Option<String>,
-    #[allow(dead_code)]
     marker: Option<String>,
+    #[serde(rename = "key-marker")]
+    key_marker: Option<String>,
+    #[serde(rename = "upload-id-marker")]
+    upload_id_marker: Option<String>,
+    #[serde(rename = "max-uploads")]
+    max_uploads: Option<u32>,
 }
 
 #[derive(OpenApi)]
@@ -1160,8 +1166,6 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 /// URL-encode a key for `encoding-type=url` list responses (S3 url-encoding:
@@ -1603,6 +1607,42 @@ fn memory_range(
     Ok((data.slice(start..start + length), selected.content_range))
 }
 
+/// Reproduces the initiation metadata FileStore persisted at multipart
+/// completion: representation headers, `x-amz-meta-*` user metadata, the
+/// tagging header, and the stored SHA-256 checksum.
+fn apply_file_stored_headers(
+    metadata: &mut ObjectMetadata,
+    representation_headers: &std::collections::BTreeMap<String, String>,
+    user_metadata: &std::collections::BTreeMap<String, String>,
+    tags: &std::collections::BTreeMap<String, String>,
+    checksum: Option<&LocalChecksumState>,
+) {
+    for (name, value) in representation_headers {
+        if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
+            metadata.insert(name, value);
+        }
+    }
+    for (name, value) in user_metadata {
+        if let Ok(name) = HeaderName::from_bytes(format!("x-amz-meta-{name}").as_bytes()) {
+            metadata.insert(name, value);
+        }
+    }
+    if !tags.is_empty() {
+        let joined = tags
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        metadata.insert(HeaderName::from_static("x-amz-tagging"), joined);
+    }
+    if let Some(state) = checksum.filter(|state| state.algorithm.eq_ignore_ascii_case("sha256")) {
+        metadata.insert(
+            HeaderName::from_static("x-amz-checksum-sha256"),
+            &state.value,
+        );
+    }
+}
+
 async fn open_backend_object(
     state: &AppState,
     backend: ResolvedBackend,
@@ -1738,16 +1778,23 @@ async fn open_backend_object(
         }
         ResolvedBackend::File(store) => {
             if head_only {
-                let (size, content_type, etag) = store
-                    .metadata(bucket, key)
+                let stored = store
+                    .stored_meta(bucket, key)
                     .await
                     .map_err(|error| OpenObjectError::Backend(error.to_string()))?
                     .ok_or(OpenObjectError::NotFound)?;
                 let mut metadata = ObjectMetadata::default();
-                metadata.insert(header::CONTENT_LENGTH, size.to_string());
-                metadata.insert(header::CONTENT_TYPE, content_type);
-                metadata.insert(header::ETAG, etag);
+                metadata.insert(header::CONTENT_LENGTH, stored.size.to_string());
+                metadata.insert(header::CONTENT_TYPE, &stored.content_type);
+                metadata.insert(header::ETAG, &stored.etag);
                 metadata.insert(header::ACCEPT_RANGES, "bytes");
+                apply_file_stored_headers(
+                    &mut metadata,
+                    &stored.representation_headers,
+                    &stored.user_metadata,
+                    &stored.tags,
+                    stored.checksum.as_ref(),
+                );
                 return Ok(OpenedObject::new(
                     StatusCode::OK,
                     metadata,
@@ -1761,15 +1808,22 @@ async fn open_backend_object(
                 .map_err(|error| OpenObjectError::Backend(error.to_string()))?
                 .ok_or(OpenObjectError::NotFound)?;
             let selected = parse_byte_range(object.object_length, range)?;
+            let mut metadata = ObjectMetadata::default();
+            metadata.insert(header::CONTENT_LENGTH, selected.length.to_string());
+            metadata.insert(header::CONTENT_TYPE, &object.content_type);
+            metadata.insert(header::ETAG, &object.etag);
+            metadata.insert(header::ACCEPT_RANGES, "bytes");
+            apply_file_stored_headers(
+                &mut metadata,
+                &object.representation_headers,
+                &object.user_metadata,
+                &object.tags,
+                object.checksum.as_ref(),
+            );
             let object = object
                 .into_range(selected.start, selected.length)
                 .await
                 .map_err(|error| OpenObjectError::Backend(error.to_string()))?;
-            let mut metadata = ObjectMetadata::default();
-            metadata.insert(header::CONTENT_LENGTH, selected.length.to_string());
-            metadata.insert(header::CONTENT_TYPE, object.content_type);
-            metadata.insert(header::ETAG, object.etag);
-            metadata.insert(header::ACCEPT_RANGES, "bytes");
             if let Some(content_range) = selected.content_range {
                 metadata.insert(header::CONTENT_RANGE, content_range);
             }
@@ -3236,6 +3290,7 @@ async fn begin_streaming_sink(
     key: &str,
     content_type: &str,
     multipart_publication: Option<(&MultipartCompletionCoordinator, &MultipartIdentity, &str)>,
+    multipart_metadata: Option<MultipartStoredMetadata>,
 ) -> Result<Box<dyn ObjectSinkTransaction>, StreamingPutError> {
     validate_streaming_backend(state, &backend)?;
     match backend {
@@ -3469,13 +3524,14 @@ async fn begin_streaming_sink(
                         ))
                     })?;
                 Ok(Box::new(
-                    FileSinkTransaction::new_for_operation(
+                    FileSinkTransaction::new_for_multipart_operation(
                         store,
                         bucket,
                         key,
                         content_type,
                         state.max_pipeline_output_bytes,
                         destination_operation_id,
+                        multipart_metadata.unwrap_or_default(),
                     )
                     .await?,
                 ))
@@ -3758,6 +3814,7 @@ async fn streaming_single_put(
         key,
         &content_type,
         None,
+        None,
     )
     .await?;
     let mut sink_guard = SinkAbortGuard::new(sink);
@@ -4026,6 +4083,7 @@ async fn streaming_avro_single_put(
         key,
         &content_type,
         None,
+        None,
     )
     .await?;
     let mut sink_guard = SinkAbortGuard::new(sink);
@@ -4263,16 +4321,55 @@ fn restore_multipart_pipeline(
     Ok(resolution)
 }
 
-fn staged_part_reservation(headers: &HeaderMap) -> Result<u64, StagingError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartReservationError {
+    Missing,
+    TooLarge(u64),
+}
+
+fn staged_part_reservation(headers: &HeaderMap) -> Result<u64, PartReservationError> {
     // SigV4 streaming carries the decoded length separately; reserving the
     // HTTP framing length would under/over-account the persisted plaintext.
-    headers
+    // A zero-byte decoded length is valid for the final part of an upload.
+    let bytes = headers
         .get("x-amz-decoded-content-length")
         .or_else(|| headers.get(header::CONTENT_LENGTH))
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
-        .filter(|bytes| *bytes > 0)
-        .ok_or(StagingError::InvalidPart)
+        .ok_or(PartReservationError::Missing)?;
+    if bytes > MAX_MULTIPART_PART_BYTES {
+        return Err(PartReservationError::TooLarge(bytes));
+    }
+    Ok(bytes)
+}
+
+fn multipart_stored_metadata(snapshot: &MultipartSnapshot) -> MultipartStoredMetadata {
+    let mut representation_headers = std::collections::BTreeMap::new();
+    let mut user_metadata = std::collections::BTreeMap::new();
+    for (name, value) in &snapshot.metadata {
+        match name.as_str() {
+            "content-type" => {}
+            "content-encoding" => {
+                representation_headers.insert(name.clone(), value.clone());
+            }
+            _ => {
+                user_metadata.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    MultipartStoredMetadata {
+        representation_headers,
+        user_metadata,
+        tags: snapshot.tags.clone(),
+        checksum_algorithm: snapshot.checksum_mode.clone(),
+    }
+}
+
+fn validate_multipart_checksum_mode(snapshot: &MultipartSnapshot) -> Result<(), &'static str> {
+    match snapshot.checksum_mode.as_deref() {
+        None | Some("SHA256") => Ok(()),
+        Some(_) => Err("unsupported checksum algorithm; supported values are SHA256"),
+    }
 }
 
 fn create_multipart_xml(bucket: &str, key: &str, upload_id: &str) -> String {
@@ -4288,21 +4385,249 @@ fn list_parts_xml(
     bucket: &str,
     key: &str,
     upload_id: &str,
+    part_number_marker: u32,
+    max_parts: usize,
     parts: &[MultipartPart],
     truncated: bool,
 ) -> String {
-    let part_xml: String = parts.iter().map(|part| format!("<Part><PartNumber>{}</PartNumber><ETag>{}</ETag><Size>{}</Size><ChecksumSHA256>{}</ChecksumSHA256></Part>", part.part_number, xml_escape(&part.etag), part.size_bytes, part.checksum_sha256)).collect();
+    let part_xml: String = parts
+        .iter()
+        .map(|part| {
+            format!(
+                "<Part><PartNumber>{}</PartNumber><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><ChecksumSHA256>{}</ChecksumSHA256></Part>",
+                part.part_number,
+                s3_timestamp(part.created_at_ms),
+                xml_escape(&part.etag),
+                part.size_bytes,
+                part.checksum_sha256
+            )
+        })
+        .collect();
+    let next_part_number_marker = if truncated {
+        parts
+            .last()
+            .map(|part| part.part_number.to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><IsTruncated>{}</IsTruncated>{part_xml}</ListPartsResult>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><PartNumberMarker>{}</PartNumberMarker><NextPartNumberMarker>{}</NextPartNumberMarker><MaxParts>{}</MaxParts><IsTruncated>{}</IsTruncated>{part_xml}</ListPartsResult>",
         xml_escape(bucket),
         xml_escape(key),
         xml_escape(upload_id),
+        part_number_marker,
+        next_part_number_marker,
+        max_parts,
         truncated
     )
 }
 
+fn s3_timestamp(millis: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(millis)
+        .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn list_multipart_uploads_xml(
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    key_marker: Option<&str>,
+    upload_id_marker: Option<&str>,
+    max_uploads: usize,
+    page: &ListMultipartUploadsPage,
+    url_encode_keys: bool,
+) -> String {
+    let encoded = |value: &str| -> String {
+        let value = if url_encode_keys {
+            url_encode(value)
+        } else {
+            value.to_string()
+        };
+        xml_escape(&value)
+    };
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+    xml.push_str(&format!("<Bucket>{}</Bucket>", xml_escape(bucket)));
+    xml.push_str(&format!(
+        "<KeyMarker>{}</KeyMarker>",
+        encoded(key_marker.unwrap_or(""))
+    ));
+    xml.push_str(&format!(
+        "<UploadIdMarker>{}</UploadIdMarker>",
+        xml_escape(upload_id_marker.unwrap_or(""))
+    ));
+    if let Some(next) = &page.next_key_marker {
+        xml.push_str(&format!("<NextKeyMarker>{}</NextKeyMarker>", encoded(next)));
+    }
+    if let Some(next) = &page.next_upload_id_marker {
+        xml.push_str(&format!(
+            "<NextUploadIdMarker>{}</NextUploadIdMarker>",
+            xml_escape(next)
+        ));
+    }
+    xml.push_str(&format!("<MaxUploads>{max_uploads}</MaxUploads>"));
+    xml.push_str(&format!("<IsTruncated>{}</IsTruncated>", page.is_truncated));
+    xml.push_str(&format!("<Prefix>{}</Prefix>", encoded(prefix)));
+    if let Some(delimiter) = delimiter {
+        xml.push_str(&format!("<Delimiter>{}</Delimiter>", encoded(delimiter)));
+    }
+    if url_encode_keys {
+        xml.push_str("<EncodingType>url</EncodingType>");
+    }
+    for upload in &page.uploads {
+        let identity = &upload.identity;
+        xml.push_str(&format!(
+            "<Upload><Key>{}</Key><UploadId>{}</UploadId><Initiator><ID>{}</ID><DisplayName>{}</DisplayName></Initiator><Owner><ID>{}</ID><DisplayName>{}</DisplayName></Owner><StorageClass>STANDARD</StorageClass><Initiated>{}</Initiated></Upload>",
+            encoded(&identity.key),
+            xml_escape(&identity.upload_id),
+            xml_escape(&identity.tenant_id),
+            xml_escape(&identity.credential_policy_id),
+            xml_escape(&identity.tenant_id),
+            xml_escape(&identity.credential_policy_id),
+            s3_timestamp(upload.created_at_ms),
+        ));
+    }
+    for common_prefix in &page.common_prefixes {
+        xml.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            encoded(common_prefix)
+        ));
+    }
+    xml.push_str("</ListMultipartUploadsResult>");
+    xml
+}
+
+async fn list_multipart_uploads_response(
+    state: &AppState,
+    auth: &Auth,
+    bucket: &str,
+    params: &S3Query,
+) -> axum::response::Response {
+    let Some(staging) = staged_multipart(state).cloned() else {
+        return s3_error::multipart_not_supported(bucket);
+    };
+    let max_uploads = match params.max_uploads {
+        Some(value) if !(1..=1000).contains(&value) => {
+            return s3_error::invalid_argument(bucket, "max-uploads must be between 1 and 1000");
+        }
+        Some(value) => value as usize,
+        None => 1000,
+    };
+    match params.encoding_type.as_deref() {
+        None | Some("url") => {}
+        Some(other) => {
+            return s3_error::invalid_argument(
+                bucket,
+                &format!("unsupported encoding-type \"{other}\""),
+            );
+        }
+    }
+    let request = ListMultipartUploadsRequest {
+        tenant_id: auth.workspace_id().as_str().to_string(),
+        credential_policy_id: auth.credential_policy_id.clone(),
+        bucket: bucket.to_string(),
+        prefix: params.prefix.clone().unwrap_or_default(),
+        delimiter: params.delimiter.clone(),
+        key_marker: params.key_marker.clone(),
+        upload_id_marker: params.upload_id_marker.clone(),
+        max_uploads,
+    };
+    let page = match staging.repository.list_authorized_uploads(&request).await {
+        Ok(page) => page,
+        Err(StagingError::InvalidListing | StagingError::NotFound) => {
+            return s3_error::invalid_argument(bucket, "invalid multipart upload listing request");
+        }
+        Err(error) => return s3_error::internal_error(bucket, &error.to_string()),
+    };
+    s3_xml_ok(list_multipart_uploads_xml(
+        bucket,
+        &request.prefix,
+        request.delimiter.as_deref(),
+        request.key_marker.as_deref(),
+        request.upload_id_marker.as_deref(),
+        max_uploads,
+        &page,
+        params.encoding_type.as_deref() == Some("url"),
+    ))
+}
+
 const MAX_COMPLETE_XML_BYTES: usize = 1024 * 1024;
 const MAX_MULTIPART_COMPLETION_SECS: u64 = 240;
+
+const MIN_MULTIPART_NONFINAL_PART_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_MULTIPART_PART_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const MAX_MULTIPART_ASSEMBLED_SOURCE_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionPartSizeError {
+    NonFinalTooSmall { part_number: u32, size_bytes: u64 },
+    AssembledTooLarge(u64),
+}
+
+/// Validates S3's part-size contract against the repository-selected parts.
+/// Every part except the numerically final selected part must be at least five
+/// MiB, and the assembled source must stay within the five TiB ceiling. Sizes
+/// and ETags come from the same durable part records, so a replacement that
+/// changes a selected size also changes its ETag and fails completion instead.
+fn validate_completion_part_sizes(parts: &[MultipartPart]) -> Result<(), CompletionPartSizeError> {
+    let final_index = parts.len().saturating_sub(1);
+    for (index, part) in parts.iter().enumerate() {
+        if index < final_index && part.size_bytes < MIN_MULTIPART_NONFINAL_PART_BYTES {
+            return Err(CompletionPartSizeError::NonFinalTooSmall {
+                part_number: part.part_number,
+                size_bytes: part.size_bytes,
+            });
+        }
+    }
+    let assembled = parts.iter().try_fold(0u64, |total, part| {
+        total
+            .checked_add(part.size_bytes)
+            .ok_or(CompletionPartSizeError::AssembledTooLarge(u64::MAX))
+    })?;
+    if assembled > MAX_MULTIPART_ASSEMBLED_SOURCE_BYTES {
+        return Err(CompletionPartSizeError::AssembledTooLarge(assembled));
+    }
+    Ok(())
+}
+
+/// Fetches the durable part records that exactly match the client's completion
+/// selection. Returns `None` when any requested part is missing or has a
+/// mismatched ETag/checksum; the repository's atomic acquisition then rejects
+/// that request as `InvalidPart`. A full match returns the matched records so
+/// the caller can enforce the five MiB non-final minimum and the five TiB
+/// assembly ceiling against the same content the completion would publish.
+async fn staged_completion_sizes(
+    repository: &dyn MultipartRepository,
+    identity: &MultipartIdentity,
+    requested: &[CompletePart],
+) -> Result<Option<Vec<MultipartPart>>, StagingError> {
+    let (current, _) = repository
+        .list_parts(identity, 0, crate::multipart_staging::MAX_PARTS as usize)
+        .await?;
+    let mut matched = Vec::with_capacity(requested.len());
+    for request in requested {
+        let Some(part) = current
+            .iter()
+            .find(|part| part.part_number == request.part_number)
+        else {
+            return Ok(None);
+        };
+        if part.etag != request.etag
+            || request
+                .checksum_sha256
+                .as_deref()
+                .is_some_and(|checksum| checksum != part.checksum_sha256)
+        {
+            return Ok(None);
+        }
+        matched.push(part.clone());
+    }
+    Ok(Some(matched))
+}
 
 fn complete_multipart_xml(bucket: &str, key: &str, result: &MultipartCompletionResult) -> String {
     format!(
@@ -4594,9 +4919,6 @@ async fn renew_and_fence_completion(
 }
 
 async fn write_completed_record(
-    staging: &MultipartStaging,
-    identity: &MultipartIdentity,
-    lease: &CompletionLease,
     sink: &mut Box<dyn ObjectSinkTransaction>,
     record: crate::record::Record,
     output_hasher: &mut sha2::Sha256,
@@ -4604,11 +4926,15 @@ async fn write_completed_record(
 ) -> Result<(), MultipartCompletionError> {
     use sha2::Digest as _;
 
+    // The caller renews and fences the completion lease at each part/chunk
+    // boundary. Destination bytes only leave the transaction via the atomic
+    // publish below, which revalidates the fencing token, so a per-record
+    // renewal (a durable state rewrite on the file repository) would make
+    // many-record completions quadratically slow for no extra safety.
     for chunk in [record.payload, record.separator] {
         if chunk.is_empty() {
             continue;
         }
-        renew_and_fence_completion(staging, identity, lease).await?;
         *output_bytes = output_bytes
             .checked_add(chunk.len() as u64)
             .ok_or_else(|| MultipartCompletionError::Invalid("output is too large".to_string()))?;
@@ -4682,6 +5008,9 @@ async fn complete_staged_multipart(
         .await;
     }
     let (format, content_type) = streaming_format_content_type(content_type)?;
+    let stored_metadata = multipart_stored_metadata(&upload.snapshot);
+    validate_multipart_checksum_mode(&upload.snapshot)
+        .map_err(|detail| MultipartCompletionError::Invalid(detail.to_string()))?;
     let fingerprint = upload
         .complete_request_fingerprint
         .as_deref()
@@ -4706,6 +5035,7 @@ async fn complete_staged_multipart(
         &identity.key,
         &content_type,
         Some((&coordinator, identity, fingerprint)),
+        Some(stored_metadata),
     )
     .await?;
     coordinator
@@ -4781,9 +5111,6 @@ async fn complete_staged_multipart(
                         .await?
                     {
                         write_completed_record(
-                            staging,
-                            identity,
-                            lease,
                             &mut sink,
                             record,
                             &mut output_hasher,
@@ -4813,9 +5140,6 @@ async fn complete_staged_multipart(
                     .await?
                 {
                     write_completed_record(
-                        staging,
-                        identity,
-                        lease,
                         &mut sink,
                         record,
                         &mut output_hasher,
@@ -4833,31 +5157,15 @@ async fn complete_staged_multipart(
                 .process(record)
                 .await?
             {
-                write_completed_record(
-                    staging,
-                    identity,
-                    lease,
-                    &mut sink,
-                    record,
-                    &mut output_hasher,
-                    &mut output_bytes,
-                )
-                .await?;
+                write_completed_record(&mut sink, record, &mut output_hasher, &mut output_bytes)
+                    .await?;
             }
         }
         let finishing = pipeline.take().expect("pipeline is present until finish");
         let (records, pipeline_fuel) = finishing.finish().await?;
         for record in records {
-            write_completed_record(
-                staging,
-                identity,
-                lease,
-                &mut sink,
-                record,
-                &mut output_hasher,
-                &mut output_bytes,
-            )
-            .await?;
+            write_completed_record(&mut sink, record, &mut output_hasher, &mut output_bytes)
+                .await?;
         }
         let pipeline_evidence = snapshot.pipeline_evidence(
             pipeline_fuel,
@@ -4876,7 +5184,8 @@ async fn complete_staged_multipart(
             size_bytes: output_bytes,
             pipeline_evidence: pipeline_evidence.clone(),
         };
-        let usage_event = multipart_completion_event(operation.grant, &precommit_result);
+        let mut usage_event = multipart_completion_event(operation.grant, &precommit_result);
+        usage_event = usage_event.with_operation_id(destination_operation_id);
         renew_and_fence_completion(staging, identity, lease).await?;
         coordinator
             .publish(
@@ -5396,6 +5705,9 @@ async fn complete_staged_avro_multipart(
         );
     let coordinator = multipart_completion_coordinator(state, staging)?;
     renew_and_fence_completion(staging, identity, lease).await?;
+    let stored_metadata = multipart_stored_metadata(&upload.snapshot);
+    validate_multipart_checksum_mode(&upload.snapshot)
+        .map_err(|detail| MultipartCompletionError::Invalid(detail.to_string()))?;
     let mut sink = begin_streaming_sink(
         state,
         backend,
@@ -5405,6 +5717,7 @@ async fn complete_staged_avro_multipart(
         &identity.key,
         content_type,
         Some((&coordinator, identity, fingerprint)),
+        Some(stored_metadata),
     )
     .await?;
     coordinator
@@ -5502,7 +5815,8 @@ async fn complete_staged_avro_multipart(
             size_bytes: output_bytes,
             pipeline_evidence: None,
         };
-        let usage_event = multipart_completion_event(operation.grant, &precommit_result);
+        let mut usage_event = multipart_completion_event(operation.grant, &precommit_result);
+        usage_event = usage_event.with_operation_id(destination_operation_id);
         renew_and_fence_completion(staging, identity, lease).await?;
         coordinator
             .publish(
@@ -5665,6 +5979,9 @@ async fn s3_upload_part(
     request: Request,
 ) -> axum::response::Response {
     let (parts, mut body) = request.into_parts();
+    if parts.headers.contains_key("x-amz-copy-source") {
+        return s3_error::not_implemented(&key);
+    }
     let (Some(part_number), Some(upload_id)) = (params.part_number, params.upload_id) else {
         return s3_error::invalid_request(&key, "partNumber and uploadId are required");
     };
@@ -5727,12 +6044,13 @@ async fn s3_upload_part(
     }
     let reserved_bytes = match staged_part_reservation(&parts.headers) {
         Ok(bytes) => bytes,
-        Err(_) => {
-            return s3_error::invalid_request(
+        Err(PartReservationError::Missing) => {
+            return s3_error::invalid_argument(
                 &key,
-                "multipart parts require a positive decoded Content-Length",
+                "multipart parts require a decoded Content-Length",
             );
         }
+        Err(PartReservationError::TooLarge(_)) => return s3_error::entity_too_large(&key),
     };
     // This is the durable quota/CAS point. It must occur before consuming a
     // body frame, opening a temp file, or creating an object-store artifact.
@@ -7064,16 +7382,25 @@ async fn s3_get(
                 return s3_error::service_unavailable(&key, &error.to_string());
             }
         }
-        let limit = params.max_parts.unwrap_or(1000).clamp(1, 1000) as usize;
+        let max_parts = match params.max_parts {
+            Some(value) if !(1..=1000).contains(&value) => {
+                return s3_error::invalid_argument(&key, "max-parts must be between 1 and 1000");
+            }
+            Some(value) => value as usize,
+            None => 1000,
+        };
+        let part_number_marker = params.part_number_marker.unwrap_or(0);
         return match staging
             .repository
-            .list_parts(&identity, params.part_number_marker.unwrap_or(0), limit)
+            .list_parts(&identity, part_number_marker, max_parts)
             .await
         {
             Ok((parts, truncated)) => s3_xml_ok(list_parts_xml(
                 &bucket,
                 &key,
                 &identity.upload_id,
+                part_number_marker,
+                max_parts,
                 &parts,
                 truncated,
             )),
@@ -9289,7 +9616,7 @@ async fn s3_post(
             return s3_error::multipart_not_supported(&key);
         };
         let identity = multipart_identity(&authentication.auth, &bucket, &key, upload_id);
-        let upload = match staging.repository.get_authorized(&identity).await {
+        let mut upload = match staging.repository.get_authorized(&identity).await {
             Ok(upload) => upload,
             Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
             Err(error) => return s3_error::internal_error(&key, &error.to_string()),
@@ -9346,10 +9673,34 @@ async fn s3_post(
             Err(error) if error.contains("sorted") => {
                 return s3_error::invalid_part_order(&key);
             }
-            Err(error) => {
+            Err(error) if error.contains("exceeds") => {
                 return s3_error::invalid_request(&key, &error);
             }
+            Err(error) => return s3_error::malformed_xml(&key, &error),
         };
+        match staged_completion_sizes(staging.repository.as_ref(), &identity, &selected).await {
+            Ok(Some(matched)) => {
+                if let Err(error) = validate_completion_part_sizes(&matched) {
+                    return match error {
+                        CompletionPartSizeError::NonFinalTooSmall {
+                            part_number,
+                            size_bytes,
+                        } => s3_error::entity_too_small(
+                            &key,
+                            &format!(
+                                "part {part_number} is {size_bytes} bytes; every non-final part must be at least 5 MiB"
+                            ),
+                        ),
+                        CompletionPartSizeError::AssembledTooLarge(_) => {
+                            s3_error::entity_too_large(&key)
+                        }
+                    };
+                }
+            }
+            Ok(None) => {}
+            Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
+            Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+        }
         if let ResolvedBackend::Managed(storage) = &backend {
             let Some(epoch) = upload.namespace_epoch else {
                 let response = s3_error::service_unavailable(
@@ -9423,7 +9774,17 @@ async fn s3_post(
                 // This exact operation may still be committing in another worker.
                 return s3_error::slow_down(&key);
             }
-            Ok(CompletionAcquire::Acquired(lease)) => lease,
+            Ok(CompletionAcquire::Acquired(lease)) => {
+                // Acquisition persisted the completion fingerprint, fencing
+                // token, and lease into the durable upload; refresh the local
+                // snapshot so completion uses the exact acquired state.
+                upload = match staging.repository.get_authorized(&identity).await {
+                    Ok(upload) => upload,
+                    Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
+                    Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+                };
+                lease
+            }
             Err(StagingError::InvalidPart) => {
                 let response = s3_error::invalid_part(
                     &key,
@@ -9717,6 +10078,9 @@ async fn s3_post(
             destination_commit: None,
             completion_result: None,
         };
+        if let Err(detail) = validate_multipart_checksum_mode(&upload.snapshot) {
+            return s3_error::invalid_argument(&key, detail);
+        }
         return match staging.repository.create(upload).await {
             Ok(()) => {
                 if let Some((storage, epoch)) = &managed_registration
@@ -9780,6 +10144,34 @@ async fn s3_list_objects(
         Ok(grant) => grant,
         Err(response) => return response,
     };
+    if params.uploads.is_some() {
+        let response = list_multipart_uploads_response(&state, &auth, &bucket, &params).await;
+        if !response.status().is_success() {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &grant,
+                &bucket,
+                response,
+            )
+            .await;
+        }
+        if let Err(response) = record_operation(
+            state.control.clone(),
+            &auth.context,
+            OperationUsage {
+                grant: &grant,
+                source_bytes: 0,
+                output_bytes: 0,
+            },
+            &bucket,
+        )
+        .await
+        {
+            return response;
+        }
+        return response;
+    }
     let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::List).await {
         Ok(backend) => backend,
         Err(_) => {
@@ -12742,5 +13134,234 @@ mod s3_provider_capability_tests {
         assert!(configured_s3_streaming_capabilities().unwrap().is_none());
         unsafe { std::env::remove_var("MASKURA_STREAMING_S3_PROVIDER") }
         assert!(configured_s3_streaming_capabilities().unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod multipart_listing_validation_tests {
+    use super::*;
+
+    fn part(number: u32, size: u64) -> MultipartPart {
+        MultipartPart {
+            upload_id: "upload-1".to_string(),
+            part_number: number,
+            attempt: 1,
+            artifact_key: format!("artifact-{number}"),
+            etag: format!("\"etag-{number}\""),
+            checksum_sha256: hex::encode([number as u8; 32]),
+            size_bytes: size,
+            created_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn listing_upload(key: &str, upload_id: &str) -> MultipartUpload {
+        MultipartUpload {
+            identity: MultipartIdentity {
+                tenant_id: "tenant-1".to_string(),
+                credential_policy_id: "credential-1".to_string(),
+                bucket: "bucket".to_string(),
+                key: key.to_string(),
+                upload_id: upload_id.to_string(),
+            },
+            namespace_epoch: None,
+            snapshot: MultipartSnapshot {
+                metadata: std::collections::BTreeMap::new(),
+                tags: std::collections::BTreeMap::new(),
+                checksum_mode: None,
+                destination: serde_json::json!({"kind": "file"}),
+                plugin_snapshot: serde_json::json!({}),
+                max_staged_bytes: 0,
+            },
+            lifecycle: MultipartLifecycle::Open,
+            staged_bytes: 0,
+            reserved_bytes: 0,
+            created_at_ms: 1_700_000_000_000,
+            expires_at_ms: 1_700_000_000_000 + 86_400_000,
+            updated_at_ms: 1_700_000_000_000,
+            tombstone_until_ms: None,
+            complete_request_fingerprint: None,
+            completion_lease_owner: None,
+            completion_lease_expires_at_ms: None,
+            completion_fencing_token: 0,
+            destination_operation_id: None,
+            publishing_started_at_ms: None,
+            destination_commit: None,
+            completion_result: None,
+        }
+    }
+
+    #[test]
+    fn list_multipart_uploads_xml_round_trips_markers_prefixes_and_encoding() {
+        let upload = listing_upload("directory/key with space", "upload-1");
+        let page = ListMultipartUploadsPage {
+            uploads: vec![upload],
+            common_prefixes: vec!["directory/".to_string()],
+            is_truncated: true,
+            next_key_marker: Some("directory/key with space".to_string()),
+            next_upload_id_marker: Some("upload-1".to_string()),
+        };
+        let xml = list_multipart_uploads_xml(
+            "bucket",
+            "directory/",
+            Some("/"),
+            Some("directory/"),
+            Some("upload-1"),
+            1000,
+            &page,
+            true,
+        );
+        assert!(xml.contains("<KeyMarker>directory%2F</KeyMarker>"));
+        assert!(xml.contains("<NextKeyMarker>directory%2Fkey%20with%20space</NextKeyMarker>"));
+        assert!(xml.contains("<NextUploadIdMarker>upload-1</NextUploadIdMarker>"));
+        assert!(xml.contains("<EncodingType>url</EncodingType>"));
+        assert!(xml.contains("<CommonPrefixes><Prefix>directory%2F</Prefix></CommonPrefixes>"));
+        assert!(xml.contains("<Upload><Key>directory%2Fkey%20with%20space</Key>"));
+        assert!(xml.contains("<StorageClass>STANDARD</StorageClass>"));
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(xml.contains("<MaxUploads>1000</MaxUploads>"));
+        xmlparser::Tokenizer::from(xml.as_str()).for_each(|token| {
+            token.expect("generated XML must be well-formed");
+        });
+    }
+
+    #[test]
+    fn list_multipart_uploads_xml_plain_keys_are_xml_escaped() {
+        let upload = listing_upload("a&b<c", "upload-2");
+        let page = ListMultipartUploadsPage {
+            uploads: vec![upload],
+            common_prefixes: Vec::new(),
+            is_truncated: false,
+            next_key_marker: None,
+            next_upload_id_marker: None,
+        };
+        let xml = list_multipart_uploads_xml("bucket", "", None, None, None, 1000, &page, false);
+        assert!(xml.contains("<Key>a&amp;b&lt;c</Key>"));
+        assert!(!xml.contains("<Key>a&b<c</Key>"));
+        assert!(!xml.contains("<EncodingType>url</EncodingType>"));
+    }
+
+    #[test]
+    fn list_parts_xml_includes_pagination_fields() {
+        let xml = list_parts_xml(
+            "bucket",
+            "key",
+            "upload-1",
+            1,
+            10,
+            &[part(2, 100), part(3, 200)],
+            true,
+        );
+        assert!(xml.contains("<PartNumberMarker>1</PartNumberMarker>"));
+        assert!(xml.contains("<NextPartNumberMarker>3</NextPartNumberMarker>"));
+        assert!(xml.contains("<MaxParts>10</MaxParts>"));
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(xml.contains("<PartNumber>2</PartNumber><LastModified>"));
+        assert!(xml.contains("<ChecksumSHA256>"));
+        xmlparser::Tokenizer::from(xml.as_str()).for_each(|token| {
+            token.expect("generated XML must be well-formed");
+        });
+    }
+
+    #[test]
+    fn completion_part_sizes_allow_zero_final_but_reject_small_nonfinal_parts() {
+        let minimum = MIN_MULTIPART_NONFINAL_PART_BYTES;
+        assert!(validate_completion_part_sizes(&[part(1, 0)]).is_ok());
+        assert!(validate_completion_part_sizes(&[part(1, minimum), part(2, 0)]).is_ok());
+        assert!(validate_completion_part_sizes(&[part(1, minimum), part(2, 1)]).is_ok());
+        assert_eq!(
+            validate_completion_part_sizes(&[part(1, minimum - 1), part(2, minimum)]),
+            Err(CompletionPartSizeError::NonFinalTooSmall {
+                part_number: 1,
+                size_bytes: minimum - 1,
+            })
+        );
+        assert_eq!(
+            validate_completion_part_sizes(&[part(1, 0), part(2, 0)]),
+            Err(CompletionPartSizeError::NonFinalTooSmall {
+                part_number: 1,
+                size_bytes: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn completion_part_sizes_reject_assembled_ceiling_overruns() {
+        let ceiling = MAX_MULTIPART_ASSEMBLED_SOURCE_BYTES;
+        let minimum = MIN_MULTIPART_NONFINAL_PART_BYTES;
+        assert_eq!(
+            validate_completion_part_sizes(&[part(1, minimum), part(2, ceiling - minimum + 1),]),
+            Err(CompletionPartSizeError::AssembledTooLarge(ceiling + 1))
+        );
+        assert!(
+            validate_completion_part_sizes(&[part(1, minimum), part(2, ceiling - minimum),])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn staged_part_reservation_accepts_zero_and_rejects_missing_and_oversized() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let zero = HeaderMap::from_iter([(header::CONTENT_LENGTH, HeaderValue::from_static("0"))]);
+        assert_eq!(staged_part_reservation(&zero), Ok(0));
+        let missing = HeaderMap::new();
+        assert_eq!(
+            staged_part_reservation(&missing),
+            Err(PartReservationError::Missing)
+        );
+        let oversized = HeaderMap::from_iter([(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_static("5368709121"),
+        )]);
+        assert_eq!(
+            staged_part_reservation(&oversized),
+            Err(PartReservationError::TooLarge(MAX_MULTIPART_PART_BYTES + 1))
+        );
+        let decoded = HeaderMap::from_iter([(
+            HeaderName::from_static("x-amz-decoded-content-length"),
+            HeaderValue::from_static("0"),
+        )]);
+        assert_eq!(staged_part_reservation(&decoded), Ok(0));
+    }
+
+    #[test]
+    fn stored_metadata_partitions_content_headers_from_user_metadata() {
+        let mut snapshot = MultipartSnapshot {
+            metadata: std::collections::BTreeMap::new(),
+            tags: std::collections::BTreeMap::new(),
+            checksum_mode: Some("SHA256".to_string()),
+            destination: serde_json::json!({"kind": "file"}),
+            plugin_snapshot: serde_json::json!({}),
+            max_staged_bytes: 0,
+        };
+        snapshot
+            .metadata
+            .insert("content-type".into(), "text/plain".into());
+        snapshot
+            .metadata
+            .insert("content-encoding".into(), "gzip".into());
+        snapshot.metadata.insert("project".into(), "maskura".into());
+        snapshot.tags.insert("team".into(), "data".into());
+        let stored = multipart_stored_metadata(&snapshot);
+        assert_eq!(
+            stored
+                .representation_headers
+                .get("content-encoding")
+                .map(String::as_str),
+            Some("gzip")
+        );
+        assert!(!stored.representation_headers.contains_key("content-type"));
+        assert_eq!(
+            stored.user_metadata.get("project").map(String::as_str),
+            Some("maskura")
+        );
+        assert_eq!(stored.user_metadata.len(), 1);
+        assert_eq!(stored.tags.get("team").map(String::as_str), Some("data"));
+        assert_eq!(stored.checksum_algorithm.as_deref(), Some("SHA256"));
+        assert!(validate_multipart_checksum_mode(&snapshot).is_ok());
+        snapshot.checksum_mode = Some("CRC32".to_string());
+        assert_eq!(
+            validate_multipart_checksum_mode(&snapshot),
+            Err("unsupported checksum algorithm; supported values are SHA256")
+        );
     }
 }
