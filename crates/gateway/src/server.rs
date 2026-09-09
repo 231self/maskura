@@ -4641,15 +4641,15 @@ fn complete_multipart_xml(bucket: &str, key: &str, result: &MultipartCompletionR
 }
 
 /// Strictly parses the small CompleteMultipartUpload grammar instead of using a
-/// general XML resolver. DTDs and entities are rejected before tokenization;
-/// S3's part ETags and SHA-256 checksums need no entity expansion.
+/// general XML resolver. DTDs and unknown entities are rejected; only XML's
+/// predefined and numeric character references are decoded in element text.
 fn parse_complete_multipart_xml(body: &[u8]) -> Result<Vec<CompletePart>, String> {
     if body.len() > MAX_COMPLETE_XML_BYTES {
         return Err("CompleteMultipartUpload XML exceeds 1 MiB".to_string());
     }
     let input = std::str::from_utf8(body)
         .map_err(|_| "CompleteMultipartUpload XML must be UTF-8".to_string())?;
-    if input.contains("<!") || input.contains('&') {
+    if input.contains("<!") {
         return Err("CompleteMultipartUpload XML entities and DTDs are prohibited".to_string());
     }
     let mut stack = Vec::<String>::new();
@@ -4667,6 +4667,7 @@ fn parse_complete_multipart_xml(body: &[u8]) -> Result<Vec<CompletePart>, String
             .ok_or_else(|| "malformed CompleteMultipartUpload XML".to_string())?;
         let text = input[cursor..open].trim();
         if !text.is_empty() {
+            let text = decode_complete_xml_text(text)?;
             match stack.last().map(String::as_str) {
                 Some("PartNumber") => {
                     if current_number.is_some() {
@@ -4680,12 +4681,12 @@ fn parse_complete_multipart_xml(body: &[u8]) -> Result<Vec<CompletePart>, String
                     );
                 }
                 Some("ETag") => {
-                    if current_etag.replace(text.to_string()).is_some() {
+                    if current_etag.replace(text).is_some() {
                         return Err("duplicate ETag value".to_string());
                     }
                 }
                 Some("ChecksumSHA256") => {
-                    if current_checksum.replace(text.to_string()).is_some() {
+                    if current_checksum.replace(text).is_some() {
                         return Err("duplicate ChecksumSHA256 value".to_string());
                     }
                 }
@@ -4777,6 +4778,50 @@ fn parse_complete_multipart_xml(body: &[u8]) -> Result<Vec<CompletePart>, String
         return Err("parts must be sorted and nonduplicate".to_string());
     }
     Ok(parts)
+}
+
+fn decode_complete_xml_text(text: &str) -> Result<String, String> {
+    if !text.contains('&') {
+        return Ok(text.to_string());
+    }
+    let mut decoded = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find('&') {
+        decoded.push_str(&remaining[..start]);
+        let entity_end = remaining[start + 1..]
+            .find(';')
+            .map(|index| start + 1 + index)
+            .ok_or_else(|| "unterminated XML character reference".to_string())?;
+        let entity = &remaining[start + 1..entity_end];
+        match entity {
+            "quot" => decoded.push('"'),
+            "apos" => decoded.push('\''),
+            "amp" => decoded.push('&'),
+            "lt" => decoded.push('<'),
+            "gt" => decoded.push('>'),
+            value if let Some(hex) = value.strip_prefix("#x") => {
+                let code = u32::from_str_radix(hex, 16)
+                    .map_err(|_| "invalid hexadecimal XML character reference".to_string())?;
+                decoded.push(
+                    char::from_u32(code)
+                        .ok_or_else(|| "invalid XML character reference".to_string())?,
+                );
+            }
+            value if let Some(decimal) = value.strip_prefix('#') => {
+                let code = decimal
+                    .parse::<u32>()
+                    .map_err(|_| "invalid decimal XML character reference".to_string())?;
+                decoded.push(
+                    char::from_u32(code)
+                        .ok_or_else(|| "invalid XML character reference".to_string())?,
+                );
+            }
+            _ => return Err("unknown XML entity is prohibited".to_string()),
+        }
+        remaining = &remaining[entity_end + 1..];
+    }
+    decoded.push_str(remaining);
+    Ok(decoded)
 }
 
 async fn cleanup_staged_parts(
