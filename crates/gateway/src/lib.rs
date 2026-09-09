@@ -6,6 +6,7 @@ pub mod binary_reductor;
 pub mod control;
 pub mod customer_headers;
 pub mod entity;
+pub(crate) mod file_staging_artifact;
 pub mod file_store;
 // Removed once the Phase 2 repositories consume every persistence primitive.
 #[allow(dead_code, reason = "introduced before its ordered Phase 2 consumers")]

@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(any(test, debug_assertions))]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -89,6 +90,8 @@ pub struct StagedArtifact {
     pub key: String,
     pub modified_at_ms: i64,
 }
+
+pub type StagingArtifactReader = Pin<Box<dyn AsyncRead + Send>>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MultipartIdentity {
@@ -2337,11 +2340,67 @@ pub trait StagingArtifactStore: Send + Sync {
     async fn put_file(&self, key: &str, path: &Path) -> Result<(), StagingError>;
     /// Returns an incremental encrypted artifact body. Callers decrypt frame by
     /// frame and must hold a valid completion fence for every read.
-    async fn get(&self, key: &str) -> Result<aws_sdk_s3::primitives::ByteStream, StagingError>;
+    async fn get(&self, key: &str) -> Result<StagingArtifactReader, StagingError>;
     async fn delete(&self, key: &str) -> Result<(), StagingError>;
     /// Discovery is required for startup reconciliation. Implementations must
     /// return every object below the supplied prefix, not an arbitrary page.
     async fn list(&self, prefix: &str) -> Result<Vec<StagedArtifact>, StagingError>;
+}
+
+#[cfg(test)]
+pub(crate) async fn assert_artifact_store_contract(
+    store: &dyn StagingArtifactStore,
+    source_root: &Path,
+) {
+    let upload_id = Uuid::nil();
+    let first = format!("{ARTIFACT_PREFIX}tenant-a/{upload_id}/2/1");
+    let second = format!("{ARTIFACT_PREFIX}tenant-a/{upload_id}/1/1");
+    let write_source = |name: &str, bytes: &[u8]| {
+        let path = source_root.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+
+    store
+        .put_file(&first, &write_source("contract-first.tmp", b"first"))
+        .await
+        .unwrap();
+    store
+        .put_file(&second, &write_source("contract-second.tmp", b"second"))
+        .await
+        .unwrap();
+    store
+        .put_file(
+            &first,
+            &write_source("contract-replacement.tmp", b"replacement"),
+        )
+        .await
+        .unwrap();
+
+    let mut reader = store.get(&first).await.unwrap();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes, b"replacement");
+    let listed = store.list(ARTIFACT_PREFIX).await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|artifact| artifact.key.as_str())
+            .collect::<Vec<_>>(),
+        vec![second.as_str(), first.as_str()]
+    );
+    assert!(listed.iter().all(|artifact| artifact.modified_at_ms > 0));
+
+    store.delete(&first).await.unwrap();
+    store.delete(&first).await.unwrap();
+    assert!(matches!(
+        store.get(&first).await,
+        Err(StagingError::NotFound)
+    ));
+    store.delete(&second).await.unwrap();
+    let _ = std::fs::remove_file(source_root.join("contract-first.tmp"));
+    let _ = std::fs::remove_file(source_root.join("contract-second.tmp"));
+    let _ = std::fs::remove_file(source_root.join("contract-replacement.tmp"));
 }
 
 pub struct S3StagingArtifactStore {
@@ -2373,17 +2432,21 @@ impl StagingArtifactStore for S3StagingArtifactStore {
             })?;
         Ok(())
     }
-    async fn get(&self, key: &str) -> Result<aws_sdk_s3::primitives::ByteStream, StagingError> {
-        self.client
+    async fn get(&self, key: &str) -> Result<StagingArtifactReader, StagingError> {
+        let output = self
+            .client
             .get_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
             .await
-            .map(|output| output.body)
             .map_err(|error| {
                 StagingError::Persistence(record_s3_failure("staging_get", &error).to_string())
-            })
+            })?;
+        let length = u64::try_from(output.content_length().unwrap_or_default()).map_err(|_| {
+            StagingError::Persistence("staging artifact has a negative content length".to_string())
+        })?;
+        Ok(Box::pin(output.body.into_async_read().take(length)))
     }
     async fn delete(&self, key: &str) -> Result<(), StagingError> {
         self.client
@@ -2428,6 +2491,7 @@ impl StagingArtifactStore for S3StagingArtifactStore {
                 ));
             }
         }
+        artifacts.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(artifacts)
     }
 }
@@ -2453,20 +2517,23 @@ impl StagingArtifactStore for MemoryStagingArtifactStore {
         );
         Ok(())
     }
-    async fn get(&self, key: &str) -> Result<aws_sdk_s3::primitives::ByteStream, StagingError> {
-        self.objects
+    async fn get(&self, key: &str) -> Result<StagingArtifactReader, StagingError> {
+        let bytes = self
+            .objects
             .lock()
             .await
             .get(key)
-            .map(|(bytes, _)| aws_sdk_s3::primitives::ByteStream::from(bytes.clone()))
-            .ok_or(StagingError::NotFound)
+            .map(|(bytes, _)| bytes.clone())
+            .ok_or(StagingError::NotFound)?;
+        let length = bytes.len() as u64;
+        Ok(Box::pin(std::io::Cursor::new(bytes).take(length)))
     }
     async fn delete(&self, key: &str) -> Result<(), StagingError> {
         self.objects.lock().await.remove(key);
         Ok(())
     }
     async fn list(&self, prefix: &str) -> Result<Vec<StagedArtifact>, StagingError> {
-        Ok(self
+        let mut artifacts = self
             .objects
             .lock()
             .await
@@ -2476,7 +2543,9 @@ impl StagingArtifactStore for MemoryStagingArtifactStore {
                 key: key.clone(),
                 modified_at_ms: *modified_at_ms,
             })
-            .collect())
+            .collect::<Vec<_>>();
+        artifacts.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(artifacts)
     }
 }
 
@@ -2815,6 +2884,53 @@ mod tests {
     use crate::key_cipher::LocalKeyWrapping;
     use crate::local_storage::LocalStorageRuntime;
 
+    #[tokio::test]
+    async fn memory_artifact_store_matches_shared_contract() {
+        let directory =
+            std::env::temp_dir().join(format!("maskura-memory-artifacts-{}", Uuid::now_v7()));
+        std::fs::create_dir(&directory).unwrap();
+        assert_artifact_store_contract(&MemoryStagingArtifactStore::default(), &directory).await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn s3_artifact_get_adapts_to_provider_neutral_reader() {
+        use aws_config::Region;
+        use aws_credential_types::Credentials;
+        use axum::Router;
+        use axum::body::Body;
+
+        let app = Router::new().fallback(|| async {
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header(axum::http::header::CONTENT_LENGTH, "10")
+                .body(Body::from("ciphertext"))
+                .unwrap()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .credentials_provider(Credentials::new("key", "secret", None, None, "test"))
+            .retry_config(crate::s3_safety::s3_retry_config())
+            .load()
+            .await;
+        let client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::from(&config)
+                .force_path_style(true)
+                .build(),
+        );
+        let store = S3StagingArtifactStore::new(client, "staging".to_string());
+
+        let mut reader = store.get("multipart/artifact").await.unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"ciphertext");
+        server.abort();
+    }
+
     #[test]
     fn legacy_completion_result_json_defaults_new_accounting_fields() {
         let result: MultipartCompletionResult = serde_json::from_value(serde_json::json!({
@@ -3138,9 +3254,11 @@ mod tests {
         let runtime = LocalStorageRuntime::new(root.clone()).await.unwrap();
         let staging = runtime.multipart_root().join("tmp");
         let snapshot = snapshot();
+        let mut restart_identity = identity();
+        restart_identity.upload_id = Uuid::now_v7().to_string();
         let mut writer = EncryptedPartWriter::begin(
             &staging,
-            &identity(),
+            &restart_identity,
             1,
             1,
             &snapshot,
@@ -3155,30 +3273,51 @@ mod tests {
             .unwrap();
         let finished = writer.finish().await.unwrap();
         let part = MultipartPart {
-            upload_id: "upload".to_string(),
+            upload_id: restart_identity.upload_id.clone(),
             part_number: 1,
             attempt: 1,
-            artifact_key: "restart-artifact".to_string(),
+            artifact_key: format!(
+                "{ARTIFACT_PREFIX}{}/{}/1/1",
+                restart_identity.tenant_id, restart_identity.upload_id
+            ),
             etag: finished.etag.clone(),
             checksum_sha256: finished.checksum_sha256.clone(),
             size_bytes: finished.size_bytes,
             created_at_ms: now_ms(),
         };
+        runtime
+            .staging_artifacts()
+            .put_file(&part.artifact_key, &finished.path)
+            .await
+            .unwrap();
         drop(runtime);
 
         let restarted = LocalStorageRuntime::new(root.clone()).await.unwrap();
-        let file = tokio::fs::File::open(&finished.path).await.unwrap();
-        let mut reader =
-            EncryptedPartReader::open(file, &identity(), &part, &snapshot, restarted.wrapping())
-                .await
-                .unwrap();
+        let body = restarted
+            .staging_artifacts()
+            .get(&part.artifact_key)
+            .await
+            .unwrap();
+        let mut reader = EncryptedPartReader::open(
+            body,
+            &restart_identity,
+            &part,
+            &snapshot,
+            restarted.wrapping(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             reader.next_chunk().await.unwrap().unwrap(),
             Bytes::from_static(b"survives-a-runtime-restart")
         );
         assert!(reader.next_chunk().await.unwrap().is_none());
-        finished.remove().await;
+        restarted
+            .staging_artifacts()
+            .delete(&part.artifact_key)
+            .await
+            .unwrap();
         drop(restarted);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -4679,7 +4679,7 @@ async fn complete_staged_multipart(
             let body = staging.artifacts.get(&part.artifact_key).await?;
             renew_and_fence_completion(staging, identity, lease).await?;
             let mut reader = EncryptedPartReader::open(
-                body.into_async_read(),
+                body,
                 identity,
                 part,
                 &upload.snapshot,
@@ -5352,7 +5352,7 @@ async fn complete_staged_avro_multipart(
         let body = staging.artifacts.get(&part.artifact_key).await?;
         renew_and_fence_completion(staging, identity, lease).await?;
         let mut reader = EncryptedPartReader::open(
-            body.into_async_read(),
+            body,
             identity,
             part,
             &upload.snapshot,

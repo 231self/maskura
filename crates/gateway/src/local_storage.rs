@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::file_staging_artifact::FileStagingArtifactStore;
 use crate::file_store::{FileStore, FileStoreError};
 use crate::filesystem_persistence::{FilesystemPersistence, PersistenceError, RootLock};
 use crate::key_cipher::{FileKeyWrapping, FileKeyWrappingError, KeyWrapping};
+use crate::multipart_staging::StagingError;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LocalStorageError {
@@ -13,6 +15,8 @@ pub(crate) enum LocalStorageError {
     FileStore(#[from] FileStoreError),
     #[error(transparent)]
     FileKeyWrapping(#[from] FileKeyWrappingError),
+    #[error(transparent)]
+    Staging(#[from] StagingError),
 }
 
 /// Owns all process-scoped resources for one local filesystem storage root.
@@ -20,6 +24,11 @@ pub(crate) enum LocalStorageError {
 pub(crate) struct LocalStorageRuntime {
     root: PathBuf,
     file_store: Arc<FileStore>,
+    #[allow(
+        dead_code,
+        reason = "consumed by subsequent local multipart startup wiring"
+    )]
+    staging_artifacts: Arc<FileStagingArtifactStore>,
     #[allow(
         dead_code,
         reason = "consumed by subsequent local multipart startup wiring"
@@ -35,9 +44,13 @@ impl LocalStorageRuntime {
             &root.join(".maskura").join("wrapping.key"),
         )?);
         let file_store = Arc::new(FileStore::open_locked(root.clone()).await?);
+        let staging_artifacts = Arc::new(FileStagingArtifactStore::open(
+            root.join(".maskura").join("multipart"),
+        )?);
         Ok(Self {
             root,
             file_store,
+            staging_artifacts,
             wrapping,
             _root_lock: root_lock,
         })
@@ -45,6 +58,14 @@ impl LocalStorageRuntime {
 
     pub(crate) fn file_store(&self) -> Arc<FileStore> {
         self.file_store.clone()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by subsequent local multipart startup wiring"
+    )]
+    pub(crate) fn staging_artifacts(&self) -> Arc<FileStagingArtifactStore> {
+        self.staging_artifacts.clone()
     }
 
     #[allow(
