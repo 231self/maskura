@@ -1039,3 +1039,160 @@ async fn run_lifecycle(root: &Path) {
     drop(restarted_app);
     drop(restarted_state);
 }
+
+#[test]
+fn local_multipart_restart_matrix_keeps_completed_object_atomic() {
+    let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build test tokio runtime");
+    runtime.block_on(run_restart_matrix());
+}
+
+/// Task 15 crash/retirement matrix over real HTTP: an existing object is
+/// atomically replaced by multipart completion, then every durable boundary
+/// that follows (completion result, exact replay, second restart) is crossed
+/// with a full state rebuild from the same root. GET must always observe
+/// exactly one complete version of the object -- never the prior body, a
+/// partial assembly, or a torn publish.
+async fn run_restart_matrix() {
+    let root = std::env::temp_dir().join(format!("maskura-local-matrix-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&root).expect("create temporary storage root");
+
+    let mut env = EnvRestore::new();
+    remove_host_configuration(&mut env);
+    env.set("AUTH_DISABLED", "0");
+    env.set("MASKURA_SINGLE_TENANT", "1");
+    env.set("MASKURA_STORAGE_MODE", "local");
+    env.set("MASKURA_LOCAL_STORAGE_DIR", &root.to_string_lossy());
+    env.set("MASKURA_MULTIPART_MODE", "staged");
+    env.set("MASKURA_STREAMING_READ_MODE", "passthrough");
+    let components = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/components");
+    assert!(
+        components.is_dir(),
+        "built filter components missing at {}; run `just build-filters`",
+        components.display()
+    );
+
+    let bucket = "bucket-main";
+    let key = "matrix.txt";
+    let prior_body = "PRIOR-EXACT-VERSION\n".as_bytes().to_vec();
+    let replacement = format!("PART-NEW-VERSION\ncontact {PLAINTEXT_EMAIL_A} now\n").into_bytes();
+    let (state, app, access_key, secret_key) = build_local_state().await;
+    let headers = auth_headers(&access_key, &secret_key);
+
+    // A completed single PUT installs the object that multipart completion must
+    // atomically replace without ever exposing a partial assembly.
+    let put_response = app
+        .clone()
+        .oneshot(add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/{bucket}/{key}"))
+                .header(header::CONTENT_TYPE, "text/plain")
+                .header(header::CONTENT_LENGTH, prior_body.len().to_string())
+                .body(Body::from(prior_body.clone()))
+                .unwrap(),
+            &headers,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put_response.status(), StatusCode::OK, "prior single PUT");
+
+    let (status, first_get) =
+        get_status_and_text(&app, &headers, "GET", &format!("/{bucket}/{key}")).await;
+    assert_eq!(status, StatusCode::OK, "{first_get}");
+    assert_eq!(first_get.as_bytes(), prior_body.as_slice());
+
+    // Single-part multipart: part 1 is the final part, so it needs no five MiB
+    // minimum. Completion replaces the prior object as one atomic generation.
+    let upload_id = initiate_upload(&app, &headers, bucket, key).await;
+    let etag = upload_part(&app, &headers, bucket, key, &upload_id, 1, &replacement).await;
+    let completion = complete_xml(&[(1, &etag)]);
+    let complete_request = add_headers(
+        Request::builder()
+            .method("POST")
+            .uri(format!("/{bucket}/{key}?uploadId={upload_id}"))
+            .body(Body::from(completion.clone()))
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(complete_request).await.unwrap();
+    let complete_status = response.status();
+    let complete_body = String::from_utf8(body_bytes(response).await).expect("completion XML");
+    assert_eq!(
+        complete_status,
+        StatusCode::OK,
+        "CompleteMultipartUpload: {complete_body}"
+    );
+    let completed_etag = extract_xml(&complete_body, "ETag");
+    assert!(!completed_etag.is_empty(), "{complete_body}");
+    drop(app);
+    drop(state);
+
+    // ---- Restart after the completion result --------------------------------
+    // The completed representation is the canonical durable body: the redacted
+    // replacement only. It must never be the prior single-PUT version, a
+    // partial assembly, or a torn publish.
+    let replacement_marker = "PART-NEW-VERSION";
+    let (state, app, _, _) = build_local_state().await;
+    let (status, after_restart) =
+        get_status_and_text(&app, &headers, "GET", &format!("/{bucket}/{key}")).await;
+    assert_eq!(status, StatusCode::OK, "{after_restart}");
+    assert!(
+        after_restart.contains(replacement_marker),
+        "{after_restart}"
+    );
+    assert!(after_restart.contains(REDACTED_EMAIL), "{after_restart}");
+    assert!(
+        !after_restart.contains("PRIOR-EXACT-VERSION"),
+        "{after_restart}"
+    );
+    assert_plaintext_never_leaks(&after_restart);
+
+    // ---- Restart with the upload tombstoned, then exact replay --------------
+    let replay_request = add_headers(
+        Request::builder()
+            .method("POST")
+            .uri(format!("/{bucket}/{key}?uploadId={upload_id}"))
+            .body(Body::from(completion.clone()))
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(replay_request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "exact completion replay");
+    let replay_body = String::from_utf8(body_bytes(response).await).expect("replay XML");
+    assert_eq!(
+        extract_xml(&replay_body, "ETag"),
+        completed_etag,
+        "{replay_body}"
+    );
+    drop(app);
+    drop(state);
+
+    // ---- Restart after the replay and verify the durable body once more -----
+    let (state, app, _, _) = build_local_state().await;
+    let (status, final_get) =
+        get_status_and_text(&app, &headers, "GET", &format!("/{bucket}/{key}")).await;
+    assert_eq!(status, StatusCode::OK, "{final_get}");
+    assert_eq!(
+        final_get, after_restart,
+        "body is stable across every restart boundary"
+    );
+    assert!(!final_get.contains("PRIOR-EXACT-VERSION"), "{final_get}");
+    drop(app);
+    drop(state);
+
+    drop(env);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Build a fresh isolated local-staged state plus router and credentials for
+/// one restart matrix test.
+async fn build_local_state() -> (Arc<AppState>, Router, String, String) {
+    let state = build_test_state().await;
+    let router = build_router(state.clone());
+    let (access_key, secret_key) = make_credentials(&state).await;
+    (state, router, access_key, secret_key)
+}
