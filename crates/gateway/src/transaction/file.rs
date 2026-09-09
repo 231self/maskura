@@ -31,6 +31,7 @@ pub struct FileSinkTransaction {
     md5: Md5,
     output_verified: bool,
     finished: bool,
+    operation_id: Option<uuid::Uuid>,
 }
 
 impl FileSinkTransaction {
@@ -63,7 +64,21 @@ impl FileSinkTransaction {
             md5: Md5::new(),
             output_verified: false,
             finished: false,
+            operation_id: None,
         })
+    }
+
+    pub async fn new_for_operation(
+        store: Arc<FileStore>,
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+        content_type: impl Into<String>,
+        max_bytes: u64,
+        operation_id: uuid::Uuid,
+    ) -> Result<Self, TransactionError> {
+        let mut sink = Self::new(store, bucket, key, content_type, max_bytes).await?;
+        sink.operation_id = Some(operation_id);
+        Ok(sink)
     }
 }
 
@@ -75,6 +90,10 @@ impl ObjectSinkTransaction for FileSinkTransaction {
         } else {
             SinkCommitState::PreCommit
         }
+    }
+
+    fn durable_operation_id(&self) -> Option<uuid::Uuid> {
+        self.operation_id
     }
 
     async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError> {
@@ -121,7 +140,9 @@ impl ObjectSinkTransaction for FileSinkTransaction {
         if !self.output_verified {
             return Err(TransactionError::OutputMismatch);
         }
-        authority.validate(None, &self.bucket, &self.key).await?;
+        authority
+            .validate(self.operation_id, &self.bucket, &self.key)
+            .await?;
         let file = self.file.take().ok_or(TransactionError::Finished)?;
         file.sync_all().await.map_err(file_error)?;
         drop(file);

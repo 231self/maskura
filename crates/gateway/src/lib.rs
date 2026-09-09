@@ -19,6 +19,7 @@ pub mod key_cipher;
 pub(crate) mod local_storage;
 pub mod managed;
 pub use maskura_mcp_protocol as mcp;
+pub(crate) mod multipart_completion;
 pub mod multipart_staging;
 pub mod object;
 pub mod pipeline;

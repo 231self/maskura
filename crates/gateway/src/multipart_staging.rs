@@ -447,55 +447,6 @@ pub trait MultipartRepository: Send + Sync {
     async fn audit(&self, audit: CleanupAudit) -> Result<(), StagingError>;
 }
 
-/// Temporary Task-10 bridge until the Task-11 coordinator owns acquisition.
-/// It converts the existing completion lease into typed publication authority
-/// before any destination commit is attempted.
-pub async fn acquire_destination_commit_authority_from_lease_compatibility(
-    repository: Arc<dyn MultipartRepository>,
-    identity: &MultipartIdentity,
-    fingerprint: &str,
-    fencing_token: u64,
-    now: i64,
-) -> Result<crate::transaction::DestinationCommitAuthority, StagingError> {
-    repository
-        .check_completion_lease(identity, fencing_token, now)
-        .await?;
-    let operation_id = DestinationCommitPermit::deterministic_operation_id(identity, fingerprint);
-    let permit = repository
-        .begin_destination_commit(identity, fingerprint, fencing_token, operation_id, now)
-        .await?;
-    Ok(
-        crate::transaction::DestinationCommitAuthority::client_multipart(
-            repository,
-            identity.clone(),
-            permit,
-        ),
-    )
-}
-
-pub async fn complete_destination_commit_from_authority_compatibility(
-    authority: &crate::transaction::DestinationCommitAuthority,
-    result: MultipartCompletionResult,
-    now: i64,
-) -> Result<(), StagingError> {
-    let crate::transaction::DestinationCommitAuthority::ClientMultipart(authority) = authority
-    else {
-        return Err(StagingError::Fenced);
-    };
-    let crate::transaction::ClientMultipartCommitAuthority {
-        repository,
-        identity,
-        permit,
-    } = authority.as_ref();
-    repository
-        .record_destination_commit(permit, result.clone(), now)
-        .await?;
-    repository
-        .complete_completion(identity, permit, result, now)
-        .await?;
-    Ok(())
-}
-
 #[derive(Default)]
 struct MemoryState {
     uploads: HashMap<String, MultipartUpload>,
@@ -4200,29 +4151,30 @@ mod tests {
             CompletionAcquire::Acquired(lease) => lease,
             _ => panic!("expected completion lease"),
         };
-        let authority = acquire_destination_commit_authority_from_lease_compatibility(
-            repo.clone(),
-            &identity(),
-            "fingerprint",
-            lease.fencing_token,
-            1,
-        )
-        .await
-        .unwrap();
-        complete_destination_commit_from_authority_compatibility(
-            &authority,
-            MultipartCompletionResult {
-                etag: Some("\"output\"".to_string()),
-                checksum_sha256: "output-sha".to_string(),
-                version_id: Some("version-a".to_string()),
-                source_bytes: 24,
-                size_bytes: 42,
-                pipeline_evidence: None,
-            },
-            1,
-        )
-        .await
-        .unwrap();
+        let permit = repo
+            .begin_destination_commit(
+                &identity(),
+                "fingerprint",
+                lease.fencing_token,
+                DestinationCommitPermit::deterministic_operation_id(&identity(), "fingerprint"),
+                1,
+            )
+            .await
+            .unwrap();
+        let result = MultipartCompletionResult {
+            etag: Some("\"output\"".to_string()),
+            checksum_sha256: "output-sha".to_string(),
+            version_id: Some("version-a".to_string()),
+            source_bytes: 24,
+            size_bytes: 42,
+            pipeline_evidence: None,
+        };
+        repo.record_destination_commit(&permit, result.clone(), 1)
+            .await
+            .unwrap();
+        repo.complete_completion(&identity(), &permit, result, 1)
+            .await
+            .unwrap();
         assert!(matches!(
             repo.acquire_completion(&identity(), "fingerprint", &request, "worker-b", 200, 2)
                 .await,

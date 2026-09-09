@@ -58,15 +58,17 @@ use crate::managed::{
     ManagedPlacementPolicy, ManagedRepository, ManagedStreamingMode, PLACEMENT_VERSION_V1,
     PostgresManagedRepository, placement_policy_fingerprint, validate_mode,
 };
+use crate::multipart_completion::{
+    MultipartCompletionCoordinator, MultipartCoordinatorError, append_usage_evidence,
+    load_usage_evidence,
+};
 use crate::multipart_staging::{
     ARTIFACT_PREFIX, AbortMutationError, COMPLETION_LEASE, CleanupAudit, CompletePart,
     CompletionAcquire, CompletionLease, EncryptedPartReader, EncryptedPartWriter,
     MAX_ACTIVE_UPLOADS, MultipartCompletionResult, MultipartIdentity, MultipartLifecycle,
     MultipartPart, MultipartRepository, MultipartSnapshot, MultipartUpload,
     PostgresMultipartRepository, S3StagingArtifactStore, StagedArtifact, StagingArtifactStore,
-    StagingError, StagingQuotaLimits,
-    acquire_destination_commit_authority_from_lease_compatibility,
-    complete_destination_commit_from_authority_compatibility, completion_fingerprint, now_ms,
+    StagingError, StagingQuotaLimits, completion_fingerprint, now_ms,
 };
 use crate::object::{
     BodyLimits, ChunkedBytesBody, ObjectMetadata, OpenedObject, filter_presigned_response_headers,
@@ -88,11 +90,11 @@ use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, BackendError, BackendErrorKind,
     CompatibilitySpoolConfig, CompatibilitySpoolTransaction, CompletionReconciliation,
     ConditionalReadCapability, DestinationCommitAuthority, DirectOperationScope, DirectS3Sink,
-    EvidenceRecord, ExpectedObject, FileSinkTransaction, IncompleteUploadDiscovery, JournalError,
-    ListCapability, MemorySinkTransaction, MultipartResponseCapability, ObjectDestination,
-    ObjectSinkTransaction, OperationJournal, OperationReconciler, OperationRecord, OperationState,
-    ProviderMutationFence, ResponseChecksumCapability, SpoolQuota, StoredObjectMeta,
-    TransactionError, VersioningCapability, WorkspaceDestinationBinding,
+    ExpectedObject, FileSinkTransaction, IncompleteUploadDiscovery, JournalError, ListCapability,
+    MemorySinkTransaction, MultipartResponseCapability, ObjectDestination, ObjectSinkTransaction,
+    OperationJournal, OperationReconciler, OperationRecord, OperationState, ProviderMutationFence,
+    ResponseChecksumCapability, SpoolQuota, StoredObjectMeta, TransactionError,
+    VersioningCapability, WorkspaceDestinationBinding,
 };
 use crate::workspace_storage::{
     BackendConfigRequest, BackendConfigResponse, BackendType, WorkspaceId, WorkspaceOperationLease,
@@ -480,42 +482,6 @@ fn multipart_completion_event(
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-struct DurableUsageEvidence {
-    receipt_id: Uuid,
-    occurred_at: chrono::DateTime<chrono::Utc>,
-    rate_version: i32,
-    source_bytes: u64,
-    output_bytes: u64,
-    processed_bytes: u64,
-    route: String,
-    kind: String,
-    bucket: String,
-    #[serde(default)]
-    pipeline_evidence: Option<crate::control::PipelineEvidence>,
-}
-
-impl From<&UsageEvent> for DurableUsageEvidence {
-    fn from(event: &UsageEvent) -> Self {
-        Self {
-            receipt_id: event.receipt_id(),
-            occurred_at: event.occurred_at(),
-            rate_version: event.rate_version(),
-            source_bytes: event.source_bytes(),
-            output_bytes: event.output_bytes(),
-            processed_bytes: event.processed_bytes(),
-            route: event.route().as_str().to_string(),
-            kind: event.kind().as_str().to_string(),
-            bucket: event.bucket().to_string(),
-            pipeline_evidence: event.pipeline_evidence().cloned(),
-        }
-    }
-}
-
-fn usage_evidence_id(receipt_id: Uuid) -> Uuid {
-    Uuid::new_v5(&Uuid::NAMESPACE_OID, receipt_id.as_bytes())
-}
-
 /// Persist the complete canonical usage event before entering a provider
 /// commit window. Exact retries use one deterministic evidence identity.
 async fn persist_usage_evidence(
@@ -556,46 +522,6 @@ async fn persist_transaction_usage_evidence(
         )));
     }
     append_usage_evidence(journal, event).await
-}
-
-async fn append_usage_evidence(
-    journal: &Arc<dyn OperationJournal>,
-    event: &UsageEvent,
-) -> Result<(), JournalError> {
-    let mut evidence = EvidenceRecord::new(
-        event.operation_id(),
-        "usage",
-        serde_json::to_value(DurableUsageEvidence::from(event))
-            .map_err(|error| JournalError::Persistence(error.to_string()))?,
-    );
-    evidence.id = usage_evidence_id(event.receipt_id());
-    journal.append_evidence(evidence).await
-}
-
-async fn load_usage_evidence(
-    journal: &Arc<dyn OperationJournal>,
-    operation_id: Uuid,
-    receipt_id: Uuid,
-) -> Result<DurableUsageEvidence, JournalError> {
-    let expected_id = usage_evidence_id(receipt_id);
-    let record = journal
-        .evidence(operation_id)
-        .await?
-        .into_iter()
-        .find(|record| record.id == expected_id && record.kind == "usage")
-        .ok_or_else(|| {
-            JournalError::Corrupt(format!(
-                "operation {operation_id} is missing deterministic usage evidence"
-            ))
-        })?;
-    let evidence: DurableUsageEvidence = serde_json::from_value(record.detail)
-        .map_err(|error| JournalError::Corrupt(error.to_string()))?;
-    if evidence.receipt_id != receipt_id {
-        return Err(JournalError::Corrupt(format!(
-            "operation {operation_id} usage evidence has the wrong receipt"
-        )));
-    }
-    Ok(evidence)
 }
 
 fn admitted_response_bytes(response: &axum::response::Response) -> Option<u64> {
@@ -3266,6 +3192,7 @@ fn direct_journal_allowed(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn begin_streaming_sink(
     state: &AppState,
     backend: ResolvedBackend,
@@ -3274,6 +3201,7 @@ async fn begin_streaming_sink(
     bucket: &str,
     key: &str,
     content_type: &str,
+    multipart_publication: Option<(&MultipartCompletionCoordinator, &MultipartIdentity, &str)>,
 ) -> Result<Box<dyn ObjectSinkTransaction>, StreamingPutError> {
     validate_streaming_backend(state, &backend)?;
     match backend {
@@ -3479,16 +3407,57 @@ async fn begin_streaming_sink(
             "presigned streaming cannot durably align the authorization and transaction journals"
                 .to_string(),
         )),
-        ResolvedBackend::File(store) => Ok(Box::new(
-            FileSinkTransaction::new(
-                store,
-                bucket,
-                key,
-                content_type,
-                state.max_pipeline_output_bytes,
-            )
-            .await?,
-        )),
+        ResolvedBackend::File(store) => {
+            if let Some((coordinator, identity, fingerprint)) = multipart_publication {
+                let operation = OperationRecord::direct_intent(
+                    direct_operation_scope(operation, destination_operation_id),
+                    ObjectDestination {
+                        backend_id: "File".to_string(),
+                        bucket: bucket.to_string(),
+                        logical_key: key.to_string(),
+                        physical_key: key.to_string(),
+                        workspace_binding: None,
+                    },
+                    ExpectedObject {
+                        metadata: std::collections::BTreeMap::from([(
+                            "content-type".to_string(),
+                            content_type.to_string(),
+                        )]),
+                        ..ExpectedObject::default()
+                    },
+                );
+                coordinator
+                    .open_operation(operation, identity, fingerprint)
+                    .await
+                    .map_err(|error| {
+                        StreamingPutError::Transaction(TransactionError::Publication(
+                            error.to_string(),
+                        ))
+                    })?;
+                Ok(Box::new(
+                    FileSinkTransaction::new_for_operation(
+                        store,
+                        bucket,
+                        key,
+                        content_type,
+                        state.max_pipeline_output_bytes,
+                        destination_operation_id,
+                    )
+                    .await?,
+                ))
+            } else {
+                Ok(Box::new(
+                    FileSinkTransaction::new(
+                        store,
+                        bucket,
+                        key,
+                        content_type,
+                        state.max_pipeline_output_bytes,
+                    )
+                    .await?,
+                ))
+            }
+        }
         ResolvedBackend::Memory(store) if state.dev_memory_streaming_enabled => {
             Ok(Box::new(MemorySinkTransaction::new(
                 store,
@@ -3754,6 +3723,7 @@ async fn streaming_single_put(
         grant.bucket(),
         key,
         &content_type,
+        None,
     )
     .await?;
     let mut sink_guard = SinkAbortGuard::new(sink);
@@ -4021,6 +3991,7 @@ async fn streaming_avro_single_put(
         grant.bucket(),
         key,
         &content_type,
+        None,
     )
     .await?;
     let mut sink_guard = SinkAbortGuard::new(sink);
@@ -4539,6 +4510,34 @@ impl From<TransactionError> for MultipartCompletionError {
     }
 }
 
+impl From<MultipartCoordinatorError> for MultipartCompletionError {
+    fn from(error: MultipartCoordinatorError) -> Self {
+        match error {
+            MultipartCoordinatorError::Staging(error) => Self::Staging(error),
+            MultipartCoordinatorError::Journal(error) => {
+                Self::Streaming(TransactionError::Journal(error).into())
+            }
+            MultipartCoordinatorError::Transaction(error) => Self::Streaming(error.into()),
+            MultipartCoordinatorError::Invalid(error) => Self::Invalid(error),
+        }
+    }
+}
+
+fn multipart_completion_coordinator(
+    state: &AppState,
+    staging: &MultipartStaging,
+) -> Result<MultipartCompletionCoordinator, MultipartCompletionError> {
+    let journal = state.operation_journal.clone().ok_or_else(|| {
+        MultipartCompletionError::Invalid(
+            "multipart completion requires a durable operation journal".to_string(),
+        )
+    })?;
+    Ok(MultipartCompletionCoordinator::new(
+        staging.repository.clone(),
+        journal,
+    )?)
+}
+
 async fn renew_and_fence_completion(
     staging: &MultipartStaging,
     identity: &MultipartIdentity,
@@ -4661,6 +4660,7 @@ async fn complete_staged_multipart(
             identity,
             fingerprint,
         );
+    let coordinator = multipart_completion_coordinator(state, staging)?;
     renew_and_fence_completion(staging, identity, lease).await?;
     let mut sink = begin_streaming_sink(
         state,
@@ -4670,8 +4670,12 @@ async fn complete_staged_multipart(
         &identity.bucket,
         &identity.key,
         &content_type,
+        Some((&coordinator, identity, fingerprint)),
     )
     .await?;
+    coordinator
+        .bind_existing_operation(destination_operation_id, identity)
+        .await?;
     let cancellation = trusted_wasm_cancellation();
     let session = s4_wasm_runtime::Session {
         format: format.as_str().to_string(),
@@ -4838,40 +4842,18 @@ async fn complete_staged_multipart(
             pipeline_evidence: pipeline_evidence.clone(),
         };
         let usage_event = multipart_completion_event(operation.grant, &precommit_result);
-        persist_transaction_usage_evidence(
-            state.operation_journal.as_ref(),
-            sink.durable_operation_id(),
-            &usage_event,
-        )
-        .await
-        .map_err(TransactionError::from)
-        .map_err(StreamingPutError::from)?;
-        sink.record_usage_evidence(&usage_event).await?;
         renew_and_fence_completion(staging, identity, lease).await?;
-        let authority = acquire_destination_commit_authority_from_lease_compatibility(
-            staging.repository.clone(),
-            identity,
-            fingerprint,
-            lease.fencing_token,
-            now_ms(),
-        )
-        .await?;
-        let stored = sink.complete(authority.clone()).await?;
-        let result = MultipartCompletionResult {
-            etag: stored.etag,
-            checksum_sha256,
-            version_id: stored.version_id,
-            source_bytes: input_bytes,
-            size_bytes: output_bytes,
-            pipeline_evidence,
-        };
-        complete_destination_commit_from_authority_compatibility(
-            &authority,
-            result.clone(),
-            now_ms(),
-        )
-        .await?;
-        Ok(result)
+        coordinator
+            .publish(
+                identity,
+                fingerprint,
+                lease.fencing_token,
+                precommit_result,
+                &usage_event,
+                &mut sink,
+            )
+            .await
+            .map_err(MultipartCompletionError::from)
     }
     .await;
     if let Err(error) = &processing {
@@ -5377,6 +5359,7 @@ async fn complete_staged_avro_multipart(
             identity,
             fingerprint,
         );
+    let coordinator = multipart_completion_coordinator(state, staging)?;
     renew_and_fence_completion(staging, identity, lease).await?;
     let mut sink = begin_streaming_sink(
         state,
@@ -5386,8 +5369,12 @@ async fn complete_staged_avro_multipart(
         &identity.bucket,
         &identity.key,
         content_type,
+        Some((&coordinator, identity, fingerprint)),
     )
     .await?;
+    coordinator
+        .bind_existing_operation(destination_operation_id, identity)
+        .await?;
     // Route admission can block; a stale completion worker must stop before it
     // polls any selected artifact.
     renew_and_fence_completion(staging, identity, lease).await?;
@@ -5481,40 +5468,18 @@ async fn complete_staged_avro_multipart(
             pipeline_evidence: None,
         };
         let usage_event = multipart_completion_event(operation.grant, &precommit_result);
-        persist_transaction_usage_evidence(
-            state.operation_journal.as_ref(),
-            sink.durable_operation_id(),
-            &usage_event,
-        )
-        .await
-        .map_err(TransactionError::from)
-        .map_err(StreamingPutError::from)?;
-        sink.record_usage_evidence(&usage_event).await?;
         renew_and_fence_completion(staging, identity, lease).await?;
-        let authority = acquire_destination_commit_authority_from_lease_compatibility(
-            staging.repository.clone(),
-            identity,
-            fingerprint,
-            lease.fencing_token,
-            now_ms(),
-        )
-        .await?;
-        let stored = sink.complete(authority.clone()).await?;
-        let result = MultipartCompletionResult {
-            etag: stored.etag,
-            checksum_sha256: output_digest,
-            version_id: stored.version_id,
-            source_bytes: input_bytes,
-            size_bytes: output_bytes,
-            pipeline_evidence: None,
-        };
-        complete_destination_commit_from_authority_compatibility(
-            &authority,
-            result.clone(),
-            now_ms(),
-        )
-        .await?;
-        Ok(result)
+        coordinator
+            .publish(
+                identity,
+                fingerprint,
+                lease.fencing_token,
+                precommit_result,
+                &usage_event,
+                &mut sink,
+            )
+            .await
+            .map_err(MultipartCompletionError::from)
     }
     .await;
 
@@ -9441,33 +9406,22 @@ async fn s3_post(
                 .complete_request_fingerprint
                 .as_deref()
                 .unwrap_or(&fingerprint);
-            let authority = match acquire_destination_commit_authority_from_lease_compatibility(
-                staging.repository.clone(),
-                &identity,
-                fingerprint,
-                lease.fencing_token,
-                now_ms(),
-            )
-            .await
-            {
-                Ok(authority) => authority,
-                Err(error) => {
-                    return multipart_completion_error_response(
-                        &key,
-                        MultipartCompletionError::Staging(error),
-                    );
-                }
+            let coordinator = match multipart_completion_coordinator(&state, &staging) {
+                Ok(coordinator) => coordinator,
+                Err(error) => return multipart_completion_error_response(&key, error),
             };
-            if let Err(error) = complete_destination_commit_from_authority_compatibility(
-                &authority,
-                result.clone(),
-                now_ms(),
-            )
-            .await
+            if let Err(error) = coordinator
+                .complete_recovered_journal_result(
+                    &identity,
+                    fingerprint,
+                    lease.fencing_token,
+                    result.clone(),
+                )
+                .await
             {
                 return multipart_completion_error_response(
                     &key,
-                    MultipartCompletionError::Staging(error),
+                    MultipartCompletionError::from(error),
                 );
             }
             result
