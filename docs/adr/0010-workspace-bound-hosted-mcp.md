@@ -36,7 +36,9 @@ workspace after insertion.
 Transport-independent MCP request schemas, result types, validation, tool
 definitions, legacy aliases, dispatch, and S3 list parsing live in the small
 `maskura-mcp-protocol` crate. The stdio binary consumes those types and
-continues to call the network S3 surface with its configured credential.
+continues to call the network S3 surface with its configured credential. The
+stdio client sends credentials over HTTPS only, except when the configured host
+is a literal loopback address; non-loopback cleartext HTTP fails during startup.
 
 Hosted adapters use `s4_gateway::server::invoke_mcp`. They provide an already
 authenticated `AuthenticatedMcpPrincipal`, server operation UUID, typed tool
@@ -55,6 +57,8 @@ authentication, metering, backend, or presigned URL headers.
   usage paths as S3 without opening a loopback listener.
 - Text MCP bodies and responses have non-configurable hard ceilings. The
   private transport remains responsible for envelope and chunk preparse bounds.
+- Local stdio development remains simple over loopback HTTP, while a
+  misconfigured remote gateway cannot receive MCP or API credentials in cleartext.
 - Cancellation reaches active Wasm work and waits for gateway settlement;
   provider SDK calls that do not expose cooperative cancellation may complete
   before the invocation returns its committed outcome.

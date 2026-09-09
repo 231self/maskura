@@ -165,9 +165,9 @@ docker run --rm -p 8080:8080 -v maskura-data:/data \
   ghcr.io/231self/maskura/maskura:latest
 ```
 
-The local-mode startup output prints `MASKURA_ACCESS_KEY` and
-`MASKURA_SECRET_KEY`. Use them with the CLI or `aws --endpoint-url
-http://localhost:8080 s3 ...`. Objects, local API keys, and in-progress staged
+With `AUTH_DISABLED=true`, clients can use any non-empty placeholder credentials;
+the quickstart uses `demo`. The gateway never prints generated key secrets to its
+logs. Objects, local API keys, and in-progress staged
 multipart uploads survive container restarts through the mounted volume. Keep
 the `.maskura/wrapping.key` file with the volume backup; losing it makes
 encrypted incomplete uploads unrecoverable.

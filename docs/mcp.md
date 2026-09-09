@@ -11,7 +11,8 @@ object tools to Claude, Codex, Cursor, and other MCP clients:
 The stdio server does not implement a second storage or processing path. Every tool
 calls the Maskura Gateway's S3-compatible HTTP surface, so gateway authentication,
 the configured plugin pipeline, backend selection, limits, and metering still
-apply.
+apply. Credential-bearing connections require HTTPS; cleartext HTTP is accepted
+only for literal loopback hosts (`localhost`, `127.0.0.0/8`, or `::1`).
 
 ## Install
 
