@@ -15,9 +15,10 @@
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" /></a>
 </p>
 
-Maskura is a privacy boundary between agents and object data. It sits in front of your
-existing S3-compatible storage and redacts or encrypts sensitive data on the way through,
-so agents get the view you allow and the raw object never leaves your bucket.
+Maskura is a privacy boundary between agents and object data. Run it locally as an
+S3-compatible endpoint backed by Docker storage, or put it in front of your existing
+object store. It redacts or encrypts sensitive data on the way through, so agents get
+the view you allow and the raw object never leaves your storage boundary.
 
 **Read path** — agents see the view you allow; the raw object stays in storage.
 
@@ -32,9 +33,11 @@ so agents get the view you allow and the raw object never leaves your bucket.
 - **Sandboxed** — wasmtime, 64 MiB memory, fuel-limited, no host imports.
 - **BYO plugins** — write in Rust (or any Wasm-capable language), wrap with
   `wasm-tools component`, `maskura plugin upload`. See [docs/plugins.md](docs/plugins.md).
-- **Any S3-compatible storage** — MinIO, AWS S3, Google Cloud Storage, Backblaze B2,
-  Cloudflare R2, Vultr Object Storage — single or multi-cloud (consistent-hash ring,
-  dual-write, read fail-over). MinIO is covered by the CI end-to-end suite;
+- **Any S3-compatible storage** — Maskura is itself an S3-compatible endpoint for
+  zero-dependency local Docker runs. Point it at MinIO, AWS S3, Google Cloud Storage,
+  Backblaze B2, Cloudflare R2, or Vultr Object Storage when you want external storage —
+  single or multi-cloud (consistent-hash ring, dual-write, read fail-over). MinIO is
+  covered by the CI end-to-end suite;
   Backblaze B2 is tested against a real bucket (redaction and
   envelope-encryption round-trips).
 - **Agent-safe reads** — read data through Maskura with `x-maskura-process: read`: the pipeline
@@ -46,14 +49,13 @@ so agents get the view you allow and the raw object never leaves your bucket.
 
 Filters shipped in-tree (as examples to learn from): `noop`, `pii-default` (redact
 emails / SSNs / credit cards), `email-detect`, `ssn-detect`, `card-detect`,
-`envelope-encrypt` (per-field RSA-OAEP / AES-256-GCM), `stable-encrypt`
+`envelope-encrypt` (per-field hybrid post-quantum encryption), `stable-encrypt`
 (deterministic encryption).
 
 ## Contents
 
 - [Quickstart](#quickstart)
 - [Install the CLI (optional)](#install-the-cli-optional)
-- [Compatibility](#compatibility)
 - [Run your own plugin](#run-your-own-plugin)
 - [Usage examples](#usage-examples)
 - [Demo](#demo)
@@ -71,7 +73,7 @@ published Maskura gateway image with its own local S3-compatible API and one
 durable Docker volume:
 
 ```bash
-docker run --rm -p 127.0.0.1:8791:8080 -v s4-local-keys:/data \
+docker run --rm -p 127.0.0.1:8791:8080 -v maskura-local-keys:/data \
   -e AUTH_DISABLED=true \
   -e MASKURA_KEYS_FILE=/data/keys.json \
   -e MASKURA_STORAGE_MODE=local \
@@ -90,10 +92,10 @@ printf '{"email":"jane@example.com","card":"4111111111111111"}\n' > data.jsonl
 
 # Write through the pipeline; pii-default redacts on the way in:
 aws s3 --endpoint-url http://localhost:8791 \
-  cp data.jsonl s3://s4-local/ingest/data.jsonl --content-type application/x-ndjson
+  cp data.jsonl s3://maskura-local/ingest/data.jsonl --content-type application/x-ndjson
 
 # Read it back:
-aws s3 --endpoint-url http://localhost:8791 cp s3://s4-local/ingest/data.jsonl -
+aws s3 --endpoint-url http://localhost:8791 cp s3://maskura-local/ingest/data.jsonl -
 # → {"email":"[REDACTED_EMAIL]","card":"[REDACTED_CARD]"}
 ```
 
@@ -101,9 +103,9 @@ aws s3 --endpoint-url http://localhost:8791 cp s3://s4-local/ingest/data.jsonl -
 
 ```bash
 echo "jane.doe@example.com 4111111111111111" > data.txt
-curl -X PUT http://localhost:8791/s4-local/ingest/data.txt \
+curl -X PUT http://localhost:8791/maskura-local/ingest/data.txt \
   -H "Content-Type: text/plain" --data-binary @data.txt
-curl http://localhost:8791/s4-local/ingest/data.txt
+curl http://localhost:8791/maskura-local/ingest/data.txt
 # → [REDACTED_EMAIL] [REDACTED_CARD]
 ```
 
@@ -113,12 +115,12 @@ anything you already run. The dashboard's copy-paste snippets use whatever
 
 ## Install the CLI (optional)
 
-Prefer the CLI? Install it with `cargo install`, or grab the prebuilt Linux
-(amd64/arm64) binaries attached to each
+Prefer the CLI? Install it with `cargo install`, or grab a prebuilt Linux
+(amd64/arm64) or native Apple Silicon binary attached to each
 [GitHub Release](https://github.com/231self/maskura/releases):
 
 ```bash
-cargo install --git https://github.com/231self/maskura --bin maskura s4ctl
+cargo install --git https://github.com/231self/maskura --bin maskura
 maskura local init                  # runs the published gateway image (Docker)
 maskura plugin list                 # the pii-default plugin is preloaded
 
@@ -126,16 +128,16 @@ maskura plugin list                 # the pii-default plugin is preloaded
 echo "jane.doe@example.com 4111111111111111" > data.csv
 
 # Write data through the pipeline; it is transformed before it reaches storage
-maskura put ./data.csv ingest/data.csv --bucket s4-local
+maskura put ./data.csv ingest/data.csv --bucket maskura-local
 
 # Read it back
-maskura get ingest/data.csv --bucket s4-local
+maskura get ingest/data.csv --bucket maskura-local
 
 # For recoverable PII, create a hybrid key with the API key and keep the
 # private key locally. New encrypted objects can then be decrypted on read.
 maskura key create --label recoverable --generate-encryption-key \
   --private-key-out ./maskura-private-key.pem
-maskura get ingest/data.csv --bucket s4-local \
+maskura get ingest/data.csv --bucket maskura-local \
   --decrypt ./maskura-private-key.pem
 ```
 
@@ -160,7 +162,7 @@ docker run --rm -p 8080:8080 -v maskura-data:/data \
   -e MASKURA_STORAGE_MODE=local \
   -e MASKURA_LOCAL_STORAGE_DIR=/data \
   -e MASKURA_MULTIPART_MODE=staged \
-  ghcr.io/231self/maskura/maskura:<release-tag>
+  ghcr.io/231self/maskura/maskura:latest
 ```
 
 The local-mode startup output prints `MASKURA_ACCESS_KEY` and
@@ -170,22 +172,10 @@ multipart uploads survive container restarts through the mounted volume. Keep
 the `.maskura/wrapping.key` file with the volume backup; losing it makes
 encrypted incomplete uploads unrecoverable.
 
-## Compatibility
-
-New integrations should use `MASKURA_*` environment variables and
-`x-maskura-*` headers. The `s4ctl` and `s4-mcp` binaries, `s4_*` MCP tools, `s4_client` Python
-module, and `S4Client` SDK exports remain available.
-
-Persistent and security-sensitive identifiers do not change: credentials still
-use `s4_`/`s4s_`/`s4m_`, local CLI state remains under `~/.config/s4`, existing
-container/volume names remain shared, WIT namespaces remain `s4:*`, stored
-metadata remains `s4-*`, and legacy images remain pullable from
-`ghcr.io/231self/s4/s4`.
-
 ## Run your own plugin
 
 ```bash
-# 1. Write a filter (Rust + wit-bindgen against wit/s4-filter/world.wit)
+# 1. Write a filter in Rust or any Wasm component-capable language
 # 2. Build it:
 cargo build --release --target wasm32-unknown-unknown
 wasm-tools component new target/wasm32-unknown-unknown/release/my_filter.wasm \
@@ -221,12 +211,12 @@ Everything below is copy-paste runnable.
 ```bash
 # Local gateway (Maskura-managed Docker container, durable FileStore):
 maskura local init
-maskura put ./data.csv ingest/data.csv --bucket s4-local
-maskura get ingest/data.csv --bucket s4-local     # emails/SSNs/cards redacted
+maskura put ./data.csv ingest/data.csv --bucket maskura-local
+maskura get ingest/data.csv --bucket maskura-local     # emails/SSNs/cards redacted
 
 # Optional external-backend validation path (MinIO + Docker Compose):
 just dev-up
-maskura put ./data.csv ingest/data.csv --bucket s4-local
+maskura put ./data.csv ingest/data.csv --bucket maskura-local
 
 # End-to-end validation:
 just e2e                # see docs/e2e.md for the feature-by-feature breakdown
@@ -236,7 +226,7 @@ just e2e                # see docs/e2e.md for the feature-by-feature breakdown
 
 ```bash
 # Data at rest stays raw (your app owns the originals).
-maskura put ./customers.json customers/c1.json --bucket s4-local
+maskura put ./customers.json customers/c1.json --bucket maskura-local
 
 # Transformed reads are deliberately opt-in. Unsafe component snapshots are
 # staged encrypted before any response bytes are disclosed.
@@ -302,8 +292,15 @@ maskura plugin reorder pii-default my-filter     # output of one feeds the next
 **SDKs — Python**
 
 ```python
+import os
+
 from maskura_client import MaskuraClient
-client = MaskuraClient("http://localhost:8080", "s4_access_key", "s4s_secret_key")
+
+client = MaskuraClient(
+    "http://localhost:8080",
+    os.environ["MASKURA_ACCESS_KEY"],
+    os.environ["MASKURA_SECRET_KEY"],
+)
 priv, pub = client.generate_keypair()                  # X25519 + ML-KEM-768
 client.attach_public_key(pub)                          # bind to your API key
 client.put_object("bucket", "key", b"jane@example.com 4111111111111111")
@@ -349,9 +346,8 @@ Two local pipeline runners, both with persistent caches:
   cache server, so cargo deps are reused across runs).
 - **`just build-local` / `just image-local` / `just publish-local TAG=x`** — dagger
   pipeline (`dagger/main.py`) with cargo registry + target dirs on persistent cache
-  volumes; `publish-local` pushes identical canonical and legacy tags to
-  `ghcr.io/231self/maskura/maskura` and `ghcr.io/231self/s4/s4` (needs `docker login ghcr.io`
-  once).
+  volumes; `publish-local` pushes the image to
+  `ghcr.io/231self/maskura/maskura` (needs `docker login ghcr.io` once).
 
 See `CONTRIBUTING.md`.
 
@@ -368,6 +364,19 @@ or security@231self.com — and never through a
 [public issue](https://github.com/231self/maskura/issues/new/choose). See
 [SECURITY.md](SECURITY.md) for the supported-version policy,
 response timeline, and what to include in a report.
+
+CI runs RustSec and dependency-policy audits, dependency-diff review, and
+CodeQL for Rust, Python, TypeScript/JavaScript, and workflow code. External
+Actions are pinned to immutable commits. Releases include `SHA256SUMS`, an SPDX
+JSON SBOM, and GitHub build-provenance attestations for downloadable artifacts
+and published container manifests. This includes the native
+`maskura-macos-arm64` and `maskura-mcp-macos-arm64` Apple Silicon builds. Verify
+a downloaded artifact with:
+
+```bash
+sha256sum --check SHA256SUMS --ignore-missing
+gh attestation verify --repo 231self/maskura ./maskura-linux-amd64
+```
 
 ## Documentation
 

@@ -24,12 +24,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@86e7197484018ef6aaa9255d186f6ce1754276dd # 1.97.0
         with:
           targets: wasm32-wasip1,wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build Wasm filters
@@ -41,12 +41,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@86e7197484018ef6aaa9255d186f6ce1754276dd # 1.97.0
         with:
           targets: wasm32-wasip1,wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build Wasm filters

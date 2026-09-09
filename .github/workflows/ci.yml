@@ -25,9 +25,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@86e7197484018ef6aaa9255d186f6ce1754276dd # 1.97.0
         with:
           components: rustfmt
       - name: Format
@@ -37,12 +37,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@86e7197484018ef6aaa9255d186f6ce1754276dd # 1.97.0
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Lint
         run: cargo clippy --locked --all-targets -- -D warnings
 
@@ -50,12 +50,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@86e7197484018ef6aaa9255d186f6ce1754276dd # 1.97.0
         with:
           targets: wasm32-wasip1,wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build Wasm filters
@@ -67,12 +67,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@86e7197484018ef6aaa9255d186f6ce1754276dd # 1.97.0
         with:
           targets: wasm32-wasip1
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build SDKs (drift check)
@@ -97,12 +97,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@86e7197484018ef6aaa9255d186f6ce1754276dd # 1.97.0
         with:
           targets: wasm32-wasip1,wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: End-to-end (MinIO)
@@ -129,12 +129,12 @@ jobs:
     env:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/maskura
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@86e7197484018ef6aaa9255d186f6ce1754276dd # 1.97.0
         with:
           targets: wasm32-wasip1,wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build Wasm filters
@@ -146,12 +146,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@86e7197484018ef6aaa9255d186f6ce1754276dd # 1.97.0
         with:
           targets: wasm32-wasip1,wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build Wasm filters
@@ -165,10 +165,60 @@ jobs:
           MASKURA_RUN_EXTERNAL_CLIENT_INTEROP: "1"
         run: cargo test --locked -p s4-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
 
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@86e7197484018ef6aaa9255d186f6ce1754276dd # 1.97.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install dependency scanners
+        run: |
+          cargo install --locked cargo-audit --version 0.22.2
+          cargo install --locked cargo-deny --version 0.20.2
+      - name: RustSec advisory audit
+        run: bash scripts/audit-rust.sh
+      - name: Dependency policy audit
+        run: cargo deny check
+
+  dependency-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Review dependency changes
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+      - name: No dependency diff outside pull requests
+        if: github.event_name != 'pull_request'
+        run: echo "dependency review applies to pull requests"
+
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, javascript-typescript, python, actions]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+      - name: Analyze
+        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+
   # Aggregate status so branch protection's required `check` keeps working
   # and never ends up "skipped" when a constituent job fails.
   check:
-    needs: [fmt, lint, test, sdk, e2e, postgres, interop]
+    needs: [fmt, lint, test, sdk, e2e, postgres, interop, security, dependency-review, codeql]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
