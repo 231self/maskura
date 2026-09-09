@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::file_store::{FileStore, FileStoreError};
 use crate::filesystem_persistence::{FilesystemPersistence, PersistenceError, RootLock};
+use crate::key_cipher::{FileKeyWrapping, FileKeyWrappingError, KeyWrapping};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LocalStorageError {
@@ -10,6 +11,8 @@ pub(crate) enum LocalStorageError {
     Persistence(#[from] PersistenceError),
     #[error(transparent)]
     FileStore(#[from] FileStoreError),
+    #[error(transparent)]
+    FileKeyWrapping(#[from] FileKeyWrappingError),
 }
 
 /// Owns all process-scoped resources for one local filesystem storage root.
@@ -17,22 +20,39 @@ pub(crate) enum LocalStorageError {
 pub(crate) struct LocalStorageRuntime {
     root: PathBuf,
     file_store: Arc<FileStore>,
+    #[allow(
+        dead_code,
+        reason = "consumed by subsequent local multipart startup wiring"
+    )]
+    wrapping: Arc<FileKeyWrapping>,
     _root_lock: RootLock,
 }
 
 impl LocalStorageRuntime {
     pub(crate) async fn new(root: PathBuf) -> Result<Self, LocalStorageError> {
         let root_lock = FilesystemPersistence::default().acquire_root_lock(&root)?;
+        let wrapping = Arc::new(FileKeyWrapping::load_or_create(
+            &root.join(".maskura").join("wrapping.key"),
+        )?);
         let file_store = Arc::new(FileStore::open_locked(root.clone()).await?);
         Ok(Self {
             root,
             file_store,
+            wrapping,
             _root_lock: root_lock,
         })
     }
 
     pub(crate) fn file_store(&self) -> Arc<FileStore> {
         self.file_store.clone()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by subsequent local multipart startup wiring"
+    )]
+    pub(crate) fn wrapping(&self) -> Arc<dyn KeyWrapping> {
+        self.wrapping.clone()
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -44,7 +64,10 @@ impl LocalStorageRuntime {
         self.root.join(".maskura")
     }
 
-    #[allow(dead_code, reason = "used by subsequent local Phase 2 components")]
+    #[allow(
+        dead_code,
+        reason = "consumed by subsequent local multipart startup wiring"
+    )]
     pub(crate) fn wrapping_key_path(&self) -> PathBuf {
         self.internal_root().join("wrapping.key")
     }
@@ -97,6 +120,7 @@ mod tests {
         let first = LocalStorageRuntime::new(directory.path().to_path_buf())
             .await
             .unwrap();
+        let key_before = std::fs::read(first.wrapping_key_path()).unwrap();
 
         let error = LocalStorageRuntime::new(directory.path().to_path_buf())
             .await
@@ -106,6 +130,10 @@ mod tests {
             error,
             LocalStorageError::Persistence(PersistenceError::RootAlreadyLocked)
         ));
+        assert_eq!(
+            std::fs::read(first.wrapping_key_path()).unwrap(),
+            key_before
+        );
         drop(first);
     }
 
@@ -136,6 +164,33 @@ mod tests {
         LocalStorageRuntime::new(directory.path().to_path_buf())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wrapping_key_is_private_and_stable_across_runtime_restart() {
+        let directory = TempDir::new();
+        let first = LocalStorageRuntime::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let path = first.wrapping_key_path();
+        let encoded = std::fs::read(&path).unwrap();
+        let wrapped = first.wrapping().wrap(b"durable-dek").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(first);
+
+        let second = LocalStorageRuntime::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), encoded);
+        assert_eq!(second.wrapping().unwrap(&wrapped).unwrap(), b"durable-dek");
     }
 
     #[tokio::test]

@@ -21,15 +21,30 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use rand::RngCore;
 use rand::rngs::OsRng;
-use std::fmt::Debug;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
+use std::fmt::{self, Debug};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::warn;
+use uuid::Uuid;
+use zeroize::Zeroize;
+
+use crate::filesystem_persistence::{create_private_dir_all, sync_parent};
 
 const LEGACY_ENVELOPE_VERSION: &str = "v1";
 const ENVELOPE_VERSION: &str = "v2";
 const AAD_DOMAIN: &[u8] = b"s4.api-key.secret.v2\0";
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
+const FILE_KEY_VERSION: u32 = 1;
+const FILE_KEY_MAX_BYTES: u64 = 4096;
+const FILE_KEY_CHECKSUM_DOMAIN: &[u8] = b"maskura.local-wrapping-key.v1\0";
+const FILE_KEY_TEMP_PREFIX: &str = ".wrapping.key.";
+const FILE_KEY_TEMP_SUFFIX: &str = ".tmp";
 
 /// Wraps (encrypts) and unwraps (decrypts) the per-secret data key (DEK).
 ///
@@ -51,10 +66,25 @@ pub trait KeyWrapping: Send + Sync + Debug {
 
 /// Wraps the DEK with a static 256-bit KEK using AES-256-GCM. The per-wrap
 /// nonce is prepended to the ciphertext so the blob is self-describing.
-#[derive(Debug)]
 pub struct LocalKeyWrapping {
     kek: [u8; KEY_LEN],
     durable: bool,
+}
+
+impl Debug for LocalKeyWrapping {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalKeyWrapping")
+            .field("kek", &"[REDACTED]")
+            .field("durable", &self.durable)
+            .finish()
+    }
+}
+
+impl Drop for LocalKeyWrapping {
+    fn drop(&mut self) {
+        self.kek.zeroize();
+    }
 }
 
 impl LocalKeyWrapping {
@@ -120,6 +150,306 @@ impl KeyWrapping for LocalKeyWrapping {
     fn is_durable(&self) -> bool {
         self.durable
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum FileKeyWrappingError {
+    #[error("local wrapping key {operation} failed: {source}")]
+    Io {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("local wrapping key is corrupt: {0}")]
+    Corrupt(String),
+    #[error("unsupported local wrapping key version {0}")]
+    UnsupportedVersion(u32),
+    #[cfg(unix)]
+    #[error("local wrapping key permissions must not grant group or other access")]
+    InsecurePermissions,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FileKeyRecord {
+    version: u32,
+    key: String,
+    checksum: String,
+}
+
+/// A durable wrapping provider scoped to one locked local-storage root.
+pub(crate) struct FileKeyWrapping {
+    wrapping: LocalKeyWrapping,
+}
+
+impl Debug for FileKeyWrapping {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileKeyWrapping")
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl FileKeyWrapping {
+    /// The caller must hold the root lock before invoking this method.
+    pub(crate) fn load_or_create(path: &Path) -> Result<Self, FileKeyWrappingError> {
+        let wrapping = match load_file_key(path)? {
+            Some(key) => LocalKeyWrapping::with_kek(key),
+            None => LocalKeyWrapping::with_kek(publish_new_file_key(path)?),
+        };
+        cleanup_file_key_temporaries(path)?;
+        Ok(Self { wrapping })
+    }
+}
+
+impl KeyWrapping for FileKeyWrapping {
+    fn wrap(&self, dek: &[u8]) -> Result<Vec<u8>> {
+        self.wrapping.wrap(dek)
+    }
+
+    fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>> {
+        self.wrapping.unwrap(wrapped)
+    }
+
+    fn is_durable(&self) -> bool {
+        true
+    }
+}
+
+fn publish_new_file_key(path: &Path) -> Result<[u8; KEY_LEN], FileKeyWrappingError> {
+    let parent = path.parent().ok_or_else(|| {
+        FileKeyWrappingError::Corrupt(format!("{} has no parent", path.display()))
+    })?;
+    create_private_dir_all(parent)
+        .map_err(|error| FileKeyWrappingError::Corrupt(error.to_string()))?;
+
+    let mut key = [0_u8; KEY_LEN];
+    OsRng.fill_bytes(&mut key);
+    let mut record = FileKeyRecord {
+        version: FILE_KEY_VERSION,
+        key: B64.encode(key),
+        checksum: hex::encode(file_key_checksum(FILE_KEY_VERSION, &key)),
+    };
+    let mut encoded = serde_json::to_vec(&record)
+        .map_err(|error| FileKeyWrappingError::Corrupt(error.to_string()))?;
+    record.key.zeroize();
+    let temporary = file_key_temporary_path(path);
+    let result = (|| {
+        let mut file = create_private_file(&temporary)?;
+        file.write_all(&encoded)
+            .map_err(|source| file_key_io("temporary write", source))?;
+        file.sync_all()
+            .map_err(|source| file_key_io("temporary sync", source))?;
+        drop(file);
+
+        match std::fs::hard_link(&temporary, path) {
+            Ok(()) => {
+                std::fs::remove_file(&temporary)
+                    .map_err(|source| file_key_io("temporary removal", source))?;
+                sync_parent(path).map_err(|source| file_key_io("parent sync", source))?;
+                Ok(key)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::remove_file(&temporary)
+                    .map_err(|source| file_key_io("temporary removal", source))?;
+                sync_parent(path).map_err(|source| file_key_io("parent sync", source))?;
+                let existing = load_file_key(path)?.ok_or_else(|| {
+                    FileKeyWrappingError::Corrupt(
+                        "canonical key disappeared during publication".into(),
+                    )
+                })?;
+                key.zeroize();
+                Ok(existing)
+            }
+            Err(source) => Err(file_key_io("no-overwrite publication", source)),
+        }
+    })();
+    if temporary.exists() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    encoded.zeroize();
+    if result.is_err() {
+        key.zeroize();
+    }
+    result
+}
+
+fn load_file_key(path: &Path) -> Result<Option<[u8; KEY_LEN]>, FileKeyWrappingError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(file_key_io("metadata read", source)),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(FileKeyWrappingError::Corrupt(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    validate_file_key_permissions(&metadata)?;
+    if metadata.len() == 0 || metadata.len() > FILE_KEY_MAX_BYTES {
+        return Err(FileKeyWrappingError::Corrupt(
+            "record has an invalid length".into(),
+        ));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|source| file_key_io("open", source))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|source| file_key_io("opened metadata read", source))?;
+    if !opened_metadata.file_type().is_file() || !same_file(&metadata, &opened_metadata) {
+        return Err(FileKeyWrappingError::Corrupt(
+            "canonical file changed while opening".into(),
+        ));
+    }
+    validate_file_key_permissions(&opened_metadata)?;
+    let mut encoded = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut encoded)
+        .map_err(|source| file_key_io("read", source))?;
+    if encoded.len() as u64 != metadata.len() {
+        return Err(FileKeyWrappingError::Corrupt(
+            "canonical file changed while reading".into(),
+        ));
+    }
+    let record: FileKeyRecord = serde_json::from_slice(&encoded)
+        .map_err(|error| FileKeyWrappingError::Corrupt(format!("invalid record: {error}")))?;
+    if record.version != FILE_KEY_VERSION {
+        return Err(FileKeyWrappingError::UnsupportedVersion(record.version));
+    }
+    let decoded = B64
+        .decode(record.key)
+        .map_err(|_| FileKeyWrappingError::Corrupt("invalid key encoding".into()))?;
+    let key: [u8; KEY_LEN] = decoded
+        .try_into()
+        .map_err(|_| FileKeyWrappingError::Corrupt("key must contain exactly 32 bytes".into()))?;
+    let checksum = hex::decode(record.checksum)
+        .map_err(|_| FileKeyWrappingError::Corrupt("invalid checksum encoding".into()))?;
+    let expected = file_key_checksum(record.version, &key);
+    if checksum.as_slice() != expected {
+        return Err(FileKeyWrappingError::Corrupt("checksum mismatch".into()));
+    }
+    Ok(Some(key))
+}
+
+fn create_private_file(path: &Path) -> Result<File, FileKeyWrappingError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|source| file_key_io("temporary creation", source))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|source| file_key_io("temporary permissions", source))?;
+    }
+    Ok(file)
+}
+
+fn cleanup_file_key_temporaries(path: &Path) -> Result<(), FileKeyWrappingError> {
+    let parent = path.parent().ok_or_else(|| {
+        FileKeyWrappingError::Corrupt(format!("{} has no parent", path.display()))
+    })?;
+    let entries = std::fs::read_dir(parent)
+        .map_err(|source| file_key_io("temporary directory read", source))?;
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry.map_err(|source| file_key_io("temporary entry read", source))?;
+        if !is_file_key_temporary(&entry.file_name()) {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|source| file_key_io("temporary metadata read", source))?;
+        if !(file_type.is_file() || file_type.is_symlink()) {
+            return Err(FileKeyWrappingError::Corrupt(format!(
+                "{} is not a removable wrapping-key temporary",
+                entry.path().display()
+            )));
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(file_key_io("temporary cleanup", source)),
+        }
+    }
+    if removed {
+        sync_parent(path).map_err(|source| file_key_io("temporary cleanup sync", source))?;
+    }
+    Ok(())
+}
+
+fn file_key_temporary_path(path: &Path) -> PathBuf {
+    path.parent()
+        .expect("wrapping key path has a parent")
+        .join(format!(
+            "{FILE_KEY_TEMP_PREFIX}{}{FILE_KEY_TEMP_SUFFIX}",
+            Uuid::now_v7()
+        ))
+}
+
+fn is_file_key_temporary(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.strip_prefix(FILE_KEY_TEMP_PREFIX)
+        .and_then(|name| name.strip_suffix(FILE_KEY_TEMP_SUFFIX))
+        .is_some_and(|id| Uuid::parse_str(id).is_ok())
+}
+
+fn file_key_checksum(version: u32, key: &[u8; KEY_LEN]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(FILE_KEY_CHECKSUM_DOMAIN);
+    digest.update(version.to_be_bytes());
+    digest.update((key.len() as u64).to_be_bytes());
+    digest.update(key);
+    digest.finalize().into()
+}
+
+#[cfg(unix)]
+fn validate_file_key_permissions(metadata: &std::fs::Metadata) -> Result<(), FileKeyWrappingError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(FileKeyWrappingError::InsecurePermissions);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_file_key_permissions(
+    _metadata: &std::fs::Metadata,
+) -> Result<(), FileKeyWrappingError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
+    true
+}
+
+fn file_key_io(operation: &'static str, source: std::io::Error) -> FileKeyWrappingError {
+    FileKeyWrappingError::Io { operation, source }
 }
 
 /// Resolve the OSS self-host wrapping: `S4_SECRET_KEK` if set, otherwise an
@@ -262,6 +592,50 @@ mod tests {
 
     fn cipher_with_kek(kek: u8) -> SecretCipher {
         SecretCipher::new(Arc::new(LocalKeyWrapping::with_kek([kek; KEY_LEN])))
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("maskura-file-key-{}", Uuid::now_v7()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn key_path(&self) -> PathBuf {
+            self.0.join(".maskura").join("wrapping.key")
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn encode_file_key(version: u32, key: &[u8]) -> Vec<u8> {
+        let checksum = if key.len() == KEY_LEN {
+            file_key_checksum(version, key.try_into().unwrap())
+        } else {
+            [0_u8; 32]
+        };
+        serde_json::to_vec(&FileKeyRecord {
+            version,
+            key: B64.encode(key),
+            checksum: hex::encode(checksum),
+        })
+        .unwrap()
+    }
+
+    fn write_private(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 
     #[derive(Debug)]
@@ -413,5 +787,173 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("S4_SECRET_KEK", B64.encode([1u8; 8])) };
         assert!(LocalKeyWrapping::from_env().is_err());
+    }
+
+    #[test]
+    fn file_key_identity_survives_reload() {
+        let directory = TempDir::new();
+        let path = directory.key_path();
+        let first = FileKeyWrapping::load_or_create(&path).unwrap();
+        let wrapped = first.wrap(b"restart-sensitive-dek").unwrap();
+        drop(first);
+
+        let second = FileKeyWrapping::load_or_create(&path).unwrap();
+
+        assert!(second.is_durable());
+        assert_eq!(second.unwrap(&wrapped).unwrap(), b"restart-sensitive-dek");
+    }
+
+    #[test]
+    fn malformed_file_key_is_rejected_without_overwrite() {
+        let directory = TempDir::new();
+        let path = directory.key_path();
+        write_private(&path, b"not-json");
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(matches!(
+            FileKeyWrapping::load_or_create(&path),
+            Err(FileKeyWrappingError::Corrupt(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn truncated_file_key_is_rejected_without_overwrite() {
+        let directory = TempDir::new();
+        let path = directory.key_path();
+        let mut encoded = encode_file_key(FILE_KEY_VERSION, &[7; KEY_LEN]);
+        encoded.truncate(encoded.len() / 2);
+        write_private(&path, &encoded);
+
+        assert!(matches!(
+            FileKeyWrapping::load_or_create(&path),
+            Err(FileKeyWrappingError::Corrupt(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), encoded);
+    }
+
+    #[test]
+    fn wrong_file_key_length_is_rejected_without_overwrite() {
+        let directory = TempDir::new();
+        let path = directory.key_path();
+        let encoded = encode_file_key(FILE_KEY_VERSION, &[7; KEY_LEN - 1]);
+        write_private(&path, &encoded);
+
+        assert!(matches!(
+            FileKeyWrapping::load_or_create(&path),
+            Err(FileKeyWrappingError::Corrupt(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), encoded);
+    }
+
+    #[test]
+    fn file_key_checksum_corruption_is_rejected_without_overwrite() {
+        let directory = TempDir::new();
+        let path = directory.key_path();
+        let mut record: FileKeyRecord =
+            serde_json::from_slice(&encode_file_key(FILE_KEY_VERSION, &[7; KEY_LEN])).unwrap();
+        record.checksum.replace_range(..2, "00");
+        let encoded = serde_json::to_vec(&record).unwrap();
+        write_private(&path, &encoded);
+
+        assert!(matches!(
+            FileKeyWrapping::load_or_create(&path),
+            Err(FileKeyWrappingError::Corrupt(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), encoded);
+    }
+
+    #[test]
+    fn unsupported_file_key_version_is_rejected_without_overwrite() {
+        let directory = TempDir::new();
+        let path = directory.key_path();
+        let encoded = encode_file_key(FILE_KEY_VERSION + 1, &[7; KEY_LEN]);
+        write_private(&path, &encoded);
+
+        assert!(matches!(
+            FileKeyWrapping::load_or_create(&path),
+            Err(FileKeyWrappingError::UnsupportedVersion(2))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), encoded);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insecure_file_key_permissions_are_rejected_without_repair() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = TempDir::new();
+        let path = directory.key_path();
+        let encoded = encode_file_key(FILE_KEY_VERSION, &[7; KEY_LEN]);
+        write_private(&path, &encoded);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        assert!(matches!(
+            FileKeyWrapping::load_or_create(&path),
+            Err(FileKeyWrappingError::InsecurePermissions)
+        ));
+        assert_eq!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_file_key_is_rejected_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new();
+        let path = directory.key_path();
+        let target = directory.0.join("target.key");
+        let encoded = encode_file_key(FILE_KEY_VERSION, &[7; KEY_LEN]);
+        write_private(&target, &encoded);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        symlink(&target, &path).unwrap();
+
+        assert!(matches!(
+            FileKeyWrapping::load_or_create(&path),
+            Err(FileKeyWrappingError::Corrupt(_))
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), encoded);
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn non_regular_file_key_is_rejected_without_replacement() {
+        let directory = TempDir::new();
+        let path = directory.key_path();
+        std::fs::create_dir_all(&path).unwrap();
+
+        assert!(matches!(
+            FileKeyWrapping::load_or_create(&path),
+            Err(FileKeyWrappingError::Corrupt(_))
+        ));
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn recognized_crash_temporaries_are_removed_but_unrecognized_files_remain() {
+        let directory = TempDir::new();
+        let path = directory.key_path();
+        FileKeyWrapping::load_or_create(&path).unwrap();
+        let stale = file_key_temporary_path(&path);
+        let unrelated = path.parent().unwrap().join(".wrapping.key.not-a-uuid.tmp");
+        write_private(&stale, b"partial-or-complete-candidate");
+        write_private(&unrelated, b"unrelated");
+
+        FileKeyWrapping::load_or_create(&path).unwrap();
+
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
     }
 }

@@ -624,7 +624,7 @@ fn open_owner_only(
     Ok(file)
 }
 
-fn create_private_dir_all(path: &Path) -> Result<(), PersistenceError> {
+pub(crate) fn create_private_dir_all(path: &Path) -> Result<(), PersistenceError> {
     std::fs::create_dir_all(path).map_err(|source| io("directory creation", source))?;
     #[cfg(unix)]
     {
@@ -635,7 +635,7 @@ fn create_private_dir_all(path: &Path) -> Result<(), PersistenceError> {
     Ok(())
 }
 
-fn sync_parent(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent(path: &Path) -> std::io::Result<()> {
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())

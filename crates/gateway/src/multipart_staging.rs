@@ -2813,6 +2813,7 @@ pub fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::key_cipher::LocalKeyWrapping;
+    use crate::local_storage::LocalStorageRuntime;
 
     #[test]
     fn legacy_completion_result_json_defaults_new_accounting_fields() {
@@ -3128,6 +3129,58 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(StagingError::Unavailable)));
+    }
+
+    #[tokio::test]
+    async fn encrypted_part_decrypts_after_local_runtime_restart() {
+        let root = std::env::temp_dir().join(format!("maskura-stage-restart-{}", Uuid::now_v7()));
+        std::fs::create_dir(&root).unwrap();
+        let runtime = LocalStorageRuntime::new(root.clone()).await.unwrap();
+        let staging = runtime.multipart_root().join("tmp");
+        let snapshot = snapshot();
+        let mut writer = EncryptedPartWriter::begin(
+            &staging,
+            &identity(),
+            1,
+            1,
+            &snapshot,
+            1024,
+            runtime.wrapping(),
+        )
+        .await
+        .unwrap();
+        writer
+            .write(Bytes::from_static(b"survives-a-runtime-restart"))
+            .await
+            .unwrap();
+        let finished = writer.finish().await.unwrap();
+        let part = MultipartPart {
+            upload_id: "upload".to_string(),
+            part_number: 1,
+            attempt: 1,
+            artifact_key: "restart-artifact".to_string(),
+            etag: finished.etag.clone(),
+            checksum_sha256: finished.checksum_sha256.clone(),
+            size_bytes: finished.size_bytes,
+            created_at_ms: now_ms(),
+        };
+        drop(runtime);
+
+        let restarted = LocalStorageRuntime::new(root.clone()).await.unwrap();
+        let file = tokio::fs::File::open(&finished.path).await.unwrap();
+        let mut reader =
+            EncryptedPartReader::open(file, &identity(), &part, &snapshot, restarted.wrapping())
+                .await
+                .unwrap();
+
+        assert_eq!(
+            reader.next_chunk().await.unwrap().unwrap(),
+            Bytes::from_static(b"survives-a-runtime-restart")
+        );
+        assert!(reader.next_chunk().await.unwrap().is_none());
+        finished.remove().await;
+        drop(restarted);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
