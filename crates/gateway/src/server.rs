@@ -64,8 +64,9 @@ use crate::multipart_staging::{
     MAX_ACTIVE_UPLOADS, MultipartCompletionResult, MultipartIdentity, MultipartLifecycle,
     MultipartPart, MultipartRepository, MultipartSnapshot, MultipartUpload,
     PostgresMultipartRepository, S3StagingArtifactStore, StagedArtifact, StagingArtifactStore,
-    StagingError, StagingQuotaLimits, complete_completion_from_lease_compatibility,
-    completion_fingerprint, now_ms,
+    StagingError, StagingQuotaLimits,
+    acquire_destination_commit_authority_from_lease_compatibility,
+    complete_destination_commit_from_authority_compatibility, completion_fingerprint, now_ms,
 };
 use crate::object::{
     BodyLimits, ChunkedBytesBody, ObjectMetadata, OpenedObject, filter_presigned_response_headers,
@@ -86,12 +87,12 @@ use crate::store::{
 use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, BackendError, BackendErrorKind,
     CompatibilitySpoolConfig, CompatibilitySpoolTransaction, CompletionReconciliation,
-    ConditionalReadCapability, DirectOperationScope, DirectS3Sink, EvidenceRecord, ExpectedObject,
-    FileSinkTransaction, IncompleteUploadDiscovery, JournalError, ListCapability,
-    MemorySinkTransaction, MultipartResponseCapability, ObjectDestination, ObjectSinkTransaction,
-    OperationJournal, OperationReconciler, OperationRecord, OperationState, ProviderMutationFence,
-    ResponseChecksumCapability, SpoolQuota, StoredObjectMeta, TransactionError,
-    VersioningCapability, WorkspaceDestinationBinding,
+    ConditionalReadCapability, DestinationCommitAuthority, DirectOperationScope, DirectS3Sink,
+    EvidenceRecord, ExpectedObject, FileSinkTransaction, IncompleteUploadDiscovery, JournalError,
+    ListCapability, MemorySinkTransaction, MultipartResponseCapability, ObjectDestination,
+    ObjectSinkTransaction, OperationJournal, OperationReconciler, OperationRecord, OperationState,
+    ProviderMutationFence, ResponseChecksumCapability, SpoolQuota, StoredObjectMeta,
+    TransactionError, VersioningCapability, WorkspaceDestinationBinding,
 };
 use crate::workspace_storage::{
     BackendConfigRequest, BackendConfigResponse, BackendType, WorkspaceId, WorkspaceOperationLease,
@@ -3228,11 +3229,14 @@ impl ObjectSinkTransaction for WorkspaceLeasedSink {
             .await
     }
 
-    async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError> {
+    async fn complete(
+        &mut self,
+        authority: DestinationCommitAuthority,
+    ) -> Result<StoredObjectMeta, TransactionError> {
         self.fence.assert_current().await.map_err(|_| {
             TransactionError::Publication("workspace routing fence changed".to_string())
         })?;
-        let stored = self.inner.complete().await?;
+        let stored = self.inner.complete(authority).await?;
         self.release(WorkspaceOperationOutcome::Committed).await?;
         Ok(stored)
     }
@@ -3266,6 +3270,7 @@ async fn begin_streaming_sink(
     state: &AppState,
     backend: ResolvedBackend,
     operation: AuthorizedOperation<'_>,
+    destination_operation_id: Uuid,
     bucket: &str,
     key: &str,
     content_type: &str,
@@ -3299,7 +3304,7 @@ async fn begin_streaming_sink(
                 )]),
                 ..ExpectedObject::default()
             };
-            let scope = direct_operation_scope(operation);
+            let scope = direct_operation_scope(operation, destination_operation_id);
             let (capabilities, backend_id, workspace_lease) = match kind {
                 BackendKind::PerUserS3 => {
                     let binding = workspace_streaming.ok_or_else(|| {
@@ -3552,7 +3557,7 @@ async fn begin_streaming_sink(
                     capabilities,
                     logical,
                     content_type,
-                    grant.operation_id(),
+                    destination_operation_id,
                     grant.receipt_id(),
                     crate::transaction::unix_time_ms(),
                     grant.rate_version(),
@@ -3566,9 +3571,12 @@ async fn begin_streaming_sink(
     }
 }
 
-fn direct_operation_scope(operation: AuthorizedOperation<'_>) -> DirectOperationScope {
+fn direct_operation_scope(
+    operation: AuthorizedOperation<'_>,
+    operation_id: Uuid,
+) -> DirectOperationScope {
     DirectOperationScope {
-        operation_id: operation.grant.operation_id(),
+        operation_id,
         tenant_id: operation.auth.workspace_id().as_str().to_string(),
     }
 }
@@ -3742,6 +3750,7 @@ async fn streaming_single_put(
             auth: &authentication.auth,
             grant,
         },
+        grant.operation_id(),
         grant.bucket(),
         key,
         &content_type,
@@ -3876,7 +3885,7 @@ async fn streaming_single_put(
         .await
         .map_err(TransactionError::from)?;
         sink.record_usage_evidence(&usage_event).await?;
-        let stored = sink.complete().await?;
+        let stored = sink.complete(DestinationCommitAuthority::SinglePut).await?;
         Ok((stored, output_bytes, pipeline_evidence))
     }
     .await;
@@ -4008,6 +4017,7 @@ async fn streaming_avro_single_put(
             auth: &authentication.auth,
             grant,
         },
+        grant.operation_id(),
         grant.bucket(),
         key,
         &content_type,
@@ -4075,7 +4085,7 @@ async fn streaming_avro_single_put(
             .await
             .map_err(TransactionError::from)?;
             sink.record_usage_evidence(&usage_event).await?;
-            sink.complete().await?
+            sink.complete(DestinationCommitAuthority::SinglePut).await?
         };
         Ok((stored, input_bytes, output_bytes))
     }
@@ -4638,11 +4648,25 @@ async fn complete_staged_multipart(
         .await;
     }
     let (format, content_type) = streaming_format_content_type(content_type)?;
+    let fingerprint = upload
+        .complete_request_fingerprint
+        .as_deref()
+        .ok_or_else(|| {
+            MultipartCompletionError::Invalid(
+                "multipart completion fingerprint is missing".to_string(),
+            )
+        })?;
+    let destination_operation_id =
+        crate::multipart_staging::DestinationCommitPermit::deterministic_operation_id(
+            identity,
+            fingerprint,
+        );
     renew_and_fence_completion(staging, identity, lease).await?;
     let mut sink = begin_streaming_sink(
         state,
         backend,
         operation,
+        destination_operation_id,
         &identity.bucket,
         &identity.key,
         &content_type,
@@ -4824,7 +4848,15 @@ async fn complete_staged_multipart(
         .map_err(StreamingPutError::from)?;
         sink.record_usage_evidence(&usage_event).await?;
         renew_and_fence_completion(staging, identity, lease).await?;
-        let stored = sink.complete().await?;
+        let authority = acquire_destination_commit_authority_from_lease_compatibility(
+            staging.repository.clone(),
+            identity,
+            fingerprint,
+            lease.fencing_token,
+            now_ms(),
+        )
+        .await?;
+        let stored = sink.complete(authority.clone()).await?;
         let result = MultipartCompletionResult {
             etag: stored.etag,
             checksum_sha256,
@@ -4833,20 +4865,8 @@ async fn complete_staged_multipart(
             size_bytes: output_bytes,
             pipeline_evidence,
         };
-        renew_and_fence_completion(staging, identity, lease).await?;
-        let fingerprint = upload
-            .complete_request_fingerprint
-            .as_deref()
-            .ok_or_else(|| {
-                MultipartCompletionError::Invalid(
-                    "multipart completion fingerprint is missing".to_string(),
-                )
-            })?;
-        complete_completion_from_lease_compatibility(
-            staging.repository.as_ref(),
-            identity,
-            fingerprint,
-            lease.fencing_token,
+        complete_destination_commit_from_authority_compatibility(
+            &authority,
             result.clone(),
             now_ms(),
         )
@@ -5344,11 +5364,25 @@ async fn complete_staged_avro_multipart(
 ) -> Result<MultipartCompletionResult, MultipartCompletionError> {
     use sha2::Digest as _;
 
+    let fingerprint = upload
+        .complete_request_fingerprint
+        .as_deref()
+        .ok_or_else(|| {
+            MultipartCompletionError::Invalid(
+                "multipart completion fingerprint is missing".to_string(),
+            )
+        })?;
+    let destination_operation_id =
+        crate::multipart_staging::DestinationCommitPermit::deterministic_operation_id(
+            identity,
+            fingerprint,
+        );
     renew_and_fence_completion(staging, identity, lease).await?;
     let mut sink = begin_streaming_sink(
         state,
         backend,
         operation,
+        destination_operation_id,
         &identity.bucket,
         &identity.key,
         content_type,
@@ -5457,7 +5491,15 @@ async fn complete_staged_avro_multipart(
         .map_err(StreamingPutError::from)?;
         sink.record_usage_evidence(&usage_event).await?;
         renew_and_fence_completion(staging, identity, lease).await?;
-        let stored = sink.complete().await?;
+        let authority = acquire_destination_commit_authority_from_lease_compatibility(
+            staging.repository.clone(),
+            identity,
+            fingerprint,
+            lease.fencing_token,
+            now_ms(),
+        )
+        .await?;
+        let stored = sink.complete(authority.clone()).await?;
         let result = MultipartCompletionResult {
             etag: stored.etag,
             checksum_sha256: output_digest,
@@ -5466,20 +5508,8 @@ async fn complete_staged_avro_multipart(
             size_bytes: output_bytes,
             pipeline_evidence: None,
         };
-        renew_and_fence_completion(staging, identity, lease).await?;
-        let fingerprint = upload
-            .complete_request_fingerprint
-            .as_deref()
-            .ok_or_else(|| {
-                MultipartCompletionError::Invalid(
-                    "multipart completion fingerprint is missing".to_string(),
-                )
-            })?;
-        complete_completion_from_lease_compatibility(
-            staging.repository.as_ref(),
-            identity,
-            fingerprint,
-            lease.fencing_token,
+        complete_destination_commit_from_authority_compatibility(
+            &authority,
             result.clone(),
             now_ms(),
         )
@@ -8112,10 +8142,13 @@ mod tests {
             operation.authorization("bucket", UsageRoute::PutObject, RequestKind::Write, 64);
         let grant = test_grant(&authorization);
 
-        let scope = direct_operation_scope(AuthorizedOperation {
-            auth: &auth,
-            grant: &grant,
-        });
+        let scope = direct_operation_scope(
+            AuthorizedOperation {
+                auth: &auth,
+                grant: &grant,
+            },
+            grant.operation_id(),
+        );
 
         assert_eq!(scope.operation_id, authorization.operation_id());
         assert_eq!(scope.tenant_id, "workspace-b");
@@ -9349,10 +9382,15 @@ async fn s3_post(
                 .await;
             }
         };
+        let destination_operation_id =
+            crate::multipart_staging::DestinationCommitPermit::deterministic_operation_id(
+                &identity,
+                &fingerprint,
+            );
         let recovered = match reconcile_existing_direct_completion(
             &state,
             &backend,
-            grant.operation_id(),
+            destination_operation_id,
             auth.workspace_id().as_str(),
             &bucket,
             &key,
@@ -9403,11 +9441,25 @@ async fn s3_post(
                 .complete_request_fingerprint
                 .as_deref()
                 .unwrap_or(&fingerprint);
-            if let Err(error) = complete_completion_from_lease_compatibility(
-                staging.repository.as_ref(),
+            let authority = match acquire_destination_commit_authority_from_lease_compatibility(
+                staging.repository.clone(),
                 &identity,
                 fingerprint,
                 lease.fencing_token,
+                now_ms(),
+            )
+            .await
+            {
+                Ok(authority) => authority,
+                Err(error) => {
+                    return multipart_completion_error_response(
+                        &key,
+                        MultipartCompletionError::Staging(error),
+                    );
+                }
+            };
+            if let Err(error) = complete_destination_commit_from_authority_compatibility(
+                &authority,
                 result.clone(),
                 now_ms(),
             )

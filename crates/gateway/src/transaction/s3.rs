@@ -15,7 +15,7 @@ use crate::s3_safety::record_s3_failure;
 
 use super::{
     AbortSignal, BackendCapabilities, BackendError, CompletionProbe, DIRECT_PART_BYTES,
-    DiscoveredMultipartPart, DiscoveredObjectVersion, DiscoveredUpload,
+    DestinationCommitAuthority, DiscoveredMultipartPart, DiscoveredObjectVersion, DiscoveredUpload,
     EXACT_ABSENCE_CONFIRMATION_DELAY, EvidenceRecord, MultipartUploadInspection, ObjectDestination,
     ObjectSinkTransaction, OperationJournal, OperationRecord, OperationState,
     PROVIDER_MUTATION_AMBIGUITY_WINDOW, PartRecord, ProviderMutationFence, SinkCommitState,
@@ -1674,13 +1674,23 @@ impl ObjectSinkTransaction for DirectS3Sink {
         Ok(())
     }
 
-    async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError> {
+    async fn complete(
+        &mut self,
+        authority: DestinationCommitAuthority,
+    ) -> Result<StoredObjectMeta, TransactionError> {
         if self.finished {
             return Err(TransactionError::Finished);
         }
         if !self.output_verified {
             return Err(TransactionError::OutputMismatch);
         }
+        authority
+            .validate(
+                Some(self.operation.id),
+                &self.operation.destination.bucket,
+                &self.operation.destination.logical_key,
+            )
+            .await?;
         let result = if self.upload_id.is_some() {
             self.complete_multipart().await
         } else {
@@ -1772,6 +1782,10 @@ mod tests {
     use axum::routing::any;
 
     use super::*;
+    use crate::file_multipart_repository::FileMultipartRepository;
+    use crate::multipart_staging::{
+        DestinationCommitPermit, MultipartIdentity, StagingQuotaLimits,
+    };
     use crate::transaction::{
         CompletionReconciliation, ExpectedObject, InMemoryOperationJournal,
         IncompleteUploadDiscovery, OperationReconciler, VersioningCapability,
@@ -2324,6 +2338,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multipart_permit_operation_mismatch_rejects_before_provider_mutation() {
+        let journal = Arc::new(InMemoryOperationJournal::new());
+        let backend = Arc::new(ScriptBackend::default());
+        let (mut sink, _receiver) = sink(journal, backend.clone(), 1).await;
+        sink.write(Bytes::from_static(b"body")).await.unwrap();
+        verify_buffered_output(&mut sink).await;
+        let root =
+            std::env::temp_dir().join(format!("maskura-s3-authority-{}", uuid::Uuid::now_v7()));
+        let repository = Arc::new(
+            FileMultipartRepository::open(
+                root.clone(),
+                StagingQuotaLimits::new(1024, 1024).unwrap(),
+            )
+            .unwrap(),
+        );
+        let identity = MultipartIdentity {
+            tenant_id: "tenant".to_string(),
+            credential_policy_id: "policy".to_string(),
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            upload_id: uuid::Uuid::now_v7().to_string(),
+        };
+        let mut operation_id = uuid::Uuid::now_v7();
+        if operation_id == sink.operation_id() {
+            operation_id = uuid::Uuid::now_v7();
+        }
+        let authority = DestinationCommitAuthority::client_multipart(
+            repository,
+            identity.clone(),
+            DestinationCommitPermit {
+                upload_id: identity.upload_id,
+                completion_fingerprint: "fingerprint".to_string(),
+                fencing_token: 1,
+                operation_id,
+            },
+        );
+
+        assert!(matches!(
+            sink.complete(authority).await,
+            Err(TransactionError::CommitAuthority(_))
+        ));
+        assert!(backend.bodies("put").is_empty());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn aes256_is_explicit_for_managed_put_and_multipart_but_not_default_byo() {
         let (client, requests, server) = provider_client().await;
         let operation = OperationRecord::intent(destination(), ExpectedObject::default());
@@ -2677,7 +2737,9 @@ mod tests {
             let (mut sink, _) = sink(journal.clone(), backend.clone(), 2).await;
             sink.write(Bytes::from(vec![7; size])).await.unwrap();
             verify_buffered_output(&mut sink).await;
-            sink.complete().await.unwrap();
+            sink.complete(DestinationCommitAuthority::SinglePut)
+                .await
+                .unwrap();
             let bodies = backend.bodies("put");
             assert_eq!(bodies.len(), 2);
             assert_eq!(bodies[0], bodies[1]);
@@ -2704,7 +2766,10 @@ mod tests {
         sink.write(Bytes::from_static(b"body")).await.unwrap();
         verify_buffered_output(&mut sink).await;
 
-        let error = sink.complete().await.unwrap_err();
+        let error = sink
+            .complete(DestinationCommitAuthority::SinglePut)
+            .await
+            .unwrap_err();
         let TransactionError::Backend(error) = error else {
             panic!("expected definitive backend error, got {error:?}");
         };
@@ -2728,9 +2793,12 @@ mod tests {
         verify_buffered_output(&mut sink).await;
 
         assert!(
-            tokio::time::timeout(Duration::from_millis(10), sink.complete())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                sink.complete(DestinationCommitAuthority::SinglePut),
+            )
+            .await
+            .is_err(),
             "the local provider future is dropped while the remote call remains accepted"
         );
         assert!(sink.reconcile_completion().await.unwrap().is_none());
@@ -3033,7 +3101,10 @@ mod tests {
         sink.write(Bytes::from_static(b"body")).await.unwrap();
         verify_buffered_output(&mut sink).await;
 
-        let error = sink.complete().await.unwrap_err();
+        let error = sink
+            .complete(DestinationCommitAuthority::SinglePut)
+            .await
+            .unwrap_err();
         let TransactionError::Backend(error) = error else {
             panic!("expected ambiguous backend error, got {error:?}");
         };
@@ -3081,7 +3152,9 @@ mod tests {
             .await
             .unwrap();
         verify_buffered_output(&mut sink).await;
-        sink.complete().await.unwrap();
+        sink.complete(DestinationCommitAuthority::SinglePut)
+            .await
+            .unwrap();
         let first = backend.bodies("part-1");
         assert_eq!(first.len(), 2);
         assert_eq!(first[0], first[1]);
@@ -3103,7 +3176,9 @@ mod tests {
             .await
             .unwrap();
         verify_buffered_output(&mut sink).await;
-        sink.complete().await.unwrap();
+        sink.complete(DestinationCommitAuthority::SinglePut)
+            .await
+            .unwrap();
         let operation_id = sink.operation_id();
         assert_eq!(
             journal.get(operation_id).await.unwrap().unwrap().state,
@@ -3146,7 +3221,9 @@ mod tests {
         sink.write(Bytes::from_static(b"committed")).await.unwrap();
         verify_buffered_output(&mut sink).await;
 
-        sink.complete().await.unwrap();
+        sink.complete(DestinationCommitAuthority::SinglePut)
+            .await
+            .unwrap();
 
         assert_eq!(sink.commit_state(), SinkCommitState::Committed);
         assert_eq!(
@@ -3169,7 +3246,11 @@ mod tests {
         sink.write(Bytes::from_static(b"committed")).await.unwrap();
         verify_buffered_output(&mut sink).await;
 
-        assert!(sink.complete().await.is_err());
+        assert!(
+            sink.complete(DestinationCommitAuthority::SinglePut)
+                .await
+                .is_err()
+        );
         assert_eq!(sink.commit_state(), SinkCommitState::CommitUnknown);
         assert_eq!(
             journal
@@ -3207,7 +3288,11 @@ mod tests {
         sink.write(Bytes::from_static(b"committed")).await.unwrap();
         verify_buffered_output(&mut sink).await;
 
-        assert!(sink.complete().await.is_err());
+        assert!(
+            sink.complete(DestinationCommitAuthority::SinglePut)
+                .await
+                .is_err()
+        );
         assert_eq!(sink.commit_state(), SinkCommitState::CommitUnknown);
         assert_eq!(
             journal
@@ -3230,7 +3315,11 @@ mod tests {
         sink.write(Bytes::from_static(b"ambiguous")).await.unwrap();
         verify_buffered_output(&mut sink).await;
 
-        assert!(sink.complete().await.is_err());
+        assert!(
+            sink.complete(DestinationCommitAuthority::SinglePut)
+                .await
+                .is_err()
+        );
         assert_eq!(sink.commit_state(), SinkCommitState::CommitUnknown);
         assert_eq!(
             journal

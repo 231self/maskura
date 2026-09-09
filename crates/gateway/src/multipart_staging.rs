@@ -447,17 +447,16 @@ pub trait MultipartRepository: Send + Sync {
     async fn audit(&self, audit: CleanupAudit) -> Result<(), StagingError>;
 }
 
-/// Task-6 compatibility bridge for existing sinks that do not accept a permit
-/// until the fenced transaction boundary lands. It preserves the old lease
-/// check through publication, then atomically enters the typed durable path.
-pub async fn complete_completion_from_lease_compatibility(
-    repository: &dyn MultipartRepository,
+/// Temporary Task-10 bridge until the Task-11 coordinator owns acquisition.
+/// It converts the existing completion lease into typed publication authority
+/// before any destination commit is attempted.
+pub async fn acquire_destination_commit_authority_from_lease_compatibility(
+    repository: Arc<dyn MultipartRepository>,
     identity: &MultipartIdentity,
     fingerprint: &str,
     fencing_token: u64,
-    result: MultipartCompletionResult,
     now: i64,
-) -> Result<DestinationCommitPermit, StagingError> {
+) -> Result<crate::transaction::DestinationCommitAuthority, StagingError> {
     repository
         .check_completion_lease(identity, fencing_token, now)
         .await?;
@@ -465,13 +464,36 @@ pub async fn complete_completion_from_lease_compatibility(
     let permit = repository
         .begin_destination_commit(identity, fingerprint, fencing_token, operation_id, now)
         .await?;
+    Ok(
+        crate::transaction::DestinationCommitAuthority::client_multipart(
+            repository,
+            identity.clone(),
+            permit,
+        ),
+    )
+}
+
+pub async fn complete_destination_commit_from_authority_compatibility(
+    authority: &crate::transaction::DestinationCommitAuthority,
+    result: MultipartCompletionResult,
+    now: i64,
+) -> Result<(), StagingError> {
+    let crate::transaction::DestinationCommitAuthority::ClientMultipart(authority) = authority
+    else {
+        return Err(StagingError::Fenced);
+    };
+    let crate::transaction::ClientMultipartCommitAuthority {
+        repository,
+        identity,
+        permit,
+    } = authority.as_ref();
     repository
-        .record_destination_commit(&permit, result.clone(), now)
+        .record_destination_commit(permit, result.clone(), now)
         .await?;
     repository
-        .complete_completion(identity, &permit, result, now)
+        .complete_completion(identity, permit, result, now)
         .await?;
-    Ok(permit)
+    Ok(())
 }
 
 #[derive(Default)]
@@ -3724,7 +3746,7 @@ mod tests {
 
     #[tokio::test]
     async fn ownership_replacement_pagination_and_expiry_are_fenced() {
-        let repo = InMemoryMultipartRepository::new();
+        let repo = Arc::new(InMemoryMultipartRepository::new());
         repo.create(upload()).await.unwrap();
         let mut thief = identity();
         thief.tenant_id = "tenant-b".to_string();
@@ -3780,7 +3802,7 @@ mod tests {
 
     #[tokio::test]
     async fn replacement_race_keeps_one_current_attempt_across_restartable_repository_state() {
-        let repo = InMemoryMultipartRepository::new();
+        let repo = Arc::new(InMemoryMultipartRepository::new());
         repo.create(upload()).await.unwrap();
         let first = MultipartPart {
             upload_id: "upload".to_string(),
@@ -4166,7 +4188,7 @@ mod tests {
 
     #[tokio::test]
     async fn completion_replays_only_the_identical_durable_request() {
-        let repo = InMemoryMultipartRepository::new();
+        let repo = Arc::new(InMemoryMultipartRepository::new());
         repo.create(upload()).await.unwrap();
         current_part(&repo, 1, "\"one\"", "sha-one").await;
         let request = vec![complete_part(1, "\"one\"", Some("sha-one"))];
@@ -4178,11 +4200,17 @@ mod tests {
             CompletionAcquire::Acquired(lease) => lease,
             _ => panic!("expected completion lease"),
         };
-        complete_completion_from_lease_compatibility(
-            &repo,
+        let authority = acquire_destination_commit_authority_from_lease_compatibility(
+            repo.clone(),
             &identity(),
             "fingerprint",
             lease.fencing_token,
+            1,
+        )
+        .await
+        .unwrap();
+        complete_destination_commit_from_authority_compatibility(
+            &authority,
             MultipartCompletionResult {
                 etag: Some("\"output\"".to_string()),
                 checksum_sha256: "output-sha".to_string(),

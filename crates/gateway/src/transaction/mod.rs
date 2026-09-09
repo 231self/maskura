@@ -658,6 +658,8 @@ pub enum TransactionError {
     CapacityExceeded,
     #[error("managed authority publication failed: {0}")]
     Publication(String),
+    #[error("destination commit authority rejected: {0}")]
+    CommitAuthority(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -665,6 +667,70 @@ pub enum SinkCommitState {
     PreCommit,
     CommitUnknown,
     Committed,
+}
+
+#[derive(Clone)]
+pub enum DestinationCommitAuthority {
+    SinglePut,
+    ClientMultipart(Box<ClientMultipartCommitAuthority>),
+}
+
+#[derive(Clone)]
+pub struct ClientMultipartCommitAuthority {
+    pub repository: Arc<dyn crate::multipart_staging::MultipartRepository>,
+    pub identity: crate::multipart_staging::MultipartIdentity,
+    pub permit: crate::multipart_staging::DestinationCommitPermit,
+}
+
+impl DestinationCommitAuthority {
+    pub fn client_multipart(
+        repository: Arc<dyn crate::multipart_staging::MultipartRepository>,
+        identity: crate::multipart_staging::MultipartIdentity,
+        permit: crate::multipart_staging::DestinationCommitPermit,
+    ) -> Self {
+        Self::ClientMultipart(Box::new(ClientMultipartCommitAuthority {
+            repository,
+            identity,
+            permit,
+        }))
+    }
+
+    pub fn permit(&self) -> Option<&crate::multipart_staging::DestinationCommitPermit> {
+        match self {
+            Self::SinglePut => None,
+            Self::ClientMultipart(authority) => Some(&authority.permit),
+        }
+    }
+
+    pub async fn validate(
+        &self,
+        durable_operation_id: Option<Uuid>,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), TransactionError> {
+        let Self::ClientMultipart(authority) = self else {
+            return Ok(());
+        };
+        let ClientMultipartCommitAuthority {
+            repository,
+            identity,
+            permit,
+        } = authority.as_ref();
+        if !repository.is_durable()
+            || identity.upload_id != permit.upload_id
+            || identity.bucket != bucket
+            || identity.key != key
+            || durable_operation_id.is_some_and(|operation_id| operation_id != permit.operation_id)
+        {
+            return Err(TransactionError::CommitAuthority(
+                "multipart destination commit authority does not match the sink".to_string(),
+            ));
+        }
+        repository
+            .validate_destination_commit_permit(permit)
+            .await
+            .map_err(|error| TransactionError::CommitAuthority(error.to_string()))
+    }
 }
 
 impl SinkCommitState {
@@ -697,7 +763,10 @@ pub trait ObjectSinkTransaction: Send {
     ) -> Result<(), TransactionError> {
         Ok(())
     }
-    async fn complete(&mut self) -> Result<StoredObjectMeta, TransactionError>;
+    async fn complete(
+        &mut self,
+        authority: DestinationCommitAuthority,
+    ) -> Result<StoredObjectMeta, TransactionError>;
     async fn abort(&mut self) -> Result<(), TransactionError>;
 }
 
