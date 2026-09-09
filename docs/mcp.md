@@ -21,10 +21,11 @@ Build and install from the public source:
 cargo install --git https://github.com/231self/maskura --bin maskura-mcp s4-mcp
 ```
 
-Linux x86_64 and arm64 binaries are also attached to each
+Linux x86_64 and arm64, plus native Apple Silicon, binaries are attached to each
 [Maskura GitHub release](https://github.com/231self/maskura/releases) as
-`maskura-mcp-linux-amd64` and `maskura-mcp-linux-arm64`. The `s4-mcp` binary
-and `s4_*` tools remain permanent compatibility aliases.
+`maskura-mcp-linux-amd64`, `maskura-mcp-linux-arm64`, and
+`maskura-mcp-macos-arm64`. The `s4-mcp` binary and `s4_*` tools remain permanent
+compatibility aliases.
 
 There is currently no npm package or public hosted MCP endpoint. The public
 gateway does provide the foundation used by a hosted transport: shared typed

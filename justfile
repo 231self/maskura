@@ -29,7 +29,7 @@ deny:
   cargo deny check
 
 audit:
-  cargo audit
+  bash scripts/audit-rust.sh
 
 # Meta-linter: runs all static checks + dependency audit (like ruff/golangci-lint)
 lint: check-fmt check-lint deny

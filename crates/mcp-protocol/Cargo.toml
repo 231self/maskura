@@ -8,7 +8,7 @@ description = "Transport-independent Maskura MCP protocol contracts"
 publish = false
 
 [dependencies]
-quick-xml = { version = "0.38", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 schemars = "1"
 serde.workspace = true
 serde_json.workspace = true
