@@ -10,6 +10,20 @@ just e2e                  # run the full suite
 bash scripts/e2e-local.sh # same, without `just`
 ```
 
+This suite intentionally validates the gateway's external S3 backend path using
+MinIO. It is separate from the standalone Docker deployment used by customers.
+For the standalone path, run the Maskura-managed container instead:
+
+```bash
+maskura local init
+# Maskura itself is the S3 endpoint; no MinIO container is started.
+```
+
+That command uses the Docker API to run one published gateway container with the
+`s4-local-keys` volume mounted at `/data`, `MASKURA_STORAGE_MODE=local`, and
+durable staged multipart enabled. Use the exact loopback URL and credentials it
+prints with `aws s3`, boto3, or another S3 client.
+
 ## How it is structured
 
 - `scripts/e2e-local.sh` — the orchestrator. Boots the shared environment

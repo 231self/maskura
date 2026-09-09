@@ -3,7 +3,7 @@
 Status: implemented (Phase 1 and Phase 2)
 Scope: self-hosted OSS gateway, durable local object storage, S3 data plane
 Repositories: public `231self/maskura` (gateway)
-Synced against: `main` @ `6407b629` (PR #113) and `s4-private` @ `9992d6cd` (PR #93)
+Synced against: public `main` after PR #116 and `s4-private` @ `9992d6cd` (PR #93)
 
 ## Objective
 

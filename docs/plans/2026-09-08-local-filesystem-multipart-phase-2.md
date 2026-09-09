@@ -27,9 +27,10 @@ distributed multi-node mode.
   `MultipartRepository` owns client uploads, parts, quota, completion fencing,
   replay, expiry, and cleanup. `OperationJournal` owns destination transaction
   recovery.
-- `MASKURA_MULTIPART_MODE=staged` currently requires Postgres, durable key
-  wrapping, and a separate S3-compatible artifact store. A
-  `FileOperationJournal` does not remove those dependencies by itself.
+- Hosted `MASKURA_MULTIPART_MODE=staged` requires Postgres, durable key wrapping,
+  and a separate S3-compatible artifact store. Standalone local staged mode uses
+  the FileStore-root file repository, `FileOperationJournal`, encrypted local
+  artifacts, and its persisted wrapping key instead.
 - The current multipart handlers and transformation-at-completion pipeline are
   already backend-neutral. Completion can construct `FileSinkTransaction`, but
   local startup cannot construct durable multipart staging.

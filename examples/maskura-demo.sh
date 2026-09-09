@@ -4,6 +4,7 @@ set -euo pipefail
 EP="http://127.0.0.1:8791"
 IMG="ghcr.io/231self/maskura/maskura:latest"
 NAME="maskura-demo"
+VOLUME="maskura-demo-data"
 F="/tmp/customers.jsonl"
 export AWS_ACCESS_KEY_ID=demo AWS_SECRET_ACCESS_KEY=demo AWS_EC2_METADATA_DISABLED=true
 
@@ -28,9 +29,14 @@ pipeline() {
 comment "pull the gateway image"
 cmd docker pull "$IMG"
 
-comment "run it — auth off, streaming read on, in-memory store"
+comment "run the Maskura container — local S3 API, durable FileStore"
 cmd docker run --rm -d --name "$NAME" -p 127.0.0.1:8791:8080 \
+  -v "$VOLUME:/data" \
   -e AUTH_DISABLED=true \
+  -e MASKURA_KEYS_FILE=/data/keys.json \
+  -e MASKURA_STORAGE_MODE=local \
+  -e MASKURA_LOCAL_STORAGE_DIR=/data \
+  -e MASKURA_MULTIPART_MODE=staged \
   -e MASKURA_STREAMING_READ_MODE=passthrough "$IMG"
 
 for _ in $(seq 1 30); do curl -s -m 2 "$EP/health" >/dev/null 2>&1 && break; sleep 1; done
@@ -70,3 +76,5 @@ comment "read it back — email and ssn are ciphertext; same value = same cipher
 cmd aws s3 --endpoint-url "$EP" cp s3://s4-local/join/customers.jsonl -
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
+comment "the Docker volume keeps local objects and multipart state durable"
+show "docker volume inspect $VOLUME"
