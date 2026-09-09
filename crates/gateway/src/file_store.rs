@@ -655,6 +655,50 @@ impl FileStore {
         self.backfill_metadata_proof(bucket, &metadata).await
     }
 
+    /// Strictly validates every durable proof before the local gateway becomes
+    /// ready. Unknown entries are rejected rather than ignored.
+    pub(crate) async fn validate_commit_proofs(&self) -> Result<(), FileStoreError> {
+        let root = self.root.join(".maskura").join("commits");
+        fs::create_dir_all(&root).await?;
+        let mut entries = fs::read_dir(&root).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            let name = entry.file_name();
+            let operation_id = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|id| format!("{id}.json") == name.to_string_lossy())
+                .ok_or_else(|| {
+                    FileStoreError::CorruptMetadata(
+                        "commit proof namespace contains an unknown entry".to_string(),
+                    )
+                })?;
+            if !file_type.is_file() {
+                return Err(FileStoreError::CorruptMetadata(
+                    "commit proof is not a regular file".to_string(),
+                ));
+            }
+            self.load_commit_proof(operation_id).await?.ok_or_else(|| {
+                FileStoreError::CorruptMetadata("commit proof disappeared during load".to_string())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Repairs exact proofs for all currently visible transactional objects.
+    pub(crate) async fn backfill_current_commit_proofs(&self) -> Result<usize, FileStoreError> {
+        let mut repaired = 0;
+        for bucket in self.list_buckets().await? {
+            for (key, _, _) in self.list_objects(&bucket).await? {
+                if self.backfill_commit_proof(&bucket, &key).await?.is_some() {
+                    repaired += 1;
+                }
+            }
+        }
+        Ok(repaired)
+    }
+
     pub async fn retire_commit_proof(
         &self,
         operation_id: Uuid,

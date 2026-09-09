@@ -44,7 +44,19 @@ pub(crate) struct LocalStorageRuntime {
 }
 
 impl LocalStorageRuntime {
+    #[cfg(test)]
     pub(crate) async fn new(root: PathBuf) -> Result<Self, LocalStorageError> {
+        Self::with_quotas(
+            root,
+            StagingQuotaLimits::new(i64::MAX as u64, i64::MAX as u64)?,
+        )
+        .await
+    }
+
+    pub(crate) async fn with_quotas(
+        root: PathBuf,
+        quotas: StagingQuotaLimits,
+    ) -> Result<Self, LocalStorageError> {
         let root_lock = FilesystemPersistence::default().acquire_root_lock(&root)?;
         let wrapping = Arc::new(FileKeyWrapping::load_or_create(
             &root.join(".maskura").join("wrapping.key"),
@@ -55,11 +67,13 @@ impl LocalStorageRuntime {
         )?);
         let multipart_repository = Arc::new(FileMultipartRepository::open(
             root.join(".maskura").join("multipart"),
-            StagingQuotaLimits::new(i64::MAX as u64, i64::MAX as u64)?,
+            quotas,
         )?);
         let operation_journal = Arc::new(FileOperationJournal::open(
             root.join(".maskura").join("journal"),
         )?);
+        file_store.validate_commit_proofs().await?;
+        file_store.backfill_current_commit_proofs().await?;
         Ok(Self {
             root,
             file_store,
@@ -143,7 +157,7 @@ impl LocalStorageRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multipart_staging::MultipartRepository as _;
+    use crate::multipart_staging::{EncryptedPartWriter, MultipartRepository as _};
     use uuid::Uuid;
 
     struct TempDir(PathBuf);
@@ -296,5 +310,69 @@ mod tests {
             runtime.commits_root(),
             directory.path().join(".maskura/commits")
         );
+    }
+
+    #[tokio::test]
+    async fn corrupt_key_repository_journal_and_proof_fail_during_runtime_construction() {
+        let key = TempDir::new();
+        std::fs::create_dir_all(key.path().join(".maskura")).unwrap();
+        std::fs::write(key.path().join(".maskura/wrapping.key"), b"corrupt").unwrap();
+        assert!(matches!(
+            LocalStorageRuntime::new(key.path().to_path_buf()).await,
+            Err(LocalStorageError::FileKeyWrapping(_))
+        ));
+
+        let repository = TempDir::new();
+        std::fs::create_dir_all(repository.path().join(".maskura/multipart/uploads")).unwrap();
+        std::fs::write(
+            repository.path().join(".maskura/multipart/uploads/unknown"),
+            b"unknown",
+        )
+        .unwrap();
+        assert!(matches!(
+            LocalStorageRuntime::new(repository.path().to_path_buf()).await,
+            Err(LocalStorageError::Staging(_))
+        ));
+
+        let journal = TempDir::new();
+        std::fs::create_dir_all(journal.path().join(".maskura/journal")).unwrap();
+        std::fs::write(journal.path().join(".maskura/journal/unknown"), b"unknown").unwrap();
+        assert!(matches!(
+            LocalStorageRuntime::new(journal.path().to_path_buf()).await,
+            Err(LocalStorageError::Journal(_))
+        ));
+
+        let proof = TempDir::new();
+        std::fs::create_dir_all(proof.path().join(".maskura/commits")).unwrap();
+        std::fs::write(proof.path().join(".maskura/commits/unknown"), b"unknown").unwrap();
+        assert!(matches!(
+            LocalStorageRuntime::new(proof.path().to_path_buf()).await,
+            Err(LocalStorageError::FileStore(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_encrypted_cleanup_removes_only_owned_temporary_names() {
+        let directory = TempDir::new();
+        let runtime = LocalStorageRuntime::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let temporary = runtime.staging_artifacts().temporary_root().to_path_buf();
+        let owned = temporary.join(format!("s4-multipart-{}.enc", Uuid::now_v7()));
+        let prefix_only = temporary.join("s4-multipart-not-owned");
+        let unrelated = temporary.join("operator-file");
+        std::fs::write(&owned, b"owned").unwrap();
+        std::fs::write(&prefix_only, b"keep").unwrap();
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        assert_eq!(
+            EncryptedPartWriter::cleanup_stale(&temporary, std::time::Duration::ZERO)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!owned.exists());
+        assert!(prefix_only.exists());
+        assert!(unrelated.exists());
     }
 }

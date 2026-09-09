@@ -2172,6 +2172,34 @@ impl MultipartRepository for FileMultipartRepository {
             .map_err(|failure| failure.error)
     }
 
+    async fn terminal_upload_candidates(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<MultipartIdentity>, StagingError> {
+        let state = self.state.lock().await;
+        state.ensure_healthy()?;
+        let mut uploads = state
+            .entries
+            .values()
+            .filter_map(|entry| entry.reducer.snapshot().upload.as_ref())
+            .filter(|upload| {
+                matches!(
+                    upload.lifecycle,
+                    MultipartLifecycle::Completed
+                        | MultipartLifecycle::Aborted
+                        | MultipartLifecycle::Expired
+                ) && upload.tombstone_until_ms.is_some_and(|until| until <= now)
+            })
+            .collect::<Vec<_>>();
+        uploads.sort_by_key(|upload| (upload.updated_at_ms, upload.identity.upload_id.clone()));
+        Ok(uploads
+            .into_iter()
+            .take(limit)
+            .map(|upload| upload.identity.clone())
+            .collect())
+    }
+
     async fn retire_terminal_uploads(
         &self,
         now: i64,

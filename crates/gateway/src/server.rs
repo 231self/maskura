@@ -143,8 +143,7 @@ pub struct AppState {
     pub dev_memory_streaming_enabled: bool,
     demo_pipelines: DemoPipelines,
     demo_limiter: Arc<DemoLimiter>,
-    multipart_staging: Option<Arc<MultipartStaging>>,
-    multipart_mode: MultipartMode,
+    multipart: Arc<MultipartPersistenceBundle>,
     continuation_token_key: [u8; 32],
 }
 
@@ -596,6 +595,33 @@ struct MultipartStaging {
     wrapping: Arc<dyn KeyWrapping>,
 }
 
+struct MultipartPersistenceBundle {
+    mode: MultipartPersistenceMode,
+    staging: Option<Arc<MultipartStaging>>,
+    coordinator: Option<Arc<MultipartCompletionCoordinator>>,
+    recovery: Option<Arc<MultipartRecoveryRuntime>>,
+    worker: Mutex<Option<MultipartRecoveryWorker>>,
+}
+
+struct MultipartRecoveryRuntime {
+    staging: Arc<MultipartStaging>,
+    coordinator: Arc<MultipartCompletionCoordinator>,
+    file_store: Option<Arc<FileStore>>,
+    service_storage: Arc<ServiceStorage>,
+}
+
+struct MultipartRecoveryWorker {
+    cancellation: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MultipartRecoveryWorker {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.task.abort();
+    }
+}
+
 const LEGACY_MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
 const WORKSPACE_OPERATION_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEMO_MAX_RECORDS: usize = 10;
@@ -903,6 +929,14 @@ enum MultipartMode {
     #[default]
     Reject,
     Staged,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum MultipartPersistenceMode {
+    #[default]
+    Reject,
+    LocalStaged,
+    HostedStaged,
 }
 
 fn multipart_mode() -> anyhow::Result<MultipartMode> {
@@ -4153,8 +4187,8 @@ fn managed_logical_key(auth: &Auth, bucket: &str, key: &str) -> LogicalObjectKey
 }
 
 fn staged_multipart(state: &AppState) -> Option<&Arc<MultipartStaging>> {
-    (state.multipart_mode == MultipartMode::Staged)
-        .then_some(state.multipart_staging.as_ref())
+    (state.multipart.mode != MultipartPersistenceMode::Reject)
+        .then_some(state.multipart.staging.as_ref())
         .flatten()
 }
 
@@ -4525,17 +4559,18 @@ impl From<MultipartCoordinatorError> for MultipartCompletionError {
 
 fn multipart_completion_coordinator(
     state: &AppState,
-    staging: &MultipartStaging,
+    _staging: &MultipartStaging,
 ) -> Result<MultipartCompletionCoordinator, MultipartCompletionError> {
-    let journal = state.operation_journal.clone().ok_or_else(|| {
-        MultipartCompletionError::Invalid(
-            "multipart completion requires a durable operation journal".to_string(),
-        )
-    })?;
-    Ok(MultipartCompletionCoordinator::new(
-        staging.repository.clone(),
-        journal,
-    )?)
+    state
+        .multipart
+        .coordinator
+        .as_deref()
+        .cloned()
+        .ok_or_else(|| {
+            MultipartCompletionError::Invalid(
+                "multipart completion requires a durable operation journal".to_string(),
+            )
+        })
 }
 
 async fn renew_and_fence_completion(
@@ -5493,8 +5528,12 @@ async fn complete_staged_avro_multipart(
     result
 }
 
-async fn reconcile_staged_artifacts(staging: &MultipartStaging) -> Result<(), StagingError> {
-    for candidate in staging.repository.cleanup_candidates(now_ms(), 256).await? {
+async fn reconcile_staged_artifacts(
+    staging: &MultipartStaging,
+    now: i64,
+    limit: usize,
+) -> Result<(), StagingError> {
+    for candidate in staging.repository.cleanup_candidates(now, limit).await? {
         if staging
             .artifacts
             .delete(&candidate.artifact_key)
@@ -5518,7 +5557,7 @@ async fn reconcile_staged_artifacts(staging: &MultipartStaging) -> Result<(), St
         }
     }
     let known = staging.repository.known_artifact_keys().await?;
-    let cutoff = now_ms() - crate::multipart_staging::RECONCILIATION_GRACE.as_millis() as i64;
+    let cutoff = now - crate::multipart_staging::RECONCILIATION_GRACE.as_millis() as i64;
     for StagedArtifact {
         key,
         modified_at_ms,
@@ -5531,6 +5570,91 @@ async fn reconcile_staged_artifacts(staging: &MultipartStaging) -> Result<(), St
         }
     }
     Ok(())
+}
+
+impl MultipartRecoveryRuntime {
+    async fn run_once(&self, now: i64, limit: usize) -> anyhow::Result<()> {
+        let limit = limit.max(1);
+        if let Some(store) = &self.file_store {
+            store.validate_commit_proofs().await?;
+            store.backfill_current_commit_proofs().await?;
+        }
+
+        reconcile_staged_artifacts(&self.staging, now, limit).await?;
+        for publishing in self.staging.repository.publishing_uploads(limit).await? {
+            let _ = self.coordinator.recover_publishing(&publishing).await?;
+        }
+
+        let expired = self.staging.repository.reap_expired(now, limit).await?;
+        let upload_ids: HashSet<_> = expired.iter().map(|part| part.upload_id.clone()).collect();
+        for upload_id in upload_ids {
+            let selected = expired
+                .iter()
+                .filter(|part| part.upload_id == upload_id)
+                .cloned()
+                .collect();
+            cleanup_staged_parts(&self.staging, &upload_id, selected, "expiry_reap").await;
+        }
+        reconcile_staged_artifacts(&self.staging, now, limit).await?;
+
+        for identity in self
+            .staging
+            .repository
+            .terminal_upload_candidates(now, 1)
+            .await?
+        {
+            for retired in self
+                .coordinator
+                .retire_terminal_upload(&identity, now, limit)
+                .await?
+            {
+                if let Some(epoch) = retired.namespace_epoch {
+                    self.service_storage
+                        .finish_managed_multipart(&retired.upload_id, &retired.tenant_id, epoch)
+                        .await
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                }
+            }
+        }
+
+        EncryptedPartWriter::cleanup_stale(
+            &self.staging.directory,
+            Duration::from_secs(24 * 60 * 60),
+        )
+        .await?;
+        if self.service_storage.managed_mode() != ManagedStreamingMode::Off {
+            self.service_storage
+                .reconcile_managed_multipart_activities(limit as u64)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+impl MultipartPersistenceBundle {
+    fn start_worker(&self) {
+        let Some(recovery) = self.recovery.clone() else {
+            return;
+        };
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = worker_cancellation.cancelled() => break,
+                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                        if let Err(error) = recovery.run_once(now_ms(), 64).await {
+                            warn!("multipart recovery worker failed: {error}");
+                        }
+                    }
+                }
+            }
+        });
+        let mut worker = self.worker.lock().expect("multipart worker lock poisoned");
+        debug_assert!(worker.is_none());
+        *worker = Some(MultipartRecoveryWorker { cancellation, task });
+    }
 }
 
 async fn s3_upload_part(
@@ -11181,10 +11305,10 @@ struct MultipartStartupDependencies {
 }
 
 fn validate_multipart_startup(
-    mode: MultipartMode,
+    mode: MultipartPersistenceMode,
     dependencies: MultipartStartupDependencies,
 ) -> anyhow::Result<()> {
-    if mode != MultipartMode::Staged {
+    if mode != MultipartPersistenceMode::HostedStaged {
         return Ok(());
     }
     let checks = [
@@ -11224,6 +11348,17 @@ fn validate_multipart_startup(
     Ok(())
 }
 
+fn multipart_persistence_mode(
+    mode: MultipartMode,
+    local_storage: bool,
+) -> MultipartPersistenceMode {
+    match (mode, local_storage) {
+        (MultipartMode::Reject, _) => MultipartPersistenceMode::Reject,
+        (MultipartMode::Staged, true) => MultipartPersistenceMode::LocalStaged,
+        (MultipartMode::Staged, false) => MultipartPersistenceMode::HostedStaged,
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn staged_multipart_startup_requires_every_production_dependency() {
@@ -11239,9 +11374,9 @@ fn staged_multipart_startup_requires_every_production_dependency() {
         tenant_quota: true,
         global_quota: true,
     };
-    validate_multipart_startup(MultipartMode::Staged, complete).unwrap();
+    validate_multipart_startup(MultipartPersistenceMode::HostedStaged, complete).unwrap();
     validate_multipart_startup(
-        MultipartMode::Reject,
+        MultipartPersistenceMode::Reject,
         MultipartStartupDependencies {
             durable_wrapping: false,
             ..complete
@@ -11264,8 +11399,133 @@ fn staged_multipart_startup_requires_every_production_dependency() {
     for remove in missing_one {
         let mut incomplete = complete;
         remove(&mut incomplete);
-        assert!(validate_multipart_startup(MultipartMode::Staged, incomplete).is_err());
+        assert!(
+            validate_multipart_startup(MultipartPersistenceMode::HostedStaged, incomplete).is_err()
+        );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn local_staged_persistence_requires_no_hosted_dependencies() {
+    let missing = MultipartStartupDependencies {
+        durable_wrapping: false,
+        database: false,
+        endpoint: false,
+        bucket: false,
+        access_key: false,
+        secret_key: false,
+        region: false,
+        directory: false,
+        tenant_quota: false,
+        global_quota: false,
+    };
+    let mode = multipart_persistence_mode(MultipartMode::Staged, true);
+    assert_eq!(mode, MultipartPersistenceMode::LocalStaged);
+    validate_multipart_startup(mode, missing).unwrap();
+    assert_eq!(
+        multipart_persistence_mode(MultipartMode::Staged, false),
+        MultipartPersistenceMode::HostedStaged
+    );
+    assert_eq!(
+        multipart_persistence_mode(MultipartMode::Reject, true),
+        MultipartPersistenceMode::Reject
+    );
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn multipart_recovery_orders_artifacts_before_expiry_and_retries_on_next_run() {
+    let root = std::env::temp_dir().join(format!("maskura-startup-recovery-{}", Uuid::now_v7()));
+    std::fs::create_dir(&root).unwrap();
+    let runtime = Arc::new(LocalStorageRuntime::new(root.clone()).await.unwrap());
+    let artifacts = runtime.staging_artifacts();
+    let staging = Arc::new(MultipartStaging {
+        repository: runtime.multipart_repository(),
+        directory: artifacts.temporary_root().to_path_buf(),
+        artifacts,
+        wrapping: runtime.wrapping(),
+    });
+    let coordinator = Arc::new(
+        MultipartCompletionCoordinator::new(
+            staging.repository.clone(),
+            runtime.operation_journal(),
+        )
+        .unwrap()
+        .with_file_proof(runtime.file_store()),
+    );
+    let recovery = MultipartRecoveryRuntime {
+        staging: staging.clone(),
+        coordinator,
+        file_store: Some(runtime.file_store()),
+        service_storage: Arc::new(ServiceStorage::new(Vec::new())),
+    };
+    let now = now_ms();
+    let identity = MultipartIdentity {
+        tenant_id: "tenant".to_string(),
+        credential_policy_id: "policy".to_string(),
+        bucket: "bucket".to_string(),
+        key: "key".to_string(),
+        upload_id: Uuid::now_v7().to_string(),
+    };
+    staging
+        .repository
+        .create(MultipartUpload {
+            identity: identity.clone(),
+            namespace_epoch: None,
+            snapshot: MultipartSnapshot {
+                metadata: Default::default(),
+                tags: Default::default(),
+                checksum_mode: None,
+                destination: serde_json::json!({"kind":"file"}),
+                plugin_snapshot: serde_json::json!({}),
+                max_staged_bytes: 1024,
+            },
+            lifecycle: MultipartLifecycle::Open,
+            staged_bytes: 0,
+            reserved_bytes: 0,
+            created_at_ms: now.saturating_sub(2),
+            expires_at_ms: now.saturating_sub(1),
+            updated_at_ms: now.saturating_sub(2),
+            tombstone_until_ms: None,
+            complete_request_fingerprint: None,
+            completion_lease_owner: None,
+            completion_lease_expires_at_ms: None,
+            completion_fencing_token: 0,
+            destination_operation_id: None,
+            publishing_started_at_ms: None,
+            destination_commit: None,
+            completion_result: None,
+        })
+        .await
+        .unwrap();
+    let unknown = root.join(".maskura/multipart/artifacts/unknown");
+    std::fs::write(&unknown, b"unknown").unwrap();
+
+    assert!(recovery.run_once(now, 16).await.is_err());
+    assert_eq!(
+        staging
+            .repository
+            .get_authorized(&identity)
+            .await
+            .unwrap()
+            .lifecycle,
+        MultipartLifecycle::Open
+    );
+
+    std::fs::remove_file(unknown).unwrap();
+    recovery.run_once(now, 16).await.unwrap();
+    assert_eq!(
+        staging
+            .repository
+            .get_authorized(&identity)
+            .await
+            .unwrap()
+            .lifecycle,
+        MultipartLifecycle::Expired
+    );
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 fn nonempty_env(name: &str) -> bool {
@@ -11326,7 +11586,7 @@ pub async fn build_state_with_pipeline_template(
         .unwrap_or_default();
     let local_storage_mode = resolve_customer_env(customer_env::STORAGE_MODE)?;
     let local_storage_dir = resolve_customer_env(customer_env::LOCAL_STORAGE_DIR)?;
-    let local_storage = match (local_storage_mode.as_deref(), local_storage_dir) {
+    let local_storage_root = match (local_storage_mode.as_deref(), local_storage_dir) {
         (Some("local"), directory) => {
             let directory = PathBuf::from(directory.unwrap_or_else(|| "./data".to_string()));
             if !explicit_single_tenant {
@@ -11337,9 +11597,7 @@ pub async fn build_state_with_pipeline_template(
                     "MASKURA_LOCAL_STORAGE_DIR is mutually exclusive with S3_ENDPOINT and S4_SERVICE_BUCKETS"
                 );
             }
-            let runtime = Arc::new(LocalStorageRuntime::new(directory.clone()).await?);
-            info!(path = %runtime.root().display(), "Storage: local filesystem");
-            Some(runtime)
+            Some(directory)
         }
         (None, Some(directory)) => {
             let directory = PathBuf::from(directory);
@@ -11351,14 +11609,11 @@ pub async fn build_state_with_pipeline_template(
                     "MASKURA_LOCAL_STORAGE_DIR is mutually exclusive with S3_ENDPOINT and S4_SERVICE_BUCKETS"
                 );
             }
-            let runtime = Arc::new(LocalStorageRuntime::new(directory.clone()).await?);
-            info!(path = %runtime.root().display(), "Storage: local filesystem");
-            Some(runtime)
+            Some(directory)
         }
         (Some(_), _) => anyhow::bail!("MASKURA_STORAGE_MODE must be local when configured"),
         (None, None) => None,
     };
-    let file_store = local_storage.as_ref().map(|runtime| runtime.file_store());
     validate_storage_boundary_startup(
         explicit_single_tenant,
         s3_endpoint.is_some(),
@@ -11370,6 +11625,66 @@ pub async fn build_state_with_pipeline_template(
     let source_body_limits = source_body_limits_from_env()?;
     let max_pipeline_output_bytes = pipeline_template.max_pipeline_output_bytes;
     let (gateway, plugins, demo_pipelines) = pipeline_template.instantiate()?;
+
+    let multipart_mode = multipart_mode()?;
+    let multipart_persistence_mode =
+        multipart_persistence_mode(multipart_mode, local_storage_root.is_some());
+    let multipart_tenant_quota_bytes = std::env::var("S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            source_body_limits
+                .max_bytes
+                .saturating_mul(MAX_ACTIVE_UPLOADS as u64)
+        });
+    let multipart_global_quota_bytes = std::env::var("S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| multipart_tenant_quota_bytes.saturating_mul(4));
+    let multipart_quotas = (multipart_mode == MultipartMode::Staged)
+        .then(|| {
+            StagingQuotaLimits::new(multipart_tenant_quota_bytes, multipart_global_quota_bytes)
+                .map_err(|_| {
+                    anyhow::anyhow!("invalid multipart staging tenant/global quota configuration")
+                })
+        })
+        .transpose()?;
+    validate_multipart_startup(
+        multipart_persistence_mode,
+        MultipartStartupDependencies {
+            durable_wrapping: wrapping.is_durable(),
+            database: nonempty_env("DATABASE_URL"),
+            endpoint: nonempty_env("S4_MULTIPART_STAGING_ENDPOINT"),
+            bucket: nonempty_env("S4_MULTIPART_STAGING_BUCKET"),
+            access_key: nonempty_env("S4_MULTIPART_STAGING_ACCESS_KEY_ID"),
+            secret_key: nonempty_env("S4_MULTIPART_STAGING_SECRET_ACCESS_KEY"),
+            region: nonempty_env("S4_MULTIPART_STAGING_REGION"),
+            directory: nonempty_env("S4_MULTIPART_STAGING_DIR"),
+            tenant_quota: nonempty_env("S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES"),
+            global_quota: nonempty_env("S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES"),
+        },
+    )?;
+    let local_storage = match local_storage_root {
+        Some(root) => {
+            let quotas = multipart_quotas
+                .unwrap_or(StagingQuotaLimits::new(i64::MAX as u64, i64::MAX as u64)?);
+            let runtime = Arc::new(LocalStorageRuntime::with_quotas(root, quotas).await?);
+            info!(path = %runtime.root().display(), "Storage: local filesystem");
+            Some(runtime)
+        }
+        None => None,
+    };
+    let file_store = local_storage.as_ref().map(|runtime| runtime.file_store());
+    let wrapping = if multipart_persistence_mode == MultipartPersistenceMode::LocalStaged {
+        local_storage
+            .as_ref()
+            .expect("local staged mode has a local runtime")
+            .wrapping()
+    } else {
+        wrapping
+    };
 
     // Envelope encryption for API key secrets (needed to verify SigV4).
     // The wrapping backend is injected by the caller so the engine stays
@@ -11443,44 +11758,6 @@ pub async fn build_state_with_pipeline_template(
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(PLACEMENT_VERSION_V1);
-    let multipart_mode = multipart_mode()?;
-    let multipart_tenant_quota_bytes = std::env::var("S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            source_body_limits
-                .max_bytes
-                .saturating_mul(MAX_ACTIVE_UPLOADS as u64)
-        });
-    let multipart_global_quota_bytes = std::env::var("S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| multipart_tenant_quota_bytes.saturating_mul(4));
-    let multipart_quotas = (multipart_mode == MultipartMode::Staged)
-        .then(|| {
-            StagingQuotaLimits::new(multipart_tenant_quota_bytes, multipart_global_quota_bytes)
-                .map_err(|_| {
-                    anyhow::anyhow!("invalid multipart staging tenant/global quota configuration")
-                })
-        })
-        .transpose()?;
-    validate_multipart_startup(
-        multipart_mode,
-        MultipartStartupDependencies {
-            durable_wrapping: wrapping.is_durable(),
-            database: nonempty_env("DATABASE_URL"),
-            endpoint: nonempty_env("S4_MULTIPART_STAGING_ENDPOINT"),
-            bucket: nonempty_env("S4_MULTIPART_STAGING_BUCKET"),
-            access_key: nonempty_env("S4_MULTIPART_STAGING_ACCESS_KEY_ID"),
-            secret_key: nonempty_env("S4_MULTIPART_STAGING_SECRET_ACCESS_KEY"),
-            region: nonempty_env("S4_MULTIPART_STAGING_REGION"),
-            directory: nonempty_env("S4_MULTIPART_STAGING_DIR"),
-            tenant_quota: nonempty_env("S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES"),
-            global_quota: nonempty_env("S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES"),
-        },
-    )?;
     let s3_streaming_capabilities = configured_s3_streaming_capabilities()?;
     let managed_streaming_capabilities = configured_managed_streaming_capabilities();
     let spool_max_object_bytes = resolve_customer_env(customer_env::SPOOL_MAX_OBJECT_BYTES)?
@@ -11520,7 +11797,16 @@ pub async fn build_state_with_pipeline_template(
     // mode (AUTH_DISABLED=true), and otherwise the in-memory KeyStore.
     let mut operation_journal: Option<Arc<dyn OperationJournal>> = None;
     let mut postgres_pool = None;
-    let keys: Arc<dyn KeyRepository> = if let Ok(database_url) = std::env::var("DATABASE_URL") {
+    let keys: Arc<dyn KeyRepository> = if let Some(runtime) = &local_storage {
+        let keys_file = resolve_customer_env(customer_env::KEYS_FILE)?
+            .map(PathBuf::from)
+            .unwrap_or_else(|| runtime.internal_root().join("keys.json"));
+        info!(path = %keys_file.display(), "Key store: local file");
+        if multipart_persistence_mode == MultipartPersistenceMode::LocalStaged {
+            operation_journal = Some(runtime.operation_journal());
+        }
+        Arc::new(FileKeyStore::with_cipher(keys_file, cipher.clone())?)
+    } else if let Ok(database_url) = std::env::var("DATABASE_URL") {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(5)
             .connect(&database_url)
@@ -11550,7 +11836,7 @@ pub async fn build_state_with_pipeline_template(
         Arc::new(KeyStore::with_cipher(cipher))
     };
     #[cfg(debug_assertions)]
-    if operation_journal.is_none() && auth_disabled {
+    if operation_journal.is_none() && auth_disabled && local_storage.is_none() {
         info!(
             "Operation journal: in-memory (dev local mode; streaming S3 PUT uses a non-durable journal)"
         );
@@ -11594,8 +11880,23 @@ pub async fn build_state_with_pipeline_template(
             );
         }
     }
-    let multipart_staging = if multipart_mode == MultipartMode::Staged && wrapping.is_durable() {
-        if let Some(pool) = postgres_pool.clone() {
+    let multipart_staging = match multipart_persistence_mode {
+        MultipartPersistenceMode::LocalStaged => {
+            let runtime = local_storage
+                .as_ref()
+                .expect("local staged mode has a local runtime");
+            let artifacts = runtime.staging_artifacts();
+            Some(Arc::new(MultipartStaging {
+                repository: runtime.multipart_repository(),
+                directory: artifacts.temporary_root().to_path_buf(),
+                artifacts,
+                wrapping: runtime.wrapping(),
+            }))
+        }
+        MultipartPersistenceMode::HostedStaged => {
+            let pool = postgres_pool
+                .clone()
+                .expect("hosted staged dependencies were validated");
             let endpoint = std::env::var("S4_MULTIPART_STAGING_ENDPOINT").ok();
             let bucket = std::env::var("S4_MULTIPART_STAGING_BUCKET").ok();
             let access_key = std::env::var("S4_MULTIPART_STAGING_ACCESS_KEY_ID").ok();
@@ -11640,31 +11941,9 @@ pub async fn build_state_with_pipeline_template(
                     None
                 }
             }
-        } else {
-            warn!(
-                "staged multipart requested without DATABASE_URL; transformed multipart remains rejected"
-            );
-            None
         }
-    } else if multipart_mode == MultipartMode::Staged {
-        warn!(
-            "staged multipart requested with ephemeral key wrapping; transformed multipart remains rejected"
-        );
-        None
-    } else {
-        None
+        MultipartPersistenceMode::Reject => None,
     };
-    if let Some(staging) = &multipart_staging {
-        let removed = EncryptedPartWriter::cleanup_stale(
-            &staging.directory,
-            Duration::from_secs(24 * 60 * 60),
-        )
-        .await?;
-        if removed > 0 {
-            info!(removed, "removed orphaned encrypted multipart spool files");
-        }
-        reconcile_staged_artifacts(staging).await?;
-    }
     validate_mode(
         managed_mode,
         managed_repository.as_ref(),
@@ -11685,11 +11964,47 @@ pub async fn build_state_with_pipeline_template(
         )
         .with_managed_capabilities(managed_streaming_capabilities),
     );
-    if multipart_staging.is_some() && managed_mode != ManagedStreamingMode::Off {
-        service_storage
-            .reconcile_managed_multipart_activities(256)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let multipart_coordinator = match (&multipart_staging, &operation_journal) {
+        (Some(staging), Some(journal)) => {
+            let coordinator =
+                MultipartCompletionCoordinator::new(staging.repository.clone(), journal.clone())?;
+            let coordinator = if multipart_persistence_mode == MultipartPersistenceMode::LocalStaged
+            {
+                coordinator.with_file_proof(
+                    file_store
+                        .clone()
+                        .expect("local staged mode has a file store"),
+                )
+            } else {
+                coordinator
+            };
+            Some(Arc::new(coordinator))
+        }
+        (None, _) => None,
+        (Some(_), None) => anyhow::bail!("staged multipart requires a durable operation journal"),
+    };
+    let multipart_recovery = multipart_staging
+        .as_ref()
+        .zip(multipart_coordinator.as_ref())
+        .map(|(staging, coordinator)| {
+            Arc::new(MultipartRecoveryRuntime {
+                staging: staging.clone(),
+                coordinator: coordinator.clone(),
+                file_store: (multipart_persistence_mode == MultipartPersistenceMode::LocalStaged)
+                    .then(|| file_store.clone())
+                    .flatten(),
+                service_storage: service_storage.clone(),
+            })
+        });
+    let multipart = Arc::new(MultipartPersistenceBundle {
+        mode: multipart_persistence_mode,
+        staging: multipart_staging,
+        coordinator: multipart_coordinator,
+        recovery: multipart_recovery,
+        worker: Mutex::new(None),
+    });
+    if let Some(recovery) = &multipart.recovery {
+        recovery.run_once(now_ms(), 256).await?;
     }
     if managed_mode == ManagedStreamingMode::Enforce
         && let (Some(journal), Some(capabilities)) =
@@ -11783,8 +12098,7 @@ pub async fn build_state_with_pipeline_template(
         dev_memory_streaming_enabled,
         demo_pipelines,
         demo_limiter: Arc::new(DemoLimiter::new()),
-        multipart_staging,
-        multipart_mode,
+        multipart,
         continuation_token_key,
     });
     if managed_mode != ManagedStreamingMode::Off
@@ -11818,59 +12132,7 @@ pub async fn build_state_with_pipeline_template(
             }
         });
     }
-    if let Some(staging) = state.multipart_staging.clone() {
-        let storage = state.service_storage.clone();
-        tokio::spawn(async move {
-            loop {
-                match staging.repository.reap_expired(now_ms(), 64).await {
-                    Ok(parts) if !parts.is_empty() => {
-                        let upload_ids: HashSet<_> =
-                            parts.iter().map(|part| part.upload_id.clone()).collect();
-                        for upload_id in upload_ids {
-                            let selected: Vec<_> = parts
-                                .iter()
-                                .filter(|part| part.upload_id == upload_id)
-                                .cloned()
-                                .collect();
-                            cleanup_staged_parts(&staging, &upload_id, selected, "expiry_reap")
-                                .await;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(error) => warn!("multipart expiry reconciliation failed: {error}"),
-                }
-                if let Err(error) = reconcile_staged_artifacts(&staging).await {
-                    warn!("multipart artifact reconciliation failed: {error}");
-                }
-                match staging
-                    .repository
-                    .retire_terminal_uploads(now_ms(), 64)
-                    .await
-                {
-                    Ok(retired) => {
-                        for upload in retired {
-                            if let Some(epoch) = upload.namespace_epoch {
-                                let _ = storage
-                                    .finish_managed_multipart(
-                                        &upload.upload_id,
-                                        &upload.tenant_id,
-                                        epoch,
-                                    )
-                                    .await;
-                            }
-                        }
-                    }
-                    Err(error) => warn!("multipart terminal retirement failed: {error}"),
-                }
-                if storage.managed_mode() != ManagedStreamingMode::Off
-                    && let Err(error) = storage.reconcile_managed_multipart_activities(64).await
-                {
-                    warn!("managed multipart registration reconciliation failed: {error}");
-                }
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-        });
-    }
+    state.multipart.start_worker();
     Ok(state)
 }
 

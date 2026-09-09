@@ -42,7 +42,6 @@ impl FileStagingArtifactStore {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn temporary_root(&self) -> &Path {
         &self.temporary
     }

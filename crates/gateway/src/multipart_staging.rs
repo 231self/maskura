@@ -434,6 +434,11 @@ pub trait MultipartRepository: Send + Sync {
         &self,
         identity: &MultipartIdentity,
     ) -> Result<(), StagingError>;
+    async fn terminal_upload_candidates(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<MultipartIdentity>, StagingError>;
     async fn retire_terminal_uploads(
         &self,
         now_ms: i64,
@@ -1943,6 +1948,24 @@ impl MultipartRepository for PostgresMultipartRepository {
             .map_err(|error| StagingError::Persistence(error.to_string()))?;
         Ok(())
     }
+    async fn terminal_upload_candidates(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<MultipartIdentity>, StagingError> {
+        multipart_upload::Entity::find()
+            .filter(multipart_upload::Column::Lifecycle.is_in(["COMPLETED", "ABORTED", "EXPIRED"]))
+            .filter(multipart_upload::Column::TombstoneUntilMs.lte(now_ms))
+            .order_by_asc(multipart_upload::Column::UpdatedAtMs)
+            .limit(limit as u64)
+            .all(&self.db)
+            .await
+            .map_err(|error| StagingError::Persistence(error.to_string()))?
+            .into_iter()
+            .map(upload_from_model)
+            .map(|upload| upload.map(|upload| upload.identity))
+            .collect()
+    }
     async fn retire_terminal_uploads(
         &self,
         now_ms: i64,
@@ -2963,6 +2986,33 @@ impl MultipartRepository for InMemoryMultipartRepository {
         state.uploads.remove(&identity.upload_id);
         Ok(())
     }
+    async fn terminal_upload_candidates(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<MultipartIdentity>, StagingError> {
+        let state = self.state.lock().await;
+        let mut uploads = state
+            .uploads
+            .values()
+            .filter(|upload| {
+                matches!(
+                    upload.lifecycle,
+                    MultipartLifecycle::Completed
+                        | MultipartLifecycle::Aborted
+                        | MultipartLifecycle::Expired
+                ) && upload
+                    .tombstone_until_ms
+                    .is_some_and(|until| until <= now_ms)
+            })
+            .collect::<Vec<_>>();
+        uploads.sort_by_key(|upload| (upload.updated_at_ms, upload.identity.upload_id.clone()));
+        Ok(uploads
+            .into_iter()
+            .take(limit)
+            .map(|upload| upload.identity.clone())
+            .collect())
+    }
     async fn retire_terminal_uploads(
         &self,
         now_ms: i64,
@@ -3420,7 +3470,15 @@ impl EncryptedPartWriter {
         let mut removed = 0;
         while let Some(entry) = entries.next_entry().await.map_err(io_error)? {
             let name = entry.file_name();
-            if !name.to_string_lossy().starts_with(FILE_PREFIX) {
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let owned = name
+                .strip_prefix(FILE_PREFIX)
+                .and_then(|name| name.strip_suffix(".enc"))
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .is_some();
+            if !owned {
                 continue;
             }
             let metadata = entry.metadata().await.map_err(io_error)?;
