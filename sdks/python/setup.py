@@ -29,7 +29,7 @@ REQUIRES = [
     "pydantic >= 2",
     "typing-extensions >= 4.7.1",
     "requests >= 2.31",
-    "cryptography >= 42",
+    "cryptography >= 47",
 ]
 
 setup(

@@ -1,24 +1,8 @@
-"""High-level Maskura client: object I/O plus legacy envelope compatibility.
+"""High-level Maskura client: object I/O and envelope encryption helpers.
 
-The generated low-level client covers the dashboard API (keys, plugins,
-backends). This module adds the S3 data-plane operations the gateway exposes
-plus the client side of the envelope-encryption scheme:
-
-* ``put_object`` / ``get_object`` — raw byte objects through the gateway,
-  authenticated with the Maskura API key headers (``x-maskura-access-key`` /
-  ``x-maskura-secret-key``).
-* ``generate_keypair`` / ``attach_public_key`` — legacy RSA provisioning for
-  pre-hybrid gateways. Current gateways reject these RSA public keys.
-* ``decrypt_payload`` — recover plaintext from legacy stored payloads: scans for
-  ``RSA-OAEP/AES-256-GCM`` envelopes, unwraps each DEK with the client-held
-  private key, and AES-256-GCM-decrypts the field back to plaintext.
-
-Legacy read path (client-side decryption):
-    raw = client.get_object("my-bucket", "ingest/data.jsonl")
-    plaintext = MaskuraClient.decrypt_payload(raw, private_pem)
-
-Extra dependencies beyond the generated client: ``requests`` and
-``cryptography``.
+The generated low-level client covers the dashboard API. This module adds the
+S3 data-plane operations plus client-held hybrid key generation and decryption.
+New keys use X25519 + ML-KEM-768; legacy RSA envelopes remain readable.
 """
 
 from __future__ import annotations
@@ -29,16 +13,40 @@ from typing import Tuple
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import padding, rsa, x25519
+from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM768PrivateKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-_ENVELOPE_ALG = "RSA-OAEP/AES-256-GCM"
-_MARKER = b'"alg":"' + _ENVELOPE_ALG.encode() + b'"'
+_HYBRID_ALG = "X25519+ML-KEM-768/AES-256-GCM"
+_LEGACY_RSA_ALG = "RSA-OAEP/AES-256-GCM"
+_HYBRID_PUBLIC_LABEL = "MASKURA HYBRID PUBLIC KEY"
+_HYBRID_PRIVATE_LABEL = "MASKURA HYBRID PRIVATE KEY"
+_KDF_INFO = b"maskura/hybrid/envelope-dek/v1"
+_X25519_KEY_LEN = 32
+_MLKEM_CIPHERTEXT_LEN = 1088
+_MLKEM_SEED_LEN = 64
 _OAEP = padding.OAEP(
     mgf=padding.MGF1(algorithm=hashes.SHA256()),
     algorithm=hashes.SHA256(),
     label=None,
 )
+
+
+def _encode_pem(label: str, raw: bytes) -> str:
+    body = base64.b64encode(raw).decode()
+    lines = "\n".join(body[offset : offset + 64] for offset in range(0, len(body), 64))
+    return f"-----BEGIN {label}-----\n{lines}\n-----END {label}-----\n"
+
+
+def _decode_pem(label: str, pem: str) -> bytes:
+    begin = f"-----BEGIN {label}-----"
+    end = f"-----END {label}-----"
+    value = pem.strip()
+    if not value.startswith(begin) or not value.endswith(end):
+        raise ValueError(f"expected a {label} PEM block")
+    body = "".join(value[len(begin) : -len(end)].split())
+    return base64.b64decode(body, validate=True)
 
 
 class MaskuraClient:
@@ -56,19 +64,28 @@ class MaskuraClient:
             "x-maskura-secret-key": self.secret_key,
         }
 
-    # -- keys ---------------------------------------------------------
-
     @staticmethod
     def generate_keypair() -> Tuple[str, str]:
-        """Generate a legacy RSA-2048 envelope keypair.
+        """Generate a gateway-compatible hybrid keypair.
 
-        Current gateways accept only Maskura hybrid public keys for new writes;
-        this helper exists to support pre-hybrid gateways and stored objects.
-
-        Returns ``(private_key_pem, public_key_pem)`` — PKCS#8 private key
-        and SPKI public key, both PEM. Store the private key somewhere safe;
-        it is the only way to decrypt what Maskura stores.
+        Returns ``(private_key_pem, public_key_pem)``. The private PEM contains
+        only the X25519 secret and the ML-KEM seed and must never be uploaded.
         """
+        x25519_private = x25519.X25519PrivateKey.generate()
+        mlkem_private = MLKEM768PrivateKey.generate()
+        private_raw = x25519_private.private_bytes_raw() + mlkem_private.private_bytes_raw()
+        public_raw = (
+            x25519_private.public_key().public_bytes_raw()
+            + mlkem_private.public_key().public_bytes_raw()
+        )
+        return (
+            _encode_pem(_HYBRID_PRIVATE_LABEL, private_raw),
+            _encode_pem(_HYBRID_PUBLIC_LABEL, public_raw),
+        )
+
+    @staticmethod
+    def generate_legacy_rsa_keypair() -> Tuple[str, str]:
+        """Generate an RSA keypair for pre-hybrid gateways and old fixtures."""
         private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         private_pem = private.private_bytes(
             encoding=serialization.Encoding.PEM,
@@ -82,11 +99,7 @@ class MaskuraClient:
         return private_pem, public_pem
 
     def attach_public_key(self, public_key_pem: str) -> None:
-        """Bind a public key to this API key.
-
-        Current gateways reject the legacy RSA keys created by
-        ``generate_keypair``. This method remains for pre-hybrid gateways.
-        """
+        """Bind a Maskura hybrid public key to this API key."""
         resp = requests.put(
             f"{self.endpoint}/dashboard/api/keys/public-key",
             headers=self._headers(),
@@ -95,10 +108,8 @@ class MaskuraClient:
         )
         resp.raise_for_status()
 
-    # -- object data plane -------------------------------------------
-
     def put_object(self, bucket: str, key: str, data: bytes, content_type: str = "text/plain") -> None:
-        """Upload ``data`` to ``bucket/key`` through the Maskura filter pipeline."""
+        """Upload ``data`` to ``bucket/key`` through the Maskura pipeline."""
         resp = requests.put(
             f"{self.endpoint}/{bucket}/{key}",
             headers={**self._headers(), "Content-Type": content_type},
@@ -117,38 +128,40 @@ class MaskuraClient:
         resp.raise_for_status()
         return resp.content
 
-    # -- envelope crypto ----------------------------------------------
-
     @staticmethod
     def decrypt_payload(payload: bytes, private_key_pem: str) -> bytes:
-        """Decrypt every envelope in ``payload`` back to plaintext.
+        """Decrypt current hybrid or legacy RSA envelopes in ``payload``."""
+        if f"-----BEGIN {_HYBRID_PRIVATE_LABEL}-----" in private_key_pem:
+            key = MaskuraClient._load_hybrid_private_key(private_key_pem)
+            supported_alg = _HYBRID_ALG
+        else:
+            key = serialization.load_pem_private_key(private_key_pem.encode(), password=None)
+            if not isinstance(key, rsa.RSAPrivateKey):
+                raise ValueError("expected a Maskura hybrid or RSA private key")
+            supported_alg = _LEGACY_RSA_ALG
 
-        Encrypted fields are replaced in place; anything else (e.g. the
-        non-Luhn numbers the detector ignores) is left untouched.
-        """
-        key = serialization.load_pem_private_key(private_key_pem.encode(), password=None)
+        marker = b'"alg":"' + supported_alg.encode() + b'"'
         out = bytearray()
         pos = 0
         while True:
-            idx = payload.find(_MARKER, pos)
+            idx = payload.find(marker, pos)
             if idx < 0:
                 out += payload[pos:]
                 break
             start = payload.rfind(b"{", 0, idx)
             if start < 0:
-                out += payload[pos : idx + len(_MARKER)]
-                pos = idx + len(_MARKER)
+                out += payload[pos : idx + len(marker)]
+                pos = idx + len(marker)
                 continue
             depth = 0
             end = -1
-            for j in range(start, len(payload)):
-                c = payload[j]
-                if c == 0x7B:
+            for offset in range(start, len(payload)):
+                if payload[offset] == 0x7B:
                     depth += 1
-                elif c == 0x7D:
+                elif payload[offset] == 0x7D:
                     depth -= 1
                     if depth == 0:
-                        end = j + 1
+                        end = offset + 1
                         break
             if end < 0:
                 out += payload[pos:]
@@ -161,12 +174,40 @@ class MaskuraClient:
         return bytes(out)
 
     @staticmethod
+    def _load_hybrid_private_key(private_key_pem: str) -> tuple[x25519.X25519PrivateKey, MLKEM768PrivateKey]:
+        raw = _decode_pem(_HYBRID_PRIVATE_LABEL, private_key_pem)
+        expected = _X25519_KEY_LEN + _MLKEM_SEED_LEN
+        if len(raw) != expected:
+            raise ValueError(f"hybrid private key must contain {expected} bytes, got {len(raw)}")
+        return (
+            x25519.X25519PrivateKey.from_private_bytes(raw[:_X25519_KEY_LEN]),
+            MLKEM768PrivateKey.from_seed_bytes(raw[_X25519_KEY_LEN:]),
+        )
+
+    @staticmethod
     def _decrypt_envelope(env: dict, private_key) -> bytes:
-        assert env["alg"] == _ENVELOPE_ALG, env["alg"]
-        dek = private_key.decrypt(base64.b64decode(env["enc_dek"]), _OAEP)
-        ciphertext = base64.b64decode(env["ct"]) + base64.b64decode(env["tag"])
-        return AESGCM(dek).decrypt(base64.b64decode(env["iv"]), ciphertext, None)
+        algorithm = env.get("alg")
+        enc_dek = base64.b64decode(env["enc_dek"], validate=True)
+        if algorithm == _HYBRID_ALG:
+            x25519_private, mlkem_private = private_key
+            expected = _X25519_KEY_LEN + _MLKEM_CIPHERTEXT_LEN
+            if len(enc_dek) != expected:
+                raise ValueError(f"hybrid enc_dek must contain {expected} bytes, got {len(enc_dek)}")
+            x25519_public = x25519.X25519PublicKey.from_public_bytes(enc_dek[:_X25519_KEY_LEN])
+            shared = x25519_private.exchange(x25519_public) + mlkem_private.decapsulate(
+                enc_dek[_X25519_KEY_LEN:]
+            )
+            dek = HKDF(
+                algorithm=hashes.SHA256(), length=32, salt=None, info=_KDF_INFO
+            ).derive(shared)
+        elif algorithm == _LEGACY_RSA_ALG:
+            dek = private_key.decrypt(enc_dek, _OAEP)
+        else:
+            raise ValueError(f"unsupported envelope algorithm: {algorithm or 'missing'}")
+        ciphertext = base64.b64decode(env["ct"], validate=True) + base64.b64decode(
+            env["tag"], validate=True
+        )
+        return AESGCM(dek).decrypt(base64.b64decode(env["iv"], validate=True), ciphertext, None)
 
 
-# Permanent compatibility export for existing integrations.
 S4Client = MaskuraClient

@@ -48,9 +48,19 @@ const client = new MaskuraClient({
 });
 ```
 
-Object PUT/GET helpers work with current gateways. The high-level
-`generateKeypair` and `decryptPayload` helpers implement the legacy RSA
-envelope for compatibility with older stored objects. Current gateways accept
-only Maskura hybrid X25519 + ML-KEM-768 public keys for new encrypted writes;
-see the [client tooling status](../../docs/encryption.md#client-tooling-status)
-before using envelope encryption.
+The high-level client supports the current hybrid encryption flow:
+
+```typescript
+const { privateKeyPem, publicKeyPem } = await MaskuraClient.generateKeypair();
+await client.attachPublicKey(publicKeyPem);
+await client.putObject("bucket", "data.jsonl", new TextEncoder().encode('{"email":"jane@example.com"}'));
+const stored = await client.getObject("bucket", "data.jsonl");
+const plaintext = await MaskuraClient.decryptPayload(stored, privateKeyPem);
+```
+
+Store `privateKeyPem` securely; only the public key is uploaded. The package
+retains CommonJS output and supports Node 18+ or browsers with Web Crypto.
+`decryptPayload` also reads legacy RSA envelopes, and
+`generateLegacyRsaKeypair` remains available only for pre-hybrid gateways and
+compatibility fixtures. See the
+[encryption reference](../../docs/encryption.md#client-tooling-status).

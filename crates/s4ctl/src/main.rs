@@ -8,6 +8,8 @@ use std::fmt;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+mod hybrid;
+
 const DEFAULT_GATEWAY: &str = "http://localhost:9000";
 const HOSTED_WORKSPACE_ID_ENV: EnvAlias = EnvAlias::new("MASKURA_WORKSPACE_ID");
 const HOSTED_ACCESS_TOKEN_ENV: EnvAlias = EnvAlias::new("MASKURA_ACCESS_TOKEN");
@@ -153,6 +155,9 @@ enum Command {
         /// Bucket name
         #[arg(short, long)]
         bucket: Option<String>,
+        /// Decrypt hybrid envelopes with this client-held private-key PEM
+        #[arg(long, value_name = "PRIVATE_KEY_PEM")]
+        decrypt: Option<PathBuf>,
     },
 
     /// List objects in the store
@@ -183,6 +188,12 @@ enum KeyCmd {
         /// Expiry: never, 30d, 90d, 1y
         #[arg(short, long, default_value = "never")]
         expiry: String,
+        /// Generate and attach a hybrid encryption key to the new API key
+        #[arg(long)]
+        generate_encryption_key: bool,
+        /// Private-key destination (defaults to maskura-private-key.pem)
+        #[arg(long, value_name = "PATH", requires = "generate_encryption_key")]
+        private_key_out: Option<PathBuf>,
     },
 
     /// List all API keys
@@ -1135,6 +1146,23 @@ fn project_root() -> anyhow::Result<PathBuf> {
     }
 }
 
+fn write_private_key(path: &std::path::Path, pem: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("Cannot create private key at {}", path.display()))?;
+    file.write_all(pem.as_bytes())
+        .with_context(|| format!("Cannot write private key at {}", path.display()))
+}
+
 fn parse_expiry(expiry: &str) -> u64 {
     match expiry {
         "never" | "0" => 0,
@@ -1224,10 +1252,26 @@ async fn main() -> anyhow::Result<()> {
         Command::Key { cmd } => {
             let client = Client::new(&cli, &config)?;
             match cmd {
-                KeyCmd::Create { label, expiry } => {
+                KeyCmd::Create {
+                    label,
+                    expiry,
+                    generate_encryption_key,
+                    private_key_out,
+                } => {
+                    let encryption = if *generate_encryption_key {
+                        let path = private_key_out
+                            .clone()
+                            .unwrap_or_else(|| PathBuf::from("maskura-private-key.pem"));
+                        let (private_key_pem, public_key_pem) = hybrid::generate_keypair();
+                        write_private_key(&path, &private_key_pem)?;
+                        Some((path, public_key_pem))
+                    } else {
+                        None
+                    };
                     let body = serde_json::json!({
                         "label": label.as_deref().unwrap_or("cli"),
-                        "expires_in": parse_expiry(expiry)
+                        "expires_in": parse_expiry(expiry),
+                        "public_key_pem": encryption.as_ref().map(|(_, public_key)| public_key),
                     });
                     let resp: serde_json::Value =
                         client.api_post("/dashboard/api/keys", &body).await?;
@@ -1236,6 +1280,12 @@ async fn main() -> anyhow::Result<()> {
                     println!("Label:      {}", resp["label"].as_str().unwrap_or("?"));
                     if let Some(exp) = resp["expires_at"].as_str() {
                         println!("Expires at: {}", exp);
+                    }
+                    if let Some((path, _)) = &encryption {
+                        println!("Private key: {}", path.display());
+                        println!(
+                            "The public key is attached; the private key never left this machine."
+                        );
                     }
                     println!("\nSave this secret — it won't be shown again.");
                 }
@@ -1838,10 +1888,20 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
-        Command::Get { key, bucket } => {
+        Command::Get {
+            key,
+            bucket,
+            decrypt,
+        } => {
             let client = Client::new(&cli, &config)?;
             let bucket = client.bucket(&cli, bucket.as_deref());
-            let data = client.s3_get(&bucket, key).await?;
+            let mut data = client.s3_get(&bucket, key).await?;
+            if let Some(path) = decrypt {
+                let private_key_pem = std::fs::read_to_string(path)
+                    .with_context(|| format!("Cannot read private key at {}", path.display()))?;
+                data = hybrid::decrypt_payload(&data, &private_key_pem)
+                    .context("Cannot decrypt object payload")?;
+            }
             std::io::Write::write_all(&mut std::io::stdout(), &data)?;
         }
 
@@ -2312,6 +2372,63 @@ mod tests {
         );
         assert_eq!(Program::Maskura.name(), "maskura");
         assert_eq!(Program::S4ctl.name(), "s4ctl");
+    }
+
+    #[test]
+    fn cli_parses_hybrid_key_creation_and_decryption_paths() {
+        let create = Cli::try_parse_from([
+            "maskura",
+            "key",
+            "create",
+            "--generate-encryption-key",
+            "--private-key-out",
+            "private.pem",
+        ])
+        .unwrap();
+        assert!(matches!(
+            create.command,
+            Command::Key {
+                cmd: KeyCmd::Create {
+                    generate_encryption_key: true,
+                    private_key_out: Some(path),
+                    ..
+                }
+            } if path == std::path::Path::new("private.pem")
+        ));
+
+        let get =
+            Cli::try_parse_from(["maskura", "get", "object.jsonl", "--decrypt", "private.pem"])
+                .unwrap();
+        assert!(matches!(
+            get.command,
+            Command::Get {
+                decrypt: Some(path),
+                ..
+            } if path == std::path::Path::new("private.pem")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_key_files_are_create_new_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "maskura-private-key-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_private_key(&path, "private").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(write_private_key(&path, "replacement").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "private");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

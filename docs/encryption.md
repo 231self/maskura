@@ -113,16 +113,25 @@ The private key never touches the gateway.
 ## Client tooling status
 
 Current gateway releases accept only `MASKURA HYBRID PUBLIC KEY` PEM blocks for
-new encrypted writes. The Python and TypeScript high-level SDK overlays still
-generate RSA-2048 keys and decrypt the legacy `RSA-OAEP/AES-256-GCM` envelope.
-They remain in the release for reading older data, but their key-generation and
-attach flow is not compatible with a current gateway. Do not use
-`generate_keypair` or `generateKeypair` to provision a new encryption key.
+new encrypted writes. `MaskuraClient.generate_keypair()` in Python and
+`MaskuraClient.generateKeypair()` in TypeScript now create that exact hybrid
+format. Their decrypt helpers decapsulate current hybrid envelopes locally and
+also retain dual-algorithm read compatibility for old RSA envelopes. Explicit
+`generate_legacy_rsa_keypair()` and `generateLegacyRsaKeypair()` helpers exist
+only for pre-hybrid gateways and compatibility fixtures.
 
-The Rust implementation and round-trip tests are the current reference for the
-hybrid key format and decapsulation behavior. Packaged cross-language hybrid
-key generation and decryption are a known gap. Redaction and ordinary S3 object
-operations in the SDKs are unaffected.
+The CLI provides the same safe path: `maskura key create
+--generate-encryption-key --private-key-out <path>` attaches the public key to
+the newly created API key and writes the private key locally with create-new
+semantics (mode `0600` on Unix). `maskura get ... --decrypt <path>` decrypts
+hybrid envelopes before writing the object to stdout. The private key is never
+sent to Maskura.
+
+Python hybrid support requires `cryptography >= 47`. TypeScript uses the Noble
+X25519, HKDF-SHA256, and ML-KEM implementations while retaining CommonJS output.
+SDK and CLI tests exercise the gateway wire sizes and round-trip behavior. The
+Python and TypeScript implementations have also been verified against the
+deterministic envelope produced by the Rust gateway reference implementation.
 
 ## Security properties
 

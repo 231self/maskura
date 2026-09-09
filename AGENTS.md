@@ -156,8 +156,8 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 - `just build-sdks` extracts spec, runs `openapi-generator` (Docker) to produce Python and TypeScript SDKs in `sdks/python/` and `sdks/typescript/`.
 - Schema is the single source of truth — SDKs always in sync with server changes.
 - `scripts/generate-sdks.sh` re-applies the hand-written high-level client from `sdks/overlay/<lang>/` after each generation, so it survives regeneration:
-  - `s4_client/highlevel.py` / `highlevel.ts` — `MaskuraClient` with `S4Client` compatibility and `put_object`/`get_object` S3 data-plane helpers.
-  - The high-level `generate_keypair` / `generateKeypair` and decrypt helpers are legacy RSA compatibility code. Current gateways reject those RSA public keys for new writes; packaged hybrid client support is a known gap documented in `docs/encryption.md`.
+  - `s4_client/highlevel.py` / `highlevel.ts` — `MaskuraClient` with `S4Client` compatibility, `put_object`/`get_object` S3 data-plane helpers, hybrid X25519 + ML-KEM-768 key generation, public-key attachment, and client-side hybrid decryption.
+  - The decrypt helpers retain dual-algorithm reads for historical RSA envelopes. New key generation is hybrid by default; explicit legacy RSA generation helpers exist only for pre-hybrid compatibility.
 
 ### Web Dashboard
 
@@ -207,8 +207,8 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
   encryption. The `enc_dek` field carries an X25519 ephemeral public key plus
   the ML-KEM-768 ciphertext.
 - Existing `RSA-OAEP/AES-256-GCM` objects remain a legacy read compatibility
-  case. The public high-level SDK helpers currently cover that legacy format,
-  not new hybrid provisioning.
+  case. The public high-level SDK helpers decrypt both algorithms and generate
+  only hybrid keys by default.
 - `filters/stable-encrypt/` is a separate, opt-in AES-SIV transform for stable
   matching keys.
 

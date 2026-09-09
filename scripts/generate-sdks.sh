@@ -130,7 +130,7 @@ pyproject = pyproject.replace(
 )
 pyproject = pyproject.replace(
     '  "typing-extensions (>=4.7.1)"',
-    '  "typing-extensions (>=4.7.1)",\n  "requests (>=2.31)",\n  "cryptography (>=42)"',
+    '  "typing-extensions (>=4.7.1)",\n  "requests (>=2.31)",\n  "cryptography (>=47)"',
 )
 root.joinpath("pyproject.toml").write_text(pyproject)
 
@@ -148,7 +148,7 @@ setup = setup.replace('NAME = "maskura-client"', 'NAME = "maskura_client"', 1)
 setup = setup.replace('    url="",', '    url="https://github.com/231self/maskura",')
 setup = setup.replace(
     '    "typing-extensions >= 4.7.1",',
-    '    "typing-extensions >= 4.7.1",\n    "requests >= 2.31",\n    "cryptography >= 42",',
+    '    "typing-extensions >= 4.7.1",\n    "requests >= 2.31",\n    "cryptography >= 47",',
 )
 setup = setup.replace(
     'package_data={"s4_client": ["py.typed"]}',
@@ -157,7 +157,7 @@ setup = setup.replace(
 root.joinpath("setup.py").write_text(setup)
 
 requirements = root.joinpath("requirements.txt")
-requirements.write_text(requirements.read_text() + "requests >= 2.31\ncryptography >= 42\n")
+requirements.write_text(requirements.read_text() + "requests >= 2.31\ncryptography >= 47\n")
 
 git_push = root.joinpath("git_push.sh").read_text()
 git_push = git_push.replace('git_user_id="GIT_USER_ID"', 'git_user_id="231self"')
