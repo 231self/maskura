@@ -149,7 +149,11 @@ impl FilesystemPersistence {
             sync_parent(&path).map_err(|source| io("root lock parent sync", source))?;
         }
         match file.try_lock() {
-            Ok(()) => Ok(RootLock { file, path }),
+            Ok(()) => Ok(RootLock {
+                file,
+                #[cfg(test)]
+                path,
+            }),
             Err(std::fs::TryLockError::WouldBlock) => Err(PersistenceError::RootAlreadyLocked),
             Err(std::fs::TryLockError::Error(source)) => Err(io("root lock acquisition", source)),
         }
@@ -412,9 +416,11 @@ impl EventLog {
 #[derive(Debug)]
 pub(crate) struct RootLock {
     file: File,
+    #[cfg(test)]
     path: PathBuf,
 }
 
+#[cfg(test)]
 impl RootLock {
     pub(crate) fn path(&self) -> &Path {
         &self.path

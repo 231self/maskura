@@ -75,7 +75,20 @@ pub struct FileStore {
 }
 
 impl FileStore {
+    /// Open a standalone store without acquiring the process-level root lock.
+    ///
+    /// This remains public for direct and integration consumers. Gateway
+    /// startup must use `LocalStorageRuntime`, which holds the root lock before
+    /// this store creates directories or removes stale temporary files.
     pub async fn new(root: PathBuf) -> Result<Self, FileStoreError> {
+        Self::initialize(root).await
+    }
+
+    pub(crate) async fn open_locked(root: PathBuf) -> Result<Self, FileStoreError> {
+        Self::initialize(root).await
+    }
+
+    async fn initialize(root: PathBuf) -> Result<Self, FileStoreError> {
         fs::create_dir_all(root.join("buckets")).await?;
         let metadata = fs::metadata(&root).await?;
         if !metadata.is_dir() {

@@ -52,6 +52,7 @@ use crate::customer_headers;
 use crate::file_store::FileStore;
 use crate::integrity::{BodyVerifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
+use crate::local_storage::LocalStorageRuntime;
 use crate::managed::{
     AuthorityListQuery, InMemoryManagedRepository, LogicalObjectKey, ManagedPlacementBackendFact,
     ManagedPlacementPolicy, ManagedRepository, ManagedStreamingMode, PLACEMENT_VERSION_V1,
@@ -102,6 +103,11 @@ pub struct AppState {
     pub gateway: Arc<Gateway>,
     pub store: Arc<MemoryStore>,
     pub file_store: Option<Arc<FileStore>>,
+    #[allow(
+        dead_code,
+        reason = "owns the local root lock for the AppState lifetime"
+    )]
+    pub(crate) local_storage: Option<Arc<LocalStorageRuntime>>,
     pub keys: Arc<dyn KeyRepository>,
     pub workspace_storage: Arc<dyn WorkspaceStorageRepository>,
     pub plugins: Arc<PluginRegistry>,
@@ -11275,7 +11281,7 @@ pub async fn build_state_with_pipeline_template(
         .unwrap_or_default();
     let local_storage_mode = resolve_customer_env(customer_env::STORAGE_MODE)?;
     let local_storage_dir = resolve_customer_env(customer_env::LOCAL_STORAGE_DIR)?;
-    let file_store = match (local_storage_mode.as_deref(), local_storage_dir) {
+    let local_storage = match (local_storage_mode.as_deref(), local_storage_dir) {
         (Some("local"), directory) => {
             let directory = PathBuf::from(directory.unwrap_or_else(|| "./data".to_string()));
             if !explicit_single_tenant {
@@ -11286,9 +11292,9 @@ pub async fn build_state_with_pipeline_template(
                     "MASKURA_LOCAL_STORAGE_DIR is mutually exclusive with S3_ENDPOINT and S4_SERVICE_BUCKETS"
                 );
             }
-            let store = Arc::new(FileStore::new(directory.clone()).await?);
-            info!(path = %directory.display(), "Storage: local filesystem");
-            Some(store)
+            let runtime = Arc::new(LocalStorageRuntime::new(directory.clone()).await?);
+            info!(path = %runtime.root().display(), "Storage: local filesystem");
+            Some(runtime)
         }
         (None, Some(directory)) => {
             let directory = PathBuf::from(directory);
@@ -11300,13 +11306,14 @@ pub async fn build_state_with_pipeline_template(
                     "MASKURA_LOCAL_STORAGE_DIR is mutually exclusive with S3_ENDPOINT and S4_SERVICE_BUCKETS"
                 );
             }
-            let store = Arc::new(FileStore::new(directory.clone()).await?);
-            info!(path = %directory.display(), "Storage: local filesystem");
-            Some(store)
+            let runtime = Arc::new(LocalStorageRuntime::new(directory.clone()).await?);
+            info!(path = %runtime.root().display(), "Storage: local filesystem");
+            Some(runtime)
         }
         (Some(_), _) => anyhow::bail!("MASKURA_STORAGE_MODE must be local when configured"),
         (None, None) => None,
     };
+    let file_store = local_storage.as_ref().map(|runtime| runtime.file_store());
     validate_storage_boundary_startup(
         explicit_single_tenant,
         s3_endpoint.is_some(),
@@ -11701,6 +11708,7 @@ pub async fn build_state_with_pipeline_template(
         gateway: Arc::new(gateway),
         store: Arc::new(MemoryStore::new()),
         file_store,
+        local_storage,
         keys,
         workspace_storage,
         plugins,
