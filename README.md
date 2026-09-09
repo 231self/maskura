@@ -130,6 +130,13 @@ maskura put ./data.csv ingest/data.csv --bucket s4-local
 
 # Read it back
 maskura get ingest/data.csv --bucket s4-local
+
+# For recoverable PII, create a hybrid key with the API key and keep the
+# private key locally. New encrypted objects can then be decrypted on read.
+maskura key create --label recoverable --generate-encryption-key \
+  --private-key-out ./maskura-private-key.pem
+maskura get ingest/data.csv --bucket s4-local \
+  --decrypt ./maskura-private-key.pem
 ```
 
 `maskura local init` pulls the gateway image tagged with the CLI version
@@ -277,6 +284,12 @@ export B2_SECRET_ACCESS_KEY=your-application-key
 bash examples/b2-encrypt-demo.sh
 ```
 
+New writes use hybrid X25519 + ML-KEM-768 key encapsulation with AES-256-GCM.
+The CLI and the Python and TypeScript high-level clients generate compatible
+hybrid keypairs, attach only the public key, and decrypt locally with the
+client-held private key. Legacy RSA envelopes remain readable through explicit
+SDK compatibility helpers. See [Encryption](docs/encryption.md#client-tooling-status).
+
 **Plugins — bring your own transform**
 
 ```bash
@@ -291,7 +304,7 @@ maskura plugin reorder pii-default my-filter     # output of one feeds the next
 ```python
 from maskura_client import MaskuraClient
 client = MaskuraClient("http://localhost:8080", "s4_access_key", "s4s_secret_key")
-priv, pub = client.generate_keypair()                  # RSA-2048
+priv, pub = client.generate_keypair()                  # X25519 + ML-KEM-768
 client.attach_public_key(pub)                          # bind to your API key
 client.put_object("bucket", "key", b"jane@example.com 4111111111111111")
 blob = client.get_object("bucket", "key")

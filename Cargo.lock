@@ -4613,14 +4613,21 @@ dependencies = [
 name = "s4ctl"
 version = "0.5.3"
 dependencies = [
+ "aes-gcm",
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "dirs",
+ "hkdf",
  "maskura-customer-config",
+ "ml-kem",
+ "rand 0.8.7",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
+ "x25519-dalek",
 ]
 
 [[package]]

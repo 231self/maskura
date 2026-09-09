@@ -35,12 +35,21 @@ client = MaskuraClient(
 )
 ```
 
-Object PUT/GET helpers work with current gateways. The high-level
-`generate_keypair` and `decrypt_payload` helpers implement the legacy RSA
-envelope for compatibility with older stored objects. Current gateways accept
-only Maskura hybrid X25519 + ML-KEM-768 public keys for new encrypted writes;
-see the [client tooling status](../../docs/encryption.md#client-tooling-status)
-before using envelope encryption.
+The high-level client supports the current hybrid encryption flow:
+
+```python
+private_pem, public_pem = MaskuraClient.generate_keypair()
+client.attach_public_key(public_pem)
+client.put_object("bucket", "data.jsonl", b'{"email":"jane@example.com"}')
+stored = client.get_object("bucket", "data.jsonl")
+plaintext = MaskuraClient.decrypt_payload(stored, private_pem)
+```
+
+Store `private_pem` securely; only the public key is uploaded. Hybrid support
+requires `cryptography >= 47`. `decrypt_payload` also reads legacy RSA
+envelopes, and `generate_legacy_rsa_keypair` remains available only for
+pre-hybrid gateways and compatibility fixtures. See the
+[encryption reference](../../docs/encryption.md#client-tooling-status).
 
 ## Tests
 

@@ -30,10 +30,13 @@
     "build": "tsc"
   },
   "dependencies": {
+    "@noble/curves": "^1.9.7",
+    "@noble/hashes": "^1.8.0",
+    "@noble/post-quantum": "^0.4.1",
     "whatwg-fetch": "^3.0.0",
     "es6-promise": "^4.2.4"
   },
   "devDependencies": {
-    "typescript": "^4.0"
+    "typescript": "^5.9.3"
   }
 }

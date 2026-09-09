@@ -21,3 +21,10 @@ tokio.workspace = true
 reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
+aes-gcm.workspace = true
+base64 = "0.22"
+hkdf.workspace = true
+ml-kem.workspace = true
+rand.workspace = true
+sha2 = "0.10"
+x25519-dalek.workspace = true

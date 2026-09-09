@@ -80,7 +80,11 @@ jobs:
         run: |
           bash scripts/generate-sdks.sh
           python3 -m compileall -q sdks/python/maskura_client sdks/python/s4_client
-          cd sdks/typescript && npm install --ignore-scripts --no-package-lock && npm run build && node --test test/highlevel-attach.test.cjs
+          python3 -m pip install -r sdks/python/requirements.txt pytest
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sdks/python python3 -m pytest -q \
+            sdks/python/test/test_highlevel_attach.py \
+            sdks/python/test/test_highlevel_crypto.py
+          cd sdks/typescript && npm install --ignore-scripts --no-package-lock && npm run build && node --test test/*.test.cjs
           cd ../..
           changes="$(git status --porcelain --untracked-files=all -- sdks/)"
           if [ -n "$changes" ]; then
