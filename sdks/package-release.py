@@ -13,7 +13,7 @@ import tomllib
 from typing import Callable
 
 SDK_ROOT = Path(__file__).resolve().parent
-REPOSITORY_URL = "https://github.com/231self/S4"
+REPOSITORY_URL = "https://github.com/231self/maskura"
 EXCLUDED_DIRS = {
     ".git",
     ".mypy_cache",

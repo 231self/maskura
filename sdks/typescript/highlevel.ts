@@ -1,5 +1,5 @@
 /**
- * High-level Maskura client: object write/read + envelope encrypt/decrypt.
+ * High-level Maskura client: object I/O plus legacy envelope compatibility.
  *
  * The generated low-level client covers the dashboard API (keys, plugins,
  * backends). This module adds the S3 data-plane operations the gateway
@@ -7,20 +7,11 @@
  *
  * - `putObject` / `getObject` — raw byte objects through the gateway,
  *   authenticated with the Maskura API key headers.
- * - `generateKeypair` — an RSA-2048 keypair (SPKI public key). Give the
- *   public half to Maskura and keep the private half locally; Maskura never sees it.
- * - `attachPublicKey` — bind the public key to this API key. After this,
- *   the gateway's `envelope-encrypt` plugin encrypts every detected PII
- *   field server-side on PUT.
- * - `decryptPayload` — recover plaintext from a stored payload: scans for
+ * - `generateKeypair` / `attachPublicKey` — legacy RSA provisioning for
+ *   pre-hybrid gateways. Current gateways reject these RSA public keys.
+ * - `decryptPayload` — recover plaintext from legacy stored payloads: scans for
  *   `RSA-OAEP/AES-256-GCM` envelopes, unwraps each DEK with the client-held
  *   private key, and AES-256-GCM-decrypts the field back to plaintext.
- *
- * Write path (server-side encryption):
- *   const client = new MaskuraClient({ endpoint, accessKey, secretKey });
- *   const { privateKeyPem, publicKeyPem } = await MaskuraClient.generateKeypair();
- *   await client.attachPublicKey(publicKeyPem);            // once per key
- *   await client.putObject("my-bucket", "ingest/data.jsonl", payload);
  *
  * Read path (client-side decryption):
  *   const raw = await client.getObject("my-bucket", "ingest/data.jsonl");
@@ -57,7 +48,9 @@ export class MaskuraClient {
 
   // -- keys ---------------------------------------------------------
 
-  /** Generate an RSA-2048 keypair for envelope encryption (SPKI/PKCS#8 PEM). */
+  /** Generate a legacy RSA-2048 envelope keypair (SPKI/PKCS#8 PEM).
+   * Current gateways accept only Maskura hybrid public keys for new writes.
+   */
   static async generateKeypair(): Promise<{ privateKeyPem: string; publicKeyPem: string }> {
     const subtle = globalThis.crypto.subtle;
     const kp = await subtle.generateKey(
@@ -78,7 +71,9 @@ export class MaskuraClient {
     };
   }
 
-  /** Bind `publicKeyPem` to this API key so the gateway encrypts PII. */
+  /** Bind a public key to this API key. Current gateways reject the legacy RSA
+   * keys returned by `generateKeypair`; this remains for pre-hybrid gateways.
+   */
   async attachPublicKey(publicKeyPem: string): Promise<void> {
     const resp = await fetch(`${this.endpoint}/dashboard/api/keys/public-key`, {
       method: "PUT",

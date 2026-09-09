@@ -226,7 +226,7 @@ body {
 <div class="container">
 <div class="hero">
   <h1>Run your plugins <mark>before</mark> data reaches storage</h1>
-  <p>Platform-agnostic processing gateway. Point any S3 client at Maskura to filter, redact, encrypt, or convert every object with your Wasm plugins.</p>
+  <p>Platform-agnostic processing gateway. Point any S3 client at Maskura to filter, redact, encrypt, or convert supported object content with your Wasm plugins.</p>
 
   <canvas class="flow-canvas" id="flowCanvas" width="1200" height="320"></canvas>
 
@@ -606,65 +606,9 @@ client.send(httpReq, HttpResponse.BodyHandlers.ofString());</div>
 </div>
 
 <div class="section">
-  <div class="section-label">Client SDKs</div>
-  <div class="section-title">Envelope encryption built in</div>
-  <div class="section-subtitle">Python and TypeScript SDKs ship a high-level client. Generate a keypair, hand Maskura the public half once, and every PUT is envelope-encrypted server-side (hybrid X25519 + ML-KEM-768 + AES-256-GCM). Read back and decrypt with your private key; Maskura never sees it.</div>
-
-  <div class="tab-bar">
-    <button class="tab-btn active" onclick="switchTab('sdk-python', this)">Python</button>
-    <button class="tab-btn" onclick="switchTab('sdk-ts', this)">TypeScript</button>
-  </div>
-
-  <div class="tab-content active" id="tab-sdk-python">
-    <div class="code-wrapper">
-      <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
-      <div class="code-block">pip install -e sdks/python requests cryptography
-
-from maskura_client import MaskuraClient
-
-client = MaskuraClient("http://localhost:9000", "s4_KEY_ID", "s4s_SECRET")
-
-# One-time: generate a keypair and hand Maskura the public half.
-# The envelope-encrypt plugin encrypts on every PUT; only you can decrypt it.
-private_pem, public_pem = MaskuraClient.generate_keypair()
-client.attach_public_key(public_pem)
-
-# Write — PII envelope-encrypted server-side (hybrid X25519 + ML-KEM-768 + AES-256-GCM)
-client.put_object("my-bucket", "ingest/data.jsonl", open("data.jsonl", "rb").read())
-
-# Read — decrypt the envelopes back to plaintext with your private key
-raw = client.get_object("my-bucket", "ingest/data.jsonl")
-plaintext = MaskuraClient.decrypt_payload(raw, private_pem)</div>
-    </div>
-  </div>
-
-  <div class="tab-content" id="tab-sdk-ts">
-    <div class="code-wrapper">
-      <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
-      <div class="code-block">npm install sdks/typescript   # builds dist/ on install
-
-import { MaskuraClient } from "maskura-client";
-
-const client = new MaskuraClient({
-  endpoint: "http://localhost:9000",
-  accessKey: "s4_KEY_ID",
-  secretKey: "s4s_SECRET",
-});
-
-// One-time: hand Maskura the public half of a fresh keypair
-const { privateKeyPem, publicKeyPem } = await MaskuraClient.generateKeypair();
-await client.attachPublicKey(publicKeyPem);
-
-// Write — PII encrypted server-side (hybrid X25519 + ML-KEM-768 + AES-256-GCM)
-await client.putObject("my-bucket", "ingest/data.jsonl",
-  new TextEncoder().encode(JSON.stringify(records)));
-
-// Read — decrypt envelopes client-side
-const raw = await client.getObject("my-bucket", "ingest/data.jsonl");
-const plaintext = new TextDecoder().decode(
-  await MaskuraClient.decryptPayload(raw, privateKeyPem));</div>
-    </div>
-  </div>
+  <div class="section-label">Envelope encryption</div>
+  <div class="section-title">Hybrid wire format; client packaging in progress</div>
+  <div class="section-subtitle">Current gateways accept Maskura hybrid X25519 + ML-KEM-768 public keys for new encrypted writes. The released Python and TypeScript high-level encryption helpers still implement the legacy RSA envelope and cannot provision a key on this gateway. Redaction and ordinary SDK object operations are unaffected. See <a href="https://github.com/231self/maskura/blob/main/docs/encryption.md#client-tooling-status">the current client compatibility boundary</a>.</div>
 </div>
 
 <div class="section">
@@ -677,7 +621,7 @@ const plaintext = new TextDecoder().decode(
 </div>
 
 <footer class="footer container">
-  Maskura Gateway &middot; pluggable processing &middot; <a href="https://github.com/231self/S4" style="color:var(--text-muted)">Maskura on GitHub</a>
+  Maskura Gateway &middot; pluggable processing &middot; <a href="https://github.com/231self/maskura" style="color:var(--text-muted)">Maskura on GitHub</a>
 </footer>
 
 <script>

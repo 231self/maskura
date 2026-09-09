@@ -15,7 +15,7 @@ from dagger import dag, function, object_type
 
 REGISTRY = "ghcr.io/231self/maskura/maskura"
 LEGACY_REGISTRY = "ghcr.io/231self/s4/s4"
-REPO = "https://github.com/231self/S4.git"
+REPO = "https://github.com/231self/maskura.git"
 DEFAULT_REF = "main"
 
 

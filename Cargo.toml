@@ -26,7 +26,7 @@ members = [
 version = "0.5.3"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/231self/S4"
+repository = "https://github.com/231self/maskura"
 
 [workspace.dependencies]
 maskura-customer-config = { path = "crates/customer-config" }

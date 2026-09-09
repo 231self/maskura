@@ -8,10 +8,10 @@ commit to in return.
 
 ## Supported versions
 
-We support the **latest stable minor release** of Maskura. Security fixes are
-backported to that release line and shipped as a new patch release.
+We support the **latest stable minor release** of Maskura shown on the
+[GitHub Releases page](https://github.com/231self/maskura/releases). Security
+fixes are backported to that release line and shipped as a new patch release.
 
-- Current stable line: **0.3.x** (this repository is at 0.3.5).
 - Older minor releases receive security fixes on a best-effort basis only.
 - Pre-release and `-dev` builds are not supported; move to the latest stable
   release before reporting.
@@ -27,7 +27,7 @@ pull request, or discussion.
 
 Two equivalent private channels:
 
-1. **[Maskura private vulnerability reporting](https://github.com/231self/S4/security/advisories/new)**
+1. **[Maskura private vulnerability reporting](https://github.com/231self/maskura/security/advisories/new)**
    — Security → Report a vulnerability on this repository.
 2. **security@231self.com** — for reports that cannot go through GitHub, or
    for incidents already in progress.
@@ -95,6 +95,9 @@ Out of scope:
 
 ## Key handling note
 
-Maskura stores only envelopes and hashes of API key secrets, never plaintext. If you
-suspect a key compromise, revoke the key immediately (`maskura key revoke`) and
-rotate any backend credentials it could reach before reporting.
+Maskura stores hashes of API key secrets rather than the plaintext secrets.
+Object confidentiality depends on the configured pipeline: pass-through writes
+can store plaintext, while redaction and encryption transform supported content
+before it reaches the destination. If you suspect a key compromise, revoke the
+key immediately (`maskura key revoke`) and rotate any backend credentials it
+could reach before reporting.

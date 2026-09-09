@@ -4,7 +4,7 @@ Thanks for considering a contribution to Maskura.
 
 ## Getting started
 
-1. Fork [Maskura on GitHub](https://github.com/231self/S4/fork) and clone your fork.
+1. Fork [Maskura on GitHub](https://github.com/231self/maskura/fork) and clone your fork.
 2. Install Rust 1.97.0 (see `rust-toolchain.toml`) with the `wasm32-wasip1` target:
    `rustup target add wasm32-wasip1`
 3. Install `wasm-tools` (`cargo install --locked wasm-tools --version 1.255.0`) and `just`.

@@ -1171,7 +1171,7 @@ struct S3Query {
 #[openapi(
     info(
         title = "Maskura Gateway API",
-        version = "0.3.5",
+        version = env!("CARGO_PKG_VERSION"),
         description = "Pluggable processing gateway for S3-compatible storage. Manage plugins and API keys, proxy S3 requests through a Wasm plugin pipeline."
     ),
     paths(get_keys, create_key, delete_key, get_mcp_tokens, create_mcp_token, delete_mcp_token, get_backend, put_backend, list_objects),
@@ -12039,6 +12039,7 @@ mod demo_limiter_tests {
     fn stateless_demo_process_is_not_published_in_openapi() {
         let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
         assert_eq!(document["info"]["title"], "Maskura Gateway API");
+        assert_eq!(document["info"]["version"], env!("CARGO_PKG_VERSION"));
         assert!(
             document["paths"]
                 .get("/dashboard/api/demo/process")

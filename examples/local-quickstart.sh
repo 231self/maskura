@@ -3,7 +3,7 @@
 # image, push a sample through the plugin pipeline, assert it was redacted,
 # then stop. No cloud account, no repo clone.
 #
-# Requires: maskura (cargo install --git https://github.com/231self/S4 --bin maskura s4ctl),
+# Requires: maskura (cargo install --git https://github.com/231self/maskura --bin maskura s4ctl),
 # Docker. The gateway image is pinned to the `maskura` executable version.
 #
 # Run: bash examples/local-quickstart.sh

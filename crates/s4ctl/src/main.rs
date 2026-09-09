@@ -1877,8 +1877,8 @@ async fn main() -> anyhow::Result<()> {
 
         Command::Local { cmd } => {
             const LOCAL_GATEWAY_NAME: &str = "s4-local-gateway";
-            // Pin the gateway image to the CLI version (v0.3.3 image for
-            // maskura 0.3.3) so CLI and gateway always match; never :latest.
+            // Pin the gateway image to the CLI version so CLI and gateway
+            // always match; never use :latest.
             let local_gateway_image = format!(
                 "ghcr.io/231self/maskura/maskura:v{}",
                 env!("CARGO_PKG_VERSION")

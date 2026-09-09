@@ -1,6 +1,7 @@
 # Summary
 
 - [Home](index.md)
+- [Open source and hosted boundaries](open-source.md)
 - [Demo](demo.md)
 - [Plugins](plugins.md)
 - [Encryption](encryption.md)
