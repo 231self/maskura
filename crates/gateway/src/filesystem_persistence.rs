@@ -159,6 +159,22 @@ impl FilesystemPersistence {
         }
     }
 
+    pub(crate) fn remove_file_durably(
+        &self,
+        path: &Path,
+        operation: &'static str,
+    ) -> Result<bool, PersistenceError> {
+        reject_non_regular_if_present(path, operation)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                sync_parent(path).map_err(|source| unknown(operation, source))?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(io(operation, source)),
+        }
+    }
+
     fn atomic_write(
         &self,
         path: &Path,
@@ -221,7 +237,7 @@ impl FilesystemPersistence {
     }
 
     #[cfg(test)]
-    fn fail_once(&self, point: FaultPoint) {
+    pub(crate) fn fail_once(&self, point: FaultPoint) {
         self.faults
             .lock()
             .expect("fault injector lock poisoned")
@@ -231,7 +247,7 @@ impl FilesystemPersistence {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FaultPoint {
+pub(crate) enum FaultPoint {
     PreWrite,
     PostWrite,
     FileSync,
