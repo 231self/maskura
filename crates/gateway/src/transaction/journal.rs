@@ -1098,10 +1098,12 @@ impl OperationJournal for InMemoryOperationJournal {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod contract {
+    use std::collections::BTreeMap;
+
     use super::*;
 
-    fn operation() -> OperationRecord {
+    pub(crate) fn operation() -> OperationRecord {
         OperationRecord::intent(
             ObjectDestination {
                 backend_id: "test".to_string(),
@@ -1112,6 +1114,180 @@ mod tests {
             },
             ExpectedObject::default(),
         )
+    }
+
+    pub(crate) async fn run(journal: &dyn OperationJournal) {
+        let mut operation = operation();
+        operation.created_at_ms = 1;
+        operation.updated_at_ms = 1;
+        journal.insert_intent(operation.clone()).await.unwrap();
+        assert_eq!(
+            journal.get(operation.id).await.unwrap(),
+            Some(operation.clone())
+        );
+
+        let expected = ExpectedObject {
+            digest: Some("output-digest".to_string()),
+            size: Some(12),
+            metadata: BTreeMap::from([("content-type".to_string(), "text/plain".to_string())]),
+        };
+        journal.set_expected(operation.id, &expected).await.unwrap();
+        journal
+            .compare_and_set_client_multipart_upload_reference(
+                operation.id,
+                None,
+                Some("client-upload"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            journal
+                .compare_and_set_client_multipart_upload_reference(
+                    operation.id,
+                    None,
+                    Some("stale"),
+                )
+                .await
+                .is_err()
+        );
+        journal
+            .set_open(operation.id, Some("provider-upload"))
+            .await
+            .unwrap();
+
+        let second = PartRecord {
+            operation_id: operation.id,
+            part_number: 2,
+            etag: "etag-2".to_string(),
+            size_bytes: 2,
+            digest: "digest-2".to_string(),
+            created_at_ms: 2,
+        };
+        let first = PartRecord {
+            part_number: 1,
+            etag: "etag-1".to_string(),
+            size_bytes: 1,
+            digest: "digest-1".to_string(),
+            ..second.clone()
+        };
+        journal.record_part(second.clone()).await.unwrap();
+        journal.record_part(first.clone()).await.unwrap();
+        journal.record_part(first.clone()).await.unwrap();
+        assert_eq!(
+            journal.parts(operation.id).await.unwrap(),
+            [first.clone(), second]
+        );
+        let mut conflicting_part = first;
+        conflicting_part.digest = "changed".to_string();
+        assert!(journal.record_part(conflicting_part).await.is_err());
+
+        let evidence = EvidenceRecord {
+            id: Uuid::now_v7(),
+            operation_id: operation.id,
+            kind: "probe".to_string(),
+            detail: serde_json::json!({"result": "absent"}),
+            created_at_ms: 3,
+        };
+        journal.append_evidence(evidence.clone()).await.unwrap();
+        journal.append_evidence(evidence.clone()).await.unwrap();
+        let mut conflicting_evidence = evidence.clone();
+        conflicting_evidence.kind = "changed".to_string();
+        assert!(journal.append_evidence(conflicting_evidence).await.is_err());
+        assert_eq!(journal.evidence(operation.id).await.unwrap(), [evidence]);
+
+        journal
+            .record_mutation_launch(operation.id, 10)
+            .await
+            .unwrap();
+        assert!(
+            !journal
+                .confirm_exact_absence(operation.id, 9, 5)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !journal
+                .confirm_exact_absence(operation.id, 10, 5)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !journal
+                .confirm_exact_absence(operation.id, 14, 5)
+                .await
+                .unwrap()
+        );
+        assert!(
+            journal
+                .confirm_exact_absence(operation.id, 15, 5)
+                .await
+                .unwrap()
+        );
+
+        journal
+            .transition(
+                operation.id,
+                OperationState::Open,
+                OperationState::Completing,
+                None,
+            )
+            .await
+            .unwrap();
+        journal
+            .transition(
+                operation.id,
+                OperationState::Completing,
+                OperationState::CommitUnknown,
+                None,
+            )
+            .await
+            .unwrap();
+        let committed = StoredObjectMeta {
+            etag: Some("etag".to_string()),
+            version_id: Some("version".to_string()),
+            superseded_version_ids: vec!["old".to_string()],
+            version_history_complete: true,
+        };
+        journal
+            .transition(
+                operation.id,
+                OperationState::CommitUnknown,
+                OperationState::Committed,
+                Some(&committed),
+            )
+            .await
+            .unwrap();
+        assert!(
+            journal
+                .retire_terminal(operation.id, OperationState::Committed, None)
+                .await
+                .is_err()
+        );
+        journal
+            .retire_terminal(
+                operation.id,
+                OperationState::Committed,
+                Some("client-upload"),
+            )
+            .await
+            .unwrap();
+        assert!(journal.get(operation.id).await.unwrap().is_none());
+        assert!(journal.parts(operation.id).await.unwrap().is_empty());
+        assert!(journal.evidence(operation.id).await.unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn operation() -> OperationRecord {
+        contract::operation()
+    }
+
+    #[tokio::test]
+    async fn memory_journal_satisfies_shared_contract() {
+        contract::run(&InMemoryOperationJournal::new()).await;
     }
 
     #[tokio::test]

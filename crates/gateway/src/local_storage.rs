@@ -7,6 +7,7 @@ use crate::file_store::{FileStore, FileStoreError};
 use crate::filesystem_persistence::{FilesystemPersistence, PersistenceError, RootLock};
 use crate::key_cipher::{FileKeyWrapping, FileKeyWrappingError, KeyWrapping};
 use crate::multipart_staging::{StagingError, StagingQuotaLimits};
+use crate::transaction::{FileOperationJournal, JournalError, OperationJournal};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LocalStorageError {
@@ -18,6 +19,8 @@ pub(crate) enum LocalStorageError {
     FileKeyWrapping(#[from] FileKeyWrappingError),
     #[error(transparent)]
     Staging(#[from] StagingError),
+    #[error(transparent)]
+    Journal(#[from] JournalError),
 }
 
 /// Owns all process-scoped resources for one local filesystem storage root.
@@ -31,6 +34,7 @@ pub(crate) struct LocalStorageRuntime {
     )]
     staging_artifacts: Arc<FileStagingArtifactStore>,
     multipart_repository: Arc<FileMultipartRepository>,
+    operation_journal: Arc<FileOperationJournal>,
     #[allow(
         dead_code,
         reason = "consumed by subsequent local multipart startup wiring"
@@ -53,11 +57,15 @@ impl LocalStorageRuntime {
             root.join(".maskura").join("multipart"),
             StagingQuotaLimits::new(i64::MAX as u64, i64::MAX as u64)?,
         )?);
+        let operation_journal = Arc::new(FileOperationJournal::open(
+            root.join(".maskura").join("journal"),
+        )?);
         Ok(Self {
             root,
             file_store,
             staging_artifacts,
             multipart_repository,
+            operation_journal,
             wrapping,
             _root_lock: root_lock,
         })
@@ -81,6 +89,14 @@ impl LocalStorageRuntime {
     )]
     pub(crate) fn multipart_repository(&self) -> Arc<FileMultipartRepository> {
         self.multipart_repository.clone()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by subsequent local multipart startup wiring"
+    )]
+    pub(crate) fn operation_journal(&self) -> Arc<dyn OperationJournal> {
+        self.operation_journal.clone()
     }
 
     #[allow(
@@ -189,6 +205,7 @@ mod tests {
         assert_eq!(first.file_store().root(), first_directory.path());
         assert_eq!(second.file_store().root(), second_directory.path());
         assert!(first.multipart_repository().is_durable());
+        assert!(first.operation_journal().is_durable());
     }
 
     #[tokio::test]

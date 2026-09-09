@@ -4,6 +4,7 @@
 //! persistence, backend, and recovery contracts without changing write routing.
 
 mod file;
+mod file_journal;
 mod journal;
 mod memory;
 mod presign;
@@ -11,6 +12,7 @@ mod s3;
 mod spool;
 
 pub use file::FileSinkTransaction;
+pub(crate) use file_journal::FileOperationJournal;
 #[cfg(any(test, debug_assertions))]
 pub use journal::InMemoryOperationJournal;
 pub use journal::PostgresOperationJournal;
@@ -130,7 +132,7 @@ pub struct ExpectedObject {
     pub metadata: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OperationRecord {
     pub id: Uuid,
     pub state: OperationState,
@@ -261,7 +263,7 @@ impl OperationRecord {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PartRecord {
     pub operation_id: Uuid,
     pub part_number: i32,
@@ -271,7 +273,7 @@ pub struct PartRecord {
     pub created_at_ms: i64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceRecord {
     pub id: Uuid,
     pub operation_id: Uuid,
@@ -292,7 +294,7 @@ impl EvidenceRecord {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StoredObjectMeta {
     pub etag: Option<String>,
     pub version_id: Option<String>,
