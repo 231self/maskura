@@ -183,10 +183,10 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 - Local dev uses Supabase CLI default credentials.
 - **Release automation** (`.github/workflows/release.yml`): `DEEPSEEK_API_KEY`
   (optional; authors release notes with a GitHub-generated fallback),
-  `DISCORD_WEBHOOK_URL` (announces new releases), and `RELEASE_TOKEN` (the
-  fine-grained PAT used by `.github/workflows/tag-on-version-bump.yml` to push
-  `v*` tags so the release workflow fires). Maintainers configure these as
-  GitHub Actions repository secrets. See ADR 0015.
+  and `DISCORD_WEBHOOK_URL` (announces new releases). Maintainers configure
+  these as GitHub Actions repository secrets. Version bumps use the scoped
+  `GITHUB_TOKEN` to create the tag and call the reusable release workflow
+  directly; no maintainer PAT is required. See ADR 0015.
 
 ### Key Formats
 

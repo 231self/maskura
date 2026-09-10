@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Existing v* tag to build and publish
+        required: true
+        type: string
 
 permissions:
   artifact-metadata: write
@@ -16,6 +22,7 @@ env:
   RUSTFLAGS: -D warnings
   CARGO_BUILD_JOBS: 2
   IMAGE: ghcr.io/${{ github.repository_owner }}/maskura/maskura
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
 jobs:
   contract:
@@ -24,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Verify release tag and version surfaces
-        run: python3 scripts/check-release-contract.py --tag "${{ github.ref_name }}"
+        run: python3 scripts/check-release-contract.py --tag "${{ env.RELEASE_TAG }}"
 
   # Native per-arch builds: amd64 on the x64 runner, arm64 on the native
   # arm64 runner. No cross-compilation, so ring/aws-lc-sys/openssl-sys build
@@ -69,7 +76,7 @@ jobs:
           cp target/release/maskura-mcp dist/maskura-mcp-linux-${{ matrix.suffix }}
           cp target/release/maskura dist/maskura-linux-${{ matrix.suffix }}
           cp -r target/components/. dist/components/
-          version="${{ github.ref_name }}"
+          version="${{ env.RELEASE_TAG }}"
           expected="maskura ${version#v}"
           test "$(dist/maskura-linux-${{ matrix.suffix }} --version)" = "$expected"
 
@@ -95,11 +102,11 @@ jobs:
           file: Dockerfile.release
           platforms: ${{ matrix.platform }}
           load: true
-          tags: ${{ env.IMAGE }}:${{ github.ref_name }}-${{ matrix.suffix }}
+          tags: ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}-${{ matrix.suffix }}
 
       - name: Boot-smoke image (${{ matrix.suffix }})
         env:
-          IMAGE_REF: ${{ env.IMAGE }}:${{ github.ref_name }}-${{ matrix.suffix }}
+          IMAGE_REF: ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}-${{ matrix.suffix }}
         run: bash scripts/release-image-smoke.sh "$IMAGE_REF"
 
       - name: Log in to GHCR
@@ -111,7 +118,7 @@ jobs:
 
       - name: Push image (${{ matrix.suffix }})
         env:
-          IMAGE_REF: ${{ env.IMAGE }}:${{ github.ref_name }}-${{ matrix.suffix }}
+          IMAGE_REF: ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}-${{ matrix.suffix }}
         run: |
           docker push "$IMAGE_REF"
 
@@ -142,7 +149,7 @@ jobs:
 
       - name: Smoke native binaries
         run: |
-          version="${{ github.ref_name }}"
+          version="${{ env.RELEASE_TAG }}"
           expected="maskura ${version#v}"
           test "$(target/release/maskura --version)" = "$expected"
           target/release/maskura --version
@@ -206,14 +213,14 @@ jobs:
       - name: Merge multi-arch manifest
         run: |
           docker buildx imagetools create \
-            -t ${{ env.IMAGE }}:${{ github.ref_name }} \
-            ${{ env.IMAGE }}:${{ github.ref_name }}-amd64 \
-            ${{ env.IMAGE }}:${{ github.ref_name }}-arm64
+            -t ${{ env.IMAGE }}:${{ env.RELEASE_TAG }} \
+            ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}-amd64 \
+            ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}-arm64
 
       - name: Resolve published image digests
         id: image-digests
         run: |
-          canonical=$(docker buildx imagetools inspect "${{ env.IMAGE }}:${{ github.ref_name }}" --format '{{json .Manifest}}' | jq -r '.digest')
+          canonical=$(docker buildx imagetools inspect "${{ env.IMAGE }}:${{ env.RELEASE_TAG }}" --format '{{json .Manifest}}' | jq -r '.digest')
           test -n "$canonical" && test "$canonical" != "null"
           echo "canonical=$canonical" >> "$GITHUB_OUTPUT"
           printf '%s@%s\n' "${{ env.IMAGE }}" "$canonical" > dist/IMAGE_DIGESTS
@@ -227,7 +234,7 @@ jobs:
 
       - name: Prove the versioned image before promotion
         env:
-          MASKURA_PROOF_IMAGE: ${{ env.IMAGE }}:${{ github.ref_name }}
+          MASKURA_PROOF_IMAGE: ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}
         run: bash examples/prove-maskura.sh
 
       - name: Attest canonical container provenance
@@ -240,7 +247,7 @@ jobs:
       - name: Extract release artifacts from image
         run: |
           mkdir -p dist/plugins
-          docker create --name maskura-extract --platform linux/amd64 "${{ env.IMAGE }}:${{ github.ref_name }}-amd64"
+          docker create --name maskura-extract --platform linux/amd64 "${{ env.IMAGE }}:${{ env.RELEASE_TAG }}-amd64"
           docker cp maskura-extract:/usr/local/bin/maskura-gateway dist/maskura-gateway-linux-x86_64
           docker cp maskura-extract:/app/components/. dist/plugins/
           docker rm maskura-extract
@@ -276,7 +283,7 @@ jobs:
         run: |
           docker buildx imagetools create \
             -t ${{ env.IMAGE }}:latest \
-            ${{ env.IMAGE }}:${{ github.ref_name }}
+            ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}
 
       - name: Make the Maskura image public
         continue-on-error: true
@@ -291,20 +298,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        run: bash scripts/release-notes.sh "${{ github.ref_name }}" release-notes.md
+        run: bash scripts/release-notes.sh "${{ env.RELEASE_TAG }}" release-notes.md
 
       - name: Create GitHub Release
         id: github-release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "release ${{ github.ref_name }} already exists; leaving it unchanged (no re-announce)"
+          if gh release view "${{ env.RELEASE_TAG }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "release ${{ env.RELEASE_TAG }} already exists; leaving it unchanged (no re-announce)"
             echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          gh release create "${{ github.ref_name }}" \
+          gh release create "${{ env.RELEASE_TAG }}" \
              dist/maskura-gateway-linux-x86_64 \
              dist/maskura-mcp-linux-amd64 \
              dist/maskura-mcp-linux-arm64 \
@@ -330,7 +337,7 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: bash scripts/post-release-discord.sh "${{ github.ref_name }}" release-notes.md
+        run: bash scripts/post-release-discord.sh "${{ env.RELEASE_TAG }}" release-notes.md
 
   verify-release:
     needs: release
@@ -347,7 +354,7 @@ jobs:
       - name: Verify published image architectures
         run: |
           docker buildx imagetools inspect \
-            "${{ env.IMAGE }}:${{ github.ref_name }}" \
+            "${{ env.IMAGE }}:${{ env.RELEASE_TAG }}" \
             --format '{{json .Manifest}}' > manifest.json
           python3 - <<'PY'
           import json
@@ -367,7 +374,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir verify-dist
-          gh release download "${{ github.ref_name }}" \
+          gh release download "${{ env.RELEASE_TAG }}" \
             --repo "${{ github.repository }}" \
             --dir verify-dist
           (cd verify-dist && sha256sum --check SHA256SUMS)
