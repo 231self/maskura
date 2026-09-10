@@ -12,8 +12,8 @@ require_command() {
 }
 
 require_command cargo
+require_command grep
 require_command npm
-require_command rg
 
 echo "==> Rust advisories"
 bash scripts/audit-rust.sh
@@ -48,16 +48,16 @@ cp sdks/typescript/package.json "$npm_audit_dir/package.json"
 )
 
 echo "==> Immutable CI and container references"
-if rg --pcre2 -n \
-  'uses:\s+(?!\./)[^@[:space:]]+@(?![0-9a-f]{40}(?:[[:space:]]|$))' \
-  .github/workflows; then
+if grep -REn \
+  'uses:[[:space:]]+[^./[:space:]][^[:space:]]*@' \
+  .github/workflows \
+  | grep -Ev '@[0-9a-f]{40}([[:space:]]|$)'; then
   echo "error: external GitHub Actions must use a full 40-character commit SHA" >&2
   exit 1
 fi
 
-if rg --pcre2 -n \
-  '^FROM\s+[^@[:space:]]+(?::[^@[:space:]]+)?(?!@sha256:[0-9a-f]{64})(?:\s+AS\s+.*)?$' \
-  Dockerfile Dockerfile.release; then
+if grep -nE '^FROM[[:space:]]+' Dockerfile Dockerfile.release \
+  | grep -Ev '@sha256:[0-9a-f]{64}([[:space:]]|$)'; then
   echo "error: Docker base images must use an immutable sha256 digest" >&2
   exit 1
 fi
