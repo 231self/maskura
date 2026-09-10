@@ -92,8 +92,9 @@ prove_redaction() {
 
 prove_plugin_import() {
   require aws
-  local component="$ROOT/components/email-detect.component.wasm"
-  [ -f "$component" ] || fail "missing component: $component"
+  local component="$TMP/email-detect.component.wasm"
+  docker cp "$CONTAINER:/app/components/email-detect.component.wasm" "$component" >/dev/null
+  [ -s "$component" ] || fail "versioned image does not contain email-detect.component.wasm"
   disable_plugins
   curl -fsS -X POST -H 'x-maskura-plugin-name: proof-email-only' \
     --data-binary "@$component" "$ENDPOINT/dashboard/api/plugins" > "$TMP/imported.json"
