@@ -165,9 +165,9 @@ docker run --rm -p 8080:8080 -v maskura-data:/data \
   ghcr.io/231self/maskura/maskura:latest
 ```
 
-The local-mode startup output prints `MASKURA_ACCESS_KEY` and
-`MASKURA_SECRET_KEY`. Use them with the CLI or `aws --endpoint-url
-http://localhost:8080 s3 ...`. Objects, local API keys, and in-progress staged
+With `AUTH_DISABLED=true`, clients can use any non-empty placeholder credentials;
+the quickstart uses `demo`. The gateway never prints generated key secrets to its
+logs. Objects, local API keys, and in-progress staged
 multipart uploads survive container restarts through the mounted volume. Keep
 the `.maskura/wrapping.key` file with the volume backup; losing it makes
 encrypted incomplete uploads unrecoverable.
@@ -332,10 +332,19 @@ S3 SDK / CLI / tool ──▶ Maskura Gateway (Wasm plugin pipeline) ──▶ s
 ## Development
 
 ```bash
-just check        # fmt + clippy + build filters + tests
-just e2e          # end-to-end against MinIO (Docker)
-just build-sdks   # regenerate Python/TypeScript SDKs from the OpenAPI spec
+just check          # fmt + clippy + build filters + tests
+just pre-push       # check + Rust/Python/npm advisories + dependency policy
+just push           # run pre-push, then publish the current jj bookmark
+just e2e            # end-to-end against MinIO (Docker)
+just build-sdks     # regenerate Python/TypeScript SDKs from the OpenAPI spec
 ```
+
+`just pre-push` is the local trust gate: it mirrors the dependency-security
+checks that would otherwise first appear in GitHub, and verifies that Actions
+and Docker base images remain pinned to immutable revisions. It requires
+`cargo-audit`, `cargo-deny`, `uvx`, and `npm`. Dependabot still handles scheduled
+update discovery; the local gate blocks known vulnerable dependencies before a
+push.
 
 ### Run CI/release locally (no GitHub minutes)
 

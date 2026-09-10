@@ -13,7 +13,7 @@ sections that do not.
 
 ## Test plan
 
-- [ ] `just check` (fmt + clippy + build filters + tests)
+- [ ] `just pre-push` (checks + Rust/Python/npm dependency audits)
 - [ ] `just e2e` (if gateway/data-plane behavior changed)
 - [ ] `cargo check -p s4-gateway` (dashboard/HTML changes — embedded via include_str!)
 - [ ] `mdbook build docs` (if `docs/` chapters changed)

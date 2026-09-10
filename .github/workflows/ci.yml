@@ -177,10 +177,9 @@ jobs:
         run: |
           cargo install --locked cargo-audit --version 0.22.2
           cargo install --locked cargo-deny --version 0.20.2
-      - name: RustSec advisory audit
-        run: bash scripts/audit-rust.sh
-      - name: Dependency policy audit
-        run: cargo deny check
+          python3 -m pip install pip-audit==2.9.0
+      - name: Dependency and supply-chain audit
+        run: bash scripts/audit-dependencies.sh
 
   dependency-review:
     runs-on: ubuntu-latest

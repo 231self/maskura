@@ -17,10 +17,10 @@ check-fmt:
   cargo fmt --check
 
 check-lint:
-  cargo clippy --all-targets -- -D warnings
+  cargo clippy --locked --all-targets -- -D warnings
 
 test:
-  cargo test --workspace
+  cargo test --locked --workspace
 
 build-filters:
   bash scripts/build-filters.sh
@@ -31,7 +31,19 @@ deny:
 audit:
   bash scripts/audit-rust.sh
 
-# Meta-linter: runs all static checks + dependency audit (like ruff/golangci-lint)
+# Audit every shipped dependency ecosystem and verify immutable build inputs.
+audit-dependencies:
+  bash scripts/audit-dependencies.sh
+
+# Canonical local gate before publishing a jj bookmark.
+pre-push: check audit-dependencies
+  @echo "Pre-push checks passed"
+
+# Safe publishing path for this jj repository. Extra arguments are passed to jj.
+push *args: pre-push
+  jj git push {{args}}
+
+# Meta-linter: runs all static checks + Rust dependency policy
 lint: check-fmt check-lint deny
   @echo "Meta-lint passed"
 

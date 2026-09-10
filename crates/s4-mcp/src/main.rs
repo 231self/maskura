@@ -17,7 +17,7 @@ use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabiliti
 use rmcp::tool;
 use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool_handler, tool_router};
-use url::Url;
+use url::{Host, Url};
 
 const DEFAULT_GATEWAY_URL: &str = "http://localhost:8080";
 const MAX_TEXT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -71,6 +71,11 @@ impl Config {
         if !matches!(gateway_url.scheme(), "http" | "https") || gateway_url.host().is_none() {
             anyhow::bail!("MASKURA_GATEWAY_URL must be an absolute HTTP(S) URL");
         }
+        if gateway_url.scheme() == "http" && !is_loopback_url(&gateway_url) {
+            anyhow::bail!(
+                "MASKURA_GATEWAY_URL must use HTTPS unless it targets a loopback address"
+            );
+        }
 
         let auth = if let Some(token) = mcp_token {
             GatewayAuth::McpToken(parse_secret_header("MASKURA_MCP_TOKEN", &token)?)
@@ -109,6 +114,15 @@ impl Config {
             }
         }
         headers
+    }
+}
+
+fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
     }
 }
 
@@ -608,6 +622,42 @@ mod tests {
         .to_string();
         assert!(error.contains("MASKURA_MCP_TOKEN"));
         assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn config_rejects_cleartext_non_loopback_gateways() {
+        let error = Config::new(
+            "http://gateway.example.com:8080",
+            Some("token".to_string()),
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("HTTPS"));
+    }
+
+    #[test]
+    fn config_accepts_https_and_ip_loopback_gateways() {
+        assert!(
+            Config::new(
+                "https://gateway.example.com",
+                Some("token".to_string()),
+                None,
+                None,
+            )
+            .is_ok()
+        );
+        assert!(
+            Config::new(
+                "http://127.0.0.1:8080",
+                Some("token".to_string()),
+                None,
+                None,
+            )
+            .is_ok()
+        );
+        assert!(Config::new("http://[::1]:8080", Some("token".to_string()), None, None,).is_ok());
     }
 
     #[test]

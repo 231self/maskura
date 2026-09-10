@@ -12474,22 +12474,17 @@ pub async fn build_state_with_pipeline_template(
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     }
 
-    // Local mode: ensure a demo key exists and print it so SDK demos and
-    // `aws s3 --endpoint-url` work out of the box.
+    // Local mode: ensure a demo principal exists for plugin context. Auth is
+    // disabled, so clients use non-secret placeholder credentials and the
+    // generated key secret must never be written to process logs.
     if auth_disabled {
         let demo_workspace = workspace_storage.resolve_workspace("demo-user").await?;
         let existing = keys.list_for_user("demo-user").await?;
         if existing.is_empty() {
-            let (secret, created) = keys
+            let (_secret, created) = keys
                 .create_key("demo-user", &demo_workspace, "local-default", 0, None)
                 .await?;
-            println!("MASKURA_ACCESS_KEY={}", created.key_id);
-            println!("MASKURA_SECRET_KEY={secret}");
-        } else if let Some(k) = existing.into_iter().find(|k| k.label == "local-default")
-            && let Some(secret) = keys.decrypt_secret(&k.key_id).await?
-        {
-            println!("MASKURA_ACCESS_KEY={}", k.key_id);
-            println!("MASKURA_SECRET_KEY={secret}");
+            info!(key_id = %created.key_id, "created local demo API key");
         }
     }
 

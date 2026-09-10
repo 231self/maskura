@@ -1414,8 +1414,8 @@ async fn main() -> anyhow::Result<()> {
                         );
                         println!("# Or with curl:");
                         println!("curl -X PUT \"{}\" \\", url);
-                        println!("  -H \"x-maskura-access-key: {}\" \\", client.access_key);
-                        println!("  -H \"x-maskura-secret-key: {}\"", client.secret_key);
+                        println!("  -H \"x-maskura-access-key: $MASKURA_ACCESS_KEY\" \\");
+                        println!("  -H \"x-maskura-secret-key: $MASKURA_SECRET_KEY\"");
                         println!("  --data-binary @file");
                     } else {
                         let err = String::from_utf8_lossy(&status.stderr);

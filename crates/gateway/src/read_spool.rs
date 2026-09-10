@@ -53,12 +53,9 @@ impl EncryptedReadSpool {
                 "transformed-read spool object limit must be greater than zero".to_string(),
             ));
         }
+        let directory = prepare_spool_directory(directory).await?;
         let reserved_bytes = disk_reservation(max_object_bytes)?;
         quota.reserve_bytes(reserved_bytes)?;
-        if let Err(error) = tokio::fs::create_dir_all(&directory).await {
-            quota.release_bytes(reserved_bytes);
-            return Err(TransactionError::Spool(error.to_string()));
-        }
         let path = directory.join(format!("{READ_FILE_PREFIX}{}.tmp", Uuid::now_v7()));
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
@@ -199,6 +196,30 @@ impl EncryptedReadSpool {
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
+}
+
+async fn prepare_spool_directory(directory: PathBuf) -> Result<PathBuf, TransactionError> {
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .map_err(spool_error)?;
+    let metadata = tokio::fs::symlink_metadata(&directory)
+        .await
+        .map_err(spool_error)?;
+    if !metadata.file_type().is_dir() {
+        return Err(TransactionError::Spool(
+            "transformed-read spool path must be a directory, not a symlink or file".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tokio::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(spool_error)?;
+    }
+    tokio::fs::canonicalize(directory)
+        .await
+        .map_err(spool_error)
 }
 
 impl Drop for EncryptedReadSpool {
@@ -389,6 +410,8 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
+            let directory_mode = std::fs::metadata(&directory).unwrap().permissions().mode();
+            assert_eq!(directory_mode & 0o777, 0o700);
             let mode = std::fs::metadata(spool.path())
                 .unwrap()
                 .permissions()
@@ -403,6 +426,28 @@ mod tests {
         spool.abort().await;
         assert_eq!(quota.reserved_bytes(), 0);
         let _ = tokio::fs::remove_dir(directory).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spool_directory_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = directory();
+        let target = root.join("target");
+        let link = root.join("link");
+        tokio::fs::create_dir_all(&target).await.unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = EncryptedReadSpool::begin(link, 8, Arc::new(SpoolQuota::new(64)))
+            .await
+            .err()
+            .expect("symlink spool directory must fail");
+        assert!(error.to_string().contains("must be a directory"));
+
+        tokio::fs::remove_file(root.join("link")).await.unwrap();
+        tokio::fs::remove_dir(target).await.unwrap();
+        tokio::fs::remove_dir(root).await.unwrap();
     }
 
     #[tokio::test]

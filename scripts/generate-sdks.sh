@@ -122,6 +122,14 @@ from pathlib import Path
 import sys
 
 root = Path(sys.argv[1])
+api_client = root.joinpath("s4_client/api_client.py")
+api_client_source = api_client.read_text()
+unsafe_json_suffix = r"[\w!#$&.+-^_]+"
+safe_json_suffix = r"[\w!#$&.+^_-]+"
+if unsafe_json_suffix not in api_client_source:
+    raise SystemExit("generated Python JSON media-type expression changed upstream")
+api_client.write_text(api_client_source.replace(unsafe_json_suffix, safe_json_suffix))
+
 pyproject = root.joinpath("pyproject.toml").read_text()
 pyproject = pyproject.replace('name = "s4_client"', 'name = "maskura_client"', 1)
 pyproject = pyproject.replace(
