@@ -55,7 +55,7 @@ Trust boundaries:
 
 ### S3 data plane — API keys
 
-A Maskura API key is a pair `s4_<32-hex>` (access key ID) + `s4s_<32-hex>`
+A Maskura API key is a pair `maskura_<32-hex>` (access key ID) + `maskura_secret_<32-hex>`
 (secret), revealed once at creation. Two authentication paths:
 
 1. **Maskura SDK header path** — the client sends the plaintext secret in
@@ -67,8 +67,9 @@ A Maskura API key is a pair `s4_<32-hex>` (access key ID) + `s4s_<32-hex>`
 whose signature does not match the stored secret.
 
 The `x-maskura-*` customer headers are the only supported names. Reserved
-metering, operation, and usage headers are rejected. Credential prefixes remain
-`s4_`, `s4s_`, and `s4m_` so existing credentials do not change.
+metering, operation, and usage headers are rejected. Credential prefixes are
+`maskura_`, `maskura_secret_`, and `maskura_mcp_`. The 0.7 namespace cut
+intentionally invalidates credentials issued under the pre-Maskura prefixes.
 
 ### SigV4 verification
 
@@ -99,7 +100,7 @@ signature verification all complete before a request body is polled.
   storage-selection or processing semantic. Optional headers may be absent, so
   a normal host-only presigned GET remains valid; violations receive the generic
   signature-mismatch response before the request body is read.
-- **Scope validation** — region (`S4_SIGV4_REGION`, default `us-east-1`),
+- **Scope validation** — region (`MASKURA_SIGV4_REGION`, default `us-east-1`),
   service (`s3`), and terminator (`aws4_request`) are enforced; the request
   timestamp must fall within the clock-skew window (15 minutes) and presigned
   URLs cannot exceed 7 days.
@@ -165,12 +166,12 @@ abstraction and does not provide multi-process locking.
 
 | Provider | Durability | When to use |
 |----------|-----------|-------------|
-| `LocalKeyWrapping` (`S4_SECRET_KEK`) | Durable (operator-provided 32-byte KEK) | Local dev and self-host with a managed KEK |
+| `LocalKeyWrapping` (`MASKURA_SECRET_KEK`) | Durable (operator-provided 32-byte KEK) | Local dev and self-host with a managed KEK |
 | Ephemeral (no KEK configured) | Not durable (random in-memory KEK, lost on restart) | Local dev only |
 | KMS/Vault-backed wrapping (injected) | Durable | **Production** |
 
 `build_state` accepts an injected `Arc<dyn KeyWrapping>`. The OSS self-host
-binary resolves `S4_SECRET_KEK` / ephemeral via `key_cipher::default_wrapping()`;
+binary resolves `MASKURA_SECRET_KEK` / ephemeral via `key_cipher::default_wrapping()`;
 a KMS/Vault-backed wrapper can be supplied by an embedding deployment without
 changing the engine. `is_durable()` is the load-bearing flag: **durable staging
 fails closed when the active wrapping is not durable** (see §7), because a lost
@@ -192,7 +193,7 @@ signatures — regenerate them if you need native S3 tools.
 ## 4. The plugin pipeline (data transformation)
 
 - Plugins are Wasm components (`wasmtime`, Component Model + WIT
-  `s4:filter@0.1.0`), 64 MiB aggregate guest memory per object, 10K table
+  `maskura:filter@0.1.0`), 64 MiB aggregate guest memory per object, 10K table
   entries, 4 memories, 512 KiB max stack. No host imports beyond WASI
   stdout/stderr; the boundary is byte-in/byte-out.
 - A **fresh `Store` and component instance per object** (ADR 0007): no runtime
@@ -282,7 +283,7 @@ deliberately strict:
   + region + optional `external_id`) that is assumed via STS per request.
   Runtime S3-compatible endpoints are governed by `WorkspaceEndpointPolicy`
   (see §10), and dashboard reads return only a redacted configuration.
-- **Service storage** — Maskura-managed multi-cloud buckets (`S4_SERVICE_BUCKETS`),
+- **Service storage** — Maskura-managed multi-cloud buckets (`MASKURA_SERVICE_BUCKETS`),
   tenant-namespaced by workspace and optionally backed by authoritative
   placement metadata (see §9).
 - **Resolution contract** — an explicit `x-maskura-storage-mode: managed` request is
@@ -291,7 +292,7 @@ deliberately strict:
   mode (`AUTH_DISABLED=true` or `MASKURA_SINGLE_TENANT=true`) may continue to the
   global `S3_ENDPOINT` and then in-memory storage.
 - **Multi-tenant fail-closed boundary** — startup rejects `S3_ENDPOINT` and
-  requires non-empty `S4_SERVICE_BUCKETS`. An unconfigured workspace therefore
+  requires non-empty `MASKURA_SERVICE_BUCKETS`. An unconfigured workspace therefore
   uses managed storage; workspace repository failures and unavailable explicit
   or workspace-managed selections never fall through to a process-global
   backend.
@@ -309,20 +310,20 @@ backend requirements described below.
 
 - **Durable encrypted staging.** Each part is written to an encrypted artifact
   (under local `.maskura/multipart/` in local mode, or
-  `S4_MULTIPART_STAGING_DIR` in hosted mode) framed as `S4MP10` magic + JSON header
+  `MASKURA_MULTIPART_STAGING_DIR` in hosted mode) framed as `MSKMP1` magic + JSON header
   (containing the wrapped DEK, tenant/upload/part identity, and a digest of the
   multipart snapshot) followed by AES-256-GCM chunks whose AAD binds the header
   and chunk number. Hosted artifacts use the dedicated Maskura-controlled object
-  store (`S4_MULTIPART_STAGING_BUCKET`/`ENDPOINT`/credentials). Local artifacts
+  store (`MASKURA_MULTIPART_STAGING_BUCKET`/`ENDPOINT`/credentials). Local artifacts
   remain on the FileStore volume and use its persisted root wrapping key.
 - **Durability requirement.** Hosted staged multipart requires a durable wrapping
-  (KMS/Vault or a configured `S4_SECRET_KEK`), `DATABASE_URL`, and complete
+  (KMS/Vault or a configured `MASKURA_SECRET_KEK`), `DATABASE_URL`, and complete
   staging backend configuration. Local staged multipart generates and persists a
   mode-0600 wrapping key under `.maskura/` and uses file-backed repository and
   journal implementations; it intentionally requires none of those hosted
   dependencies.
 - **Durable quota reservations.** Per-workspace and global staging quotas
-  (`S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES` / `_GLOBAL_QUOTA_BYTES`) are
+  (`MASKURA_MULTIPART_STAGING_TENANT_QUOTA_BYTES` / `_GLOBAL_QUOTA_BYTES`) are
   reserved by the active multipart repository *before* any body frame is
   consumed, temp file opened, or artifact created. Hosted reservations use
   Postgres row locks; local reservations use the locked file-backed event log.
@@ -375,12 +376,12 @@ Streaming writes (single-part `PUT`, and staged multipart when
 
 ## 9. Managed replication — authority and repair fencing
 
-`S4_MANAGED_STREAMING_MODE` (default `off`; `observe`/`enforce` require
-`S4_MANAGED_STREAMING_TRANSACTIONAL=true` and a durable repository) adds
+`MASKURA_MANAGED_STREAMING_MODE` (default `off`; `observe`/`enforce` require
+`MASKURA_MANAGED_STREAMING_TRANSACTIONAL=true` and a durable repository) adds
 authoritative metadata over the consistent-hash placement:
 
 - **Placement.** Deterministic rendezvous hashing (versioned,
-  `S4_MANAGED_PLACEMENT_VERSION`) selects a primary and one replica backend per
+  `MASKURA_MANAGED_PLACEMENT_VERSION`) selects a primary and one replica backend per
   logical object, independent of backend input order.
 - **Authority.** An `ObjectAuthority` row records generation, digest, size,
   metadata, and primary/replica copy status with compare-and-swap semantics
@@ -397,18 +398,18 @@ authoritative metadata over the consistent-hash placement:
 Presigned-URL handling (`PresignedHttpPolicy`) applies the following before a
 single byte is fetched or sent:
 
-- **Host allowlist** — the URL host must be in `S4_PRESIGNED_HTTP_ALLOWLIST`
+- **Host allowlist** — the URL host must be in `MASKURA_PRESIGNED_HTTP_ALLOWLIST`
   (supports `*.suffix` wildcards).
-- **Scheme** — HTTPS is required. `S4_PRESIGNED_HTTP_ALLOW_HTTP=true` permits
+- **Scheme** — HTTPS is required. `MASKURA_PRESIGNED_HTTP_ALLOW_HTTP=true` permits
   HTTP only for an explicit presigned source `GET`; presigned `PUT` and
   `DELETE` destinations remain HTTPS-only.
 - **No userinfo or fragments**, and the scheme must be supported.
 - **Expiry validation** — the URL must carry an explicit expiry
   (`X-Amz-Date`+`X-Amz-Expires` or `Expires`) with at least
-  `S4_PRESIGNED_HTTP_MIN_VALIDITY_SECS` (default 30s) remaining.
+  `MASKURA_PRESIGNED_HTTP_MIN_VALIDITY_SECS` (default 30s) remaining.
 - **DNS + address pinning** — the host is resolved at request time; any
   non-public address range rejects the request unless the host is in
-  `S4_PRESIGNED_HTTP_PRIVATE_ALLOWLIST`. The resolved address is pinned on the
+  `MASKURA_PRESIGNED_HTTP_PRIVATE_ALLOWLIST`. The resolved address is pinned on the
   client (no re-resolution) and proxying is disabled.
 - **No redirects** — redirects are disabled at the client and redirect
   responses are rejected outright on reads.
@@ -418,7 +419,7 @@ Persisted S3-compatible workspace endpoints use a separate
 
 - In multi-tenant mode HTTPS is mandatory, URLs cannot contain userinfo, query,
   or fragment components, and the host must exactly match or be a strict
-  dot-boundary `*.suffix` entry in `S4_WORKSPACE_ENDPOINT_ALLOWLIST`.
+  dot-boundary `*.suffix` entry in `MASKURA_WORKSPACE_ENDPOINT_ALLOWLIST`.
 - DNS is revalidated before every per-workspace AWS SDK client is constructed.
   Empty answers, private/reserved addresses, mixed public/private answers,
   IP-literal allowlist bypasses, and IPv4-mapped private IPv6 are rejected.
@@ -433,7 +434,7 @@ Persisted S3-compatible workspace endpoints use a separate
   fencing, and reconciliation rather than occurring inside the SDK.
 - HTTP or private addresses are accepted only in explicit single-tenant mode.
   Private destinations additionally require an exact operator entry in
-  `S4_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST`; wildcard private exceptions are
+  `MASKURA_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST`; wildcard private exceptions are
   invalid.
 - Public builds provide no common-provider allowlist defaults. Deployments must
   choose the provider domains they trust.
@@ -534,28 +535,28 @@ These are **operator responsibilities**; Maskura will not and cannot enforce the
 from inside a container:
 
 Customer-configurable gateway settings use `MASKURA_*` environment variables.
-Internal/operator controls such as `S4_SECRET_KEK`,
-`S4_SERVICE_BUCKETS`, `S4_WORKSPACE_ENDPOINT_*`, `S4_PRESIGNED_HTTP_*`,
-`S4_SIGV4_*`, `S4_MANAGED_*`, and `S4_MULTIPART_STAGING_*` keep their existing
+Internal/operator controls such as `MASKURA_SECRET_KEK`,
+`MASKURA_SERVICE_BUCKETS`, `MASKURA_WORKSPACE_ENDPOINT_*`, `MASKURA_PRESIGNED_HTTP_*`,
+`MASKURA_SIGV4_*`, `MASKURA_MANAGED_*`, and `MASKURA_MULTIPART_STAGING_*` keep their existing
 names and are not exposed through customer aliases.
 
 - **TLS termination** — place the gateway behind a TLS-terminating proxy
   (platform load balancer, ingress, or reverse proxy). SigV4 is signed
   over-the-wire, but the SDK header path sends secrets in headers, so HTTPS is
-  required for the secret-bearing headers. Set `S4_SIGV4_TRUSTED_TLS=true` if
+  required for the secret-bearing headers. Set `MASKURA_SIGV4_TRUSTED_TLS=true` if
   your proxy terminates TLS and the gateway sees HTTP.
 - **Trusted proxy** — restrict access to the gateway to the trusted proxy
   (or bind the listener accordingly); do not expose it directly on the
   internet without TLS.
 - **KMS/Vault readiness** — configure a durable `KeyWrapping` (KMS or Vault)
-  for any non-local deployment. `S4_SECRET_KEK` is durable but operator-managed
+  for any non-local deployment. `MASKURA_SECRET_KEK` is durable but operator-managed
   plaintext; the ephemeral wrapper loses all wrapped secrets on restart.
   Durable multipart staging fails closed without a durable wrapping.
 - **Durable journal / staging dependencies** — standalone local mode uses one
   mounted `MASKURA_LOCAL_STORAGE_DIR` and automatically places its file-backed
   repository, journal, proofs, artifacts, and wrapping key beneath that root;
   it must run as one active process per root. Hosted staged mode requires
-  `DATABASE_URL` plus the complete `S4_MULTIPART_STAGING_*` configuration;
+  `DATABASE_URL` plus the complete `MASKURA_MULTIPART_STAGING_*` configuration;
   managed observe/enforce still requires Postgres and transactional capabilities.
 - **Backend lifecycle permissions** — the backend credentials Maskura uses for
   direct/managed streaming must be able to create, abort, and discover
@@ -566,7 +567,7 @@ names and are not exposed through customer aliases.
 - **Feature-gate defaults** — transformed reads and managed streaming are
   **off/reject by default** and must be explicitly enabled:
   `MASKURA_STREAMING_READ_MODE=off`, `MASKURA_MULTIPART_MODE=reject`,
-  `S4_MANAGED_STREAMING_MODE=off`. Single-part streaming writes are always
+  `MASKURA_MANAGED_STREAMING_MODE=off`. Single-part streaming writes are always
   enabled; staged multipart additionally requires `MASKURA_MULTIPART_MODE=staged`.
   Local mode supplies its durable file-backed dependencies from the mounted root;
   hosted mode requires its Postgres, wrapping, and staging-backend dependencies.

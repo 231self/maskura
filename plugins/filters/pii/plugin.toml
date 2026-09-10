@@ -1,0 +1,9 @@
+schema_version = 1
+id = "maskura.filters.pii"
+name = "PII redaction"
+category = "filters"
+status = "official"
+version = "0.1.0"
+world = "maskura:plugin/transformer@0.1.0"
+capabilities = []
+

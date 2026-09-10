@@ -233,8 +233,8 @@ fn request_operation_identity() -> OperationIdentity {
     }
 }
 
-fn trusted_wasm_cancellation() -> s4_wasm_runtime::CancellationToken {
-    let pipeline = s4_wasm_runtime::CancellationToken::new();
+fn trusted_wasm_cancellation() -> maskura_wasm_runtime::CancellationToken {
+    let pipeline = maskura_wasm_runtime::CancellationToken::new();
     if let Ok(invocation) = TRUSTED_INVOCATION.try_with(|value| value.cancellation.clone()) {
         let pipeline_on_cancel = pipeline.clone();
         tokio::spawn(async move {
@@ -671,7 +671,7 @@ impl DemoPipelineTemplate {
 /// state without recompiling the same Wasm components.
 #[doc(hidden)]
 pub struct StatePipelineTemplate {
-    engine: Arc<s4_wasm_runtime::FilterEngine>,
+    engine: Arc<maskura_wasm_runtime::FilterEngine>,
     plugins: PluginRegistry,
     demo: DemoPipelineTemplate,
     max_pipeline_output_bytes: u64,
@@ -686,7 +686,7 @@ impl StatePipelineTemplate {
         let pipeline_fuel = resolve_customer_env(customer_env::WASM_FUEL)?
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(crate::plugin_registry::DEFAULT_PIPELINE_FUEL);
-        let engine = Arc::new(s4_wasm_runtime::FilterEngine::with_fuel(
+        let engine = Arc::new(maskura_wasm_runtime::FilterEngine::with_fuel(
             &component_bytes,
             pipeline_fuel,
         )?);
@@ -708,7 +708,7 @@ impl StatePipelineTemplate {
         let plugins = PluginRegistry::with_options(
             pipeline_fuel,
             pipeline_limits,
-            s4_wasm_runtime::ExecutorConfig::default(),
+            maskura_wasm_runtime::ExecutorConfig::default(),
         )?;
         let prefix_safe_hashes = prefix_safe_component_hashes()?;
 
@@ -976,7 +976,7 @@ fn configured_s3_streaming_capabilities() -> anyhow::Result<Option<BackendCapabi
 }
 
 fn configured_managed_streaming_capabilities() -> Option<BackendCapabilities> {
-    let configured = std::env::var("S4_MANAGED_STREAMING_TRANSACTIONAL")
+    let configured = std::env::var("MASKURA_MANAGED_STREAMING_TRANSACTIONAL")
         .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
     configured.then_some(BackendCapabilities {
         incomplete_upload_discovery: IncompleteUploadDiscovery::ExactKeyAndStartTime,
@@ -1015,7 +1015,7 @@ fn legacy_max_object_bytes() -> anyhow::Result<usize> {
 }
 
 /// Derive the deterministic-encryption key for an API key secret:
-/// two 32-byte HMAC-SHA256 outputs (`"s4-stable-encrypt"` + counter) giving
+/// two 32-byte HMAC-SHA256 outputs (`"maskura-stable-encrypt"` + counter) giving
 /// the 64-byte key AES-256-SIV requires. The plugin receives only this
 /// derived key, never the raw secret.
 fn derive_stable_key(secret: &str) -> Vec<u8> {
@@ -1026,7 +1026,7 @@ fn derive_stable_key(secret: &str) -> Vec<u8> {
     for i in 1..=2u8 {
         let mut mac =
             HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
-        mac.update(b"s4-stable-encrypt");
+        mac.update(b"maskura-stable-encrypt");
         mac.update(&[i]);
         out.extend_from_slice(&mac.finalize().into_bytes());
     }
@@ -2061,8 +2061,8 @@ async fn authenticate_headers(
     match auth {
         Some(a) if a.starts_with("Bearer ") => {
             let token = &a[7..];
-            // MCP bearer token (s4m_...): a self-contained credential.
-            if token.starts_with("s4m_") {
+            // MCP bearer token (maskura_mcp_...): a self-contained credential.
+            if token.starts_with("maskura_mcp_") {
                 let context = keys.resolve_mcp_token(token).await.map_err(|error| {
                     HeaderAuthError::CredentialStoreUnavailable(error.to_string())
                 })?;
@@ -2078,7 +2078,7 @@ async fn authenticate_headers(
                 }
                 return Err(HeaderAuthError::Denied);
             }
-            // Try API key format: Bearer s4_xxx:s4s_xxx
+            // Try API key format: Bearer maskura_xxx:maskura_secret_xxx
             if let Some((ak, sk)) = token.split_once(':') {
                 let (context, public_key_pem) = keys
                     .resolve_credentials(ak, sk)
@@ -2113,7 +2113,7 @@ async fn authenticate_headers(
     if let Some(tok) = customer_headers::validated(headers, customer_headers::MCP_TOKEN)
         .and_then(|v| v.to_str().ok())
     {
-        let context = if tok.starts_with("s4m_") {
+        let context = if tok.starts_with("maskura_mcp_") {
             keys.resolve_mcp_token(tok)
                 .await
                 .map_err(|error| HeaderAuthError::CredentialStoreUnavailable(error.to_string()))?
@@ -2623,22 +2623,24 @@ async fn decode_demo_json<T: DeserializeOwned>(
     Ok(decoded)
 }
 
-fn demo_pipeline_error(error: &s4_error::S4Error) -> axum::response::Response {
+fn demo_pipeline_error(error: &maskura_error::MaskuraError) -> axum::response::Response {
     match error.code() {
-        s4_error::codes::LIMIT_INPUT_BYTES | s4_error::codes::RECORD_TOO_LARGE => demo_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "input_too_large",
-            "Demo input exceeds 64 KiB",
-        ),
-        s4_error::codes::LIMIT_OUTPUT_BYTES
-        | s4_error::codes::LIMIT_EXPANSION
-        | s4_error::codes::LIMIT_INTERMEDIATE_BYTES
-        | s4_error::codes::LIMIT_FINISH_BYTES => demo_error(
+        maskura_error::codes::LIMIT_INPUT_BYTES | maskura_error::codes::RECORD_TOO_LARGE => {
+            demo_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "input_too_large",
+                "Demo input exceeds 64 KiB",
+            )
+        }
+        maskura_error::codes::LIMIT_OUTPUT_BYTES
+        | maskura_error::codes::LIMIT_EXPANSION
+        | maskura_error::codes::LIMIT_INTERMEDIATE_BYTES
+        | maskura_error::codes::LIMIT_FINISH_BYTES => demo_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "output_too_large",
             "Demo output exceeds 64 KiB",
         ),
-        s4_error::codes::WASM_DEADLINE | s4_error::codes::WASM_CANCELLED => demo_error(
+        maskura_error::codes::WASM_DEADLINE | maskura_error::codes::WASM_CANCELLED => demo_error(
             StatusCode::REQUEST_TIMEOUT,
             "demo_timeout",
             "Demo operation timed out",
@@ -2651,19 +2653,19 @@ fn demo_pipeline_error(error: &s4_error::S4Error) -> axum::response::Response {
     }
 }
 
-fn demo_deadline_error() -> s4_error::S4Error {
-    s4_error::S4Error::new(
-        s4_error::codes::WASM_DEADLINE,
+fn demo_deadline_error() -> maskura_error::MaskuraError {
+    maskura_error::MaskuraError::new(
+        maskura_error::codes::WASM_DEADLINE,
         "demo operation deadline exceeded",
     )
 }
 
 async fn execute_demo_records(
     snapshot: PipelineSnapshot,
-    session: s4_wasm_runtime::Session,
+    session: maskura_wasm_runtime::Session,
     records: Vec<crate::record::Record>,
     deadline: Instant,
-) -> Result<(Vec<crate::record::Record>, Vec<crate::record::Record>), s4_error::S4Error> {
+) -> Result<(Vec<crate::record::Record>, Vec<crate::record::Record>), maskura_error::MaskuraError> {
     let cancellation = trusted_wasm_cancellation();
     let mut pipeline = snapshot
         .start_streaming_session_with_deadline(session, cancellation, deadline)
@@ -2678,8 +2680,8 @@ async fn execute_demo_records(
             Ok(Some(record)) => output.push(record),
             Ok(None) => {
                 let _ = pipeline.cancel_and_wait().await;
-                return Err(s4_error::S4Error::new(
-                    s4_error::codes::WASM_REJECT,
+                return Err(maskura_error::MaskuraError::new(
+                    maskura_error::codes::WASM_REJECT,
                     "demo pipeline dropped a record",
                 ));
             }
@@ -2697,11 +2699,11 @@ fn append_demo_output(
     output: &mut Vec<u8>,
     record: crate::record::Record,
     max_output_bytes: Option<usize>,
-) -> Result<(), s4_error::S4Error> {
+) -> Result<(), maskura_error::MaskuraError> {
     let added = record.payload.len().saturating_add(record.separator.len());
     if max_output_bytes.is_some_and(|limit| output.len().saturating_add(added) > limit) {
-        return Err(s4_error::S4Error::new(
-            s4_error::codes::LIMIT_OUTPUT_BYTES,
+        return Err(maskura_error::MaskuraError::new(
+            maskura_error::codes::LIMIT_OUTPUT_BYTES,
             "demo output exceeds limit",
         ));
     }
@@ -2757,11 +2759,11 @@ async fn demo_redact(
         }
     }
     let records_processed = records.len();
-    let session = s4_wasm_runtime::Session {
+    let session = maskura_wasm_runtime::Session {
         format: Format::Text.as_str().to_string(),
         content_type: "text/plain".to_string(),
         policy_version: 0,
-        operation: s4_wasm_runtime::Operation::Write,
+        operation: maskura_wasm_runtime::Operation::Write,
         config_json: None,
         public_key_pem: None,
         stable_key: None,
@@ -2864,11 +2866,11 @@ async fn demo_process(
         DemoMode::Safe => None,
         DemoMode::Join => Some(demo_request_stable_key()),
     };
-    let session = s4_wasm_runtime::Session {
+    let session = maskura_wasm_runtime::Session {
         format: Format::Jsonl.as_str().to_string(),
         content_type: "application/x-ndjson".to_string(),
         policy_version: 0,
-        operation: s4_wasm_runtime::Operation::Write,
+        operation: maskura_wasm_runtime::Operation::Write,
         config_json: None,
         public_key_pem: None,
         stable_key: stable_key.as_ref().map(|key| key.as_slice().to_vec()),
@@ -2952,7 +2954,7 @@ fn wants_transformed_read(headers: &HeaderMap) -> bool {
 #[derive(Debug)]
 enum StreamingPutError {
     Integrity(IntegrityError),
-    Pipeline(s4_error::S4Error),
+    Pipeline(maskura_error::MaskuraError),
     Transaction(TransactionError),
     InputTooLarge,
     SourceFrameTooLarge,
@@ -2968,8 +2970,8 @@ impl StreamingPutError {
     }
 }
 
-impl From<s4_error::S4Error> for StreamingPutError {
-    fn from(error: s4_error::S4Error) -> Self {
+impl From<maskura_error::MaskuraError> for StreamingPutError {
+    fn from(error: maskura_error::MaskuraError) -> Self {
         Self::Pipeline(error)
     }
 }
@@ -3019,24 +3021,27 @@ fn streaming_put_error_response(key: &str, error: StreamingPutError) -> axum::re
     }
 }
 
-fn pipeline_error_response(key: &str, error: &s4_error::S4Error) -> axum::response::Response {
+fn pipeline_error_response(
+    key: &str,
+    error: &maskura_error::MaskuraError,
+) -> axum::response::Response {
     match error.code() {
-        s4_error::codes::WASM_ADMISSION => s3_error::slow_down(key),
-        s4_error::codes::LIMIT_INPUT_BYTES
-        | s4_error::codes::LIMIT_OUTPUT_BYTES
-        | s4_error::codes::LIMIT_EXPANSION
-        | s4_error::codes::LIMIT_INTERMEDIATE_BYTES
-        | s4_error::codes::LIMIT_FINISH_BYTES
-        | s4_error::codes::RECORD_TOO_LARGE => s3_error::entity_too_large(key),
-        s4_error::codes::DECODE_JSON
-        | s4_error::codes::DECODE_JSONL
-        | s4_error::codes::DECODE_CSV
-        | s4_error::codes::DECODE_ENCODING
-        | s4_error::codes::WASM_REJECT
-        | s4_error::codes::UNSUPPORTED_FORMAT
-        | s4_error::codes::CONFIG_INVALID
-        | s4_error::codes::POLICY_EXPIRED
-        | s4_error::codes::POLICY_TAMPERED => {
+        maskura_error::codes::WASM_ADMISSION => s3_error::slow_down(key),
+        maskura_error::codes::LIMIT_INPUT_BYTES
+        | maskura_error::codes::LIMIT_OUTPUT_BYTES
+        | maskura_error::codes::LIMIT_EXPANSION
+        | maskura_error::codes::LIMIT_INTERMEDIATE_BYTES
+        | maskura_error::codes::LIMIT_FINISH_BYTES
+        | maskura_error::codes::RECORD_TOO_LARGE => s3_error::entity_too_large(key),
+        maskura_error::codes::DECODE_JSON
+        | maskura_error::codes::DECODE_JSONL
+        | maskura_error::codes::DECODE_CSV
+        | maskura_error::codes::DECODE_ENCODING
+        | maskura_error::codes::WASM_REJECT
+        | maskura_error::codes::UNSUPPORTED_FORMAT
+        | maskura_error::codes::CONFIG_INVALID
+        | maskura_error::codes::POLICY_EXPIRED
+        | maskura_error::codes::POLICY_TAMPERED => {
             s3_error::invalid_request(key, "The processing pipeline rejected the request.")
         }
         _ => s3_error::internal_error(key, error.code()),
@@ -3822,11 +3827,11 @@ async fn streaming_single_put(
     let stable_fields = customer_headers::validated(headers, customer_headers::STABLE_FIELDS)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
-    let session = s4_wasm_runtime::Session {
+    let session = maskura_wasm_runtime::Session {
         format: format.as_str().to_string(),
         content_type: content_type.clone(),
         policy_version: 0,
-        operation: s4_wasm_runtime::Operation::Write,
+        operation: maskura_wasm_runtime::Operation::Write,
         config_json: None,
         public_key_pem: authentication.auth.public_key_pem.clone(),
         stable_key: authentication.auth.stable_key.clone(),
@@ -4015,15 +4020,15 @@ fn avro_pump(
         crate::binary_reductor::CommonTypeBinaryReductor,
         crate::binary_pump::EnvelopeBinaryTransform,
     >,
-    s4_error::S4Error,
+    maskura_error::MaskuraError,
 > {
     let targets = customer_headers::validated(headers, customer_headers::ENCRYPT_FIELDS)
         .map(|value| {
             value
                 .to_str()
                 .map_err(|_| {
-                    s4_error::S4Error::new(
-                        s4_error::codes::CONFIG_INVALID,
+                    maskura_error::MaskuraError::new(
+                        maskura_error::codes::CONFIG_INVALID,
                         "invalid x-maskura-encrypt-fields",
                     )
                 })
@@ -4306,7 +4311,7 @@ fn multipart_snapshot(
 #[derive(Debug)]
 enum MultipartPipelineRestoreError {
     LegacyRawSnapshot,
-    Invalid(s4_error::S4Error),
+    Invalid(maskura_error::MaskuraError),
 }
 
 fn restore_multipart_pipeline(
@@ -4902,8 +4907,8 @@ impl From<StreamingPutError> for MultipartCompletionError {
     }
 }
 
-impl From<s4_error::S4Error> for MultipartCompletionError {
-    fn from(error: s4_error::S4Error) -> Self {
+impl From<maskura_error::MaskuraError> for MultipartCompletionError {
+    fn from(error: maskura_error::MaskuraError) -> Self {
         Self::Streaming(error.into())
     }
 }
@@ -5101,11 +5106,11 @@ async fn complete_staged_multipart(
         .bind_existing_operation(destination_operation_id, identity)
         .await?;
     let cancellation = trusted_wasm_cancellation();
-    let session = s4_wasm_runtime::Session {
+    let session = maskura_wasm_runtime::Session {
         format: format.as_str().to_string(),
         content_type,
         policy_version: 0,
-        operation: s4_wasm_runtime::Operation::Write,
+        operation: maskura_wasm_runtime::Operation::Write,
         config_json: None,
         public_key_pem: operation.auth.public_key_pem.clone(),
         stable_key: operation.auth.stable_key.clone(),
@@ -6459,9 +6464,9 @@ async fn s3_put(
                 StreamingPutError::Pipeline(error) => error.code(),
                 StreamingPutError::PreserveReservation(error) => match error.as_ref() {
                     StreamingPutError::Pipeline(error) => error.code(),
-                    _ => s4_error::codes::INTERNAL,
+                    _ => maskura_error::codes::INTERNAL,
                 },
-                _ => s4_error::codes::INTERNAL,
+                _ => maskura_error::codes::INTERNAL,
             };
             record_failed_pipeline_attempt(
                 state.control.as_ref(),
@@ -6491,12 +6496,12 @@ enum TransformedReadError {
     InvalidRequest(String),
     Capacity(String),
     Source(String),
-    Pipeline(s4_error::S4Error),
+    Pipeline(maskura_error::MaskuraError),
     Spool(TransactionError),
 }
 
-impl From<s4_error::S4Error> for TransformedReadError {
-    fn from(error: s4_error::S4Error) -> Self {
+impl From<maskura_error::MaskuraError> for TransformedReadError {
+    fn from(error: maskura_error::MaskuraError) -> Self {
         Self::Pipeline(error)
     }
 }
@@ -6727,12 +6732,12 @@ fn transformed_session(
     headers: &HeaderMap,
     format: Format,
     content_type: String,
-) -> s4_wasm_runtime::Session {
-    s4_wasm_runtime::Session {
+) -> maskura_wasm_runtime::Session {
+    maskura_wasm_runtime::Session {
         format: format.as_str().to_string(),
         content_type,
         policy_version: 0,
-        operation: s4_wasm_runtime::Operation::Read,
+        operation: maskura_wasm_runtime::Operation::Read,
         config_json: None,
         public_key_pem: auth.public_key_pem.clone(),
         stable_key: auth.stable_key.clone(),
@@ -6772,7 +6777,7 @@ async fn collect_opened_object(
 async fn serve_spooled_bytes(
     state: &AppState,
     bytes: Vec<u8>,
-    source_cancellation: s4_wasm_runtime::CancellationToken,
+    source_cancellation: maskura_wasm_runtime::CancellationToken,
 ) -> Result<(axum::body::Body, u64), TransformedReadError> {
     let mut spool = EncryptedReadSpool::begin(
         state.spool_config.directory.clone(),
@@ -6972,8 +6977,8 @@ fn direct_settlement_future(
 struct DirectReadBody {
     first: Option<bytes::Bytes>,
     receiver: tokio::sync::mpsc::Receiver<DirectReadEvent>,
-    source_cancellation: s4_wasm_runtime::CancellationToken,
-    pipeline_cancellation: s4_wasm_runtime::CancellationToken,
+    source_cancellation: maskura_wasm_runtime::CancellationToken,
+    pipeline_cancellation: maskura_wasm_runtime::CancellationToken,
     control: Arc<dyn ControlPlane>,
     context: AuthenticatedRequestContext,
     grant: AuthorizationGrant,
@@ -7030,7 +7035,7 @@ impl http_body::Body for DirectReadBody {
                 let resolution = self.failure_resolution.clone();
                 let error_code = match &error {
                     TransformedReadError::Pipeline(error) => error.code(),
-                    _ => s4_error::codes::INTERNAL,
+                    _ => maskura_error::codes::INTERNAL,
                 };
                 tokio::spawn(async move {
                     record_failed_pipeline_attempt(
@@ -7211,8 +7216,8 @@ async fn transformed_read_response(
             return (
                 transformed_read_error_response(
                     key,
-                    TransformedReadError::Pipeline(s4_error::S4Error::new(
-                        s4_error::codes::INTERNAL,
+                    TransformedReadError::Pipeline(maskura_error::MaskuraError::new(
+                        maskura_error::codes::INTERNAL,
                         "transformed read worker terminated unexpectedly",
                     )),
                 ),
@@ -7760,7 +7765,7 @@ async fn s3_get(
                 &bucket,
                 crate::pipeline::PipelineDirection::Read,
                 resolution.as_ref(),
-                s4_error::codes::INTERNAL,
+                maskura_error::codes::INTERNAL,
                 resolution_started.elapsed().as_millis() as u64,
             )
             .await;
@@ -8720,34 +8725,34 @@ mod tests {
     async fn pipeline_failure_taxonomy_is_stable_bounded_and_opaque() {
         for (code, status, s3_code) in [
             (
-                s4_error::codes::WASM_ADMISSION,
+                maskura_error::codes::WASM_ADMISSION,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "SlowDown",
             ),
             (
-                s4_error::codes::CONFIG_INVALID,
+                maskura_error::codes::CONFIG_INVALID,
                 StatusCode::BAD_REQUEST,
                 "InvalidRequest",
             ),
             (
-                s4_error::codes::POLICY_TAMPERED,
+                maskura_error::codes::POLICY_TAMPERED,
                 StatusCode::BAD_REQUEST,
                 "InvalidRequest",
             ),
             (
-                s4_error::codes::COMPONENT_LOAD,
+                maskura_error::codes::COMPONENT_LOAD,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",
             ),
             (
-                s4_error::codes::INTERNAL,
+                maskura_error::codes::INTERNAL,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",
             ),
         ] {
             let response = pipeline_error_response(
                 "key",
-                &s4_error::S4Error::new(code, "PRINTABLE_GRANTED_SECRET"),
+                &maskura_error::MaskuraError::new(code, "PRINTABLE_GRANTED_SECRET"),
             );
             assert_eq!(response.status(), status);
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -8984,23 +8989,23 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../target/components/noop.component.wasm"),
         )
-        .expect("noop.component.wasm; run just build-filters");
+        .expect("noop.component.wasm; run just build-plugins");
         let registry = PluginRegistry::new();
         registry.import("noop", &component).unwrap();
         let pipeline = registry
             .snapshot()
             .start_streaming_session(
-                s4_wasm_runtime::Session {
+                maskura_wasm_runtime::Session {
                     format: "text".to_string(),
                     content_type: "text/plain".to_string(),
                     policy_version: 0,
-                    operation: s4_wasm_runtime::Operation::Read,
+                    operation: maskura_wasm_runtime::Operation::Read,
                     config_json: None,
                     public_key_pem: None,
                     stable_key: None,
                     stable_fields: None,
                 },
-                s4_wasm_runtime::CancellationToken::new(),
+                maskura_wasm_runtime::CancellationToken::new(),
             )
             .await
             .unwrap();
@@ -9025,9 +9030,9 @@ mod tests {
     async fn successful_drop_all_direct_read_keeps_measured_finish_evidence() {
         let component = std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/test-components/test-filter.component.wasm"),
+                .join("../../target/test-components/test-transformer.component.wasm"),
         )
-        .expect("test-filter.component.wasm; run just build-filters");
+        .expect("test-transformer.component.wasm; run just build-plugins");
         let registry = Arc::new(PluginRegistry::new());
         registry
             .import_with_capabilities(
@@ -9054,17 +9059,17 @@ mod tests {
         let mut pipeline = snapshot
             .clone()
             .start_streaming_session(
-                s4_wasm_runtime::Session {
+                maskura_wasm_runtime::Session {
                     format: "text".to_string(),
                     content_type: "text/plain".to_string(),
                     policy_version: 0,
-                    operation: s4_wasm_runtime::Operation::Read,
+                    operation: maskura_wasm_runtime::Operation::Read,
                     config_json: None,
                     public_key_pem: None,
                     stable_key: None,
                     stable_fields: None,
                 },
-                s4_wasm_runtime::CancellationToken::new(),
+                maskura_wasm_runtime::CancellationToken::new(),
             )
             .await
             .unwrap();
@@ -9100,17 +9105,17 @@ mod tests {
         let pipeline = registry
             .snapshot()
             .start_streaming_session(
-                s4_wasm_runtime::Session {
+                maskura_wasm_runtime::Session {
                     format: "text".to_string(),
                     content_type: "text/plain".to_string(),
                     policy_version: 0,
-                    operation: s4_wasm_runtime::Operation::Write,
+                    operation: maskura_wasm_runtime::Operation::Write,
                     config_json: None,
                     public_key_pem: None,
                     stable_key: None,
                     stable_fields: None,
                 },
-                s4_wasm_runtime::CancellationToken::new(),
+                maskura_wasm_runtime::CancellationToken::new(),
             )
             .await
             .unwrap();
@@ -11254,7 +11259,7 @@ async fn get_mcp_tokens(
     Json(resp).into_response()
 }
 
-/// Create an MCP bearer token (`s4m_...`). The plaintext token is returned
+/// Create an MCP bearer token (`maskura_mcp_...`). The plaintext token is returned
 /// once and only its hash is stored.
 #[utoipa::path(
     post,
@@ -11536,7 +11541,7 @@ async fn authenticate_public_key_mutation(
         });
     }
 
-    if state.auth_disabled || token.starts_with("s4m_") {
+    if state.auth_disabled || token.starts_with("maskura_mcp_") {
         return Err(StatusCode::UNAUTHORIZED);
     }
     require_user_id(headers, state)
@@ -11687,7 +11692,7 @@ async fn list_objects(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 fn component_path() -> anyhow::Result<PathBuf> {
-    Ok(resolve_customer_env(customer_env::FILTER_COMPONENT)?
+    Ok(resolve_customer_env(customer_env::DEFAULT_PLUGIN)?
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -11738,7 +11743,7 @@ fn validate_storage_boundary_startup(
         anyhow::bail!("S3_ENDPOINT is forbidden in multi-tenant mode");
     }
     if !explicit_single_tenant && !has_service_backends {
-        anyhow::bail!("multi-tenant mode requires a non-empty S4_SERVICE_BUCKETS");
+        anyhow::bail!("multi-tenant mode requires a non-empty MASKURA_SERVICE_BUCKETS");
     }
     Ok(())
 }
@@ -11767,25 +11772,25 @@ fn validate_multipart_startup(
     let checks = [
         (dependencies.durable_wrapping, "durable key wrapping"),
         (dependencies.database, "DATABASE_URL"),
-        (dependencies.endpoint, "S4_MULTIPART_STAGING_ENDPOINT"),
-        (dependencies.bucket, "S4_MULTIPART_STAGING_BUCKET"),
+        (dependencies.endpoint, "MASKURA_MULTIPART_STAGING_ENDPOINT"),
+        (dependencies.bucket, "MASKURA_MULTIPART_STAGING_BUCKET"),
         (
             dependencies.access_key,
-            "S4_MULTIPART_STAGING_ACCESS_KEY_ID",
+            "MASKURA_MULTIPART_STAGING_ACCESS_KEY_ID",
         ),
         (
             dependencies.secret_key,
-            "S4_MULTIPART_STAGING_SECRET_ACCESS_KEY",
+            "MASKURA_MULTIPART_STAGING_SECRET_ACCESS_KEY",
         ),
-        (dependencies.region, "S4_MULTIPART_STAGING_REGION"),
-        (dependencies.directory, "S4_MULTIPART_STAGING_DIR"),
+        (dependencies.region, "MASKURA_MULTIPART_STAGING_REGION"),
+        (dependencies.directory, "MASKURA_MULTIPART_STAGING_DIR"),
         (
             dependencies.tenant_quota,
-            "S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES",
+            "MASKURA_MULTIPART_STAGING_TENANT_QUOTA_BYTES",
         ),
         (
             dependencies.global_quota,
-            "S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES",
+            "MASKURA_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES",
         ),
     ];
     let missing = checks
@@ -12031,7 +12036,7 @@ pub async fn build_state_with_pipeline_template(
         resolve_customer_env(customer_env::SINGLE_TENANT)?
             .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
     );
-    let service_backends = std::env::var("S4_SERVICE_BUCKETS")
+    let service_backends = std::env::var("MASKURA_SERVICE_BUCKETS")
         .ok()
         .map(|value| parse_service_backends(&value))
         .transpose()
@@ -12047,7 +12052,7 @@ pub async fn build_state_with_pipeline_template(
             }
             if s3_endpoint.is_some() || !service_backends.is_empty() {
                 anyhow::bail!(
-                    "MASKURA_LOCAL_STORAGE_DIR is mutually exclusive with S3_ENDPOINT and S4_SERVICE_BUCKETS"
+                    "MASKURA_LOCAL_STORAGE_DIR is mutually exclusive with S3_ENDPOINT and MASKURA_SERVICE_BUCKETS"
                 );
             }
             Some(directory)
@@ -12059,7 +12064,7 @@ pub async fn build_state_with_pipeline_template(
             }
             if s3_endpoint.is_some() || !service_backends.is_empty() {
                 anyhow::bail!(
-                    "MASKURA_LOCAL_STORAGE_DIR is mutually exclusive with S3_ENDPOINT and S4_SERVICE_BUCKETS"
+                    "MASKURA_LOCAL_STORAGE_DIR is mutually exclusive with S3_ENDPOINT and MASKURA_SERVICE_BUCKETS"
                 );
             }
             Some(directory)
@@ -12082,20 +12087,22 @@ pub async fn build_state_with_pipeline_template(
     let multipart_mode = multipart_mode()?;
     let multipart_persistence_mode =
         multipart_persistence_mode(multipart_mode, local_storage_root.is_some());
-    let multipart_tenant_quota_bytes = std::env::var("S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            source_body_limits
-                .max_bytes
-                .saturating_mul(MAX_ACTIVE_UPLOADS as u64)
-        });
-    let multipart_global_quota_bytes = std::env::var("S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| multipart_tenant_quota_bytes.saturating_mul(4));
+    let multipart_tenant_quota_bytes =
+        std::env::var("MASKURA_MULTIPART_STAGING_TENANT_QUOTA_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| {
+                source_body_limits
+                    .max_bytes
+                    .saturating_mul(MAX_ACTIVE_UPLOADS as u64)
+            });
+    let multipart_global_quota_bytes =
+        std::env::var("MASKURA_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| multipart_tenant_quota_bytes.saturating_mul(4));
     let multipart_quotas = (multipart_mode == MultipartMode::Staged)
         .then(|| {
             StagingQuotaLimits::new(multipart_tenant_quota_bytes, multipart_global_quota_bytes)
@@ -12109,14 +12116,14 @@ pub async fn build_state_with_pipeline_template(
         MultipartStartupDependencies {
             durable_wrapping: wrapping.is_durable(),
             database: nonempty_env("DATABASE_URL"),
-            endpoint: nonempty_env("S4_MULTIPART_STAGING_ENDPOINT"),
-            bucket: nonempty_env("S4_MULTIPART_STAGING_BUCKET"),
-            access_key: nonempty_env("S4_MULTIPART_STAGING_ACCESS_KEY_ID"),
-            secret_key: nonempty_env("S4_MULTIPART_STAGING_SECRET_ACCESS_KEY"),
-            region: nonempty_env("S4_MULTIPART_STAGING_REGION"),
-            directory: nonempty_env("S4_MULTIPART_STAGING_DIR"),
-            tenant_quota: nonempty_env("S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES"),
-            global_quota: nonempty_env("S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES"),
+            endpoint: nonempty_env("MASKURA_MULTIPART_STAGING_ENDPOINT"),
+            bucket: nonempty_env("MASKURA_MULTIPART_STAGING_BUCKET"),
+            access_key: nonempty_env("MASKURA_MULTIPART_STAGING_ACCESS_KEY_ID"),
+            secret_key: nonempty_env("MASKURA_MULTIPART_STAGING_SECRET_ACCESS_KEY"),
+            region: nonempty_env("MASKURA_MULTIPART_STAGING_REGION"),
+            directory: nonempty_env("MASKURA_MULTIPART_STAGING_DIR"),
+            tenant_quota: nonempty_env("MASKURA_MULTIPART_STAGING_TENANT_QUOTA_BYTES"),
+            global_quota: nonempty_env("MASKURA_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES"),
         },
     )?;
     let local_storage = match local_storage_root {
@@ -12204,9 +12211,9 @@ pub async fn build_state_with_pipeline_template(
     let jwt_decoder = supabase_jwt_secret
         .map(|secret| Arc::new(jsonwebtoken::DecodingKey::from_secret(secret.as_bytes())));
 
-    let managed_mode_value = std::env::var("S4_MANAGED_STREAMING_MODE").ok();
+    let managed_mode_value = std::env::var("MASKURA_MANAGED_STREAMING_MODE").ok();
     let managed_mode = ManagedStreamingMode::from_value(managed_mode_value.as_deref())?;
-    let managed_placement_version = std::env::var("S4_MANAGED_PLACEMENT_VERSION")
+    let managed_placement_version = std::env::var("MASKURA_MANAGED_PLACEMENT_VERSION")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
@@ -12329,7 +12336,7 @@ pub async fn build_state_with_pipeline_template(
             .map_err(anyhow::Error::msg)?;
         if !recorded {
             anyhow::bail!(
-                "S4_MANAGED_PLACEMENT_VERSION {managed_placement_version} is already durable with a different backend policy fingerprint; bump the placement version to change the policy"
+                "MASKURA_MANAGED_PLACEMENT_VERSION {managed_placement_version} is already durable with a different backend policy fingerprint; bump the placement version to change the policy"
             );
         }
     }
@@ -12350,13 +12357,13 @@ pub async fn build_state_with_pipeline_template(
             let pool = postgres_pool
                 .clone()
                 .expect("hosted staged dependencies were validated");
-            let endpoint = std::env::var("S4_MULTIPART_STAGING_ENDPOINT").ok();
-            let bucket = std::env::var("S4_MULTIPART_STAGING_BUCKET").ok();
-            let access_key = std::env::var("S4_MULTIPART_STAGING_ACCESS_KEY_ID").ok();
-            let secret_key = std::env::var("S4_MULTIPART_STAGING_SECRET_ACCESS_KEY").ok();
+            let endpoint = std::env::var("MASKURA_MULTIPART_STAGING_ENDPOINT").ok();
+            let bucket = std::env::var("MASKURA_MULTIPART_STAGING_BUCKET").ok();
+            let access_key = std::env::var("MASKURA_MULTIPART_STAGING_ACCESS_KEY_ID").ok();
+            let secret_key = std::env::var("MASKURA_MULTIPART_STAGING_SECRET_ACCESS_KEY").ok();
             match (endpoint, bucket, access_key, secret_key) {
                 (Some(endpoint), Some(bucket), Some(access_key), Some(secret_key)) => {
-                    let region = std::env::var("S4_MULTIPART_STAGING_REGION")
+                    let region = std::env::var("MASKURA_MULTIPART_STAGING_REGION")
                         .unwrap_or_else(|_| "us-east-1".to_string());
                     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
                         .region(Region::new(region))
@@ -12381,7 +12388,7 @@ pub async fn build_state_with_pipeline_template(
                             Client::new(&config),
                             bucket,
                         )),
-                        directory: std::env::var("S4_MULTIPART_STAGING_DIR")
+                        directory: std::env::var("MASKURA_MULTIPART_STAGING_DIR")
                             .map(PathBuf::from)
                             .unwrap_or_else(|_| spool_config.directory.join("multipart")),
                         wrapping: wrapping.clone(),
@@ -12405,7 +12412,7 @@ pub async fn build_state_with_pipeline_template(
     .await?;
     if managed_mode != ManagedStreamingMode::Off && managed_streaming_capabilities.is_none() {
         anyhow::bail!(
-            "managed observe/enforce mode requires S4_MANAGED_STREAMING_TRANSACTIONAL=true"
+            "managed observe/enforce mode requires MASKURA_MANAGED_STREAMING_TRANSACTIONAL=true"
         );
     }
     let service_storage = Arc::new(
@@ -13061,9 +13068,9 @@ mod demo_limiter_tests {
     fn dedicated_demo_snapshots_are_ordered_and_join_fails_closed() {
         let components = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/components");
         let pii = std::fs::read(components.join("pii-default.component.wasm"))
-            .expect("pii-default.component.wasm; run just build-filters");
+            .expect("pii-default.component.wasm; run just build-plugins");
         let stable = std::fs::read(components.join("stable-encrypt.component.wasm"))
-            .expect("stable-encrypt.component.wasm; run just build-filters");
+            .expect("stable-encrypt.component.wasm; run just build-plugins");
 
         let unavailable = build_demo_pipelines(&pii, None, 1_000_000_000).unwrap();
         assert!(unavailable.join.is_none());

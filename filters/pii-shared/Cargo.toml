@@ -1,7 +1,0 @@
-[package]
-name = "pii-shared"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]

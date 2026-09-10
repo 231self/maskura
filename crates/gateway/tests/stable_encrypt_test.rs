@@ -6,8 +6,8 @@ use aes_siv::aead::{Aead, KeyInit};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use hmac::{Hmac, Mac};
-use s4_gateway::Format;
-use s4_gateway::plugin_registry::PluginRegistry;
+use maskura_gateway::Format;
+use maskura_gateway::plugin_registry::PluginRegistry;
 use sha2::Sha256;
 use std::fs;
 use std::path::PathBuf;
@@ -23,7 +23,7 @@ fn component(name: &str) -> Vec<u8> {
             .join("components")
             .join(name),
     )
-    .unwrap_or_else(|_| panic!("component not found: {name}; run `just build-filters` first"))
+    .unwrap_or_else(|_| panic!("component not found: {name}; run `just build-plugins` first"))
 }
 
 fn stable_key(secret: &str) -> Vec<u8> {
@@ -32,7 +32,7 @@ fn stable_key(secret: &str) -> Vec<u8> {
     for i in 1..=2u8 {
         let mut mac =
             <HmacSha256 as hmac::Mac>::new_from_slice(secret.as_bytes()).expect("hmac key");
-        mac.update(b"s4-stable-encrypt");
+        mac.update(b"maskura-stable-encrypt");
         mac.update(&[i]);
         out.extend_from_slice(&mac.finalize().into_bytes());
     }
@@ -81,7 +81,7 @@ const INPUT: &[u8] =
 #[test]
 fn stable_encryption_is_deterministic() {
     let registry = registry();
-    let key = stable_key("s4s_testsecret");
+    let key = stable_key("maskura_secret_testsecret");
     let a = run(&registry, INPUT, Some(&key), Some("email"));
     let b = run(&registry, INPUT, Some(&key), Some("email"));
     assert_eq!(a, b, "same key + input must produce identical output");
@@ -90,7 +90,7 @@ fn stable_encryption_is_deterministic() {
 #[test]
 fn stable_encryption_roundtrips_and_preserves_other_fields() {
     let registry = registry();
-    let key = stable_key("s4s_testsecret");
+    let key = stable_key("maskura_secret_testsecret");
     let out = run(&registry, INPUT, Some(&key), Some("email"));
     let out_str = String::from_utf8_lossy(&out);
 
@@ -123,8 +123,8 @@ fn stable_encryption_roundtrips_and_preserves_other_fields() {
 #[test]
 fn different_keys_produce_different_ciphertext() {
     let registry = registry();
-    let k1 = stable_key("s4s_secret_one");
-    let k2 = stable_key("s4s_secret_two");
+    let k1 = stable_key("maskura_secret_secret_one");
+    let k2 = stable_key("maskura_secret_secret_two");
     let a = run(&registry, INPUT, Some(&k1), Some("email"));
     let b = run(&registry, INPUT, Some(&k2), Some("email"));
     assert_ne!(a, b, "different tenants must not share ciphertext");
@@ -133,7 +133,7 @@ fn different_keys_produce_different_ciphertext() {
 #[test]
 fn no_fields_no_encryption() {
     let registry = registry();
-    let key = stable_key("s4s_testsecret");
+    let key = stable_key("maskura_secret_testsecret");
     let out = run(&registry, INPUT, Some(&key), None);
     assert_eq!(
         out, INPUT,
@@ -154,7 +154,7 @@ fn no_key_no_encryption() {
 #[test]
 fn non_json_records_are_rejected_for_jsonl_output() {
     let registry = registry();
-    let key = stable_key("s4s_testsecret");
+    let key = stable_key("maskura_secret_testsecret");
     let input = b"plain text line\nanother line\n";
     let error = common::stream_process(
         &registry,
@@ -166,13 +166,13 @@ fn non_json_records_are_rejected_for_jsonl_output() {
         Some("email"),
     )
     .unwrap_err();
-    assert_eq!(error.code(), s4_error::codes::DECODE_INVALID_OUTPUT);
+    assert_eq!(error.code(), maskura_error::codes::DECODE_INVALID_OUTPUT);
 }
 
 #[test]
 fn unknown_tagged_field_is_skipped() {
     let registry = registry();
-    let key = stable_key("s4s_testsecret");
+    let key = stable_key("maskura_secret_testsecret");
     let out = run(&registry, INPUT, Some(&key), Some("does_not_exist"));
     assert_eq!(out, INPUT);
 }

@@ -1,0 +1,12 @@
+[package]
+name = "maskura-plugin-filter-email"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+maskura-plugin-sdk = { path = "../../../crates/plugin-sdk" }
+maskura-plugin-pii-core = { path = "../../shared/pii" }

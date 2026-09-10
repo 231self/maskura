@@ -34,9 +34,9 @@ jobs:
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build Wasm filters
-        run: bash scripts/build-filters.sh
+        run: bash scripts/build-plugins.sh
       - name: High-case property tests (10k cases)
-        run: PROPTEST_CASES=10000 cargo test --locked -p s4-gateway --test property --test record_decoder
+        run: PROPTEST_CASES=10000 cargo test --locked -p maskura-gateway --test property --test record_decoder
 
   rss:
     runs-on: ubuntu-latest
@@ -47,7 +47,7 @@ jobs:
         uses: dtolnay/rust-toolchain@86e7197484018ef6aaa9255d186f6ce1754276dd # 1.97.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Fixed-RSS 1 GiB streaming
-        run: cargo test --locked -p s4-gateway --test streaming_rss -- --nocapture
+        run: cargo test --locked -p maskura-gateway --test streaming_rss -- --nocapture
 
   interop:
     runs-on: ubuntu-latest
@@ -62,7 +62,7 @@ jobs:
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build Wasm filters
-        run: bash scripts/build-filters.sh
+        run: bash scripts/build-plugins.sh
       - name: Install AWS CLI and boto3
         run: |
           python3 -m pip install --user awscli boto3
@@ -70,7 +70,7 @@ jobs:
       - name: Unmodified-client interop (AWS CLI + boto3)
         env:
           MASKURA_RUN_EXTERNAL_CLIENT_INTEROP: "1"
-        run: cargo test --locked -p s4-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
+        run: cargo test --locked -p maskura-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
 
   e2e:
     runs-on: ubuntu-latest

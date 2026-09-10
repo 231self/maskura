@@ -6,9 +6,9 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use s4_gateway::Format;
-use s4_gateway::hybrid::{HybridPrivateKey, HybridPublicKey};
-use s4_gateway::plugin_registry::PluginRegistry;
+use maskura_gateway::Format;
+use maskura_gateway::hybrid::{HybridPrivateKey, HybridPublicKey};
+use maskura_gateway::plugin_registry::PluginRegistry;
 use std::fs;
 use std::path::PathBuf;
 
@@ -36,7 +36,7 @@ fn read_component(name: &str) -> Vec<u8> {
             .join("components")
             .join(name),
     )
-    .unwrap_or_else(|_| panic!("component not found: {name}; run `just build-filters` first"))
+    .unwrap_or_else(|_| panic!("component not found: {name}; run `just build-plugins` first"))
 }
 
 fn encrypt_registry() -> PluginRegistry {

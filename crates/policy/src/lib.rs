@@ -1,8 +1,8 @@
 use ciborium::value::Value;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use maskura_error::{MaskuraError, codes};
 use rand::RngCore;
 use rand::rngs::OsRng;
-use s4_error::{S4Error, codes};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -161,9 +161,10 @@ impl PolicyManifest {
         btree_to_cbor_value(m)
     }
 
-    pub fn decode_canonical(body: &[u8]) -> Result<Self, S4Error> {
-        ciborium::de::from_reader(body)
-            .map_err(|e| S4Error::new(codes::POLICY_TAMPERED, format!("CBOR decode failed: {e}")))
+    pub fn decode_canonical(body: &[u8]) -> Result<Self, MaskuraError> {
+        ciborium::de::from_reader(body).map_err(|e| {
+            MaskuraError::new(codes::POLICY_TAMPERED, format!("CBOR decode failed: {e}"))
+        })
     }
 
     pub fn sign(&self, signing_key: &SigningKey) -> SignedManifest {
@@ -181,17 +182,17 @@ impl SignedManifest {
     pub fn verify(
         &self,
         trust_roots: &BTreeMap<String, VerifyingKey>,
-    ) -> Result<PolicyManifest, S4Error> {
+    ) -> Result<PolicyManifest, MaskuraError> {
         let vk = trust_roots.get(&self.signer_id).ok_or_else(|| {
-            S4Error::new(
+            MaskuraError::new(
                 codes::POLICY_TAMPERED,
                 format!("unknown signer: {}", self.signer_id),
             )
         })?;
         let sig = Signature::from_slice(&self.signature);
-        let sig = sig.map_err(|e| S4Error::new(codes::POLICY_TAMPERED, e.to_string()))?;
+        let sig = sig.map_err(|e| MaskuraError::new(codes::POLICY_TAMPERED, e.to_string()))?;
         vk.verify_strict(&self.body, &sig).map_err(|e| {
-            S4Error::new(
+            MaskuraError::new(
                 codes::POLICY_TAMPERED,
                 format!("signature verification failed: {e}"),
             )
@@ -200,7 +201,7 @@ impl SignedManifest {
         Ok(manifest)
     }
 
-    pub fn decode_only(&self) -> Result<PolicyManifest, S4Error> {
+    pub fn decode_only(&self) -> Result<PolicyManifest, MaskuraError> {
         PolicyManifest::decode_canonical(&self.body)
     }
 }

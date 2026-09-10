@@ -8,7 +8,7 @@ from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM768PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from s4_client.highlevel import MaskuraClient
+from maskura_client.highlevel import MaskuraClient
 
 
 def _pem_bytes(pem, label):

@@ -18,7 +18,7 @@
 # intentionally separate future harnesses (each keeps its own boot contract):
 # the positive Avro round trip and envelope/stable field encryption need
 # MASKURA_ENABLE_AVRO=true plus OCF fixtures and an Avro codec to assert on;
-# managed service storage needs an S4_SERVICE_BUCKETS multi-backend boot
+# managed service storage needs an MASKURA_SERVICE_BUCKETS multi-backend boot
 # without S3_ENDPOINT; staged multipart needs Postgres + a durable KEK; key
 # expiry/revocation rejection on the data plane needs an auth-enabled boot
 # that can create keys; presigned URL proxying needs a container-network
@@ -72,9 +72,9 @@ e2e_boot() {
 
     # 2. Build the filters and the debug binaries.
     echo "--- Building filters and binaries ---"
-    (cd "$ROOT" && bash scripts/build-filters.sh)
-    (cd "$ROOT" && cargo build --locked -p s4-gateway --bin s4-gateway)
-    (cd "$ROOT" && cargo build --locked -p s4ctl --bin maskura)
+    (cd "$ROOT" && bash scripts/build-plugins.sh)
+    (cd "$ROOT" && cargo build --locked -p maskura-gateway --bin maskura-gateway)
+    (cd "$ROOT" && cargo build --locked -p maskura --bin maskura)
 
     # 3. Start the gateway against MinIO (auth disabled, isolated keys file).
     echo "--- Starting Maskura Gateway on $E2E_GW_URL ---"
@@ -83,7 +83,7 @@ e2e_boot() {
     S3_SECRET_ACCESS_KEY=minioadmin \
     S3_REGION=us-east-1 \
     LISTEN_ADDR="127.0.0.1:$MASKURA_E2E_GW_PORT" \
-    MASKURA_FILTER_COMPONENT="$E2E_COMPONENT" \
+    MASKURA_DEFAULT_PLUGIN="$E2E_COMPONENT" \
     MASKURA_STREAMING_READ_MODE=passthrough \
     MASKURA_STREAMING_S3_PROVIDER=minio \
     MASKURA_KEYS_FILE="$E2E_KEYS_FILE" \

@@ -40,7 +40,7 @@ continues to call the network S3 surface with its configured credential. The
 stdio client sends credentials over HTTPS only, except when the configured host
 is a literal loopback address; non-loopback cleartext HTTP fails during startup.
 
-Hosted adapters use `s4_gateway::server::invoke_mcp`. They provide an already
+Hosted adapters use `maskura_gateway::server::invoke_mcp`. They provide an already
 authenticated `AuthenticatedMcpPrincipal`, server operation UUID, typed tool
 request, hard-bounded request/response limits, timeout, and cancellation token.
 The gateway derives credential policy identity only from that principal, binds

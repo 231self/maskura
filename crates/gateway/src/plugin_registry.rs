@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use s4_error::{S4Error, codes};
-use s4_wasm_runtime::{
-    CancellationToken, ExecutorConfig, FilterEngine, FilterSession, FilterWorldVersion,
-    SensitiveGrant, TransformOutcome, WasmExecutor,
+use maskura_error::{MaskuraError, codes};
+use maskura_wasm_runtime::{
+    CancellationToken, ExecutorConfig, FilterEngine, FilterSession, SensitiveGrant,
+    TransformOutcome, WasmExecutor,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -206,7 +206,7 @@ impl Default for PipelineLimits {
 }
 
 impl PipelineLimits {
-    fn validate(self) -> Result<Self, S4Error> {
+    fn validate(self) -> Result<Self, MaskuraError> {
         if self.max_intermediate_record_bytes == 0
             || self.max_plugin_finish_bytes == 0
             || self.max_input_bytes == 0
@@ -216,7 +216,7 @@ impl PipelineLimits {
             || self.max_cumulative_fuel == 0
             || self.max_wall_time.is_zero()
         {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::CONFIG_INVALID,
                 "pipeline limits except expansion slack must be greater than zero",
             ));
@@ -226,17 +226,25 @@ impl PipelineLimits {
 }
 
 trait PipelineFilter: Send {
-    fn transform(&mut self, payload: &[u8], fuel_limit: u64) -> Result<TransformOutcome, S4Error>;
-    fn finish(self: Box<Self>, fuel_limit: u64) -> Result<(Vec<u8>, u64), S4Error>;
+    fn transform(
+        &mut self,
+        payload: &[u8],
+        fuel_limit: u64,
+    ) -> Result<TransformOutcome, MaskuraError>;
+    fn finish(self: Box<Self>, fuel_limit: u64) -> Result<(Vec<u8>, u64), MaskuraError>;
     fn fuel_consumed(&self) -> u64;
 }
 
 impl PipelineFilter for FilterSession {
-    fn transform(&mut self, payload: &[u8], fuel_limit: u64) -> Result<TransformOutcome, S4Error> {
+    fn transform(
+        &mut self,
+        payload: &[u8],
+        fuel_limit: u64,
+    ) -> Result<TransformOutcome, MaskuraError> {
         self.transform_with_fuel_limit(payload, fuel_limit)
     }
 
-    fn finish(self: Box<Self>, fuel_limit: u64) -> Result<(Vec<u8>, u64), S4Error> {
+    fn finish(self: Box<Self>, fuel_limit: u64) -> Result<(Vec<u8>, u64), MaskuraError> {
         self.finish_with_fuel_limit(fuel_limit)
     }
 
@@ -263,8 +271,11 @@ pub struct PipelineSession {
 }
 
 enum PipelineCommand {
-    Process(Record, oneshot::Sender<Result<Option<Record>, S4Error>>),
-    Finish(oneshot::Sender<Result<(Vec<Record>, u64), S4Error>>),
+    Process(
+        Record,
+        oneshot::Sender<Result<Option<Record>, MaskuraError>>,
+    ),
+    Finish(oneshot::Sender<Result<(Vec<Record>, u64), MaskuraError>>),
     Cancel,
 }
 
@@ -274,7 +285,7 @@ enum PipelineCommand {
 pub struct StreamingPipelineSession {
     sender: Option<mpsc::Sender<PipelineCommand>>,
     cancellation: CancellationToken,
-    task: Option<tokio::task::JoinHandle<Result<(), S4Error>>>,
+    task: Option<tokio::task::JoinHandle<Result<(), MaskuraError>>>,
     watchdog: Option<tokio::task::JoinHandle<()>>,
     object_deadline: Instant,
 }
@@ -290,7 +301,7 @@ impl Default for PluginRegistry {
 /// that startup administration imported, so fetches always hit the cache.
 #[async_trait]
 impl ComponentSource for PluginRegistry {
-    async fn load(&self, component_hash: &str) -> Result<Bytes, S4Error> {
+    async fn load(&self, component_hash: &str) -> Result<Bytes, MaskuraError> {
         self.component_bytes(component_hash)
             .map(|bytes| Bytes::from(bytes.to_vec()))
             .ok_or_else(|| crate::pipeline::missing_component_error(component_hash))
@@ -315,7 +326,7 @@ impl PluginRegistry {
         fuel: u64,
         pipeline_limits: PipelineLimits,
         executor_config: ExecutorConfig,
-    ) -> Result<Self, S4Error> {
+    ) -> Result<Self, MaskuraError> {
         Self::with_options_and_cache(fuel, pipeline_limits, executor_config, None)
     }
 
@@ -324,16 +335,16 @@ impl PluginRegistry {
         pipeline_limits: PipelineLimits,
         executor_config: ExecutorConfig,
         cache_max_weight: Option<usize>,
-    ) -> Result<Self, S4Error> {
+    ) -> Result<Self, MaskuraError> {
         if fuel == 0 {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::CONFIG_INVALID,
                 "pipeline fuel must be greater than zero",
             ));
         }
         let cache_max_weight = cache_max_weight.unwrap_or(DEFAULT_COMPILE_CACHE_MAX_WEIGHT);
         if cache_max_weight == 0 {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::CONFIG_INVALID,
                 "component compile cache weight must be greater than zero",
             ));
@@ -353,7 +364,7 @@ impl PluginRegistry {
     /// Create an isolated registry that reuses only immutable compiled Wasm
     /// engines and component bytes. Catalog mutations and executor admission
     /// state remain local to the returned registry.
-    pub fn isolated_clone(&self) -> Result<Self, S4Error> {
+    pub fn isolated_clone(&self) -> Result<Self, MaskuraError> {
         Ok(Self {
             state: RwLock::new(self.state.read().unwrap().clone()),
             fuel: self.fuel,
@@ -546,11 +557,11 @@ impl PluginRegistry {
         capabilities: PluginCapabilities,
         bytes: Arc<[u8]>,
         weight: usize,
-    ) -> Result<Arc<FilterEngine>, S4Error> {
+    ) -> Result<Arc<FilterEngine>, MaskuraError> {
         let mut state = self.state.write().unwrap();
         if let Some(existing) = state.engines.get(&component_hash) {
             if existing.capabilities != capabilities {
-                return Err(S4Error::new(
+                return Err(MaskuraError::new(
                     codes::CONFIG_INVALID,
                     format!(
                         "component {component_hash} is already registered with different capabilities"
@@ -583,9 +594,9 @@ impl PluginRegistry {
         &self,
         resolution: &PipelineResolution,
         source: &dyn ComponentSource,
-    ) -> Result<PipelineSnapshot, S4Error> {
+    ) -> Result<PipelineSnapshot, MaskuraError> {
         if pipeline_requires_passthrough(resolution) {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::CONFIG_INVALID,
                 "empty pipeline requires explicit pass-through",
             ));
@@ -595,12 +606,6 @@ impl PluginRegistry {
         for step in &resolution.steps {
             let engine = if step.enabled {
                 let engine = self.engine_for(step, source).await?;
-                if step.config_json.is_some() && engine.world_version() == FilterWorldVersion::V01 {
-                    return Err(S4Error::new(
-                        codes::CONFIG_INVALID,
-                        "v0.1 components cannot carry step configuration",
-                    ));
-                }
                 Some(engine)
             } else {
                 None
@@ -629,10 +634,10 @@ impl PluginRegistry {
         &self,
         step: &PipelineStep,
         source: &dyn ComponentSource,
-    ) -> Result<Arc<FilterEngine>, S4Error> {
+    ) -> Result<Arc<FilterEngine>, MaskuraError> {
         if let Some((engine, registered)) = self.cached_engine(&step.component_hash) {
             if registered != step.capabilities {
-                return Err(S4Error::new(
+                return Err(MaskuraError::new(
                     codes::CONFIG_INVALID,
                     format!(
                         "component {} is already registered with different capabilities",
@@ -645,7 +650,7 @@ impl PluginRegistry {
         let bytes = source.load(&step.component_hash).await?;
         let actual = hex::encode(Sha256::digest(&bytes));
         if actual != step.component_hash {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::WASM_INIT,
                 format!(
                     "component {} digest mismatch after fetch",
@@ -655,7 +660,7 @@ impl PluginRegistry {
         }
         // Compile outside the registry lock (we already hold no lock here).
         let engine = Arc::new(FilterEngine::with_fuel(&bytes, self.fuel).map_err(|error| {
-            S4Error::new(
+            MaskuraError::new(
                 codes::WASM_INIT,
                 format!(
                     "component {} failed to compile: {error}",
@@ -775,7 +780,7 @@ impl PluginRegistry {
 impl PipelineSnapshot {
     /// Return a snapshot with endpoint-specific limits. Every field is merged
     /// with `min`, so a caller can only tighten the registry configuration.
-    pub fn constrained(&self, constraints: PipelineLimits) -> Result<Self, S4Error> {
+    pub fn constrained(&self, constraints: PipelineLimits) -> Result<Self, MaskuraError> {
         let constraints = constraints.validate()?;
         let mut snapshot = self.clone();
         snapshot.limits.max_intermediate_record_bytes = snapshot
@@ -836,7 +841,7 @@ impl PipelineSnapshot {
             .collect()
     }
 
-    pub fn guest_memory_reservation(&self) -> Result<usize, S4Error> {
+    pub fn guest_memory_reservation(&self) -> Result<usize, MaskuraError> {
         self.plugins
             .iter()
             .filter(|plugin| plugin.enabled)
@@ -850,7 +855,7 @@ impl PipelineSnapshot {
                             .guest_memory_limit(),
                     )
                     .ok_or_else(|| {
-                        S4Error::new(
+                        MaskuraError::new(
                             codes::WASM_ADMISSION,
                             "Wasm guest-memory reservation overflow",
                         )
@@ -860,9 +865,9 @@ impl PipelineSnapshot {
 
     pub fn start_session(
         &self,
-        session: &s4_wasm_runtime::Session,
+        session: &maskura_wasm_runtime::Session,
         cancellation: CancellationToken,
-    ) -> Result<PipelineSession, S4Error> {
+    ) -> Result<PipelineSession, MaskuraError> {
         self.start_session_with_deadline(
             session,
             cancellation,
@@ -872,10 +877,10 @@ impl PipelineSnapshot {
 
     pub fn start_session_with_deadline(
         &self,
-        session: &s4_wasm_runtime::Session,
+        session: &maskura_wasm_runtime::Session,
         cancellation: CancellationToken,
         requested_deadline: Instant,
-    ) -> Result<PipelineSession, S4Error> {
+    ) -> Result<PipelineSession, MaskuraError> {
         let enabled_plugins = self.plugins.iter().filter(|plugin| plugin.enabled).count();
         if enabled_plugins > self.limits.max_plugins {
             return Err(limit_error(
@@ -934,9 +939,9 @@ impl PipelineSnapshot {
 
     pub async fn start_streaming_session(
         self,
-        session: s4_wasm_runtime::Session,
+        session: maskura_wasm_runtime::Session,
         cancellation: CancellationToken,
-    ) -> Result<StreamingPipelineSession, S4Error> {
+    ) -> Result<StreamingPipelineSession, MaskuraError> {
         let deadline = Instant::now() + self.limits.max_wall_time;
         self.start_streaming_session_with_deadline(session, cancellation, deadline)
             .await
@@ -944,10 +949,10 @@ impl PipelineSnapshot {
 
     pub async fn start_streaming_session_with_deadline(
         self,
-        session: s4_wasm_runtime::Session,
+        session: maskura_wasm_runtime::Session,
         cancellation: CancellationToken,
         requested_deadline: Instant,
-    ) -> Result<StreamingPipelineSession, S4Error> {
+    ) -> Result<StreamingPipelineSession, MaskuraError> {
         let object_deadline = requested_deadline.min(Instant::now() + self.limits.max_wall_time);
         let reservation = self.guest_memory_reservation()?;
         let executor = Arc::clone(&self.executor);
@@ -1035,11 +1040,11 @@ impl PipelineSnapshot {
                 drop(sender);
                 match task.await {
                     Ok(Err(error)) => Err(error),
-                    Ok(Ok(())) => Err(S4Error::new(
+                    Ok(Ok(())) => Err(MaskuraError::new(
                         codes::INTERNAL,
                         "Wasm pipeline stopped before session startup",
                     )),
-                    Err(error) => Err(S4Error::new(codes::INTERNAL, error.to_string())),
+                    Err(error) => Err(MaskuraError::new(codes::INTERNAL, error.to_string())),
                 }
             }
         }
@@ -1047,7 +1052,7 @@ impl PipelineSnapshot {
 }
 
 impl StreamingPipelineSession {
-    pub async fn process(&mut self, record: Record) -> Result<Option<Record>, S4Error> {
+    pub async fn process(&mut self, record: Record) -> Result<Option<Record>, MaskuraError> {
         let (response_sender, response_receiver) = oneshot::channel();
         let sender = self.sender.as_ref().ok_or_else(pipeline_stopped)?;
         let deadline = tokio::time::Instant::from_std(self.object_deadline);
@@ -1076,7 +1081,7 @@ impl StreamingPipelineSession {
         result
     }
 
-    pub async fn finish(mut self) -> Result<(Vec<Record>, u64), S4Error> {
+    pub async fn finish(mut self) -> Result<(Vec<Record>, u64), MaskuraError> {
         let (response_sender, response_receiver) = oneshot::channel();
         let Some(sender) = self.sender.take() else {
             let _ = self.abort_and_wait().await;
@@ -1114,11 +1119,11 @@ impl StreamingPipelineSession {
         result
     }
 
-    pub async fn cancel_and_wait(mut self) -> Result<(), S4Error> {
+    pub async fn cancel_and_wait(mut self) -> Result<(), MaskuraError> {
         self.abort_and_wait().await
     }
 
-    async fn abort_and_wait(&mut self) -> Result<(), S4Error> {
+    async fn abort_and_wait(&mut self) -> Result<(), MaskuraError> {
         self.cancellation.cancel();
         self.sender.take();
         self.stop_watchdog().await;
@@ -1128,17 +1133,17 @@ impl StreamingPipelineSession {
         }
     }
 
-    async fn wait(&mut self) -> Result<(), S4Error> {
+    async fn wait(&mut self) -> Result<(), MaskuraError> {
         let result = self.wait_task().await;
         self.stop_watchdog().await;
         result
     }
 
-    async fn wait_task(&mut self) -> Result<(), S4Error> {
+    async fn wait_task(&mut self) -> Result<(), MaskuraError> {
         match self.task.take() {
             Some(task) => task
                 .await
-                .map_err(|error| S4Error::new(codes::INTERNAL, error.to_string()))?,
+                .map_err(|error| MaskuraError::new(codes::INTERNAL, error.to_string()))?,
             None => Ok(()),
         }
     }
@@ -1176,16 +1181,16 @@ fn spawn_deadline_watchdog(
     })
 }
 
-fn pipeline_stopped() -> S4Error {
-    S4Error::new(codes::WASM_CANCELLED, "Wasm pipeline session stopped")
+fn pipeline_stopped() -> MaskuraError {
+    MaskuraError::new(codes::WASM_CANCELLED, "Wasm pipeline session stopped")
 }
 
-fn deadline_error() -> S4Error {
-    S4Error::new(codes::WASM_DEADLINE, "Wasm pipeline deadline exceeded")
+fn deadline_error() -> MaskuraError {
+    MaskuraError::new(codes::WASM_DEADLINE, "Wasm pipeline deadline exceeded")
 }
 
 impl PipelineSession {
-    pub fn process(&mut self, record: Record) -> Result<Option<Record>, S4Error> {
+    pub fn process(&mut self, record: Record) -> Result<Option<Record>, MaskuraError> {
         self.check_deadline()?;
         self.input_bytes = checked_total(
             codes::LIMIT_INPUT_BYTES,
@@ -1197,11 +1202,11 @@ impl PipelineSession {
         self.route_from(0, record)
     }
 
-    pub fn finish(self) -> Result<Vec<Record>, S4Error> {
+    pub fn finish(self) -> Result<Vec<Record>, MaskuraError> {
         self.finish_with_fuel().map(|(records, _)| records)
     }
 
-    fn finish_with_fuel(mut self) -> Result<(Vec<Record>, u64), S4Error> {
+    fn finish_with_fuel(mut self) -> Result<(Vec<Record>, u64), MaskuraError> {
         let mut output = Vec::new();
         for index in 0..self.plugins.len() {
             self.check_deadline()?;
@@ -1252,7 +1257,11 @@ impl PipelineSession {
         self.fuel_consumed
     }
 
-    fn route_from(&mut self, start: usize, mut record: Record) -> Result<Option<Record>, S4Error> {
+    fn route_from(
+        &mut self,
+        start: usize,
+        mut record: Record,
+    ) -> Result<Option<Record>, MaskuraError> {
         for index in start..self.plugins.len() {
             let remaining_fuel = self.remaining_fuel()?;
             let (name, outcome, fuel_delta) = {
@@ -1282,7 +1291,7 @@ impl PipelineSession {
         Ok(Some(record))
     }
 
-    fn check_intermediate(&self, bytes: usize) -> Result<(), S4Error> {
+    fn check_intermediate(&self, bytes: usize) -> Result<(), MaskuraError> {
         if bytes > self.limits.max_intermediate_record_bytes {
             return Err(limit_error(
                 codes::LIMIT_INTERMEDIATE_BYTES,
@@ -1294,26 +1303,27 @@ impl PipelineSession {
         Ok(())
     }
 
-    fn account_stage(&mut self, index: usize, bytes: u64) -> Result<(), S4Error> {
+    fn account_stage(&mut self, index: usize, bytes: u64) -> Result<(), MaskuraError> {
         let total = self.stage_output_bytes[index]
             .checked_add(bytes)
-            .ok_or_else(|| S4Error::new(codes::LIMIT_OUTPUT_BYTES, "stage byte count overflow"))?;
+            .ok_or_else(|| {
+                MaskuraError::new(codes::LIMIT_OUTPUT_BYTES, "stage byte count overflow")
+            })?;
         self.check_cumulative_output(total)?;
         self.stage_output_bytes[index] = total;
         Ok(())
     }
 
-    fn account_output(&mut self, bytes: u64) -> Result<(), S4Error> {
-        let total = self
-            .output_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| S4Error::new(codes::LIMIT_OUTPUT_BYTES, "output byte count overflow"))?;
+    fn account_output(&mut self, bytes: u64) -> Result<(), MaskuraError> {
+        let total = self.output_bytes.checked_add(bytes).ok_or_else(|| {
+            MaskuraError::new(codes::LIMIT_OUTPUT_BYTES, "output byte count overflow")
+        })?;
         self.check_cumulative_output(total)?;
         self.output_bytes = total;
         Ok(())
     }
 
-    fn check_cumulative_output(&self, total: u64) -> Result<(), S4Error> {
+    fn check_cumulative_output(&self, total: u64) -> Result<(), MaskuraError> {
         if total > self.limits.max_output_bytes {
             return Err(limit_error(
                 codes::LIMIT_OUTPUT_BYTES,
@@ -1338,7 +1348,7 @@ impl PipelineSession {
         Ok(())
     }
 
-    fn remaining_fuel(&self) -> Result<u64, S4Error> {
+    fn remaining_fuel(&self) -> Result<u64, MaskuraError> {
         self.limits
             .max_cumulative_fuel
             .checked_sub(self.fuel_consumed)
@@ -1346,9 +1356,9 @@ impl PipelineSession {
             .ok_or_else(fuel_limit_error)
     }
 
-    fn check_deadline(&self) -> Result<(), S4Error> {
+    fn check_deadline(&self) -> Result<(), MaskuraError> {
         if Instant::now() >= self.object_deadline {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::WASM_DEADLINE,
                 "Wasm pipeline wall-time deadline exceeded",
             ));
@@ -1356,7 +1366,7 @@ impl PipelineSession {
         Ok(())
     }
 
-    fn account_fuel(&mut self, consumed: u64) -> Result<(), S4Error> {
+    fn account_fuel(&mut self, consumed: u64) -> Result<(), MaskuraError> {
         self.fuel_consumed = self
             .fuel_consumed
             .checked_add(consumed)
@@ -1368,12 +1378,12 @@ impl PipelineSession {
     }
 }
 
-fn output_validation_error(error: S4Error) -> S4Error {
-    S4Error::new(codes::DECODE_INVALID_OUTPUT, error.message().to_string())
+fn output_validation_error(error: MaskuraError) -> MaskuraError {
+    MaskuraError::new(codes::DECODE_INVALID_OUTPUT, error.message().to_string())
 }
 
-fn plugin_error(name: &str, error: S4Error) -> S4Error {
-    S4Error::new(error.code(), format!("plugin {name}: {}", error.message()))
+fn plugin_error(name: &str, error: MaskuraError) -> MaskuraError {
+    MaskuraError::new(error.code(), format!("plugin {name}: {}", error.message()))
 }
 
 fn record_len(record: &Record) -> u64 {
@@ -1386,22 +1396,22 @@ fn checked_total(
     current: u64,
     added: u64,
     limit: u64,
-) -> Result<u64, S4Error> {
+) -> Result<u64, MaskuraError> {
     let total = current
         .checked_add(added)
-        .ok_or_else(|| S4Error::new(code, format!("{kind} count overflow")))?;
+        .ok_or_else(|| MaskuraError::new(code, format!("{kind} count overflow")))?;
     if total > limit {
         return Err(limit_error(code, kind, total, limit));
     }
     Ok(total)
 }
 
-fn limit_error(code: &'static str, kind: &str, actual: u64, limit: u64) -> S4Error {
-    S4Error::new(code, format!("{kind} {actual} exceeds limit {limit}"))
+fn limit_error(code: &'static str, kind: &str, actual: u64, limit: u64) -> MaskuraError {
+    MaskuraError::new(code, format!("{kind} {actual} exceeds limit {limit}"))
 }
 
-fn fuel_limit_error() -> S4Error {
-    S4Error::new(codes::WASM_FUEL, "Wasm pipeline cumulative fuel exhausted")
+fn fuel_limit_error() -> MaskuraError {
+    MaskuraError::new(codes::WASM_FUEL, "Wasm pipeline cumulative fuel exhausted")
 }
 
 #[cfg(test)]
@@ -1418,7 +1428,7 @@ mod tests {
             .join("target")
             .join("components")
             .join(name);
-        std::fs::read(path).unwrap_or_else(|_| panic!("{name}; run just build-filters"))
+        std::fs::read(path).unwrap_or_else(|_| panic!("{name}; run just build-plugins"))
     }
 
     fn component() -> Vec<u8> {
@@ -1429,17 +1439,17 @@ mod tests {
         std::fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
-                .join("target/test-components/test-filter-v02.component.wasm"),
+                .join("target/test-components/test-transformer-context.component.wasm"),
         )
-        .expect("test-filter-v02.component.wasm; run just build-filters")
+        .expect("test-transformer-context.component.wasm; run just build-plugins")
     }
 
-    fn session() -> s4_wasm_runtime::Session {
-        s4_wasm_runtime::Session {
+    fn session() -> maskura_wasm_runtime::Session {
+        maskura_wasm_runtime::Session {
             format: "text".to_string(),
             content_type: "text/plain".to_string(),
             policy_version: 1,
-            operation: s4_wasm_runtime::Operation::Write,
+            operation: maskura_wasm_runtime::Operation::Write,
             config_json: None,
             public_key_pem: None,
             stable_key: None,
@@ -1463,7 +1473,7 @@ mod tests {
             &mut self,
             payload: &[u8],
             _fuel_limit: u64,
-        ) -> Result<TransformOutcome, S4Error> {
+        ) -> Result<TransformOutcome, MaskuraError> {
             self.count += 1;
             self.calls.lock().unwrap().push(format!(
                 "{}:{}",
@@ -1471,7 +1481,7 @@ mod tests {
                 String::from_utf8_lossy(payload)
             ));
             if let Some(message) = self.reject {
-                return Err(S4Error::new(codes::WASM_REJECT, message));
+                return Err(MaskuraError::new(codes::WASM_REJECT, message));
             }
             if self.drop {
                 return Ok(TransformOutcome::Drop);
@@ -1484,7 +1494,7 @@ mod tests {
             Ok(TransformOutcome::Emit(output))
         }
 
-        fn finish(self: Box<Self>, _fuel_limit: u64) -> Result<(Vec<u8>, u64), S4Error> {
+        fn finish(self: Box<Self>, _fuel_limit: u64) -> Result<(Vec<u8>, u64), MaskuraError> {
             self.calls
                 .lock()
                 .unwrap()
@@ -2122,10 +2132,12 @@ mod tests {
         let test_component = std::fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
-                .join("target/test-components/test-filter.component.wasm"),
+                .join("target/test-components/test-transformer.component.wasm"),
         )
-        .expect("test-filter.component.wasm; run just build-filters");
-        registry.import("test-filter", &test_component).unwrap();
+        .expect("test-transformer.component.wasm; run just build-plugins");
+        registry
+            .import("test-transformer", &test_component)
+            .unwrap();
         let snapshot = registry.snapshot();
 
         let first_cancellation = CancellationToken::new();
@@ -2181,10 +2193,12 @@ mod tests {
         let test_component = std::fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
-                .join("target/test-components/test-filter.component.wasm"),
+                .join("target/test-components/test-transformer.component.wasm"),
         )
-        .expect("test-filter.component.wasm; run just build-filters");
-        registry.import("test-filter", &test_component).unwrap();
+        .expect("test-transformer.component.wasm; run just build-plugins");
+        registry
+            .import("test-transformer", &test_component)
+            .unwrap();
         let snapshot = registry
             .snapshot()
             .constrained(PipelineLimits {
@@ -2224,7 +2238,7 @@ mod tests {
                 ))
                 .is_ok()
         );
-        let task = tokio::task::spawn_blocking(move || -> Result<(), S4Error> {
+        let task = tokio::task::spawn_blocking(move || -> Result<(), MaskuraError> {
             std::thread::sleep(Duration::from_millis(25));
             while receiver.blocking_recv().is_some() {}
             Ok(())
@@ -2582,7 +2596,7 @@ mod tests {
         };
         let snapshot = registry.snapshot_for(&resolution, &source).await.unwrap();
         let mut request = session();
-        request.operation = s4_wasm_runtime::Operation::Read;
+        request.operation = maskura_wasm_runtime::Operation::Read;
         request.content_type = "test/require-step-context".to_string();
         request.public_key_pem = Some("must-not-be-shared".to_string());
         request.stable_key = Some(vec![7; 32]);
@@ -2597,50 +2611,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn snapshot_for_publicly_rejects_config_on_v01_component() {
-        let bytes = component();
-        let digest = hex::encode(Sha256::digest(&bytes));
-        let registry = PluginRegistry::new();
-        registry.import("v01", &bytes).unwrap();
-        let resolution = PipelineResolution {
-            locator: crate::pipeline::PipelineLocator {
-                revision: "configured-v01".to_string(),
-                fingerprint: "fingerprint".to_string(),
-            },
-            steps: vec![PipelineStep {
-                component_hash: digest,
-                plugin_version_id: None,
-                enabled: true,
-                version: Some("0.1.0".to_string()),
-                config_json: Some(r#"{"forbidden":true}"#.to_string()),
-                capabilities: PluginCapabilities::default(),
-                sensitive_grant: SensitiveGrant::NONE,
-            }],
-            policy_generation: None,
-            explicit_passthrough: false,
-            limits: PipelineLimits::default(),
-        };
-
-        let error = registry
-            .snapshot_for(&resolution, &registry)
-            .await
-            .err()
-            .expect("configured v0.1 step must be rejected");
-        assert_eq!(error.code(), codes::CONFIG_INVALID);
-        assert_eq!(
-            error.message(),
-            "v0.1 components cannot carry step configuration"
-        );
-    }
-
     struct StaticComponentSource {
         bytes: Arc<Vec<u8>>,
     }
 
     #[async_trait]
     impl ComponentSource for StaticComponentSource {
-        async fn load(&self, _component_hash: &str) -> Result<Bytes, S4Error> {
+        async fn load(&self, _component_hash: &str) -> Result<Bytes, MaskuraError> {
             Ok(Bytes::from(self.bytes.as_ref().clone()))
         }
     }

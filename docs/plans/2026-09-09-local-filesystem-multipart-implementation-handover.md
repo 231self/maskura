@@ -84,7 +84,7 @@ The active toolchain currently has `rustup`, `wasm32-unknown-unknown`, and
 The earlier missing-filter failure was environmental and is resolved:
 
 ```bash
-just build-filters
+just build-plugins
 ```
 
 now succeeds.
@@ -123,7 +123,7 @@ Postgres test wrappers compiled, but live database bodies were skipped because
 
 Tasks 12 through 16 are complete. Task 17 is the current described change:
 `docs(storage): complete standalone multipart rollout`. Its focused gates are
-green: `just check`, `cargo test -p s4ctl`, `cargo clippy -p s4ctl --all-targets
+green: `just check`, `cargo test -p maskura`, `cargo clippy -p maskura --all-targets
 -- -D warnings`, `cargo fmt --check`, and `mdbook build docs`. The optional
 `cargo-deny` and `cargo-audit` tools are not installed in this environment, and
 live Postgres migration tests remain conditional on `DATABASE_URL`.
@@ -169,7 +169,7 @@ Current validation:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo check --locked -p s4-gateway
+cargo check --locked -p maskura-gateway
 ```
 
 passes. No `TODO`, `todo!`, or `unimplemented!` markers were found. Task 12 has
@@ -190,13 +190,13 @@ Then run the smallest focused gates:
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo fmt --all -- --check
-cargo test --locked -p s4-gateway local_staged_persistence_requires_no_hosted_dependencies
-cargo test --locked -p s4-gateway multipart_recovery_orders_artifacts_before_expiry_and_retries_on_next_run
-cargo test --locked -p s4-gateway local_storage::tests
-cargo test --locked -p s4-gateway file_multipart_repository
-cargo test --locked -p s4-gateway file_journal
-cargo test --locked -p s4-gateway multipart
-cargo clippy --locked -p s4-gateway --all-targets -- -D warnings
+cargo test --locked -p maskura-gateway local_staged_persistence_requires_no_hosted_dependencies
+cargo test --locked -p maskura-gateway multipart_recovery_orders_artifacts_before_expiry_and_retries_on_next_run
+cargo test --locked -p maskura-gateway local_storage::tests
+cargo test --locked -p maskura-gateway file_multipart_repository
+cargo test --locked -p maskura-gateway file_journal
+cargo test --locked -p maskura-gateway multipart
+cargo clippy --locked -p maskura-gateway --all-targets -- -D warnings
 ```
 
 Fix failures in the current six files only unless the compiler demonstrates a
@@ -216,8 +216,8 @@ missing contract change. Confirm specifically:
 After focused gates pass, run:
 
 ```bash
-just build-filters
-cargo test --locked -p s4-gateway --test s3_frontdoor_test
+just build-plugins
+cargo test --locked -p maskura-gateway --test s3_frontdoor_test
 ```
 
 Only then start a new jj change.
@@ -330,7 +330,7 @@ Run these only after Tasks 12 through 17 pass focused gates:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-just build-filters
+just build-plugins
 just check
 just deny
 just audit
@@ -341,7 +341,7 @@ With a configured local Postgres test database, also run:
 
 ```bash
 sqlx migrate info
-cargo test --locked -p s4-gateway --test db_keys_test
+cargo test --locked -p maskura-gateway --test db_keys_test
 ```
 
 Finally verify:

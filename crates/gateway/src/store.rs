@@ -45,7 +45,7 @@ pub struct ApiKey {
     pub public_key_pem: Option<String>,
 }
 
-/// MCP bearer token (`s4m_...`). The full token is the credential; only its
+/// MCP bearer token (`maskura_mcp_...`). The full token is the credential; only its
 /// SHA-256 hash is stored.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct McpToken {
@@ -272,7 +272,7 @@ pub trait KeyRepository: Send + Sync {
 
     async fn delete_key(&self, key_id: &str, user_id: &str) -> anyhow::Result<bool>;
 
-    /// Create an MCP bearer token (`s4m_...`) and return the plaintext token
+    /// Create an MCP bearer token (`maskura_mcp_...`) and return the plaintext token
     /// (shown once). Only its SHA-256 hash is stored.
     async fn create_mcp_token(
         &self,
@@ -372,8 +372,11 @@ fn generate_api_key(
         .as_deref()
         .map(canonicalize_public_key_pem)
         .transpose()?;
-    let key_id = format!("s4_{}", Uuid::new_v4().to_string().replace('-', ""));
-    let secret = format!("s4s_{}", Uuid::new_v4().to_string().replace('-', ""));
+    let key_id = format!("maskura_{}", Uuid::new_v4().to_string().replace('-', ""));
+    let secret = format!(
+        "maskura_secret_{}",
+        Uuid::new_v4().to_string().replace('-', "")
+    );
     let secret_hash = sha256_hash(&secret);
     let secret_encrypted = match cipher {
         Some(cipher) => Some(
@@ -414,20 +417,20 @@ fn generate_api_key(
 
 fn validate_bootstrap_key_id(key_id: &str) -> anyhow::Result<()> {
     let valid = key_id
-        .strip_prefix("s4_")
+        .strip_prefix("maskura_")
         .is_some_and(|rest| rest.len() == 32 && rest.bytes().all(|byte| byte.is_ascii_hexdigit()));
     if !valid {
-        anyhow::bail!("bootstrap key id must match `s4_<32-hex>`");
+        anyhow::bail!("bootstrap key id must match `maskura_<32-hex>`");
     }
     Ok(())
 }
 
 fn validate_bootstrap_secret(secret: &str) -> anyhow::Result<()> {
     let valid = secret
-        .strip_prefix("s4s_")
+        .strip_prefix("maskura_secret_")
         .is_some_and(|rest| rest.len() == 32 && rest.bytes().all(|byte| byte.is_ascii_hexdigit()));
     if !valid {
-        anyhow::bail!("bootstrap secret must match `s4s_<32-hex>`");
+        anyhow::bail!("bootstrap secret must match `maskura_secret_<32-hex>`");
     }
     Ok(())
 }
@@ -479,7 +482,10 @@ fn generate_mcp_token(
 ) -> anyhow::Result<(McpToken, String)> {
     let label = canonicalize_credential_label(label)?;
     validate_credential_ttl(expires_in)?;
-    let token = format!("s4m_{}", Uuid::new_v4().to_string().replace('-', ""));
+    let token = format!(
+        "maskura_mcp_{}",
+        Uuid::new_v4().to_string().replace('-', "")
+    );
     let now = chrono_now().parse::<u64>().unwrap_or(0);
     let expires_at = if expires_in > 0 {
         Some(
@@ -913,7 +919,7 @@ impl KeyRepository for KeyStore {
     }
 }
 
-/// Persistent key store backed by a JSON file (e.g. `~/.config/s4/keys.json`).
+/// Persistent key store backed by a JSON file (e.g. `~/.config/maskura/keys.json`).
 ///
 /// Loads the file once at construction and rewrites it atomically (0600 on
 /// unix) after every mutation, so API keys survive gateway restarts without
@@ -982,7 +988,7 @@ impl FileKeyStore {
     pub fn default_path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("s4")
+            .join("maskura")
             .join("keys.json")
     }
 
@@ -2023,7 +2029,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(token.starts_with("s4m_"));
+        assert!(token.starts_with("maskura_mcp_"));
         assert_eq!(mcp.label, "agent");
         assert!(mcp.expires_at.is_some());
         assert!(
@@ -2137,8 +2143,8 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_key_seeds_a_resolvable_stable_credential() {
         let store = KeyStore::with_cipher(test_cipher());
-        let key_id = format!("s4_{}", "a".repeat(32));
-        let secret = format!("s4s_{}", "b".repeat(32));
+        let key_id = format!("maskura_{}", "a".repeat(32));
+        let secret = format!("maskura_secret_{}", "b".repeat(32));
 
         let created = store
             .bootstrap_key(
@@ -2185,7 +2191,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_key_rejects_malformed_id_and_secret() {
         let store = KeyStore::with_cipher(test_cipher());
-        let secret = format!("s4s_{}", "b".repeat(32));
+        let secret = format!("maskura_secret_{}", "b".repeat(32));
         assert!(
             store
                 .bootstrap_key(
@@ -2199,7 +2205,7 @@ mod tests {
                 .is_err()
         );
 
-        let key_id = format!("s4_{}", "a".repeat(32));
+        let key_id = format!("maskura_{}", "a".repeat(32));
         assert!(
             store
                 .bootstrap_key(
@@ -2232,8 +2238,8 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_rewrap_encryption_failure_is_a_repository_error() {
-        let key_id = "s4_legacy";
-        let secret = "s4s_legacy";
+        let key_id = "maskura_legacy";
+        let secret = "maskura_secret_legacy";
         let legacy = test_cipher().encrypt_v1(secret).unwrap();
         let cipher = Arc::new(SecretCipher::new(Arc::new(FailingWrapKeyWrapping(
             LocalKeyWrapping::with_kek([7; 32]),
@@ -2381,7 +2387,12 @@ mod tests {
         })
         .join();
 
-        assert!(store.resolve_mcp_token("s4m_missing").await.is_err());
+        assert!(
+            store
+                .resolve_mcp_token("maskura_mcp_missing")
+                .await
+                .is_err()
+        );
         assert!(store.list_mcp_tokens("u1").await.is_err());
         assert!(
             store
@@ -2608,7 +2619,7 @@ mod tests {
     async fn file_store_loads_legacy_bare_key_map() {
         let path = temp_keys_file();
         let key = build_api_key(
-            "s4_legacy",
+            "maskura_legacy",
             "u1",
             None,
             "legacy",
@@ -2629,7 +2640,7 @@ mod tests {
         assert_eq!(store.get_key(&key.key_id).await.unwrap(), Some(key));
         assert!(
             store
-                .resolve_credentials("s4_legacy", "secret")
+                .resolve_credentials("maskura_legacy", "secret")
                 .await
                 .unwrap()
                 .is_none(),
@@ -2641,7 +2652,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_file_mcp_token_without_workspace_fails_closed() {
         let path = temp_keys_file();
-        let token = "s4m_legacy";
+        let token = "maskura_mcp_legacy";
         let persisted = serde_json::json!({
             "keys": {},
             "mcp_tokens": {
@@ -2664,7 +2675,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_bound_file_mcp_token_gets_a_stable_credential_identity() {
         let path = temp_keys_file();
-        let token = "s4m_legacy_bound";
+        let token = "maskura_mcp_legacy_bound";
         let persisted = serde_json::json!({
             "keys": {},
             "mcp_tokens": {
@@ -3344,7 +3355,7 @@ mod tests {
 
         assert!(
             store
-                .get_key("s4_missing")
+                .get_key("maskura_missing")
                 .await
                 .unwrap_err()
                 .to_string()
@@ -3352,7 +3363,7 @@ mod tests {
         );
         assert!(
             store
-                .decrypt_secret("s4_missing")
+                .decrypt_secret("maskura_missing")
                 .await
                 .unwrap_err()
                 .to_string()
@@ -3360,7 +3371,7 @@ mod tests {
         );
         assert!(
             store
-                .resolve_credentials("s4_missing", "s4s_missing")
+                .resolve_credentials("maskura_missing", "maskura_secret_missing")
                 .await
                 .unwrap_err()
                 .to_string()
@@ -3376,7 +3387,7 @@ mod tests {
         );
         assert!(
             store
-                .delete_key("s4_missing", "u1")
+                .delete_key("maskura_missing", "u1")
                 .await
                 .unwrap_err()
                 .to_string()
@@ -3384,7 +3395,7 @@ mod tests {
         );
         assert!(
             store
-                .resolve_mcp_token("s4m_missing")
+                .resolve_mcp_token("maskura_mcp_missing")
                 .await
                 .unwrap_err()
                 .to_string()

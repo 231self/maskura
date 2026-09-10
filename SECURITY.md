@@ -82,7 +82,7 @@ In scope:
 - The gateway (`crates/gateway`) — authentication (SigV4, API keys), the
   transformation pipeline, transactional storage paths, and staging.
 - The Wasm filter runtime and plugins (`crates/wasm-runtime`, `filters/`).
-- The SDKs (`sdks/`) and the CLI (`crates/s4ctl`).
+- The SDKs (`sdks/`) and the CLI (`crates/maskura`).
 - The cryptographic designs described in `docs/adr/` and `docs/security.md`.
 
 Out of scope:

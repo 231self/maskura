@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build deterministic canonical and legacy SDK release archives."""
+"""Build deterministic Maskura SDK release archives."""
 
 from __future__ import annotations
 
@@ -25,46 +25,6 @@ EXCLUDED_DIRS = {
     "node_modules",
 }
 EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
-
-
-def replace_once(data: bytes, old: str, new: str, path: str) -> bytes:
-    text = data.decode()
-    if text.count(old) != 1:
-        raise ValueError(f"expected one {old!r} in {path}")
-    return text.replace(old, new, 1).encode()
-
-
-def python_metadata(project_name: str) -> Callable[[str, bytes], bytes]:
-    def transform(path: str, data: bytes) -> bytes:
-        if path == "pyproject.toml":
-            return replace_once(
-                data, 'name = "maskura_client"', f'name = "{project_name}"', path
-            )
-        if path == "setup.py":
-            return replace_once(
-                data, 'NAME = "maskura_client"', f'NAME = "{project_name}"', path
-            )
-        return data
-
-    return transform
-
-
-def python_legacy_metadata(path: str, data: bytes) -> bytes:
-    if path == "pyproject.toml":
-        return replace_once(data, 'name = "maskura_client"', 'name = "s4-client"', path)
-    if path == "setup.py":
-        return replace_once(data, 'NAME = "maskura_client"', 'NAME = "s4-client"', path)
-    return data
-
-
-def typescript_legacy_metadata(path: str, data: bytes) -> bytes:
-    if path != "package.json":
-        return data
-    package = json.loads(data)
-    if package.get("name") != "maskura-client":
-        raise ValueError("expected canonical TypeScript package name maskura-client")
-    package["name"] = "s4-client"
-    return (json.dumps(package, indent=2) + "\n").encode()
 
 
 def source_files(source: Path) -> list[Path]:
@@ -135,8 +95,8 @@ def validate_python_archive(path: Path, project_name: str) -> None:
         "setup.py",
         "maskura_client/__init__.py",
         "maskura_client/py.typed",
-        "s4_client/__init__.py",
-        "s4_client/py.typed",
+        "maskura_client/__init__.py",
+        "maskura_client/py.typed",
     }
     if missing := required - names:
         raise ValueError(f"{path.name} is missing {sorted(missing)}")
@@ -174,16 +134,8 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     archives = {
-        "maskura-python-sdk.tar.gz": (
-            SDK_ROOT / "python",
-            python_metadata("maskura-client"),
-        ),
-        "s4-python-sdk.tar.gz": (SDK_ROOT / "python", python_legacy_metadata),
+        "maskura-python-sdk.tar.gz": (SDK_ROOT / "python", None),
         "maskura-typescript-sdk.tar.gz": (SDK_ROOT / "typescript", None),
-        "s4-typescript-sdk.tar.gz": (
-            SDK_ROOT / "typescript",
-            typescript_legacy_metadata,
-        ),
     }
     for filename, (source, transform) in archives.items():
         create_archive(source, args.output_dir / filename, transform)
@@ -191,12 +143,8 @@ def main() -> None:
     validate_python_archive(
         args.output_dir / "maskura-python-sdk.tar.gz", "maskura-client"
     )
-    validate_python_archive(args.output_dir / "s4-python-sdk.tar.gz", "s4-client")
     validate_typescript_archive(
         args.output_dir / "maskura-typescript-sdk.tar.gz", "maskura-client"
-    )
-    validate_typescript_archive(
-        args.output_dir / "s4-typescript-sdk.tar.gz", "s4-client"
     )
 
 

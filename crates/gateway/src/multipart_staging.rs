@@ -42,9 +42,9 @@ pub const MAX_ACTIVE_UPLOADS: usize = 16;
 pub const MAX_PARTS: u32 = 10_000;
 pub const MAX_MULTIPART_UPLOADS_PAGE: usize = 1_000;
 pub const DEFAULT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
-const MAGIC: &[u8] = b"S4MP10\0";
+const MAGIC: &[u8] = b"MSKMP1\0";
 const NONCE_LEN: usize = 12;
-const FILE_PREFIX: &str = "s4-multipart-";
+const FILE_PREFIX: &str = "maskura-multipart-";
 pub const ARTIFACT_PREFIX: &str = "multipart/";
 #[cfg(any(test, debug_assertions))]
 static FAIL_ABORT_AFTER_UPDATE: AtomicBool = AtomicBool::new(false);
@@ -3623,7 +3623,7 @@ impl<R: AsyncRead + Unpin> EncryptedPartReader<R> {
 
 fn artifact_aad(header: &ArtifactHeader, chunk: u64) -> Vec<u8> {
     format!(
-        "s4.multipart.stage.v1\0{}\0{}\0{}\0{}\0{}\0{}",
+        "maskura.multipart.stage.v1\0{}\0{}\0{}\0{}\0{}\0{}",
         header.tenant_id,
         header.upload_id,
         header.part_number,

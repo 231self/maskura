@@ -346,7 +346,7 @@ impl AwsS3TransactionBackend {
             Ok(output) => {
                 let matches_operation = output
                     .metadata()
-                    .and_then(|metadata| metadata.get("s4-operation-id"))
+                    .and_then(|metadata| metadata.get("maskura-operation-id"))
                     .is_some_and(|id| id == &operation.id.to_string());
                 let matches_size = operation.expected.size.is_none_or(|expected| {
                     output
@@ -419,19 +419,19 @@ fn object_metadata(operation: &OperationRecord) -> std::collections::HashMap<Str
         .iter()
         .filter(|(key, _)| key.as_str() != "content-type")
         .map(|(key, value)| (key.clone(), value.clone()))
-        .chain([("s4-operation-id".to_string(), operation.id.to_string())])
+        .chain([("maskura-operation-id".to_string(), operation.id.to_string())])
         .chain(
             operation
                 .expected
                 .digest
                 .as_ref()
-                .map(|digest| ("s4-sha256".to_string(), digest.clone())),
+                .map(|digest| ("maskura-sha256".to_string(), digest.clone())),
         )
         .chain(
             operation
                 .expected
                 .size
-                .map(|size| ("s4-size".to_string(), size.to_string())),
+                .map(|size| ("maskura-size".to_string(), size.to_string())),
         )
         .collect()
 }
@@ -840,7 +840,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
                     })?;
                 let operation_matches = head
                     .metadata()
-                    .and_then(|metadata| metadata.get("s4-operation-id"))
+                    .and_then(|metadata| metadata.get("maskura-operation-id"))
                     .is_some_and(|id| id == &operation.id.to_string());
                 discovered.push(DiscoveredObjectVersion {
                     version_id: version_id.to_string(),
@@ -1865,13 +1865,13 @@ mod tests {
                 .header("x-amz-server-side-encryption", "AES256");
             if version != "customer-version" {
                 response = response.header(
-                    "x-amz-meta-s4-operation-id",
+                    "x-amz-meta-maskura-operation-id",
                     "018f0000-0000-7000-8000-000000000001",
                 );
             }
             return response
-                .header("x-amz-meta-s4-sha256", "digest")
-                .header("x-amz-meta-s4-size", "3")
+                .header("x-amz-meta-maskura-sha256", "digest")
+                .header("x-amz-meta-maskura-size", "3")
                 .body(Body::empty())
                 .unwrap();
         }
@@ -2560,7 +2560,7 @@ mod tests {
                     *method == Method::PUT
                         && !uri.contains("uploadId")
                         && !headers.contains_key("x-amz-server-side-encryption")
-                        && headers.contains_key("x-amz-meta-s4-operation-id")
+                        && headers.contains_key("x-amz-meta-maskura-operation-id")
                 })
         );
         assert_eq!(
@@ -2700,7 +2700,7 @@ mod tests {
             destination(),
             ExpectedObject {
                 metadata: std::collections::BTreeMap::from([(
-                    "s4-generation".to_string(),
+                    "maskura-generation".to_string(),
                     "generation".to_string(),
                 )]),
                 ..ExpectedObject::default()
@@ -2709,8 +2709,8 @@ mod tests {
         let initiation_metadata = object_metadata(&operation);
 
         assert!(metadata_matches(Some(&initiation_metadata), &operation));
-        assert!(!initiation_metadata.contains_key("s4-sha256"));
-        assert!(!initiation_metadata.contains_key("s4-size"));
+        assert!(!initiation_metadata.contains_key("maskura-sha256"));
+        assert!(!initiation_metadata.contains_key("maskura-size"));
 
         operation.expected.digest = Some("verified-digest".to_string());
         operation.expected.size = Some((DIRECT_PART_BYTES + 1) as u64);
@@ -2719,11 +2719,11 @@ mod tests {
         let completed_metadata = object_metadata(&operation);
         assert!(metadata_matches(Some(&completed_metadata), &operation));
         assert_eq!(
-            completed_metadata.get("s4-sha256"),
+            completed_metadata.get("maskura-sha256"),
             Some(&"verified-digest".to_string())
         );
         assert_eq!(
-            completed_metadata.get("s4-size"),
+            completed_metadata.get("maskura-size"),
             Some(&(DIRECT_PART_BYTES + 1).to_string())
         );
     }

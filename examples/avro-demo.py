@@ -4,7 +4,7 @@
 Start a local gateway with binary processing enabled and local auth:
 
     AUTH_DISABLED=true MASKURA_ENABLE_AVRO=true MASKURA_TRANSFORMED_READ_SPOOL=encrypted \
-        cargo run --bin s4-gateway
+        cargo run --bin maskura-gateway
 
 The gateway prints ``MASKURA_ACCESS_KEY`` / ``MASKURA_SECRET_KEY`` at startup. Export them
 and run this script:

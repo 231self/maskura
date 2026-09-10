@@ -20,7 +20,7 @@ maskura local init
 ```
 
 That command uses the Docker API to run one published gateway container with the
-`s4-local-keys` volume mounted at `/data`, `MASKURA_STORAGE_MODE=local`, and
+`maskura-local-keys` volume mounted at `/data`, `MASKURA_STORAGE_MODE=local`, and
 durable staged multipart enabled. Use the exact loopback URL and credentials it
 prints with `aws s3`, boto3, or another S3 client.
 
@@ -51,7 +51,7 @@ The orchestrator starts (or reuses) one shared environment for every feature:
   (`minioadmin`/`minioadmin`), it is reused instead of failing on the port
   clash (common when a dev/ad MinIO is running). Otherwise `docker compose -f
   local/docker-compose.yml up -d minio` starts one, torn down on exit.
-- **Bucket `s4-local`** is created if missing.
+- **Bucket `maskura-local`** is created if missing.
 - **Gateway (AUTH_DISABLED)** on `$MASKURA_E2E_GW_PORT` (default `9010`),
   single-tenant streaming against that MinIO, an isolated `keys.json`, the
   built `pii-default` component, and `MASKURA_STREAMING_READ_MODE=passthrough`.
@@ -59,7 +59,7 @@ The orchestrator starts (or reuses) one shared environment for every feature:
   each run, so the suite validates the code you have checked out.
 
 Requirements: `bash`, Docker + `docker compose`, `curl`, `python3`, and a Rust
-toolchain with the WASM/WASI targets used by `scripts/build-filters.sh`. No
+toolchain with the WASM/WASI targets used by `scripts/build-plugins.sh`. No
 environment variables, secrets, or network access are required.
 
 > Note: with `AUTH_DISABLED=true`, unauthenticated and unresolvable-credential
@@ -75,7 +75,7 @@ environment variables, secrets, or network access are required.
 | `15-avro-gate.sh` | Avro gate | A PUT with `Content-Type: application/avro` is rejected (501) while `MASKURA_ENABLE_AVRO` is unset, and nothing is stored |
 | `20-redaction-roundtrip.sh` | Core redaction | `maskura test upload` stores a PII fixture through the pipeline; the object read directly back from MinIO contains `[REDACTED_EMAIL]`/`[REDACTED_SSN]`/`[REDACTED_CARD]` and no plaintext |
 | `25-strict-auth-denial.sh` | Auth enforcement | Boots a second, isolated gateway on `$MASKURA_STRICT_GW_PORT` (default `9011`) **without** `AUTH_DISABLED` and an empty keystore: unauthenticated S3 PUT/GET/List are denied 403 and the dashboard key API is denied 401 — no demo fallback |
-| `30-keys-s3-lifecycle.sh` | Keys + S3 data plane | Dashboard key create / list / revoke happy paths (`s4_`/`s4s_` formats, revoke returns 204 and removes the key); header-authenticated S3 PUT → HEAD → GET byte-identical read-back → ListObjects v1 and v2 via the real MinIO backend → DELETE → 404 |
+| `30-keys-s3-lifecycle.sh` | Keys + S3 data plane | Dashboard key create / list / revoke happy paths (`maskura_`/`maskura_secret_` formats, revoke returns 204 and removes the key); header-authenticated S3 PUT → HEAD → GET byte-identical read-back → ListObjects v1 and v2 via the real MinIO backend → DELETE → 404 |
 | `40-plugin-admin-http.sh` | Plugin management | Import a real `.wasm` component (201), catalog list, enable (200 + `enabled: true`), reorder, and remove (204) over the HTTP admin routes mounted in `AUTH_DISABLED` mode. Runs last because enabling an imported component can change the write pipeline |
 
 Each feature prints `PASS:`/`FAIL:` lines and exits non-zero on failure, so a
@@ -105,7 +105,7 @@ are deliberately not part of this suite yet. Each is a natural future
    and an Avro codec (e.g. `fastavro`) on the runner to assert typed output.
    See [Avro OCF support](avro.md).
 - **Managed service storage** — needs a multi-backend boot with
-  `S4_SERVICE_BUCKETS` and no `S3_ENDPOINT` (the two are mutually exclusive at
+  `MASKURA_SERVICE_BUCKETS` and no `S3_ENDPOINT` (the two are mutually exclusive at
   startup).
 - **Staged multipart** — local mode is covered without Postgres or MinIO by the
   standalone filesystem multipart tests and AWS SDK conformance suite. Hosted

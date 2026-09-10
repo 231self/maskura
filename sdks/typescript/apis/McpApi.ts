@@ -19,7 +19,7 @@ import { McpTokenResponse } from '../models/McpTokenResponse';
 export class McpApiRequestFactory extends BaseAPIRequestFactory {
 
     /**
-     * Create an MCP bearer token (`s4m_...`). The plaintext token is returned once and only its hash is stored.
+     * Create an MCP bearer token (`maskura_mcp_...`). The plaintext token is returned once and only its hash is stored.
      * @param createMcpTokenRequest 
      */
     public async createMcpToken(createMcpTokenRequest: CreateMcpTokenRequest, _options?: Configuration): Promise<RequestContext> {

@@ -1,6 +1,6 @@
 use sea_orm::entity::prelude::*;
 
-/// MCP bearer tokens: `s4m_...`. The full token is the credential; only its
+/// MCP bearer tokens: `maskura_mcp_...`. The full token is the credential; only its
 /// SHA-256 hash is stored.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
 #[sea_orm(table_name = "mcp_tokens")]

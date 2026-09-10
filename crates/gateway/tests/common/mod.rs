@@ -7,11 +7,11 @@
 //! the tests keep exercising real production infrastructure.
 #![allow(dead_code)]
 
-use s4_error::S4Error;
-use s4_gateway::Format;
-use s4_gateway::plugin_registry::PluginRegistry;
-use s4_gateway::record::{DecoderLimits, Record, RecordDecoder};
-use s4_wasm_runtime::CancellationToken;
+use maskura_error::MaskuraError;
+use maskura_gateway::Format;
+use maskura_gateway::plugin_registry::PluginRegistry;
+use maskura_gateway::record::{DecoderLimits, Record, RecordDecoder};
+use maskura_wasm_runtime::CancellationToken;
 
 /// Process `input` through the registry's streaming pipeline, preserving the
 /// original record separators. Returns the complete transformed bytes.
@@ -23,7 +23,7 @@ pub async fn stream_process_async(
     public_key_pem: Option<&str>,
     stable_key: Option<&[u8]>,
     stable_fields: Option<&str>,
-) -> Result<Vec<u8>, S4Error> {
+) -> Result<Vec<u8>, MaskuraError> {
     let limits = DecoderLimits::default();
     Ok(stream_chunked_counted_async(
         registry,
@@ -51,7 +51,7 @@ pub async fn stream_chunked_async(
     stable_key: Option<&[u8]>,
     stable_fields: Option<&str>,
     frame_bytes: usize,
-) -> Result<Vec<u8>, S4Error> {
+) -> Result<Vec<u8>, MaskuraError> {
     Ok(stream_chunked_counted_async(
         registry,
         input,
@@ -78,12 +78,12 @@ pub async fn stream_chunked_counted_async(
     stable_key: Option<&[u8]>,
     stable_fields: Option<&str>,
     frame_bytes: usize,
-) -> Result<(Vec<u8>, usize), S4Error> {
-    let session = s4_wasm_runtime::Session {
+) -> Result<(Vec<u8>, usize), MaskuraError> {
+    let session = maskura_wasm_runtime::Session {
         format: format.as_str().to_string(),
         content_type: content_type.to_string(),
         policy_version: 0,
-        operation: s4_wasm_runtime::Operation::Write,
+        operation: maskura_wasm_runtime::Operation::Write,
         config_json: None,
         public_key_pem: public_key_pem.map(str::to_string),
         stable_key: stable_key.map(<[u8]>::to_vec),
@@ -138,7 +138,7 @@ pub fn stream_process(
     public_key_pem: Option<&str>,
     stable_key: Option<&[u8]>,
     stable_fields: Option<&str>,
-) -> Result<Vec<u8>, S4Error> {
+) -> Result<Vec<u8>, MaskuraError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -160,7 +160,7 @@ pub fn stream_process_counted(
     input: &[u8],
     format: Format,
     content_type: &str,
-) -> Result<(Vec<u8>, usize), S4Error> {
+) -> Result<(Vec<u8>, usize), MaskuraError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -184,7 +184,7 @@ pub fn stream_chunked(
     format: Format,
     content_type: &str,
     frame_bytes: usize,
-) -> Result<Vec<u8>, S4Error> {
+) -> Result<Vec<u8>, MaskuraError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

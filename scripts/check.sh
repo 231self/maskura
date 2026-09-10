@@ -8,7 +8,7 @@ echo "=== cargo clippy ==="
 cargo clippy --locked --all-targets -- -D warnings
 
 echo "=== building filters ==="
-bash scripts/build-filters.sh
+bash scripts/build-plugins.sh
 
 echo "=== cargo test ==="
 cargo test --locked --workspace

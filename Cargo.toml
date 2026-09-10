@@ -1,29 +1,30 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/plugin-sdk",
   "crates/mcp-protocol",
   "crates/customer-config",
   "crates/error",
   "crates/policy",
   "crates/wasm-runtime",
   "crates/gateway",
-  "crates/s4-mcp",
-  "crates/s4ctl",
-  "filters/pii-default",
-  "filters/pii-shared",
-  "filters/noop",
-  "filters/email-detect",
-  "filters/ssn-detect",
-  "filters/card-detect",
-  "filters/envelope-encrypt",
-  "filters/stable-encrypt",
-  "filters/test-filter",
-  "filters/test-filter-v02",
-  "filters/test-binary-reductor",
+  "crates/mcp",
+  "crates/cli",
+  "plugins/filters/pii",
+  "plugins/shared/pii",
+  "plugins/transforms/noop",
+  "plugins/filters/email",
+  "plugins/filters/ssn",
+  "plugins/filters/payment-card",
+  "plugins/crypto/envelope",
+  "plugins/crypto/deterministic",
+  "tests/plugins/transformer",
+  "tests/plugins/transformer-context",
+  "tests/plugins/binary-reductor",
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/231self/maskura"

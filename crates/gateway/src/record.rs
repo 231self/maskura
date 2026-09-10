@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use csv_core::{ReadRecordResult, Reader as CsvReader};
-use s4_error::{S4Error, codes};
+use maskura_error::{MaskuraError, codes};
 
 use crate::Format;
 
@@ -68,13 +68,13 @@ pub struct RecordDecoder {
 }
 
 impl RecordDecoder {
-    pub fn new(format: Format, limits: DecoderLimits) -> Result<Self, S4Error> {
+    pub fn new(format: Format, limits: DecoderLimits) -> Result<Self, MaskuraError> {
         if limits.max_source_frame_bytes == 0
             || limits.max_record_bytes == 0
             || limits.max_json_document_bytes == 0
             || limits.max_csv_fields == 0
         {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::CONFIG_INVALID,
                 "decoder limits must be greater than zero",
             ));
@@ -94,15 +94,15 @@ impl RecordDecoder {
         })
     }
 
-    pub fn push(&mut self, chunk: &[u8]) -> Result<(), S4Error> {
+    pub fn push(&mut self, chunk: &[u8]) -> Result<(), MaskuraError> {
         if self.finished {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::INTERNAL,
                 "cannot push after decoder finish",
             ));
         }
         if self.ready.is_some() {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::INTERNAL,
                 "drain the ready record before pushing another source frame",
             ));
@@ -120,7 +120,7 @@ impl RecordDecoder {
         self.prepare_next(false)
     }
 
-    pub fn next_record(&mut self) -> Result<Option<Record>, S4Error> {
+    pub fn next_record(&mut self) -> Result<Option<Record>, MaskuraError> {
         if self.ready.is_none() {
             self.prepare_next(self.finished)?;
         }
@@ -131,12 +131,12 @@ impl RecordDecoder {
         Ok(record)
     }
 
-    pub fn finish(&mut self) -> Result<(), S4Error> {
+    pub fn finish(&mut self) -> Result<(), MaskuraError> {
         if self.finished {
             return Ok(());
         }
         if self.ready.is_some() {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::INTERNAL,
                 "drain the ready record before finishing the decoder",
             ));
@@ -144,7 +144,7 @@ impl RecordDecoder {
         self.finished = true;
         self.prepare_next(true)?;
         if self.format == Format::Csv && self.ready.is_none() && self.records_emitted == 0 {
-            return Err(S4Error::new(codes::DECODE_CSV, "no CSV records found"));
+            return Err(MaskuraError::new(codes::DECODE_CSV, "no CSV records found"));
         }
         Ok(())
     }
@@ -164,7 +164,7 @@ impl RecordDecoder {
     /// reset so the next segment decodes independently; a document that spans
     /// segment boundaries stays buffered until it completes. Line/TSV/CSV
     /// formats emit incrementally and need no per-segment handling.
-    pub fn end_of_segment(&mut self) -> Result<(), S4Error> {
+    pub fn end_of_segment(&mut self) -> Result<(), MaskuraError> {
         if self.format != Format::Json || self.pending.is_empty() || self.ready.is_some() {
             return Ok(());
         }
@@ -178,12 +178,12 @@ impl RecordDecoder {
                 self.scan_offset = 0;
             }
             Err(error) if error.is_eof() => {}
-            Err(error) => return Err(S4Error::new(codes::DECODE_JSON, error.to_string())),
+            Err(error) => return Err(MaskuraError::new(codes::DECODE_JSON, error.to_string())),
         }
         Ok(())
     }
 
-    fn prepare_next(&mut self, at_eof: bool) -> Result<(), S4Error> {
+    fn prepare_next(&mut self, at_eof: bool) -> Result<(), MaskuraError> {
         if self.ready.is_some() || self.complete {
             return Ok(());
         }
@@ -194,7 +194,7 @@ impl RecordDecoder {
         }
     }
 
-    fn prepare_line(&mut self, at_eof: bool) -> Result<(), S4Error> {
+    fn prepare_line(&mut self, at_eof: bool) -> Result<(), MaskuraError> {
         if let Some(relative_end) = self.pending[self.scan_offset..]
             .iter()
             .position(|byte| *byte == b'\n')
@@ -224,7 +224,7 @@ impl RecordDecoder {
         Ok(())
     }
 
-    fn prepare_json(&mut self, at_eof: bool) -> Result<(), S4Error> {
+    fn prepare_json(&mut self, at_eof: bool) -> Result<(), MaskuraError> {
         self.ensure_pending_limit(self.limits.max_json_document_bytes, "JSON document")?;
         if !at_eof {
             return Ok(());
@@ -235,12 +235,12 @@ impl RecordDecoder {
         }
         validate_utf8(&self.pending, codes::DECODE_ENCODING)?;
         serde_json::from_slice::<serde_json::Value>(&self.pending)
-            .map_err(|error| S4Error::new(codes::DECODE_JSON, error.to_string()))?;
+            .map_err(|error| MaskuraError::new(codes::DECODE_JSON, error.to_string()))?;
         self.emit_final();
         Ok(())
     }
 
-    fn prepare_csv(&mut self, at_eof: bool) -> Result<(), S4Error> {
+    fn prepare_csv(&mut self, at_eof: bool) -> Result<(), MaskuraError> {
         while self.scan_offset < self.pending.len() {
             let byte = self.pending[self.scan_offset];
             match self.csv_state {
@@ -268,7 +268,7 @@ impl RecordDecoder {
                         self.csv_state = CsvState::FieldStart;
                     }
                     b'"' => {
-                        return Err(S4Error::new(
+                        return Err(MaskuraError::new(
                             codes::DECODE_CSV,
                             "quote inside an unquoted CSV field",
                         ));
@@ -305,7 +305,7 @@ impl RecordDecoder {
                         break;
                     }
                     _ => {
-                        return Err(S4Error::new(
+                        return Err(MaskuraError::new(
                             codes::DECODE_CSV,
                             "unexpected byte after closing CSV quote",
                         ));
@@ -318,7 +318,7 @@ impl RecordDecoder {
         self.ensure_pending_limit(self.limits.max_record_bytes, "CSV record")?;
         if at_eof {
             if self.csv_state == CsvState::Quoted {
-                return Err(S4Error::new(
+                return Err(MaskuraError::new(
                     codes::DECODE_CSV,
                     "unterminated quoted CSV field",
                 ));
@@ -350,7 +350,7 @@ impl RecordDecoder {
         at_eof.then_some((at, at + 1))
     }
 
-    fn emit_csv(&mut self, payload_end: usize, separator_end: usize) -> Result<(), S4Error> {
+    fn emit_csv(&mut self, payload_end: usize, separator_end: usize) -> Result<(), MaskuraError> {
         self.validate_csv(payload_end)?;
         validate_utf8(&self.pending[..payload_end], codes::DECODE_ENCODING)?;
         self.emit(payload_end, payload_end, separator_end, codes::DECODE_CSV)?;
@@ -358,7 +358,7 @@ impl RecordDecoder {
         Ok(())
     }
 
-    fn validate_csv(&self, payload_end: usize) -> Result<(), S4Error> {
+    fn validate_csv(&self, payload_end: usize) -> Result<(), MaskuraError> {
         let mut input = Vec::with_capacity(payload_end + 1);
         input.extend_from_slice(&self.pending[..payload_end]);
         input.push(b'\n');
@@ -367,7 +367,7 @@ impl RecordDecoder {
         let mut reader = CsvReader::new();
         let (result, consumed, _, fields) = reader.read_record(&input, &mut output, &mut ends);
         if !matches!(result, ReadRecordResult::Record) || consumed != input.len() {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::DECODE_CSV,
                 "CSV parser did not produce one complete record",
             ));
@@ -389,7 +389,7 @@ impl RecordDecoder {
         separator_start: usize,
         consumed: usize,
         utf8_code: &'static str,
-    ) -> Result<(), S4Error> {
+    ) -> Result<(), MaskuraError> {
         if payload_end > self.limits.max_record_bytes {
             return Err(limit_error(
                 codes::RECORD_TOO_LARGE,
@@ -428,7 +428,7 @@ impl RecordDecoder {
         self.scan_offset = 0;
     }
 
-    fn increment_csv_fields(&mut self) -> Result<(), S4Error> {
+    fn increment_csv_fields(&mut self) -> Result<(), MaskuraError> {
         self.csv_fields += 1;
         if self.csv_fields > self.limits.max_csv_fields {
             return Err(limit_error(
@@ -441,7 +441,7 @@ impl RecordDecoder {
         Ok(())
     }
 
-    fn ensure_pending_limit(&self, max: usize, kind: &str) -> Result<(), S4Error> {
+    fn ensure_pending_limit(&self, max: usize, kind: &str) -> Result<(), MaskuraError> {
         if self.pending.len() > max {
             return Err(limit_error(
                 codes::RECORD_TOO_LARGE,
@@ -454,10 +454,10 @@ impl RecordDecoder {
     }
 }
 
-fn validate_utf8(input: &[u8], code: &'static str) -> Result<(), S4Error> {
+fn validate_utf8(input: &[u8], code: &'static str) -> Result<(), MaskuraError> {
     std::str::from_utf8(input)
         .map(|_| ())
-        .map_err(|error| S4Error::new(code, error.to_string()))
+        .map_err(|error| MaskuraError::new(code, error.to_string()))
 }
 
 /// Stateful validator for the aggregate byte stream emitted by an untrusted
@@ -473,7 +473,7 @@ pub struct OutputValidator {
 }
 
 impl OutputValidator {
-    pub fn new(format: Format, limits: DecoderLimits) -> Result<Self, S4Error> {
+    pub fn new(format: Format, limits: DecoderLimits) -> Result<Self, MaskuraError> {
         let decoder = RecordDecoder::new(format, limits)?;
         Ok(Self {
             format,
@@ -484,9 +484,9 @@ impl OutputValidator {
         })
     }
 
-    pub fn push_record(&mut self, record: &Record) -> Result<(), S4Error> {
+    pub fn push_record(&mut self, record: &Record) -> Result<(), MaskuraError> {
         if self.finished {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::INTERNAL,
                 "cannot validate output after finish",
             ));
@@ -495,7 +495,7 @@ impl OutputValidator {
         self.push_bytes(&record.separator)
     }
 
-    pub fn finish(&mut self) -> Result<(), S4Error> {
+    pub fn finish(&mut self) -> Result<(), MaskuraError> {
         if self.finished {
             return Ok(());
         }
@@ -509,7 +509,7 @@ impl OutputValidator {
         self.drain_records()
     }
 
-    fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), S4Error> {
+    fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), MaskuraError> {
         self.input_seen |= !bytes.is_empty();
         // `max_source_frame_bytes` bounds transport chunks, not complete
         // records. Feed large final records incrementally while retaining the
@@ -521,12 +521,12 @@ impl OutputValidator {
         Ok(())
     }
 
-    fn drain_records(&mut self) -> Result<(), S4Error> {
+    fn drain_records(&mut self) -> Result<(), MaskuraError> {
         while let Some(record) = self.decoder.next_record()? {
             if self.format == Format::Jsonl {
                 validate_utf8(&record.payload, codes::DECODE_ENCODING)?;
                 serde_json::from_slice::<serde_json::Value>(&record.payload)
-                    .map_err(|error| S4Error::new(codes::DECODE_JSONL, error.to_string()))?;
+                    .map_err(|error| MaskuraError::new(codes::DECODE_JSONL, error.to_string()))?;
             }
         }
         Ok(())
@@ -538,7 +538,7 @@ pub fn validate_output_records(
     format: Format,
     records: &[Record],
     limits: DecoderLimits,
-) -> Result<(), S4Error> {
+) -> Result<(), MaskuraError> {
     let mut validator = OutputValidator::new(format, limits)?;
     for record in records {
         validator.push_record(record)?;
@@ -546,8 +546,8 @@ pub fn validate_output_records(
     validator.finish()
 }
 
-fn limit_error(code: &'static str, kind: &str, actual: usize, limit: usize) -> S4Error {
-    S4Error::new(code, format!("{kind} size {actual} exceeds limit {limit}"))
+fn limit_error(code: &'static str, kind: &str, actual: usize, limit: usize) -> MaskuraError {
+    MaskuraError::new(code, format!("{kind} size {actual} exceeds limit {limit}"))
 }
 
 #[cfg(test)]

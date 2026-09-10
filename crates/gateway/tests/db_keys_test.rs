@@ -9,19 +9,19 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use s4_gateway::entity::api_key;
-use s4_gateway::entity::managed_list_cursor;
-use s4_gateway::entity::managed_logical_operation;
-use s4_gateway::entity::managed_namespace;
-use s4_gateway::entity::managed_namespace_purge;
-use s4_gateway::entity::managed_object_authority;
-use s4_gateway::entity::managed_object_repair;
-use s4_gateway::entity::managed_physical_object_version;
-use s4_gateway::entity::managed_workspace_usage;
-use s4_gateway::entity::multipart_upload;
-use s4_gateway::entity::object_operation;
-use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher};
-use s4_gateway::managed::{
+use maskura_gateway::entity::api_key;
+use maskura_gateway::entity::managed_list_cursor;
+use maskura_gateway::entity::managed_logical_operation;
+use maskura_gateway::entity::managed_namespace;
+use maskura_gateway::entity::managed_namespace_purge;
+use maskura_gateway::entity::managed_object_authority;
+use maskura_gateway::entity::managed_object_repair;
+use maskura_gateway::entity::managed_physical_object_version;
+use maskura_gateway::entity::managed_workspace_usage;
+use maskura_gateway::entity::multipart_upload;
+use maskura_gateway::entity::object_operation;
+use maskura_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher};
+use maskura_gateway::managed::{
     AuthorityListQuery, AuthorityPlacementPageQuery, BackendVersioningCapability,
     BackendVersioningMode, CopyStatus, InMemoryManagedRepository, LogicalObjectKey,
     MANAGED_LIST_CURSOR_RESPONSE_MAX_BYTES, MANAGED_LIST_CURSOR_WORKSPACE_LIMIT,
@@ -32,18 +32,18 @@ use s4_gateway::managed::{
     NamespacePurgeStatus, ObjectAuthority, PhysicalWriteIntent, Placement,
     PostgresManagedRepository, ProviderStorageIdentity, generation_physical_key,
 };
-use s4_gateway::multipart_staging::{
+use maskura_gateway::multipart_staging::{
     ARTIFACT_PREFIX, CompletePart, CompletionAcquire, DestinationCommitPermit,
     MultipartCompletionResult, MultipartIdentity, MultipartLifecycle, MultipartPart,
     MultipartRepository, MultipartSnapshot, MultipartUpload, PostgresMultipartRepository,
 };
-use s4_gateway::store::{KeyRepository, PostgresKeyStore, sha256_hash};
-use s4_gateway::transaction::{
+use maskura_gateway::store::{KeyRepository, PostgresKeyStore, sha256_hash};
+use maskura_gateway::transaction::{
     EvidenceRecord, ExpectedObject, ObjectDestination, OperationJournal, OperationRecord,
     OperationState, PartRecord, PostgresOperationJournal, StoredObjectMeta,
     WorkspaceDestinationBinding,
 };
-use s4_gateway::workspace_storage::WorkspaceId;
+use maskura_gateway::workspace_storage::WorkspaceId;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
@@ -61,11 +61,11 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Method, Request, StatusCode, header};
-use s4_gateway::control::{
+use maskura_gateway::control::{
     AuthenticatedRequestContext, AuthorizationDecision, AuthorizationError, AuthorizationGrant,
     ControlPlane, MeteringError, RequestKind, UsageAuthorization, UsageEvent, UsageRoute,
 };
-use s4_gateway::server::{build_router, build_state};
+use maskura_gateway::server::{build_router, build_state};
 use tower::ServiceExt;
 
 const TEST_KEK: [u8; 32] = [7; 32];
@@ -216,7 +216,7 @@ async fn assert_physical_intent_duplicate_contract(
     for conflicting in conflicts {
         assert!(matches!(
             repository.begin_physical_write(conflicting).await,
-            Err(s4_gateway::managed::ManagedError::Conflict)
+            Err(maskura_gateway::managed::ManagedError::Conflict)
         ));
     }
     let pending = repository.pending_physical_write_intents(10).await.unwrap();
@@ -267,7 +267,7 @@ fn engine_migration_helper_ignores_unknown_private_versions_but_rejects_checksum
         .execute(&pool)
         .await
         .unwrap();
-        s4_gateway::run_engine_migrations(&pool)
+        maskura_gateway::run_engine_migrations(&pool)
             .await
             .expect("unknown private migration must be ignored");
         sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
@@ -291,7 +291,7 @@ fn engine_migration_helper_ignores_unknown_private_versions_but_rejects_checksum
             .execute(&pool)
             .await
             .unwrap();
-        let mismatch = s4_gateway::run_engine_migrations(&pool).await;
+        let mismatch = maskura_gateway::run_engine_migrations(&pool).await;
         sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2")
             .bind(&checksum)
             .bind(version)
@@ -299,7 +299,7 @@ fn engine_migration_helper_ignores_unknown_private_versions_but_rejects_checksum
             .await
             .unwrap();
         assert!(mismatch.is_err(), "public checksum mismatch must fail");
-        s4_gateway::run_engine_migrations(&pool)
+        maskura_gateway::run_engine_migrations(&pool)
             .await
             .expect("restored public checksum must migrate cleanly");
     });
@@ -337,7 +337,7 @@ fn public_migrations_apply_fresh_after_private_shared_history() {
             .connect(&url)
             .await
             .unwrap();
-        s4_gateway::run_engine_migrations(&isolated)
+        maskura_gateway::run_engine_migrations(&isolated)
             .await
             .expect("fresh public schema must migrate around private history");
 
@@ -383,8 +383,8 @@ fn workspace_credential_migration_upgrades_hosted_uuid_schema() {
                 REFERENCES workspaces(id) ON DELETE SET NULL; \
              INSERT INTO workspaces (id) VALUES ('{bound}'); \
              INSERT INTO api_keys (key_id, secret_hash, user_id, label, created_at, workspace_id) \
-                 VALUES ('s4_bound', 'hash', 'user', 'bound', '1970-01-01T00:00:00Z', '{bound}'), \
-                        ('s4_unbound', 'hash2', 'user', 'unbound', '1970-01-01T00:00:00Z', NULL); \
+                 VALUES ('maskura_bound', 'hash', 'user', 'bound', '1970-01-01T00:00:00Z', '{bound}'), \
+                        ('maskura_unbound', 'hash2', 'user', 'unbound', '1970-01-01T00:00:00Z', NULL); \
              {migration}"
         );
         sqlx::raw_sql(&upgrade).execute(&pool).await.unwrap();
@@ -398,8 +398,8 @@ fn workspace_credential_migration_upgrades_hosted_uuid_schema() {
         assert_eq!(
             rows,
             [
-                ("s4_bound".to_string(), Some(bound.to_string())),
-                ("s4_unbound".to_string(), None),
+                ("maskura_bound".to_string(), Some(bound.to_string())),
+                ("maskura_unbound".to_string(), None),
             ]
         );
         let foreign_keys: i64 = sqlx::query_scalar(
@@ -512,7 +512,7 @@ fn postgres_namespace_purge_fences_late_writes_and_completes_idempotently() {
                     ..physical_intent
                 })
                 .await,
-            Err(s4_gateway::managed::ManagedError::Conflict)
+            Err(maskura_gateway::managed::ManagedError::Conflict)
         ));
         journal
             .insert_intent(OperationRecord::scoped_intent(
@@ -583,7 +583,7 @@ fn postgres_namespace_purge_fences_late_writes_and_completes_idempotently() {
         );
         assert!(matches!(
             repository.assert_namespace_active(&tenant).await,
-            Err(s4_gateway::managed::ManagedError::NamespaceFenced)
+            Err(maskura_gateway::managed::ManagedError::NamespaceFenced)
         ));
         assert!(matches!(
             repository
@@ -596,7 +596,7 @@ fn postgres_namespace_purge_fences_late_writes_and_completes_idempotently() {
                     "stale-writer",
                 ))
                 .await,
-            Err(s4_gateway::managed::ManagedError::NamespaceFenced)
+            Err(maskura_gateway::managed::ManagedError::NamespaceFenced)
         ));
 
         repository
@@ -789,7 +789,7 @@ where
             .connect(&url)
             .await
             .expect("DATABASE_URL must be reachable when configured");
-        s4_gateway::run_engine_migrations(&pool)
+        maskura_gateway::run_engine_migrations(&pool)
             .await
             .expect("migrations should apply");
         body(pool.clone()).await;
@@ -1004,7 +1004,7 @@ fn postgres_workspace_destination_survives_restart_in_every_recovery_state() {
                 routing_fencing_token: 11,
             };
             let operation = OperationRecord::direct_intent(
-                s4_gateway::transaction::DirectOperationScope {
+                maskura_gateway::transaction::DirectOperationScope {
                     operation_id,
                     tenant_id: "workspace-restart".to_string(),
                 },
@@ -1381,7 +1381,7 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             &repository,
             &tenant,
             "primary",
-            &s4_gateway::managed::generation_physical_key(&logical, generation),
+            &maskura_gateway::managed::generation_physical_key(&logical, generation),
         )
         .await;
         let authority = ObjectAuthority {
@@ -1475,15 +1475,15 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
         );
         let current_after_repair = repository.get(&logical).await.unwrap().unwrap();
         repository
-            .enqueue(s4_gateway::managed::RepairRecord::copy(
-                s4_gateway::managed::RepairKind::Replica,
+            .enqueue(maskura_gateway::managed::RepairRecord::copy(
+                maskura_gateway::managed::RepairKind::Replica,
                 &current_after_repair,
                 Some(current_after_repair.primary_backend_id.clone()),
                 current_after_repair
                     .replica_backend_id
                     .clone()
                     .expect("replica backend"),
-                s4_gateway::managed::RepairTargetRole::Replica,
+                maskura_gateway::managed::RepairTargetRole::Replica,
                 current_after_repair.placement_version,
             ))
             .await
@@ -1503,11 +1503,11 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             replica_backend_id: Some("replica-v2".to_string()),
         };
         repository
-            .enqueue(s4_gateway::managed::RepairRecord::placement(
+            .enqueue(maskura_gateway::managed::RepairRecord::placement(
                 &repaired,
                 Some("primary".to_string()),
                 "replica-v2".to_string(),
-                s4_gateway::managed::RepairTargetRole::Replica,
+                maskura_gateway::managed::RepairTargetRole::Replica,
                 &replica_placement,
             ))
             .await
@@ -1543,15 +1543,15 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
         for (target_backend_id, target_role) in [
             (
                 full_placement.primary_backend_id.clone(),
-                s4_gateway::managed::RepairTargetRole::Primary,
+                maskura_gateway::managed::RepairTargetRole::Primary,
             ),
             (
                 full_placement.replica_backend_id.clone().unwrap(),
-                s4_gateway::managed::RepairTargetRole::Replica,
+                maskura_gateway::managed::RepairTargetRole::Replica,
             ),
         ] {
             repository
-                .enqueue(s4_gateway::managed::RepairRecord::placement(
+                .enqueue(maskura_gateway::managed::RepairRecord::placement(
                     &migrated,
                     Some("primary".to_string()),
                     target_backend_id,
@@ -1569,7 +1569,7 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
         // only its two placement legs participate in this cutover race.
         let (placement_repairs, cleanup_repairs): (Vec<_>, Vec<_>) = migration_repairs
             .into_iter()
-            .partition(|repair| repair.kind == s4_gateway::managed::RepairKind::Placement);
+            .partition(|repair| repair.kind == maskura_gateway::managed::RepairKind::Placement);
         assert_eq!(placement_repairs.len(), 2);
         for repair in cleanup_repairs {
             assert!(!repository.complete_repair(&repair).await.unwrap());
@@ -1592,16 +1592,16 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
         let (target_backend_id, target_role) = if partial.primary_backend_id == "primary-v3" {
             (
                 "replica-v3".to_string(),
-                s4_gateway::managed::RepairTargetRole::Replica,
+                maskura_gateway::managed::RepairTargetRole::Replica,
             )
         } else {
             (
                 "primary-v3".to_string(),
-                s4_gateway::managed::RepairTargetRole::Primary,
+                maskura_gateway::managed::RepairTargetRole::Primary,
             )
         };
         repository
-            .enqueue(s4_gateway::managed::RepairRecord::placement(
+            .enqueue(maskura_gateway::managed::RepairRecord::placement(
                 &partial,
                 Some(partial.primary_backend_id.clone()),
                 target_backend_id,
@@ -1785,7 +1785,7 @@ fn postgres_managed_logical_quota_listing_cursor_and_release_contract() {
             repository
                 .reserve_logical_operation(concurrent.operation_id, 1)
                 .await,
-            Err(s4_gateway::managed::ManagedError::MutationInProgress)
+            Err(maskura_gateway::managed::ManagedError::MutationInProgress)
         ));
         let lease = repository.begin_physical_write(child).await.unwrap();
         repository
@@ -1851,7 +1851,7 @@ fn postgres_managed_logical_quota_listing_cursor_and_release_contract() {
             repository
                 .commit_logical_put(intent.operation_id, authority.clone(), 3)
                 .await,
-            Err(s4_gateway::managed::ManagedError::Conflict)
+            Err(maskura_gateway::managed::ManagedError::Conflict)
         ));
         let committed = repository
             .commit_logical_put(intent.operation_id, authority.clone(), 6)
@@ -1952,7 +1952,7 @@ fn postgres_managed_logical_quota_listing_cursor_and_release_contract() {
                     now,
                 )
                 .await,
-            Err(s4_gateway::managed::ManagedError::CursorLimitExceeded)
+            Err(maskura_gateway::managed::ManagedError::CursorLimitExceeded)
         ));
         let oversized_bytes = vec![b'x'; MANAGED_LIST_CURSOR_RESPONSE_MAX_BYTES as usize + 1];
         assert!(
@@ -2000,7 +2000,7 @@ fn postgres_managed_logical_quota_listing_cursor_and_release_contract() {
             repository
                 .use_list_cursor(cursor.id, &binding, now + 3)
                 .await,
-            Err(s4_gateway::managed::ManagedError::CursorExpired)
+            Err(maskura_gateway::managed::ManagedError::CursorExpired)
         ));
 
         let versions = repository
@@ -2308,7 +2308,7 @@ fn postgres_proven_abort_rejects_under_counted_physical_allocation() {
                     }),
                 )
                 .await,
-            Err(s4_gateway::managed::ManagedError::Conflict)
+            Err(maskura_gateway::managed::ManagedError::Conflict)
         ));
         let aborted = repository
             .prove_logical_abort(
@@ -2794,7 +2794,7 @@ fn postgres_mcp_creation_returns_persisted_metadata() {
             .find(|candidate| candidate.token_hash == created.token_hash)
             .expect("persisted MCP token is listed");
 
-        assert!(token.starts_with("s4m_"));
+        assert!(token.starts_with("maskura_mcp_"));
         assert_eq!(created, listed);
         let principal = store
             .resolve_mcp_token(&token)
@@ -3289,31 +3289,34 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
             std::env::set_var("S3_ENDPOINT", &endpoint);
             std::env::set_var("S3_ACCESS_KEY_ID", "destination-access");
             std::env::set_var("S3_SECRET_ACCESS_KEY", "destination-secret");
-            std::env::remove_var("S4_SERVICE_BUCKETS");
-            std::env::remove_var("S4_SECRET_KEK");
+            std::env::remove_var("MASKURA_SERVICE_BUCKETS");
+            std::env::remove_var("MASKURA_SECRET_KEK");
             std::env::set_var("MASKURA_STREAMING_S3_PROVIDER", "minio");
             std::env::remove_var("MASKURA_PLUGINS_DIR");
-            std::env::remove_var("MASKURA_FILTER_COMPONENT");
-            std::env::remove_var("S4_MANAGED_STREAMING_MODE");
-            std::env::remove_var("S4_MANAGED_STREAMING_TRANSACTIONAL");
+            std::env::remove_var("MASKURA_DEFAULT_PLUGIN");
+            std::env::remove_var("MASKURA_MANAGED_STREAMING_MODE");
+            std::env::remove_var("MASKURA_MANAGED_STREAMING_TRANSACTIONAL");
             std::env::set_var("MASKURA_STREAMING_READ_MODE", "passthrough");
             std::env::set_var("MASKURA_DEV_MEMORY_STREAMING", "1");
             std::env::set_var("MASKURA_MULTIPART_MODE", "staged");
-            std::env::set_var("S4_MULTIPART_STAGING_DIR", staging_dir.to_str().unwrap());
-            std::env::set_var("S4_MULTIPART_STAGING_ENDPOINT", &endpoint);
-            std::env::set_var("S4_MULTIPART_STAGING_BUCKET", MOCK_STAGING_BUCKET);
-            std::env::set_var("S4_MULTIPART_STAGING_ACCESS_KEY_ID", "test-access");
-            std::env::set_var("S4_MULTIPART_STAGING_SECRET_ACCESS_KEY", "test-secret");
-            std::env::set_var("S4_MULTIPART_STAGING_REGION", "us-east-1");
-            std::env::set_var("S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES", "67108864");
-            std::env::set_var("S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES", "268435456");
+            std::env::set_var(
+                "MASKURA_MULTIPART_STAGING_DIR",
+                staging_dir.to_str().unwrap(),
+            );
+            std::env::set_var("MASKURA_MULTIPART_STAGING_ENDPOINT", &endpoint);
+            std::env::set_var("MASKURA_MULTIPART_STAGING_BUCKET", MOCK_STAGING_BUCKET);
+            std::env::set_var("MASKURA_MULTIPART_STAGING_ACCESS_KEY_ID", "test-access");
+            std::env::set_var("MASKURA_MULTIPART_STAGING_SECRET_ACCESS_KEY", "test-secret");
+            std::env::set_var("MASKURA_MULTIPART_STAGING_REGION", "us-east-1");
+            std::env::set_var("MASKURA_MULTIPART_STAGING_TENANT_QUOTA_BYTES", "67108864");
+            std::env::set_var("MASKURA_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES", "268435456");
         }
 
         let control = Arc::new(MultipartBillingControl::default());
         let state = build_state(
             control.clone(),
             Arc::new(LocalKeyWrapping::with_kek(TEST_KEK)),
-            Arc::new(s4_gateway::workspace_storage::InMemoryWorkspaceStorageRepository::new()),
+            Arc::new(maskura_gateway::workspace_storage::InMemoryWorkspaceStorageRepository::new()),
         )
         .await
         .expect("build_state with durable staged multipart");
@@ -3392,7 +3395,7 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         let restarted_state = build_state(
             control.clone(),
             Arc::new(LocalKeyWrapping::with_kek(TEST_KEK)),
-            Arc::new(s4_gateway::workspace_storage::InMemoryWorkspaceStorageRepository::new()),
+            Arc::new(maskura_gateway::workspace_storage::InMemoryWorkspaceStorageRepository::new()),
         )
         .await
         .expect("restart gateway with durable staged multipart");

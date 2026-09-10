@@ -1,5 +1,5 @@
 #[derive(Debug, thiserror::Error)]
-pub enum S4Error {
+pub enum MaskuraError {
     #[error("{code}: {message}")]
     Generic { code: &'static str, message: String },
 }
@@ -38,7 +38,7 @@ pub mod codes {
     pub const COMPONENT_LOAD: &str = "component.load";
 }
 
-impl S4Error {
+impl MaskuraError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self::Generic {
             code,
@@ -65,7 +65,7 @@ mod tests {
 
     #[test]
     fn error_display_includes_code_and_message() {
-        let err = S4Error::new(codes::INTERNAL, "something broke");
+        let err = MaskuraError::new(codes::INTERNAL, "something broke");
         let s = err.to_string();
         assert!(s.contains(codes::INTERNAL), "display should include code");
         assert!(
@@ -76,19 +76,19 @@ mod tests {
 
     #[test]
     fn error_code_accessor() {
-        let err = S4Error::new(codes::WASM_TRAP, "trap");
+        let err = MaskuraError::new(codes::WASM_TRAP, "trap");
         assert_eq!(err.code(), codes::WASM_TRAP);
     }
 
     #[test]
     fn error_message_accessor() {
-        let err = S4Error::new(codes::DECODE_CSV, "bad csv");
+        let err = MaskuraError::new(codes::DECODE_CSV, "bad csv");
         assert_eq!(err.message(), "bad csv");
     }
 
     #[test]
     fn error_is_std_error() {
-        let err = S4Error::new(codes::INTERNAL, "x");
+        let err = MaskuraError::new(codes::INTERNAL, "x");
         let _: &dyn std::error::Error = &err;
     }
 

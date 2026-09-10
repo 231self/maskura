@@ -1,0 +1,11 @@
+[package]
+name = "maskura-plugin-transform-noop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+maskura-plugin-sdk = { path = "../../../crates/plugin-sdk" }

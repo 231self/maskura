@@ -232,7 +232,7 @@ impl Config {
         if let Some(value) = std::env::var("S3_REGION").ok().filter(|v| !v.is_empty()) {
             self.storage.s3_region = Some(value);
         }
-        if let Ok(value) = std::env::var("S4_SERVICE_BUCKETS") {
+        if let Ok(value) = std::env::var("MASKURA_SERVICE_BUCKETS") {
             self.storage.service_buckets = split_commas(&value);
         }
         if let Some(value) = resolve(aliases::SINGLE_TENANT)? {
@@ -266,14 +266,14 @@ impl Config {
             self.features.dev_memory_streaming =
                 parse_bool("features.dev_memory_streaming", &value)?;
         }
-        if let Ok(value) = std::env::var("S4_MANAGED_STREAMING_MODE") {
+        if let Ok(value) = std::env::var("MASKURA_MANAGED_STREAMING_MODE") {
             self.features.managed_streaming_mode = parse_managed_mode(&value)?;
         }
-        if let Ok(value) = std::env::var("S4_MANAGED_STREAMING_TRANSACTIONAL") {
+        if let Ok(value) = std::env::var("MASKURA_MANAGED_STREAMING_TRANSACTIONAL") {
             self.features.managed_streaming_transactional =
                 parse_bool("features.managed_streaming_transactional", &value)?;
         }
-        if let Some(value) = resolve(aliases::FILTER_COMPONENT)? {
+        if let Some(value) = resolve(aliases::DEFAULT_PLUGIN)? {
             self.wasm.filter_component = Some(value);
         }
         if let Some(value) = resolve(aliases::PLUGINS_DIR)? {
@@ -319,55 +319,55 @@ impl Config {
         if let Some(value) = resolve(aliases::BOOTSTRAP_KEY)? {
             self.keys.bootstrap_key = Some(value);
         }
-        if let Ok(value) = std::env::var("S4_MANAGED_PLACEMENT_VERSION") {
+        if let Ok(value) = std::env::var("MASKURA_MANAGED_PLACEMENT_VERSION") {
             self.managed.placement_version = Some(parse_u32("managed.placement_version", &value)?);
         }
-        if let Ok(value) = std::env::var("S4_MULTIPART_STAGING_ENDPOINT") {
+        if let Ok(value) = std::env::var("MASKURA_MULTIPART_STAGING_ENDPOINT") {
             self.multipart_staging.endpoint = Some(value);
         }
-        if let Ok(value) = std::env::var("S4_MULTIPART_STAGING_BUCKET") {
+        if let Ok(value) = std::env::var("MASKURA_MULTIPART_STAGING_BUCKET") {
             self.multipart_staging.bucket = Some(value);
         }
-        if let Ok(value) = std::env::var("S4_MULTIPART_STAGING_REGION") {
+        if let Ok(value) = std::env::var("MASKURA_MULTIPART_STAGING_REGION") {
             self.multipart_staging.region = Some(value);
         }
-        if let Ok(value) = std::env::var("S4_MULTIPART_STAGING_DIR") {
+        if let Ok(value) = std::env::var("MASKURA_MULTIPART_STAGING_DIR") {
             self.multipart_staging.dir = Some(value);
         }
-        if let Ok(value) = std::env::var("S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES") {
+        if let Ok(value) = std::env::var("MASKURA_MULTIPART_STAGING_TENANT_QUOTA_BYTES") {
             self.multipart_staging.tenant_quota_bytes =
                 Some(parse_u64("multipart_staging.tenant_quota_bytes", &value)?);
         }
-        if let Ok(value) = std::env::var("S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES") {
+        if let Ok(value) = std::env::var("MASKURA_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES") {
             self.multipart_staging.global_quota_bytes =
                 Some(parse_u64("multipart_staging.global_quota_bytes", &value)?);
         }
-        if let Some(value) = std::env::var("S4_SIGV4_REGION")
+        if let Some(value) = std::env::var("MASKURA_SIGV4_REGION")
             .ok()
             .filter(|v| !v.is_empty())
         {
             self.sigv4.region = Some(value);
         }
-        if let Ok(value) = std::env::var("S4_SIGV4_TRUSTED_TLS") {
+        if let Ok(value) = std::env::var("MASKURA_SIGV4_TRUSTED_TLS") {
             self.sigv4.trusted_tls = parse_bool("sigv4.trusted_tls", &value)?;
         }
-        if let Ok(value) = std::env::var("S4_WORKSPACE_ENDPOINT_ALLOWLIST") {
+        if let Ok(value) = std::env::var("MASKURA_WORKSPACE_ENDPOINT_ALLOWLIST") {
             self.allowlists.workspace_endpoint = split_commas(&value);
         }
-        if let Ok(value) = std::env::var("S4_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST") {
+        if let Ok(value) = std::env::var("MASKURA_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST") {
             self.allowlists.workspace_endpoint_private = split_commas(&value);
         }
-        if let Ok(value) = std::env::var("S4_PRESIGNED_HTTP_ALLOWLIST") {
+        if let Ok(value) = std::env::var("MASKURA_PRESIGNED_HTTP_ALLOWLIST") {
             self.allowlists.presigned_http = split_commas(&value);
         }
-        if let Ok(value) = std::env::var("S4_PRESIGNED_HTTP_PRIVATE_ALLOWLIST") {
+        if let Ok(value) = std::env::var("MASKURA_PRESIGNED_HTTP_PRIVATE_ALLOWLIST") {
             self.allowlists.presigned_http_private = split_commas(&value);
         }
-        if let Ok(value) = std::env::var("S4_PRESIGNED_HTTP_ALLOW_HTTP") {
+        if let Ok(value) = std::env::var("MASKURA_PRESIGNED_HTTP_ALLOW_HTTP") {
             self.allowlists.presigned_http_allow_http =
                 parse_bool("allowlists.presigned_http_allow_http", &value)?;
         }
-        if let Ok(value) = std::env::var("S4_PRESIGNED_HTTP_MIN_VALIDITY_SECS") {
+        if let Ok(value) = std::env::var("MASKURA_PRESIGNED_HTTP_MIN_VALIDITY_SECS") {
             self.allowlists.presigned_http_min_validity_secs = Some(parse_u64(
                 "allowlists.presigned_http_min_validity_secs",
                 &value,

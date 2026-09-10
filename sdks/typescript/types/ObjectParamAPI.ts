@@ -180,7 +180,7 @@ export class ObjectMcpApi {
     }
 
     /**
-     * Create an MCP bearer token (`s4m_...`). The plaintext token is returned once and only its hash is stored.
+     * Create an MCP bearer token (`maskura_mcp_...`). The plaintext token is returned once and only its hash is stored.
      * @param param the request object
      */
     public createMcpTokenWithHttpInfo(param: McpApiCreateMcpTokenRequest, options?: ConfigurationOptions): Promise<HttpInfo<McpTokenCreatedResponse>> {
@@ -188,7 +188,7 @@ export class ObjectMcpApi {
     }
 
     /**
-     * Create an MCP bearer token (`s4m_...`). The plaintext token is returned once and only its hash is stored.
+     * Create an MCP bearer token (`maskura_mcp_...`). The plaintext token is returned once and only its hash is stored.
      * @param param the request object
      */
     public createMcpToken(param: McpApiCreateMcpTokenRequest, options?: ConfigurationOptions): Promise<McpTokenCreatedResponse> {

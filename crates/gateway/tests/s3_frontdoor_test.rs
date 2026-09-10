@@ -3,7 +3,7 @@
 //!
 //! These build the real gateway state (in-memory keystore + MemoryStore) via
 //! `build_state`, so the Wasm filter component must exist first
-//! (`just build-filters`).
+//! (`just build-plugins`).
 
 use axum::Router;
 use axum::body::Body;
@@ -11,43 +11,43 @@ use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use http_body_util::BodyExt as _;
-use s4_gateway::Gateway;
-use s4_gateway::backend::{
+use maskura_gateway::Gateway;
+use maskura_gateway::backend::{
     AddressResolver, PresignedHttpPolicy, TokioAddressResolver, WorkspaceEndpointPolicy,
 };
-use s4_gateway::control::{
+use maskura_gateway::control::{
     AuthenticatedRequestContext, AuthorizationDecision, AuthorizationError, AuthorizationGrant,
     BlockReason, ControlPlane, MeteringError, NoopControlPlane, RequestKind, UsageAuthorization,
     UsageEvent, UsageRoute,
 };
-use s4_gateway::file_store::FileStore;
-use s4_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher, default_wrapping};
-use s4_gateway::mcp::{
+use maskura_gateway::file_store::FileStore;
+use maskura_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher, default_wrapping};
+use maskura_gateway::mcp::{
     DeleteObjectRequest, GetObjectRequest, ListObjectsRequest, PutObjectRequest, ToolRequest,
     ToolResult,
 };
-use s4_gateway::object::BodyLimits;
-use s4_gateway::pipeline::{
+use maskura_gateway::object::BodyLimits;
+use maskura_gateway::pipeline::{
     ComponentSource, PipelineDirection, PipelineResolution, PipelineResolver,
     StaticPipelineResolver,
 };
-use s4_gateway::plugin_registry::{PipelineLimits, PluginRegistry};
-use s4_gateway::server::{
+use maskura_gateway::plugin_registry::{PipelineLimits, PluginRegistry};
+use maskura_gateway::server::{
     AppState, InvocationError, InvocationLimits, StatePipelineTemplate, StreamingReadMode,
     TrustedInvocationContext, build_router, build_state_with_pipeline_template, invoke_mcp,
 };
-use s4_gateway::sigv4::SigV4Policy;
-use s4_gateway::store::{
+use maskura_gateway::sigv4::SigV4Policy;
+use maskura_gateway::store::{
     FileKeyStore, KeyRepository, KeyStore, MAX_CREDENTIAL_LABEL_BYTES, MAX_CREDENTIAL_TTL_SECONDS,
     MAX_PUBLIC_KEY_PEM_BYTES, PostgresKeyStore,
 };
-use s4_gateway::transaction::{
+use maskura_gateway::transaction::{
     BackendCapabilities, CompletionReconciliation, ConditionalReadCapability,
     InMemoryOperationJournal, IncompleteUploadDiscovery, ListCapability,
     MultipartResponseCapability, OperationJournal, ResponseChecksumCapability, SpoolQuota,
     VersioningCapability,
 };
-use s4_gateway::workspace_storage::{
+use maskura_gateway::workspace_storage::{
     BackendConfigRequest, BackendConfigResponse, BackendConfigVersionId, CapabilityAttestationId,
     InMemoryWorkspaceStorageRepository, RuntimeBackendConfig, S3CapabilityAttestation,
     S3ProviderFamily, S3StreamingPermissions, WorkspaceId, WorkspaceStorageError,
@@ -236,7 +236,7 @@ struct RecordedUsage {
 #[derive(Debug, Default)]
 struct RecordingMeteringControl {
     events: Mutex<Vec<RecordedUsage>>,
-    attempts: Mutex<Vec<s4_gateway::control::PipelineAttempt>>,
+    attempts: Mutex<Vec<maskura_gateway::control::PipelineAttempt>>,
     authorizations: Mutex<Vec<(AuthenticatedRequestContext, UsageAuthorization)>>,
     releases: Mutex<Vec<(AuthenticatedRequestContext, uuid::Uuid)>>,
     authorization_failure: Option<AuthorizationError>,
@@ -291,7 +291,7 @@ struct PipelineAttemptControl {
     authorizations: AtomicUsize,
     releases: AtomicUsize,
     usage: AtomicUsize,
-    attempts: Mutex<Vec<s4_gateway::control::PipelineAttempt>>,
+    attempts: Mutex<Vec<maskura_gateway::control::PipelineAttempt>>,
 }
 
 #[async_trait::async_trait]
@@ -332,7 +332,7 @@ impl ControlPlane for PipelineAttemptControl {
     async fn record_pipeline_attempt(
         &self,
         _context: &AuthenticatedRequestContext,
-        attempt: &s4_gateway::control::PipelineAttempt,
+        attempt: &maskura_gateway::control::PipelineAttempt,
     ) -> Result<(), MeteringError> {
         self.attempts.lock().unwrap().push(attempt.clone());
         Ok(())
@@ -353,17 +353,20 @@ impl PipelineResolver for TestPipelineResolver {
         workspace_id: &str,
         bucket: &str,
         direction: PipelineDirection,
-    ) -> Result<PipelineResolution, s4_error::S4Error> {
+    ) -> Result<PipelineResolution, maskura_error::MaskuraError> {
         self.calls
             .lock()
             .unwrap()
             .push((workspace_id.to_string(), bucket.to_string(), direction));
         self.resolved.store(true, Ordering::Release);
         if let Some(code) = self.failure_code {
-            return Err(s4_error::S4Error::new(code, "private resolver detail"));
+            return Err(maskura_error::MaskuraError::new(
+                code,
+                "private resolver detail",
+            ));
         }
         let mut resolution = self.resolution.clone();
-        resolution.locator.fingerprint = s4_gateway::pipeline::resolution_fingerprint(
+        resolution.locator.fingerprint = maskura_gateway::pipeline::resolution_fingerprint(
             direction,
             &resolution.steps,
             resolution.explicit_passthrough,
@@ -377,7 +380,7 @@ struct CorruptComponentSource;
 
 #[async_trait::async_trait]
 impl ComponentSource for CorruptComponentSource {
-    async fn load(&self, _component_hash: &str) -> Result<Bytes, s4_error::S4Error> {
+    async fn load(&self, _component_hash: &str) -> Result<Bytes, maskura_error::MaskuraError> {
         Ok(Bytes::from_static(b"corrupt artifact bytes"))
     }
 }
@@ -386,7 +389,7 @@ struct FixedComponentSource(Bytes);
 
 #[async_trait::async_trait]
 impl ComponentSource for FixedComponentSource {
-    async fn load(&self, _component_hash: &str) -> Result<Bytes, s4_error::S4Error> {
+    async fn load(&self, _component_hash: &str) -> Result<Bytes, maskura_error::MaskuraError> {
         Ok(self.0.clone())
     }
 }
@@ -403,9 +406,9 @@ impl PipelineResolver for SwitchingResolver {
         _workspace_id: &str,
         _bucket: &str,
         direction: PipelineDirection,
-    ) -> Result<PipelineResolution, s4_error::S4Error> {
+    ) -> Result<PipelineResolution, maskura_error::MaskuraError> {
         let mut resolution = self.current.lock().unwrap().clone();
-        resolution.locator.fingerprint = s4_gateway::pipeline::resolution_fingerprint(
+        resolution.locator.fingerprint = maskura_gateway::pipeline::resolution_fingerprint(
             direction,
             &resolution.steps,
             resolution.explicit_passthrough,
@@ -467,7 +470,7 @@ impl ControlPlane for RecordingMeteringControl {
     async fn record_pipeline_attempt(
         &self,
         _context: &AuthenticatedRequestContext,
-        attempt: &s4_gateway::control::PipelineAttempt,
+        attempt: &maskura_gateway::control::PipelineAttempt,
     ) -> Result<(), MeteringError> {
         self.attempts.lock().unwrap().push(attempt.clone());
         Ok(())
@@ -576,13 +579,13 @@ fn test_pipeline_template() -> &'static StatePipelineTemplate {
         unsafe {
             std::env::set_var("AUTH_DISABLED", "0");
             std::env::set_var("MASKURA_SINGLE_TENANT", "1");
-            std::env::set_var("S4_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST", "127.0.0.1");
-            std::env::remove_var("S4_WORKSPACE_ENDPOINT_ALLOWLIST");
+            std::env::set_var("MASKURA_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST", "127.0.0.1");
+            std::env::remove_var("MASKURA_WORKSPACE_ENDPOINT_ALLOWLIST");
             std::env::remove_var("DATABASE_URL");
             std::env::remove_var("MASKURA_KEYS_FILE");
             std::env::remove_var("S3_ENDPOINT");
-            std::env::remove_var("S4_SECRET_KEK");
-            std::env::remove_var("S4_SERVICE_BUCKETS");
+            std::env::remove_var("MASKURA_SECRET_KEK");
+            std::env::remove_var("MASKURA_SERVICE_BUCKETS");
             std::env::remove_var("MASKURA_LEGACY_MAX_OBJECT_BYTES");
             std::env::remove_var("MASKURA_MAX_OBJECT_BYTES");
             std::env::remove_var("MASKURA_MAX_PIPELINE_OUTPUT_BYTES");
@@ -593,9 +596,9 @@ fn test_pipeline_template() -> &'static StatePipelineTemplate {
             std::env::remove_var("MASKURA_SPOOL_MAX_OBJECT_BYTES");
             std::env::remove_var("MASKURA_SPOOL_QUOTA_BYTES");
             std::env::remove_var("MASKURA_STREAMING_S3_PROVIDER");
-            std::env::remove_var("S4_MANAGED_STREAMING_MODE");
-            std::env::remove_var("S4_MANAGED_STREAMING_TRANSACTIONAL");
-            std::env::remove_var("S4_MANAGED_PLACEMENT_VERSION");
+            std::env::remove_var("MASKURA_MANAGED_STREAMING_MODE");
+            std::env::remove_var("MASKURA_MANAGED_STREAMING_TRANSACTIONAL");
+            std::env::remove_var("MASKURA_MANAGED_PLACEMENT_VERSION");
             std::env::remove_var("MASKURA_DEV_MEMORY_STREAMING");
             std::env::remove_var("MASKURA_MULTIPART_MODE");
             // Phase 12 removed the legacy buffered PUT/GET path entirely; the
@@ -797,7 +800,7 @@ async fn create_key_persistence_failure_returns_unavailable_without_secret() {
         .await
         .unwrap();
     assert_eq!(body.as_ref(), br#"{"error":"internal_error"}"#);
-    assert!(!String::from_utf8_lossy(&body).contains("s4s_"));
+    assert!(!String::from_utf8_lossy(&body).contains("maskura_secret_"));
     std::fs::remove_file(blocking_parent).unwrap();
 }
 
@@ -874,7 +877,7 @@ async fn public_key_persistence_failure_returns_generic_503_and_rolls_back() {
 fn unavailable_key_store() -> Arc<dyn KeyRepository> {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .acquire_timeout(Duration::from_millis(25))
-        .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/s4")
+        .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/maskura")
         .unwrap();
     Arc::new(PostgresKeyStore::new(pool))
 }
@@ -918,7 +921,7 @@ async fn dashboard_credential_repository_failures_return_generic_503() {
             .method("DELETE")
             .uri("/dashboard/api/keys")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"key_id":"s4_missing"}"#))
+            .body(Body::from(r#"{"key_id":"maskura_missing"}"#))
             .unwrap(),
         Request::builder()
             .uri("/dashboard/api/mcp-tokens")
@@ -940,8 +943,8 @@ async fn dashboard_credential_repository_failures_return_generic_503() {
             )))
             .unwrap(),
         add_headers(
-            public_key_request("s4_missing", TEST_PUBLIC_KEY_PEM),
-            &auth_headers("s4_missing", "s4s_missing"),
+            public_key_request("maskura_missing", TEST_PUBLIC_KEY_PEM),
+            &auth_headers("maskura_missing", "maskura_secret_missing"),
         ),
     ];
 
@@ -952,8 +955,8 @@ async fn dashboard_credential_repository_failures_return_generic_503() {
             .await
             .unwrap();
         let body = String::from_utf8_lossy(&body);
-        assert!(!body.contains("s4s_"));
-        assert!(!body.contains("s4m_"));
+        assert!(!body.contains("maskura_secret_"));
+        assert!(!body.contains("maskura_mcp_"));
         assert!(!body.contains("Postgres"));
         assert!(!body.contains("127.0.0.1"));
     }
@@ -973,12 +976,12 @@ async fn credential_authentication_store_failures_return_s3_service_unavailable(
                 .uri("/outage/key.txt")
                 .body(Body::from("sensitive"))
                 .unwrap(),
-            &auth_headers("s4_missing", "s4s_missing"),
+            &auth_headers("maskura_missing", "maskura_secret_missing"),
         ),
         Request::builder()
             .method("PUT")
             .uri("/outage/token.txt")
-            .header("authorization", "Bearer s4m_missing")
+            .header("authorization", "Bearer maskura_mcp_missing")
             .body(Body::from("sensitive"))
             .unwrap(),
     ];
@@ -1051,12 +1054,12 @@ fn public_key_request(key_id: &str, public_key_pem: &str) -> Request<Body> {
         .unwrap()
 }
 
-fn test_filter_component() -> Vec<u8> {
+fn test_transformer_component() -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/test-components/test-filter.component.wasm");
+        .join("../../target/test-components/test-transformer.component.wasm");
     std::fs::read(&path).unwrap_or_else(|error| {
         panic!(
-            "{}: run `just build-filters` first: {error}",
+            "{}: run `just build-plugins` first: {error}",
             path.display()
         )
     })
@@ -1088,7 +1091,7 @@ async fn unsafe_transformed_test_state(later_filter: bool) -> Arc<AppState> {
     }
     state
         .plugins
-        .import("test-failure", &test_filter_component())
+        .import("test-failure", &test_transformer_component())
         .unwrap();
     state
 }
@@ -1120,7 +1123,7 @@ fn read_component(name: &str) -> Vec<u8> {
         .join(name);
     std::fs::read(&path).unwrap_or_else(|error| {
         panic!(
-            "{}: run `just build-filters` first: {error}",
+            "{}: run `just build-plugins` first: {error}",
             path.display()
         )
     })
@@ -1216,7 +1219,7 @@ async fn public_key_mutation_rejects_unauthenticated_requests_in_production_and_
 }
 
 #[tokio::test]
-async fn auth_headers_accept_canonical_and_reject_legacy_s4_names() {
+async fn auth_headers_accept_the_canonical_maskura_names() {
     let (app, state) = router().await;
     let (access_key, secret_key) = make_key(&state).await;
 
@@ -1232,23 +1235,6 @@ async fn auth_headers_accept_canonical_and_reject_legacy_s4_names() {
     assert_eq!(
         app.clone().oneshot(canonical).await.unwrap().status(),
         StatusCode::OK
-    );
-
-    let legacy = add_headers(
-        Request::builder()
-            .method("PUT")
-            .uri("/aliases/legacy.txt")
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from("legacy"))
-            .unwrap(),
-        &[
-            ("x-s4-access-key", access_key),
-            ("x-s4-secret-key", secret_key),
-        ],
-    );
-    assert_eq!(
-        app.clone().oneshot(legacy).await.unwrap().status(),
-        StatusCode::FORBIDDEN
     );
 }
 
@@ -3313,7 +3299,7 @@ async fn pipeline_expansion_past_output_cap_releases_before_sink_commit() {
     let component_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/components/pii-default.component.wasm");
     let component = std::fs::read(component_path).expect("built pii-default component");
-    let fuel = s4_gateway::plugin_registry::DEFAULT_PIPELINE_FUEL;
+    let fuel = maskura_gateway::plugin_registry::DEFAULT_PIPELINE_FUEL;
     let registry = Arc::new(
         PluginRegistry::with_options(
             fuel,
@@ -3325,7 +3311,7 @@ async fn pipeline_expansion_past_output_cap_releases_before_sink_commit() {
                 max_cumulative_fuel: fuel,
                 ..PipelineLimits::default()
             },
-            s4_wasm_runtime::ExecutorConfig::default(),
+            maskura_wasm_runtime::ExecutorConfig::default(),
         )
         .unwrap(),
     );
@@ -3333,7 +3319,7 @@ async fn pipeline_expansion_past_output_cap_releases_before_sink_commit() {
     let control = Arc::new(RecordingMeteringControl::default());
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.gateway = Arc::new(Gateway::with_registry(
-        s4_wasm_runtime::FilterEngine::with_fuel(&component, fuel).unwrap(),
+        maskura_wasm_runtime::FilterEngine::with_fuel(&component, fuel).unwrap(),
         registry.clone(),
     ));
     state_mut.plugins = registry;
@@ -3382,7 +3368,7 @@ async fn pipeline_expansion_past_output_cap_releases_before_sink_commit() {
 
 #[test]
 fn public_engine_migration_helper_compiles_for_private_integration() {
-    let _helper = s4_gateway::run_engine_migrations;
+    let _helper = maskura_gateway::run_engine_migrations;
 }
 
 #[tokio::test]
@@ -4891,7 +4877,7 @@ async fn sigv4_signed_request_accepted_and_rejected() {
     );
 
     // Unknown access key → 403.
-    let req = signed_request("s4_unknown", &sk, "PUT", uri, b"hello world", &[]);
+    let req = signed_request("maskura_unknown", &sk, "PUT", uri, b"hello world", &[]);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
@@ -5896,7 +5882,7 @@ async fn mcp_token_roundtrip_and_auth() {
         .await
         .unwrap()
         .0;
-    assert!(token.starts_with("s4m_"), "token prefix: {token}");
+    assert!(token.starts_with("maskura_mcp_"), "token prefix: {token}");
 
     // Use it as a Bearer token to write.
     let put = Request::builder()
@@ -5931,7 +5917,7 @@ async fn mcp_token_roundtrip_and_auth() {
     let bad = Request::builder()
         .method("PUT")
         .uri("/mcpbkt/obj.txt")
-        .header("Authorization", "Bearer s4m_forged_token_0000")
+        .header("Authorization", "Bearer maskura_mcp_forged_token_0000")
         .body(Body::from("x"))
         .unwrap();
     let resp = app.clone().oneshot(bad).await.unwrap();
@@ -5942,7 +5928,7 @@ async fn mcp_token_roundtrip_and_auth() {
     );
 
     // Delete works (returns 200/204).
-    let hash = s4_gateway::store::sha256_hash(&token);
+    let hash = maskura_gateway::store::sha256_hash(&token);
     assert!(
         state
             .keys
@@ -6199,7 +6185,7 @@ fn trusted_mcp_limits_have_non_configurable_hard_ceilings() {
     assert!(InvocationLimits::new(0, 1, Duration::from_secs(1)).is_err());
     assert!(
         InvocationLimits::new(
-            s4_gateway::mcp::MAX_TEXT_BODY_BYTES + 1,
+            maskura_gateway::mcp::MAX_TEXT_BODY_BYTES + 1,
             1,
             Duration::from_secs(1)
         )
@@ -6208,7 +6194,7 @@ fn trusted_mcp_limits_have_non_configurable_hard_ceilings() {
     assert!(
         InvocationLimits::new(
             1,
-            s4_gateway::server::MAX_INVOCATION_RESPONSE_BYTES + 1,
+            maskura_gateway::server::MAX_INVOCATION_RESPONSE_BYTES + 1,
             Duration::from_secs(1)
         )
         .is_err()
@@ -7091,7 +7077,7 @@ async fn resolver_outage_and_artifact_corruption_fail_closed_without_body_or_cha
             resolution,
             calls: Mutex::default(),
             resolved: resolved.clone(),
-            failure_code: (!artifact_corruption).then_some(s4_error::codes::INTERNAL),
+            failure_code: (!artifact_corruption).then_some(maskura_error::codes::INTERNAL),
         });
         let control = Arc::new(PipelineAttemptControl {
             resolved,
@@ -7570,9 +7556,9 @@ async fn direct_read_client_cancellation_after_disclosure_preserves_recoverable_
 async fn direct_read_terminal_plugin_error_never_settles_customer_usage() {
     let component = std::fs::read(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/test-components/test-filter.component.wasm"),
+            .join("../../target/test-components/test-transformer.component.wasm"),
     )
-    .expect("test-filter.component.wasm; run just build-filters");
+    .expect("test-transformer.component.wasm; run just build-plugins");
     let registry = Arc::new(PluginRegistry::new());
     registry.import("prefix-safe-test", &component).unwrap();
     let mut resolution = StaticPipelineResolver::new(registry.clone())
@@ -7596,7 +7582,7 @@ async fn direct_read_terminal_plugin_error_never_settles_customer_usage() {
     state_mut.plugins = execution_registry.clone();
     state_mut.gateway = Arc::new(
         Gateway::with_registry(
-            s4_wasm_runtime::FilterEngine::new(&component).unwrap(),
+            maskura_wasm_runtime::FilterEngine::new(&component).unwrap(),
             execution_registry,
         )
         .with_resolver(resolver, Arc::new(FixedComponentSource(component.into()))),

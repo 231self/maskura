@@ -15,9 +15,6 @@ tar -xzf maskura-typescript-sdk.tar.gz -C vendor/maskura-client
 npm install --install-links ./vendor/maskura-client --save
 ```
 
-The legacy `s4-typescript-sdk.tar.gz` release archive remains available with
-`s4-client` package metadata. Both archives contain the same client API.
-
 ### Install From Source
 
 From a checkout of `https://github.com/231self/maskura`:
@@ -42,9 +39,9 @@ node --test test/highlevel-attach.test.cjs
 import { MaskuraClient } from "maskura-client";
 
 const client = new MaskuraClient({
-  endpoint: "https://api.s4.231self.com",
-  accessKey: "s4_example",
-  secretKey: "s4s_example",
+  endpoint: "https://maskura.dev",
+  accessKey: "maskura_example",
+  secretKey: "maskura_secret_example",
 });
 ```
 

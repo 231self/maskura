@@ -1,0 +1,8 @@
+schema_version = 1
+id = "maskura.transforms.noop"
+name = "No-op transform"
+category = "transforms"
+status = "official"
+version = "0.1.0"
+world = "maskura:plugin/transformer@0.1.0"
+capabilities = []

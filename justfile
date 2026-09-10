@@ -10,7 +10,7 @@ check-fast: check-fmt check-lint
   @echo "Fast checks passed"
 
 # Full check: format, lint, build filters, tests
-check: check-fmt check-lint build-filters test
+check: check-fmt check-lint build-plugins test
   @echo "All checks passed"
 
 check-fmt:
@@ -21,12 +21,15 @@ check-lint:
 
 # Keep the public evidence entry points executable and parseable without
 # starting Docker or reaching the network.
-check-evidence: check-release test-release-notifications
-  bash -n examples/prove-maskura.sh examples/local-quickstart.sh examples/maskura-demo.sh scripts/bench-filters.sh scripts/release-notes.sh scripts/post-release-discord.sh scripts/test-release-notifications.sh
+check-evidence: check-release check-plugin-contract test-release-notifications
+  bash -n examples/prove-maskura.sh examples/local-quickstart.sh examples/maskura-demo.sh scripts/bench-plugins.sh scripts/release-notes.sh scripts/post-release-discord.sh scripts/test-release-notifications.sh
   python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("examples/python-hybrid-roundtrip.py").read_text())'
 
 test-release-notifications:
   bash scripts/test-release-notifications.sh
+
+check-plugin-contract:
+  python3 scripts/check-plugin-contract.py
 
 # Ensure every public version surface agrees before a release tag can be cut.
 check-release:
@@ -35,8 +38,8 @@ check-release:
 test:
   cargo test --locked --workspace
 
-build-filters:
-  bash scripts/build-filters.sh
+build-plugins:
+  bash scripts/build-plugins.sh
 
 deny:
   cargo deny check
@@ -71,7 +74,7 @@ e2e:
 
 # Streaming data-plane focused suite (the gateway crate is the streaming plane)
 test-streaming:
-  cargo test -p s4-gateway
+  cargo test -p maskura-gateway
 
 # Streaming end-to-end against MinIO (direct S3 sink; requires Docker)
 e2e-streaming:
@@ -79,7 +82,7 @@ e2e-streaming:
 
 # Unmodified AWS CLI + boto3 interop (requires awscli/boto3 on PATH)
 interop:
-  cargo test -p s4-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
+  cargo test -p maskura-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
 
 # Public, black-box evidence: AWS CLI redaction, runtime Wasm import, and the
 # Python X25519 + ML-KEM-768 encrypted round trip. Optional mode: redaction,
@@ -89,23 +92,23 @@ proof *args:
 
 # Fault-injection suite: multipart staging fault matrix + streaming failure paths
 fault-streaming:
-  cargo test -p s4-gateway multipart_staging::tests
-  cargo test -p s4-gateway --test s3_frontdoor_test streaming_put_limit_failure_has_no_partial_visibility
-  cargo test -p s4-gateway --test s3_frontdoor_test unsafe_transformed_failures_never_disclose_early_late_or_finish_output
-  cargo test -p s4-gateway --test s3_frontdoor_test valid_sigv4_seed_polls_then_rejects_payload_hash_mismatch
+  cargo test -p maskura-gateway multipart_staging::tests
+  cargo test -p maskura-gateway --test s3_frontdoor_test streaming_put_limit_failure_has_no_partial_visibility
+  cargo test -p maskura-gateway --test s3_frontdoor_test unsafe_transformed_failures_never_disclose_early_late_or_finish_output
+  cargo test -p maskura-gateway --test s3_frontdoor_test valid_sigv4_seed_polls_then_rejects_payload_hash_mismatch
 
 # Fixed-RSS memory bound (1 GiB source; asserts allocation is object-size-independent)
 bench-rss:
-  cargo test -p s4-gateway --test streaming_rss -- --nocapture
+  cargo test -p maskura-gateway --test streaming_rss -- --nocapture
 
 # Micro-benchmark: per-plugin Wasm fuel, latency, and expansion (Tier 1)
-bench-filters: build-filters
-  bash scripts/bench-filters.sh
+bench-plugins: build-plugins
+  bash scripts/bench-plugins.sh
 
 # Soak: high-case-count property tests + repeated streaming round-trips
 soak-streaming:
-  PROPTEST_CASES=10000 cargo test -p s4-gateway --test property --test record_decoder
-  MASKURA_SOAK_ITERATIONS=500 cargo test -p s4-gateway --test s3_frontdoor_test soak_streaming_roundtrip_holds_under_repetition -- --ignored
+  PROPTEST_CASES=10000 cargo test -p maskura-gateway --test property --test record_decoder
+  MASKURA_SOAK_ITERATIONS=500 cargo test -p maskura-gateway --test s3_frontdoor_test soak_streaming_roundtrip_holds_under_repetition -- --ignored
 
 # Release image smoke (boot smoke against the built OCI image)
 release-smoke IMAGE_REF:
@@ -133,13 +136,13 @@ publish-local TAG='latest':
   dagger call publish --tag={{TAG}}
 
 # Start local dev environment (Docker Compose + MinIO + gateway)
-dev-up: build-filters
+dev-up: build-plugins
   docker compose -f local/docker-compose.yml up -d --build --wait minio gateway
   echo "Local dev environment ready:"
   echo "  MinIO:     http://localhost:9000 (API) / :9001 (Console)"
   echo "  Gateway:   http://localhost:8080/health"
-  docker run --rm --network host minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 --no-color mb local/s4-local --ignore-existing 2>/dev/null || true
-  echo "  S3 bucket: s4-local (created)"
+  docker run --rm --network host minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 --no-color mb local/maskura-local --ignore-existing 2>/dev/null || true
+  echo "  S3 bucket: maskura-local (created)"
 
 # Stop local dev environment
 dev-down:
@@ -147,9 +150,9 @@ dev-down:
 
 # Full dev flow: start infra + run E2E test
 dev: dev-up
-  cargo run -p s4ctl -- test upload
+  cargo run -p maskura -- test upload
 
 # Generate client SDKs from OpenAPI spec (requires Docker)
 # Produces sdks/python/ and sdks/typescript/
-build-sdks: build-filters
+build-sdks: build-plugins
   bash scripts/generate-sdks.sh

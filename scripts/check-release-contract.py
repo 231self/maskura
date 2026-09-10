@@ -19,23 +19,29 @@ def load_toml(path: Path) -> dict:
         return tomllib.load(source)
 
 
-def workspace_package_names() -> set[str]:
-    names: set[str] = set()
+def workspace_package_versions(workspace_version: str) -> dict[str, str]:
+    versions: dict[str, str] = {}
     manifests = sorted((ROOT / "crates").glob("*/Cargo.toml"))
-    manifests += sorted((ROOT / "filters").glob("*/Cargo.toml"))
+    manifests += sorted((ROOT / "plugins").glob("*/*/Cargo.toml"))
+    manifests += sorted((ROOT / "tests" / "plugins").glob("*/Cargo.toml"))
     for path in manifests:
         package = load_toml(path)["package"]
+        if package["name"] == "maskura-plugin-sdk":
+            if package.get("version") != "0.1.0":
+                raise SystemExit("maskura-plugin-sdk version must match its 0.1.0 WIT ABI")
+            versions[package["name"]] = "0.1.0"
+            continue
         if package.get("version") != {"workspace": True}:
             raise SystemExit(
                 f"{path.relative_to(ROOT)} does not inherit the workspace version"
             )
-        names.add(package["name"])
-    return names
+        versions[package["name"]] = workspace_version
+    return versions
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tag", help="release tag to compare, such as v0.6.0")
+    parser.add_argument("--tag", help="release tag to compare, such as v0.7.0")
     args = parser.parse_args()
 
     version = load_toml(ROOT / "Cargo.toml")["workspace"]["package"]["version"]
@@ -50,11 +56,11 @@ def main() -> None:
         for package in lock_packages
         if "source" not in package
     }
-    for name in sorted(workspace_package_names()):
-        if locked_versions.get(name) != version:
+    for name, expected_version in sorted(workspace_package_versions(version).items()):
+        if locked_versions.get(name) != expected_version:
             raise SystemExit(
                 f"Cargo.lock has {name} {locked_versions.get(name)!r}, "
-                f"expected {version}"
+                f"expected {expected_version}"
             )
 
     openapi_version = json.loads((ROOT / "sdks/openapi.json").read_text())["info"][

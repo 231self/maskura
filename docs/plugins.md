@@ -1,57 +1,55 @@
-# Maskura plugins: create and consume your own
+# Maskura plugins
 
-Plugins are how Maskura transforms text data. A plugin is a WebAssembly component that receives
-each object's payload, optionally transforms it, and returns a decision. Plugins run in
-a pipeline — the output of one is the input of the next — so you compose transforms:
-filter, then encrypt, then convert.
+Plugins are WebAssembly components that transform object data in an ordered
+pipeline. A plugin can filter, redact, encrypt, validate, normalize, convert,
+or perform another deterministic byte transformation. The output of one plugin
+is the input of the next.
 
-## The interface
+## Contract ownership
 
-Plugins implement one world, `s4:filter`
-([`wit/s4-filter/world.wit`](https://github.com/231self/maskura/blob/main/wit/s4-filter/world.wit)):
+The public [`maskura-plugin-sdk`](../crates/plugin-sdk/) crate owns the
+canonical WIT contract and thin Rust bindings. Both the gateway host and every
+in-tree transformer consume that same source:
+
+```wit
+package maskura:plugin@0.1.0;
+world transformer { /* begin, transform, finish */ }
+```
+
+Purpose is metadata, not ABI. A plugin under `plugins/crypto/` and one under
+`plugins/filters/` implement the same `transformer` world, so new capability
+families do not require new protocols.
 
 | Function | Called | Purpose |
 |---|---|---|
-| `begin(context)` | once per object | Per-object setup; context carries `format`, `content-type`, `policy-version`, and optional `public-key-pem`, `stable-key`, `stable-fields` |
-| `transform(payload)` | once per record | Transform the bytes; return `emit(bytes)`, `drop`, or `reject(reason)` |
-| `finish()` | once at the end | Flush buffered output; return trailing bytes |
+| `begin(context)` | once per object | Receive format, operation, policy, bounded config, and explicitly granted sensitive inputs |
+| `transform(payload)` | once per record | Return `emit(bytes)`, `drop`, or `reject(reason)` |
+| `finish()` | once at the end | Flush bounded trailing output |
 
-Sandbox limits: wasmtime, 64 MiB memory, 10K table entries, 512 KiB stack, no host
-imports, and a fuel budget (`MASKURA_WASM_FUEL`, default 1B; enough for crypto filters).
+The sandbox provides bounded memory, tables, stack, time, and fuel. It does not
+inherit the host filesystem, environment, network, stdout, or stderr.
 
-## Write one (Rust)
-
-`Cargo.toml`:
+## Write a Rust plugin
 
 ```toml
-[package]
-name = "my-filter"
-edition = "2021"
-
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = "0.60"
+maskura-plugin-sdk = { git = "https://github.com/231self/maskura", tag = "v0.7.0" }
 ```
 
-`src/lib.rs`:
-
 ```rust
-wit_bindgen::generate!({
-    world: "filter",
-    path: "path/to/wit/s4-filter/world.wit",
-});
+use maskura_plugin_sdk::{Context, Decision, Guest, export_plugin};
 
-struct MyFilter;
+struct Normalize;
 
-impl Guest for MyFilter {
+impl Guest for Normalize {
     fn begin(_context: Context) -> Result<(), String> {
         Ok(())
     }
 
     fn transform(payload: Vec<u8>) -> Result<Decision, String> {
-        // ... transform the bytes ...
         Ok(Decision::Emit(payload))
     }
 
@@ -60,106 +58,74 @@ impl Guest for MyFilter {
     }
 }
 
-export!(MyFilter);
+export_plugin!(Normalize);
 ```
 
-Build and wrap as a component:
+Build it as a WASI reactor and lift it to a component with the pinned adapter,
+as demonstrated by [`scripts/build-plugins.sh`](../scripts/build-plugins.sh).
+The minimal in-tree example is [`plugins/transforms/noop`](../plugins/transforms/noop/).
+
+## Official plugin layout
+
+Maskura keeps one contribution surface until external contribution volume
+justifies another repository:
+
+```text
+plugins/
+  filters/       content selection and redaction
+  crypto/        encryption and deterministic protection
+  transforms/    general-purpose byte transformations
+  shared/        internal libraries, not loadable components
+```
+
+Each loadable plugin has a `plugin.toml` with its stable ID, category, status,
+world, version, and requested capabilities. `official` means maintained and
+released by Maskura; `experimental` means the API or behavior may still change.
+The label does not weaken sandboxing or validation.
+
+Do not add an empty category to advertise a roadmap. Add a category when its
+first useful plugin lands. If outside contributions eventually need independent
+ownership or release cadence, the SDK keeps a future community repository from
+forking the ABI.
+
+## Load a component
+
+Self-hosted gateways support runtime import without rebuilding the server:
 
 ```bash
-cargo build --release --target wasm32-unknown-unknown
-wasm-tools component new target/wasm32-unknown-unknown/release/my_filter.wasm \
-  -o my-filter.component.wasm
+maskura plugin upload my-plugin.component.wasm
+maskura plugin list
+maskura plugin reorder my-plugin pii-default
+maskura plugin disable <id>
+maskura plugin delete <id>
 ```
 
-`filters/noop/` is a minimal example; `filters/pii-default/` shows detection + redaction
-with `addr-spec` / `card-validate` style libraries and a pure-Wasm crypto fallback.
-
-## Load it
-
-At runtime — no gateway rebuild, no restart:
+Or auto-load every `.wasm` component in a directory at startup:
 
 ```bash
-maskura plugin upload my-filter.component.wasm     # prints the plugin id
-maskura plugin list                                # shows pipeline order
-maskura plugin reorder my-filter pii-default       # output of one feeds the next
-maskura plugin disable <id>                        # remove from the pipeline
-maskura plugin delete <id>                         # drop the plugin
+MASKURA_PLUGINS_DIR=./components ./target/debug/maskura-gateway
 ```
 
-To verify runtime import against the published container, including an
-observable transform produced only by the imported component:
+`MASKURA_DEFAULT_PLUGIN` selects the initial component; local images use the
+official `pii-default` artifact. `just proof plugin` verifies runtime import
+against the published container and observes a transformation produced only by
+the imported component.
+
+Hosted workspaces persist immutable plugin versions, installations, ordered
+pipeline revisions, assignments, grants, and validation results. Uploads use
+the same world identifier:
 
 ```bash
-just proof plugin
+maskura hosted upload ./my-plugin.component.wasm \
+  --slug my-plugin --display-name "My Plugin" --version 1.0.0 \
+  --world maskura:plugin/transformer@0.1.0 --wit-version 0.1.0
 ```
 
-Or auto-load a directory of plugins at gateway startup:
+Only workspace owners mutate hosted plugin state. Sensitive context is passed
+only after an explicit capability grant. Empty pipelines require explicit
+pass-through, and failed read transforms never disclose unprocessed fallback
+data.
 
-```bash
-MASKURA_PLUGINS_DIR=./components ./target/debug/s4-gateway
-```
+Typed binary formats can additionally use the `binary-reductor` world from the
+same WIT package. See [Binary adapters](binary-adapters.md).
 
-The default local setup preloads `pii-default` via `MASKURA_FILTER_COMPONENT`.
-
-## Decision semantics
-
-- `emit(bytes)` — pass the transformed bytes to the next plugin.
-- `drop` — discard this record entirely.
-- `reject(reason)` — fail the request with the reason.
-
-## Notes
-
-- Plugins are pure byte-in/byte-out. The gateway handles transport (S3 API), auth, and
-  storage.
-- Plugins do not declare an output schema, so they cannot be used directly for Avro,
-  Parquet, or another typed binary format. Binary codecs use schema-aware transforms and
-  optional `s4:binary-reductor` components instead; see
-  [Binary adapters](binary-adapters.md).
-- Filters shipped in-tree: `noop` (pass-through baseline), `pii-default`,
-  `email-detect`, `ssn-detect`, `card-detect`, `envelope-encrypt`, `stable-encrypt`.
-- The original WIT design is recorded in
-  [ADR-0001: component model and WIT](adr/0001-component-model-wit.md).
-
-## Hosted workspaces (`maskura hosted`)
-
-Self-hosted/local gateways load plugins with the `maskura plugin` commands above and a
-directory (`MASKURA_PLUGINS_DIR`) at startup. Hosted Maskura workspaces instead manage
-plugins as first-class relational configuration owned by the workspace owner. The
-`maskura plugin` commands and directory auto-enable **do not** apply there and are not
-available on hosted Maskura. Hosted management is available only when the hosted deployment
-enables filter pipelines (and separately enables custom uploads). It authenticates with a
-**Supabase access token** (`MASKURA_ACCESS_TOKEN` or `--token`) and a workspace ID
-(`MASKURA_WORKSPACE_ID` or `--workspace`); a Maskura data-plane API key is never accepted
-for hosted mutations. The `s4ctl` binary name remains available as an alias for
-`maskura`.
-
-```bash
-export MASKURA_ACCESS_TOKEN=<supabase-jwt>
-export MASKURA_WORKSPACE_ID=<workspace-uuid>
-maskura hosted catalog                  # catalog + versions + capability grants
-maskura hosted upload ./my-filter.component.wasm \
-  --slug my-filter --display-name "My Filter" --version 1.0.0 \
-  --world s4-filter@0.2.0 --wit-version 0.2.0 --capability stable_fields
-maskura hosted validation <version-id>  # poll the secret-free validation run
-maskura hosted grant --installation-id <id> --capability stable_fields --version-id <version-id>
-maskura hosted pipelines create write "redact"
-maskura hosted pipelines draft <pipeline-id> --step <install-id>:<version-id>:config.json
-maskura hosted pipelines publish <pipeline-id>
-maskura hosted assign-default write --pipeline-id <id>
-maskura hosted assign-bucket write ingest --pipeline-id <id>
-maskura hosted audit
-```
-
-- **Worlds.** Components implement `s4-filter@0.1.0` (no config) or `s4-filter@0.2.0`
-  (`operation` + optional `config-json`). Config is only valid for v0.2 components.
-- **Ordering.** Draft steps run in the order given (`installation_id:version_id[:config]`);
-  the fingerprint covers ordered versions, enabled flags, configs, and grants.
-- **Capability grants.** A component only receives sensitive context (for example
-  `stable_fields`) after the owner explicitly grants it per installation/version.
-- **Pass-through.** An empty chain is only publishable when `--passthrough` is set; a
-  missing bucket assignment inherits the workspace default, and an exact bucket
-  assignment replaces the chain entirely.
-- **Read spooling.** Custom read filters are spooled to encrypted storage and never
-  disclosed as a raw fallback on failure.
-- **Ownership.** Only workspace owners mutate plugins, grants, pipelines, or assignments;
-  members may inspect the effective configuration and audit trail.

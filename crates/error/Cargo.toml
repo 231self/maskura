@@ -1,5 +1,5 @@
 [package]
-name = "s4-error"
+name = "maskura-error"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

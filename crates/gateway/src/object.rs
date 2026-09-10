@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use http_body::{Frame, SizeHint};
-use s4_wasm_runtime::CancellationToken;
+use maskura_wasm_runtime::CancellationToken;
 
 pub const DEFAULT_MAX_SOURCE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_MAX_SOURCE_BYTES: u64 = 5 * 1024 * 1024 * 1024;

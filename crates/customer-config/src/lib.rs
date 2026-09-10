@@ -32,7 +32,7 @@ pub mod aliases {
     pub const MCP_TOKEN: EnvAlias = EnvAlias::new("MASKURA_MCP_TOKEN");
     pub const PORT: EnvAlias = EnvAlias::new("MASKURA_PORT");
 
-    pub const FILTER_COMPONENT: EnvAlias = EnvAlias::new("MASKURA_FILTER_COMPONENT");
+    pub const DEFAULT_PLUGIN: EnvAlias = EnvAlias::new("MASKURA_DEFAULT_PLUGIN");
     pub const PLUGINS_DIR: EnvAlias = EnvAlias::new("MASKURA_PLUGINS_DIR");
     pub const WASM_FUEL: EnvAlias = EnvAlias::new("MASKURA_WASM_FUEL");
     pub const SOURCE_MAX_FRAME_BYTES: EnvAlias = EnvAlias::new("MASKURA_SOURCE_MAX_FRAME_BYTES");
@@ -61,7 +61,7 @@ pub mod aliases {
     pub const BOOTSTRAP_SECRET: EnvAlias = EnvAlias::new("MASKURA_BOOTSTRAP_SECRET");
 
     pub const GATEWAY_CUSTOMER_SETTINGS: &[EnvAlias] = &[
-        FILTER_COMPONENT,
+        DEFAULT_PLUGIN,
         PLUGINS_DIR,
         WASM_FUEL,
         SOURCE_MAX_FRAME_BYTES,
@@ -164,13 +164,13 @@ mod tests {
             assert!(names.insert(alias.name()));
         }
         for operator_only in [
-            "S4_SECRET_KEK",
-            "S4_SERVICE_BUCKETS",
-            "S4_SIGV4_REGION",
-            "S4_WORKSPACE_ENDPOINT_ALLOWLIST",
-            "S4_PRESIGNED_HTTP_ALLOWLIST",
-            "S4_MANAGED_STREAMING_MODE",
-            "S4_MULTIPART_STAGING_BUCKET",
+            "MASKURA_SECRET_KEK",
+            "MASKURA_SERVICE_BUCKETS",
+            "MASKURA_SIGV4_REGION",
+            "MASKURA_WORKSPACE_ENDPOINT_ALLOWLIST",
+            "MASKURA_PRESIGNED_HTTP_ALLOWLIST",
+            "MASKURA_MANAGED_STREAMING_MODE",
+            "MASKURA_MULTIPART_STAGING_BUCKET",
         ] {
             assert!(!names.contains(operator_only));
         }

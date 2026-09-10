@@ -1,7 +1,7 @@
 mod common;
 
-use s4_gateway::Format;
-use s4_gateway::plugin_registry::PluginRegistry;
+use maskura_gateway::Format;
+use maskura_gateway::plugin_registry::PluginRegistry;
 use std::fs;
 use std::path::PathBuf;
 
@@ -16,7 +16,7 @@ fn component_path(name: &str) -> PathBuf {
 
 fn read_component(name: &str) -> Vec<u8> {
     fs::read(component_path(name))
-        .unwrap_or_else(|_| panic!("component not found: {name}; run `just build-filters` first"))
+        .unwrap_or_else(|_| panic!("component not found: {name}; run `just build-plugins` first"))
 }
 
 fn registry_with(components: &[&str]) -> PluginRegistry {

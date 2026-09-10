@@ -1,10 +1,10 @@
 mod common;
 
 use bytes::Bytes;
-use s4_gateway::Format;
-use s4_gateway::plugin_registry::PluginRegistry;
-use s4_gateway::record::{DecoderLimits, Record, RecordDecoder};
-use s4_wasm_runtime::CancellationToken;
+use maskura_gateway::Format;
+use maskura_gateway::plugin_registry::PluginRegistry;
+use maskura_gateway::record::{DecoderLimits, Record, RecordDecoder};
+use maskura_wasm_runtime::CancellationToken;
 use std::fs;
 use std::path::PathBuf;
 
@@ -28,18 +28,18 @@ fn component_path() -> PathBuf {
 
 fn load_registry() -> PluginRegistry {
     let component = fs::read(component_path())
-        .expect("filter component not found; run `just build-filters` first");
+        .expect("filter component not found; run `just build-plugins` first");
     let registry = PluginRegistry::new();
     registry.import("pii-default", &component).unwrap();
     registry
 }
 
-fn session(format: &str, content_type: &str) -> s4_wasm_runtime::Session {
-    s4_wasm_runtime::Session {
+fn session(format: &str, content_type: &str) -> maskura_wasm_runtime::Session {
+    maskura_wasm_runtime::Session {
         format: format.to_string(),
         content_type: content_type.to_string(),
         policy_version: 1,
-        operation: s4_wasm_runtime::Operation::Write,
+        operation: maskura_wasm_runtime::Operation::Write,
         config_json: None,
         public_key_pem: None,
         stable_key: None,

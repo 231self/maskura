@@ -3,7 +3,7 @@
 //! The gateway never stores plaintext API key secrets. Each secret is
 //! encrypted with a fresh 256-bit data key (DEK) using AES-256-GCM, and the
 //! DEK itself is wrapped by a [`KeyWrapping`] implementation so the master
-//! key can live elsewhere (operator-provided `S4_SECRET_KEK`, or a KMS key in
+//! key can live elsewhere (operator-provided `MASKURA_SECRET_KEK`, or a KMS key in
 //! a follow-up). Decryption only happens in memory, on demand, to recompute a
 //! SigV4 signature.
 //!
@@ -37,7 +37,7 @@ use crate::filesystem_persistence::{create_private_dir_all, sync_parent};
 
 const LEGACY_ENVELOPE_VERSION: &str = "v1";
 const ENVELOPE_VERSION: &str = "v2";
-const AAD_DOMAIN: &[u8] = b"s4.api-key.secret.v2\0";
+const AAD_DOMAIN: &[u8] = b"maskura.api-key.secret.v2\0";
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const FILE_KEY_VERSION: u32 = 1;
@@ -88,20 +88,20 @@ impl Drop for LocalKeyWrapping {
 }
 
 impl LocalKeyWrapping {
-    /// Read the KEK from `S4_SECRET_KEK` (base64, 32 bytes).
+    /// Read the KEK from `MASKURA_SECRET_KEK` (base64, 32 bytes).
     pub fn from_env() -> Result<Option<Self>> {
-        match std::env::var("S4_SECRET_KEK") {
+        match std::env::var("MASKURA_SECRET_KEK") {
             Ok(v) => {
                 let kek = B64
                     .decode(v.trim())
-                    .context("S4_SECRET_KEK must be base64")?;
+                    .context("MASKURA_SECRET_KEK must be base64")?;
                 let kek: [u8; KEY_LEN] = kek
                     .try_into()
-                    .map_err(|_| anyhow!("S4_SECRET_KEK must decode to 32 bytes"))?;
+                    .map_err(|_| anyhow!("MASKURA_SECRET_KEK must decode to 32 bytes"))?;
                 Ok(Some(Self { kek, durable: true }))
             }
             Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(e) => Err(e).context("failed to read S4_SECRET_KEK"),
+            Err(e) => Err(e).context("failed to read MASKURA_SECRET_KEK"),
         }
     }
 
@@ -452,7 +452,7 @@ fn file_key_io(operation: &'static str, source: std::io::Error) -> FileKeyWrappi
     FileKeyWrappingError::Io { operation, source }
 }
 
-/// Resolve the OSS self-host wrapping: `S4_SECRET_KEK` if set, otherwise an
+/// Resolve the OSS self-host wrapping: `MASKURA_SECRET_KEK` if set, otherwise an
 /// ephemeral key with a warning that SigV4 verification will not survive a
 /// restart. KMS/Vault wrappers are injected by callers that construct their
 /// own [`KeyWrapping`] and pass it to `build_state`.
@@ -461,7 +461,7 @@ pub fn default_wrapping() -> Result<Arc<dyn KeyWrapping>> {
         Some(wrapping) => Ok(Arc::new(wrapping)),
         None => {
             warn!(
-                "S4_SECRET_KEK is not set; API key secrets use an ephemeral key and SigV4 verification will not survive a restart"
+                "MASKURA_SECRET_KEK is not set; API key secrets use an ephemeral key and SigV4 verification will not survive a restart"
             );
             Ok(Arc::new(LocalKeyWrapping::ephemeral()))
         }
@@ -655,12 +655,12 @@ mod tests {
     fn v2_roundtrip_local_kek() {
         let cipher = cipher_with_kek(7);
         let blob = cipher
-            .encrypt("s4_key_identity", "s4s_secret_value_1234")
+            .encrypt("maskura_key_identity", "maskura_secret_secret_value_1234")
             .unwrap();
         assert!(blob.starts_with("v2:"));
         assert_eq!(
-            cipher.decrypt("s4_key_identity", &blob).as_deref(),
-            Some("s4s_secret_value_1234")
+            cipher.decrypt("maskura_key_identity", &blob).as_deref(),
+            Some("maskura_secret_secret_value_1234")
         );
     }
 
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn env_kek_parses() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("S4_SECRET_KEK", B64.encode([3u8; KEY_LEN])) };
+        unsafe { std::env::set_var("MASKURA_SECRET_KEK", B64.encode([3u8; KEY_LEN])) };
         let w = LocalKeyWrapping::from_env()
             .expect("no env error")
             .expect("Some");
@@ -785,7 +785,7 @@ mod tests {
     #[test]
     fn env_kek_rejects_short_key() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("S4_SECRET_KEK", B64.encode([1u8; 8])) };
+        unsafe { std::env::set_var("MASKURA_SECRET_KEK", B64.encode([1u8; 8])) };
         assert!(LocalKeyWrapping::from_env().is_err());
     }
 

@@ -4,7 +4,7 @@ All URIs are relative to *http://localhost*
 
 Method | HTTP request | Description
 ------------- | ------------- | -------------
-[**create_mcp_token**](McpApi.md#create_mcp_token) | **POST** /dashboard/api/mcp-tokens | Create an MCP bearer token (&#x60;s4m_...&#x60;). The plaintext token is returned once and only its hash is stored.
+[**create_mcp_token**](McpApi.md#create_mcp_token) | **POST** /dashboard/api/mcp-tokens | Create an MCP bearer token (&#x60;maskura_mcp_...&#x60;). The plaintext token is returned once and only its hash is stored.
 [**delete_mcp_token**](McpApi.md#delete_mcp_token) | **DELETE** /dashboard/api/mcp-tokens | Revoke an MCP bearer token.
 [**get_mcp_tokens**](McpApi.md#get_mcp_tokens) | **GET** /dashboard/api/mcp-tokens | List MCP bearer tokens for the authenticated user (hashes only).
 
@@ -12,7 +12,7 @@ Method | HTTP request | Description
 # **create_mcp_token**
 > McpTokenCreatedResponse create_mcp_token(create_mcp_token_request)
 
-Create an MCP bearer token (`s4m_...`). The plaintext token is returned once and only its hash is stored.
+Create an MCP bearer token (`maskura_mcp_...`). The plaintext token is returned once and only its hash is stored.
 
 ### Example
 
@@ -38,7 +38,7 @@ with maskura_client.ApiClient(configuration) as api_client:
     create_mcp_token_request = maskura_client.CreateMcpTokenRequest() # CreateMcpTokenRequest | 
 
     try:
-        # Create an MCP bearer token (`s4m_...`). The plaintext token is returned once and only its hash is stored.
+        # Create an MCP bearer token (`maskura_mcp_...`). The plaintext token is returned once and only its hash is stored.
         api_response = api_instance.create_mcp_token(create_mcp_token_request)
         print("The response of McpApi->create_mcp_token:\n")
         pprint(api_response)

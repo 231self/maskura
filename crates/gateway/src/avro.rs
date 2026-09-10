@@ -9,8 +9,8 @@ use std::io::{self, Read};
 
 use apache_avro::{Codec, Reader, Schema, Writer, types::Value as AvroValue};
 use chrono::{DateTime, Duration, NaiveDate, NaiveTime, SecondsFormat, Timelike, Utc};
+use maskura_error::{MaskuraError, codes};
 use num_bigint::{BigInt, Sign};
-use s4_error::{S4Error, codes};
 use serde_json::{Value as JsonValue, json};
 
 use crate::binary_ir::{
@@ -41,10 +41,14 @@ impl Default for AvroLimits {
 ///
 /// The source reader is capped before the Avro library sees bytes; each emitted
 /// value is separately validated against the bounded Maskura IR schema.
-pub fn decode_ocf<R, F>(source: R, limits: AvroLimits, mut emit: F) -> Result<SchemaIr, S4Error>
+pub fn decode_ocf<R, F>(
+    source: R,
+    limits: AvroLimits,
+    mut emit: F,
+) -> Result<SchemaIr, MaskuraError>
 where
     R: Read,
-    F: FnMut(ValueIr) -> Result<(), S4Error>,
+    F: FnMut(ValueIr) -> Result<(), MaskuraError>,
 {
     validate_limits(limits)?;
     let mut reader =
@@ -64,7 +68,7 @@ pub fn encode_ocf(
     schema: &SchemaIr,
     values: &[ValueIr],
     limits: AvroLimits,
-) -> Result<Vec<u8>, S4Error> {
+) -> Result<Vec<u8>, MaskuraError> {
     validate_limits(limits)?;
     schema.validate(limits.ir)?;
     let avro_schema = Schema::parse(&schema_to_avro_json(&schema.root)?).map_err(avro_error)?;
@@ -89,7 +93,7 @@ pub fn process_ocf<R, Reductor, Transform>(
     source: R,
     limits: AvroLimits,
     pump: &mut BinaryPump<Reductor, Transform>,
-) -> Result<Vec<u8>, S4Error>
+) -> Result<Vec<u8>, MaskuraError>
 where
     R: Read,
     Reductor: BinaryReductor,
@@ -126,14 +130,14 @@ where
     writer.into_inner().map_err(avro_error)
 }
 
-pub fn schema_from_avro(schema: &Schema, limits: BinaryIrLimits) -> Result<SchemaIr, S4Error> {
+pub fn schema_from_avro(schema: &Schema, limits: BinaryIrLimits) -> Result<SchemaIr, MaskuraError> {
     let raw = serde_json::to_value(schema).map_err(avro_error)?;
     let schema = SchemaIr::new(schema_node_from_json(&raw)?);
     schema.validate(limits)?;
     Ok(schema)
 }
 
-fn schema_node_from_json(raw: &JsonValue) -> Result<SchemaNode, S4Error> {
+fn schema_node_from_json(raw: &JsonValue) -> Result<SchemaNode, MaskuraError> {
     if let Some(kind) = raw.as_str() {
         return primitive_schema(kind);
     }
@@ -223,7 +227,7 @@ fn schema_node_from_json(raw: &JsonValue) -> Result<SchemaNode, S4Error> {
                         schema: schema_node_from_json(kind)?,
                     })
                 })
-                .collect::<Result<Vec<_>, S4Error>>()?;
+                .collect::<Result<Vec<_>, MaskuraError>>()?;
             Ok(SchemaNode::required(SchemaKind::Record { fields }))
         }
         "array" => Ok(SchemaNode::required(SchemaKind::Array {
@@ -247,7 +251,7 @@ fn schema_node_from_json(raw: &JsonValue) -> Result<SchemaNode, S4Error> {
     }
 }
 
-fn primitive_schema(kind: &str) -> Result<SchemaNode, S4Error> {
+fn primitive_schema(kind: &str) -> Result<SchemaNode, MaskuraError> {
     let kind = match kind {
         "null" => SchemaKind::Null,
         "boolean" => SchemaKind::Boolean,
@@ -266,12 +270,12 @@ fn primitive_schema(kind: &str) -> Result<SchemaNode, S4Error> {
     Ok(SchemaNode::required(kind))
 }
 
-fn schema_to_avro_json(root: &SchemaNode) -> Result<JsonValue, S4Error> {
+fn schema_to_avro_json(root: &SchemaNode) -> Result<JsonValue, MaskuraError> {
     let mut records = 0_u32;
     schema_node_to_json(root, &mut records)
 }
 
-fn schema_node_to_json(node: &SchemaNode, records: &mut u32) -> Result<JsonValue, S4Error> {
+fn schema_node_to_json(node: &SchemaNode, records: &mut u32) -> Result<JsonValue, MaskuraError> {
     let raw = match &node.kind {
         SchemaKind::Null => json!("null"),
         SchemaKind::Boolean => json!("boolean"),
@@ -293,7 +297,7 @@ fn schema_node_to_json(node: &SchemaNode, records: &mut u32) -> Result<JsonValue
             let fields = fields
                 .iter()
                 .map(|field| Ok(json!({"name":field.name,"type":schema_node_to_json(&field.schema, records)?})))
-                .collect::<Result<Vec<_>, S4Error>>()?;
+                .collect::<Result<Vec<_>, MaskuraError>>()?;
             json!({"type":"record","name":name,"fields":fields})
         }
         SchemaKind::Date => json!({"type":"int","logicalType":"date"}),
@@ -319,7 +323,7 @@ fn schema_node_to_json(node: &SchemaNode, records: &mut u32) -> Result<JsonValue
     })
 }
 
-fn avro_value_to_ir(value: AvroValue, schema: &SchemaNode) -> Result<Value, S4Error> {
+fn avro_value_to_ir(value: AvroValue, schema: &SchemaNode) -> Result<Value, MaskuraError> {
     let value = match value {
         AvroValue::Union(_, value) => *value,
         value => value,
@@ -380,7 +384,7 @@ fn avro_value_to_ir(value: AvroValue, schema: &SchemaNode) -> Result<Value, S4Er
                         value: avro_value_to_ir(value, values)?,
                     })
                 })
-                .collect::<Result<Vec<_>, S4Error>>()?,
+                .collect::<Result<Vec<_>, MaskuraError>>()?,
         }),
         (SchemaKind::Record { fields }, AvroValue::Record(values)) => Ok(Value::Record {
             fields: fields
@@ -398,7 +402,7 @@ fn avro_value_to_ir(value: AvroValue, schema: &SchemaNode) -> Result<Value, S4Er
                         value: avro_value_to_ir(value, &field.schema)?,
                     })
                 })
-                .collect::<Result<Vec<_>, S4Error>>()?,
+                .collect::<Result<Vec<_>, MaskuraError>>()?,
         }),
         _ => Err(unsupported(
             "Avro value does not match its supported schema",
@@ -406,7 +410,7 @@ fn avro_value_to_ir(value: AvroValue, schema: &SchemaNode) -> Result<Value, S4Er
     }
 }
 
-fn ir_value_to_avro(value: &Value, schema: &SchemaNode) -> Result<AvroValue, S4Error> {
+fn ir_value_to_avro(value: &Value, schema: &SchemaNode) -> Result<AvroValue, MaskuraError> {
     if schema.nullable {
         if matches!(value, Value::Null) {
             return Ok(AvroValue::Union(0, Box::new(AvroValue::Null)));
@@ -419,7 +423,10 @@ fn ir_value_to_avro(value: &Value, schema: &SchemaNode) -> Result<AvroValue, S4E
     ir_value_to_avro_required(value, schema)
 }
 
-fn ir_value_to_avro_required(value: &Value, schema: &SchemaNode) -> Result<AvroValue, S4Error> {
+fn ir_value_to_avro_required(
+    value: &Value,
+    schema: &SchemaNode,
+) -> Result<AvroValue, MaskuraError> {
     match (&schema.kind, value) {
         (SchemaKind::Null, Value::Null) => Ok(AvroValue::Null),
         (SchemaKind::Boolean, Value::Boolean { value }) => Ok(AvroValue::Boolean(*value)),
@@ -457,7 +464,7 @@ fn ir_value_to_avro_required(value: &Value, schema: &SchemaNode) -> Result<AvroV
             entries
                 .iter()
                 .map(|entry| Ok((entry.key.clone(), ir_value_to_avro(&entry.value, values)?)))
-                .collect::<Result<_, S4Error>>()?,
+                .collect::<Result<_, MaskuraError>>()?,
         )),
         (SchemaKind::Record { fields }, Value::Record { fields: values }) => Ok(AvroValue::Record(
             fields
@@ -474,7 +481,7 @@ fn ir_value_to_avro_required(value: &Value, schema: &SchemaNode) -> Result<AvroV
                         ir_value_to_avro(&value.value, &field.schema)?,
                     ))
                 })
-                .collect::<Result<_, S4Error>>()?,
+                .collect::<Result<_, MaskuraError>>()?,
         )),
         _ => Err(unsupported(
             "IR value does not match its supported Avro schema",
@@ -482,7 +489,7 @@ fn ir_value_to_avro_required(value: &Value, schema: &SchemaNode) -> Result<AvroV
     }
 }
 
-fn decimal_to_unscaled(value: &str, scale: u32) -> Result<BigInt, S4Error> {
+fn decimal_to_unscaled(value: &str, scale: u32) -> Result<BigInt, MaskuraError> {
     let (negative, unsigned) = match value.strip_prefix('-') {
         Some(unsigned) => (true, unsigned),
         None => (false, value),
@@ -551,14 +558,14 @@ fn min_decimal_len(precision: u32) -> usize {
     len
 }
 
-fn date_from_epoch_days(days: i32) -> Result<String, S4Error> {
+fn date_from_epoch_days(days: i32) -> Result<String, MaskuraError> {
     NaiveDate::from_ymd_opt(1970, 1, 1)
         .and_then(|epoch| epoch.checked_add_signed(Duration::days(i64::from(days))))
         .map(|date| date.format("%F").to_string())
         .ok_or_else(|| unsupported("Avro date is outside the supported calendar range"))
 }
 
-fn date_to_epoch_days(value: &str) -> Result<i32, S4Error> {
+fn date_to_epoch_days(value: &str) -> Result<i32, MaskuraError> {
     let date =
         NaiveDate::parse_from_str(value, "%F").map_err(|_| unsupported("invalid date IR value"))?;
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("1970-01-01 is valid");
@@ -566,7 +573,7 @@ fn date_to_epoch_days(value: &str) -> Result<i32, S4Error> {
         .map_err(|_| unsupported("date is outside the Avro i32 day range"))
 }
 
-fn time_from_micros(micros: i64) -> Result<String, S4Error> {
+fn time_from_micros(micros: i64) -> Result<String, MaskuraError> {
     let micros_per_day = 86_400_000_000_i64;
     if !(0..micros_per_day).contains(&micros) {
         return Err(unsupported("Avro time is outside one UTC day"));
@@ -578,20 +585,20 @@ fn time_from_micros(micros: i64) -> Result<String, S4Error> {
         .ok_or_else(|| unsupported("invalid Avro time"))
 }
 
-fn time_to_micros(value: &str) -> Result<i64, S4Error> {
+fn time_to_micros(value: &str) -> Result<i64, MaskuraError> {
     let time = NaiveTime::parse_from_str(value, "%H:%M:%S%.f")
         .map_err(|_| unsupported("invalid time IR value"))?;
     Ok(i64::from(time.num_seconds_from_midnight()) * 1_000_000
         + i64::from(time.nanosecond() / 1_000))
 }
 
-fn timestamp_from_micros(micros: i64) -> Result<String, S4Error> {
+fn timestamp_from_micros(micros: i64) -> Result<String, MaskuraError> {
     DateTime::from_timestamp_micros(micros)
         .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::AutoSi, true))
         .ok_or_else(|| unsupported("Avro timestamp is outside the supported range"))
 }
 
-fn timestamp_from_nanos(nanos: i64) -> Result<String, S4Error> {
+fn timestamp_from_nanos(nanos: i64) -> Result<String, MaskuraError> {
     let seconds = nanos.div_euclid(1_000_000_000);
     let nanoseconds = u32::try_from(nanos.rem_euclid(1_000_000_000)).expect("remainder is bounded");
     DateTime::from_timestamp(seconds, nanoseconds)
@@ -599,16 +606,16 @@ fn timestamp_from_nanos(nanos: i64) -> Result<String, S4Error> {
         .ok_or_else(|| unsupported("Avro timestamp is outside the supported range"))
 }
 
-fn timestamp_to_micros(value: &str) -> Result<i64, S4Error> {
+fn timestamp_to_micros(value: &str) -> Result<i64, MaskuraError> {
     Ok(DateTime::parse_from_rfc3339(value)
         .map_err(|_| unsupported("invalid timestamp IR value"))?
         .with_timezone(&Utc)
         .timestamp_micros())
 }
 
-fn validate_limits(limits: AvroLimits) -> Result<(), S4Error> {
+fn validate_limits(limits: AvroLimits) -> Result<(), MaskuraError> {
     if limits.max_source_bytes == 0 {
-        return Err(S4Error::new(
+        return Err(MaskuraError::new(
             codes::CONFIG_INVALID,
             "Avro source byte limit must be greater than zero",
         ));
@@ -616,15 +623,15 @@ fn validate_limits(limits: AvroLimits) -> Result<(), S4Error> {
     Ok(())
 }
 
-fn avro_error(error: impl std::fmt::Display) -> S4Error {
-    S4Error::new(
+fn avro_error(error: impl std::fmt::Display) -> MaskuraError {
+    MaskuraError::new(
         codes::UNSUPPORTED_FORMAT,
         format!("invalid Avro OCF: {error}"),
     )
 }
 
-fn unsupported(message: impl Into<String>) -> S4Error {
-    S4Error::new(codes::UNSUPPORTED_FORMAT, message)
+fn unsupported(message: impl Into<String>) -> MaskuraError {
+    MaskuraError::new(codes::UNSUPPORTED_FORMAT, message)
 }
 
 struct LimitedReader<R> {
@@ -907,7 +914,7 @@ mod tests {
     struct Uppercase;
 
     impl BinaryTransform for Uppercase {
-        fn output_schema(&mut self, input_schema: &SchemaIr) -> Result<SchemaIr, S4Error> {
+        fn output_schema(&mut self, input_schema: &SchemaIr) -> Result<SchemaIr, MaskuraError> {
             Ok(input_schema.clone())
         }
 
@@ -916,15 +923,15 @@ mod tests {
             value: ValueIr,
             _input_schema: &SchemaIr,
             _output_schema: &SchemaIr,
-        ) -> Result<Option<ValueIr>, S4Error> {
+        ) -> Result<Option<ValueIr>, MaskuraError> {
             let Value::Record { mut fields } = value.root else {
-                return Err(S4Error::new(codes::INTERNAL, "test expects a record"));
+                return Err(MaskuraError::new(codes::INTERNAL, "test expects a record"));
             };
             match &mut fields[1].value {
                 Value::String { value } => *value = value.to_uppercase(),
                 Value::Null => {}
                 _ => {
-                    return Err(S4Error::new(
+                    return Err(MaskuraError::new(
                         codes::INTERNAL,
                         "test expects an optional email string",
                     ));

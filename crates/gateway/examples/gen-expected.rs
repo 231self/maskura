@@ -1,7 +1,7 @@
-use s4_gateway::Format;
-use s4_gateway::plugin_registry::PluginRegistry;
-use s4_gateway::record::{DecoderLimits, RecordDecoder};
-use s4_wasm_runtime::CancellationToken;
+use maskura_gateway::Format;
+use maskura_gateway::plugin_registry::PluginRegistry;
+use maskura_gateway::record::{DecoderLimits, RecordDecoder};
+use maskura_wasm_runtime::CancellationToken;
 use std::fs;
 use std::path::PathBuf;
 
@@ -14,7 +14,7 @@ fn main() {
             .join("components")
             .join("pii-default.component.wasm"),
     )
-    .expect("component not found; run `just build-filters` first");
+    .expect("component not found; run `just build-plugins` first");
     let registry = PluginRegistry::new();
     registry.import("pii-default", &component).unwrap();
     let snapshot = registry.snapshot();
@@ -82,7 +82,7 @@ fn main() {
 /// Stream a bounded in-memory fixture through the same decoder + persistent
 /// pipeline session the gateway uses for single PUTs.
 fn stream_process(
-    snapshot: &s4_gateway::plugin_registry::PipelineSnapshot,
+    snapshot: &maskura_gateway::plugin_registry::PipelineSnapshot,
     input: &[u8],
     format: Format,
     content_type: &str,
@@ -93,11 +93,11 @@ fn stream_process(
         .expect("tokio runtime");
     runtime
         .block_on(async move {
-            let session = s4_wasm_runtime::Session {
+            let session = maskura_wasm_runtime::Session {
                 format: format.as_str().to_string(),
                 content_type: content_type.to_string(),
                 policy_version: 0,
-                operation: s4_wasm_runtime::Operation::Write,
+                operation: maskura_wasm_runtime::Operation::Write,
                 config_json: None,
                 public_key_pem: None,
                 stable_key: None,
@@ -134,7 +134,7 @@ fn stream_process(
                 output.extend_from_slice(&record.payload);
                 output.extend_from_slice(&record.separator);
             }
-            Ok::<_, s4_error::S4Error>(output)
+            Ok::<_, maskura_error::MaskuraError>(output)
         })
         .expect("fixture pipeline must succeed")
 }

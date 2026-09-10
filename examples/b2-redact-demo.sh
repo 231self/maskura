@@ -41,14 +41,14 @@ trap cleanup EXIT
 
 echo "=== B2 redaction demo ==="
 echo "--- building filters + gateway (first run only) ---"
-(cd "$ROOT" && bash scripts/build-filters.sh >/dev/null 2>&1)
-[ -x "$ROOT/target/debug/s4-gateway" ] || (cd "$ROOT" && cargo build -p s4-gateway)
+(cd "$ROOT" && bash scripts/build-plugins.sh >/dev/null 2>&1)
+[ -x "$ROOT/target/debug/maskura-gateway" ] || (cd "$ROOT" && cargo build -p maskura-gateway)
 
 SERVICE_BUCKETS="b2|${B2_S3_ENDPOINT}|${B2_REGION}|${B2_BUCKET}|${B2_ACCESS_KEY_ID}|${B2_SECRET_ACCESS_KEY}"
 
 echo "--- starting gateway on ${GATEWAY_URL} ---"
-LISTEN_ADDR="127.0.0.1:${PORT}" S4_SERVICE_BUCKETS="$SERVICE_BUCKETS" \
-  "$ROOT/target/debug/s4-gateway" >"$GW_LOG" 2>&1 &
+LISTEN_ADDR="127.0.0.1:${PORT}" MASKURA_SERVICE_BUCKETS="$SERVICE_BUCKETS" \
+  "$ROOT/target/debug/maskura-gateway" >"$GW_LOG" 2>&1 &
 GW_PID=$!
 for _ in $(seq 1 30); do
   curl -fsS "$GATEWAY_URL/health" >/dev/null 2>&1 && break

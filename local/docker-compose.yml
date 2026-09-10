@@ -28,15 +28,15 @@ services:
       S3_SECRET_ACCESS_KEY: minioadmin
       S3_REGION: us-east-1
       LISTEN_ADDR: 0.0.0.0:8080
-      MASKURA_FILTER_COMPONENT: /app/pii-default.component.wasm
+      MASKURA_DEFAULT_PLUGIN: /app/pii-default.component.wasm
       AUTH_DISABLED: "true"
       MASKURA_KEYS_FILE: /app/data/keys.json
     volumes:
-      - s4-keys:/app/data
+      - maskura-keys:/app/data
     depends_on:
       minio:
         condition: service_healthy
 
 volumes:
   minio-data:
-  s4-keys:
+  maskura-keys:

@@ -1,0 +1,80 @@
+package maskura:plugin@0.1.0;
+
+/// A streaming byte transformer. Capability folders such as filters, crypto,
+/// and transforms describe a plugin's purpose; they do not fork the ABI.
+world transformer {
+  enum operation {
+    write,
+    read,
+  }
+
+  record context {
+    format: string,
+    content-type: string,
+    operation: operation,
+    policy-version: u64,
+    config-json: option<string>,
+    public-key-pem: option<string>,
+    entropy-seed: option<list<u8>>,
+    stable-key: option<list<u8>>,
+    stable-fields: option<string>,
+  }
+
+  variant decision {
+    emit(list<u8>),
+    drop,
+    reject(string),
+  }
+
+  export begin: func(context: context) -> result<_, string>;
+  export transform: func(payload: list<u8>) -> result<decision, string>;
+  export finish: func() -> result<list<u8>, string>;
+}
+
+/// A structural adapter for formats that need schema-aware reduction before
+/// their logical values can pass through the transformer pipeline.
+world binary-reductor {
+  variant path-segment {
+    field(string),
+    array-element,
+    map-value,
+    logical-value,
+  }
+
+  record claim {
+    path: list<path-segment>,
+    type-id: string,
+  }
+
+  record planned-reduction {
+    claims: list<claim>,
+    reduced-schema-ir: list<u8>,
+    plan: list<u8>,
+  }
+
+  record planned-restoration {
+    output-schema-ir: list<u8>,
+    restore-plan: list<u8>,
+  }
+
+  record reductor-error {
+    code: string,
+    message: string,
+  }
+
+  export plan: func(source-schema-ir: list<u8>) -> result<planned-reduction, reductor-error>;
+  export plan-restore: func(
+    source-schema-ir: list<u8>,
+    transformed-reduced-schema-ir: list<u8>,
+    plan: list<u8>,
+  ) -> result<planned-restoration, reductor-error>;
+  export reduce: func(
+    plan: list<u8>,
+    source-value-ir: list<u8>,
+  ) -> result<list<u8>, reductor-error>;
+  export restore: func(
+    restore-plan: list<u8>,
+    transformed-value-ir: list<u8>,
+  ) -> result<list<u8>, reductor-error>;
+}
+

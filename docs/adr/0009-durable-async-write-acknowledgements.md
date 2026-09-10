@@ -42,7 +42,7 @@ keyed by operation and target identity and may not create another visible
 version.
 
 The canonical request policy name is `x-maskura-write-mode`; the permanent
-compatibility alias is `x-s4-write-mode`. A request may only select a mode
+compatibility alias is `x-maskura-write-mode`. A request may only select a mode
 allowed by authenticated workspace policy. `DELETE` remains synchronous until
 its post-acknowledgement semantics receive a separate decision.
 

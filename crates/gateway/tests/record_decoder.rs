@@ -1,7 +1,7 @@
+use maskura_error::codes;
+use maskura_gateway::Format;
+use maskura_gateway::record::{DecoderLimits, Record, RecordDecoder};
 use proptest::prelude::*;
-use s4_error::codes;
-use s4_gateway::Format;
-use s4_gateway::record::{DecoderLimits, Record, RecordDecoder};
 
 fn small_limits() -> DecoderLimits {
     DecoderLimits {
@@ -19,7 +19,7 @@ fn decode_all(
     input: &[u8],
     format: Format,
     limits: DecoderLimits,
-) -> Result<Vec<Record>, s4_error::S4Error> {
+) -> Result<Vec<Record>, maskura_error::MaskuraError> {
     let mut decoder = RecordDecoder::new(format, limits)?;
     let mut records = Vec::new();
     for chunk in input.chunks(limits.max_source_frame_bytes) {
@@ -40,7 +40,7 @@ fn decode_chunks(
     format: Format,
     limits: DecoderLimits,
     chunk_sizes: &[usize],
-) -> Result<Vec<Record>, s4_error::S4Error> {
+) -> Result<Vec<Record>, maskura_error::MaskuraError> {
     let mut decoder = RecordDecoder::new(format, limits)?;
     let mut records = Vec::new();
     let mut offset = 0;

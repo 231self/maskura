@@ -1074,13 +1074,13 @@ impl ServiceStorage {
             return false;
         };
         let generation_matches = metadata
-            .get("s4-generation")
+            .get("maskura-generation")
             .is_some_and(|value| value == &authority.generation.to_string());
         let digest_matches = metadata
-            .get("s4-sha256")
+            .get("maskura-sha256")
             .is_some_and(|value| value == &authority.digest);
         let size_metadata_matches = metadata
-            .get("s4-size")
+            .get("maskura-size")
             .and_then(|value| value.parse::<u64>().ok())
             == Some(authority.size);
         let response_size_matches = ranged
@@ -1413,7 +1413,7 @@ impl ServiceStorage {
         }
         let mut metadata = BTreeMap::from([
             ("content-type".to_string(), content_type.to_string()),
-            ("s4-generation".to_string(), generation.to_string()),
+            ("maskura-generation".to_string(), generation.to_string()),
         ]);
         let primary = self
             .direct_sink_for(
@@ -1426,7 +1426,7 @@ impl ServiceStorage {
                 ManagedChildIdentity::Supplied(child_scope),
             )
             .await?;
-        metadata.remove("s4-generation");
+        metadata.remove("maskura-generation");
         Ok(Box::new(ManagedReplicatedSink {
             repository,
             logical,
@@ -1629,14 +1629,20 @@ impl ServiceStorage {
             Arc::new(AwsS3TransactionBackend::new(client, capabilities))
         };
         if let Some(instance_id) = self.backends[index].provider_instance_id() {
-            metadata.insert("s4-provider-instance".to_string(), instance_id.to_string());
+            metadata.insert(
+                "maskura-provider-instance".to_string(),
+                instance_id.to_string(),
+            );
         }
         if let Some(account_id) = self.backends[index].provider_account_id() {
-            metadata.insert("s4-provider-account".to_string(), account_id.to_string());
+            metadata.insert(
+                "maskura-provider-account".to_string(),
+                account_id.to_string(),
+            );
         }
         if let Some(credential_epoch) = self.backends[index].credential_epoch() {
             metadata.insert(
-                "s4-credential-epoch".to_string(),
+                "maskura-credential-epoch".to_string(),
                 credential_epoch.to_string(),
             );
         }
@@ -1895,7 +1901,10 @@ impl ServiceStorage {
             return Err("repair source generation metadata does not match authority".to_string());
         }
         let mut metadata = repair.metadata.clone();
-        metadata.insert("s4-generation".to_string(), repair.generation.to_string());
+        metadata.insert(
+            "maskura-generation".to_string(),
+            repair.generation.to_string(),
+        );
         let mut target = self
             .direct_sink_for(
                 &journal,
@@ -2625,18 +2634,18 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
             ),
             _ => {
                 return Err(format!(
-                    "invalid S4_SERVICE_BUCKETS entry {entry}: expected six legacy fields, nine managed identity fields, or eleven managed placement fields"
+                    "invalid MASKURA_SERVICE_BUCKETS entry {entry}: expected six legacy fields, nine managed identity fields, or eleven managed placement fields"
                 ));
             }
         };
         if parts.iter().any(|part| part.trim().is_empty()) {
             return Err(format!(
-                "invalid S4_SERVICE_BUCKETS entry {entry}: fields must be non-empty"
+                "invalid MASKURA_SERVICE_BUCKETS entry {entry}: fields must be non-empty"
             ));
         }
         if !valid_identifier(provider, 128) {
             return Err(format!(
-                "invalid S4_SERVICE_BUCKETS entry {entry}: malformed provider"
+                "invalid MASKURA_SERVICE_BUCKETS entry {entry}: malformed provider"
             ));
         }
         let explicit_identity = instance
@@ -2645,22 +2654,22 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
             .map(|((instance, account), credential_epoch)| {
                 if !valid_identifier(instance, 128) {
                     return Err(format!(
-                        "invalid S4_SERVICE_BUCKETS entry {entry}: malformed provider instance ID"
+                        "invalid MASKURA_SERVICE_BUCKETS entry {entry}: malformed provider instance ID"
                     ));
                 }
                 if !valid_identifier(account, 256) {
                     return Err(format!(
-                        "invalid S4_SERVICE_BUCKETS entry {entry}: malformed provider account ID"
+                        "invalid MASKURA_SERVICE_BUCKETS entry {entry}: malformed provider account ID"
                     ));
                 }
                 let credential_epoch = credential_epoch.parse::<u64>().map_err(|_| {
                     format!(
-                        "invalid S4_SERVICE_BUCKETS entry {entry}: malformed credential epoch"
+                        "invalid MASKURA_SERVICE_BUCKETS entry {entry}: malformed credential epoch"
                     )
                 })?;
                 if credential_epoch == 0 {
                     return Err(format!(
-                        "invalid S4_SERVICE_BUCKETS entry {entry}: credential epoch must be positive"
+                        "invalid MASKURA_SERVICE_BUCKETS entry {entry}: credential epoch must be positive"
                     ));
                 }
                 Ok((instance, account, credential_epoch))
@@ -2670,14 +2679,14 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
             .zip(placement_capacity_units)
             .map(|(weight, capacity_units)| {
                 let weight = weight.parse::<u64>().map_err(|_| {
-                    format!("invalid S4_SERVICE_BUCKETS entry {entry}: malformed placement weight")
+                    format!("invalid MASKURA_SERVICE_BUCKETS entry {entry}: malformed placement weight")
                 })?;
                 let capacity_units = capacity_units.parse::<u64>().map_err(|_| {
-                    format!("invalid S4_SERVICE_BUCKETS entry {entry}: malformed placement capacity units")
+                    format!("invalid MASKURA_SERVICE_BUCKETS entry {entry}: malformed placement capacity units")
                 })?;
                 if weight == 0 || capacity_units == 0 || weight.checked_mul(capacity_units).is_none() {
                     return Err(format!(
-                        "invalid S4_SERVICE_BUCKETS entry {entry}: placement weight and capacity units must be positive without overflow"
+                        "invalid MASKURA_SERVICE_BUCKETS entry {entry}: placement weight and capacity units must be positive without overflow"
                     ));
                 }
                 Ok((weight, capacity_units))
@@ -2686,8 +2695,9 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
             // S7a's deployed managed identity form had no placement policy.
             // Its single backend retains the equivalent 1x1 static policy.
             .unwrap_or((1, 1));
-        let endpoint_url = reqwest::Url::parse(endpoint)
-            .map_err(|_| format!("invalid S4_SERVICE_BUCKETS entry {entry}: malformed endpoint"))?;
+        let endpoint_url = reqwest::Url::parse(endpoint).map_err(|_| {
+            format!("invalid MASKURA_SERVICE_BUCKETS entry {entry}: malformed endpoint")
+        })?;
         if endpoint.len() > 2048
             || !endpoint.bytes().all(|byte| byte.is_ascii_graphic())
             || !matches!(endpoint_url.scheme(), "http" | "https")
@@ -2698,30 +2708,30 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
             || endpoint_url.fragment().is_some()
         {
             return Err(format!(
-                "invalid S4_SERVICE_BUCKETS entry {entry}: malformed endpoint"
+                "invalid MASKURA_SERVICE_BUCKETS entry {entry}: malformed endpoint"
             ));
         }
         let canonical_endpoint = canonical_provider_endpoint(endpoint).ok_or_else(|| {
-            format!("invalid S4_SERVICE_BUCKETS entry {entry}: malformed endpoint")
+            format!("invalid MASKURA_SERVICE_BUCKETS entry {entry}: malformed endpoint")
         })?;
         if !valid_identifier(region, 128) {
             return Err(format!(
-                "invalid S4_SERVICE_BUCKETS entry {entry}: malformed region"
+                "invalid MASKURA_SERVICE_BUCKETS entry {entry}: malformed region"
             ));
         }
         if !valid_identifier(bucket, 255) {
             return Err(format!(
-                "invalid S4_SERVICE_BUCKETS entry {entry}: malformed bucket"
+                "invalid MASKURA_SERVICE_BUCKETS entry {entry}: malformed bucket"
             ));
         }
         if !valid_credential(access_key) {
             return Err(format!(
-                "invalid S4_SERVICE_BUCKETS entry {entry}: malformed access key"
+                "invalid MASKURA_SERVICE_BUCKETS entry {entry}: malformed access key"
             ));
         }
         if !valid_credential(secret_key) {
             return Err(format!(
-                "invalid S4_SERVICE_BUCKETS entry {entry}: malformed secret key"
+                "invalid MASKURA_SERVICE_BUCKETS entry {entry}: malformed secret key"
             ));
         }
         backends.push(ServiceBackend {
@@ -3511,11 +3521,11 @@ mod tests {
         let authority = authority();
         let current = std::collections::HashMap::from([
             (
-                "s4-generation".to_string(),
+                "maskura-generation".to_string(),
                 authority.generation.to_string(),
             ),
-            ("s4-sha256".to_string(), authority.digest.clone()),
-            ("s4-size".to_string(), authority.size.to_string()),
+            ("maskura-sha256".to_string(), authority.digest.clone()),
+            ("maskura-size".to_string(), authority.size.to_string()),
         ]);
         assert!(ServiceStorage::metadata_matches(
             Some(&current),
@@ -3526,7 +3536,7 @@ mod tests {
 
         let mut stale_generation = current.clone();
         stale_generation.insert(
-            "s4-generation".to_string(),
+            "maskura-generation".to_string(),
             uuid::Uuid::now_v7().to_string(),
         );
         assert!(!ServiceStorage::metadata_matches(
@@ -3536,7 +3546,7 @@ mod tests {
             false,
         ));
         let mut stale_digest = current.clone();
-        stale_digest.insert("s4-sha256".to_string(), "old".to_string());
+        stale_digest.insert("maskura-sha256".to_string(), "old".to_string());
         assert!(!ServiceStorage::metadata_matches(
             Some(&stale_digest),
             Some(authority.size as i64),
