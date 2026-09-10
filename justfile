@@ -21,9 +21,12 @@ check-lint:
 
 # Keep the public evidence entry points executable and parseable without
 # starting Docker or reaching the network.
-check-evidence: check-release
-  bash -n examples/prove-maskura.sh examples/local-quickstart.sh examples/maskura-demo.sh scripts/bench-filters.sh
+check-evidence: check-release test-release-notifications
+  bash -n examples/prove-maskura.sh examples/local-quickstart.sh examples/maskura-demo.sh scripts/bench-filters.sh scripts/release-notes.sh scripts/post-release-discord.sh scripts/test-release-notifications.sh
   python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("examples/python-hybrid-roundtrip.py").read_text())'
+
+test-release-notifications:
+  bash scripts/test-release-notifications.sh
 
 # Ensure every public version surface agrees before a release tag can be cut.
 check-release:

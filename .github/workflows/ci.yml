@@ -34,9 +34,10 @@ jobs:
         run: cargo fmt --check
       - name: Proof harness syntax
         run: |
-          bash -n examples/prove-maskura.sh examples/local-quickstart.sh examples/maskura-demo.sh scripts/bench-filters.sh
+          bash -n examples/prove-maskura.sh examples/local-quickstart.sh examples/maskura-demo.sh scripts/bench-filters.sh scripts/release-notes.sh scripts/post-release-discord.sh scripts/test-release-notifications.sh
           python3 -c 'import ast, pathlib; [ast.parse(path.read_text()) for path in map(pathlib.Path, ["examples/python-hybrid-roundtrip.py", "scripts/check-release-contract.py"])]'
           python3 scripts/check-release-contract.py
+          bash scripts/test-release-notifications.sh
 
   lint:
     runs-on: ubuntu-latest

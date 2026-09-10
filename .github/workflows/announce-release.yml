@@ -1,0 +1,64 @@
+name: Announce release
+
+# Manually (re)announce an already-published release to Discord, or build the
+# payload with dry_run to preview it. Kept separate from release.yml so the
+# tag-triggered release path stays free of dispatch/ref ambiguity.
+#
+# Secrets: DISCORD_WEBHOOK_URL (see docs/adr/0015-release-notes-and-discord-notifications.md).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to announce (e.g. v0.6.0)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Build the Discord payload but do not post'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: announce-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Validate release tag
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Refusing invalid release tag: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+      - name: Fetch published release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${RELEASE_TAG}" \
+            --repo "${{ github.repository }}" \
+            --json body -q .body > release-notes.md
+          test -s release-notes.md
+
+      - name: Post to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ "${DRY_RUN}" = "true" ]; then
+            bash scripts/post-release-discord.sh "${RELEASE_TAG}" release-notes.md --dry-run
+          else
+            bash scripts/post-release-discord.sh "${RELEASE_TAG}" release-notes.md
+          fi
