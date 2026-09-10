@@ -35,8 +35,9 @@ audit:
 audit-dependencies:
   bash scripts/audit-dependencies.sh
 
-# Canonical local gate before publishing a jj bookmark.
-pre-push: check audit-dependencies
+# Canonical fast local gate before publishing a jj bookmark. The protected CI
+# remains responsible for the long Wasm, SDK, database, interop, and E2E suites.
+pre-push: check-fast audit-dependencies
   @echo "Pre-push checks passed"
 
 # Safe publishing path for this jj repository. Extra arguments are passed to jj.

@@ -8,12 +8,16 @@ This is a **jj** repository. Do not use `git` directly for mutations.
 jj st                # show working copy status
 jj log               # show commit history
 jj commit -m "msg"   # commit working copy changes
-jj git push          # push to origin
+just pre-push         # required local correctness + security gate
+just push             # run the gate, then push with jj
 jj git fetch         # fetch from origin
 ```
 
 All commits require a description (-m). Avoid interactive flags.
 Verify with `jj st` and `jj log` after each mutation.
+Always use `just push` to publish changes. A direct `jj git push` bypasses the
+local gate and is allowed only after `just pre-push` has passed in the same
+working copy.
 
 Author identity: commit as `amit231self <amit@231self.com>` (jj user config).
 Never append AI `Co-Authored-By` / `Generated with <tool>` trailers (Claude,
@@ -31,6 +35,8 @@ owner after an explicit, documented decision.
 - `just build-sdks` — generate Python + TypeScript client SDKs from OpenAPI spec
 - `just deny` — run cargo-deny
 - `just audit` — run cargo-audit
+- `just pre-push` — format/lint plus Rust/Python/npm dependency and pinning audits
+- `just push` — required guarded wrapper around `jj git push`
 
 ## Code Conventions
 

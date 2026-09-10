@@ -22,10 +22,12 @@ analysis of Rust, Python, JavaScript/TypeScript, and GitHub Actions workflows in
 addition to the existing format, lint, test, SDK, database, interoperability,
 and end-to-end jobs.
 
-`just pre-push` is the canonical local gate. It runs the correctness suite, the
-same Rust, Python, and npm dependency audits, and immutable-reference checks for
-workflow actions and container base images. `just push` runs that gate before
-delegating publication to `jj git push`.
+`just pre-push` is the canonical fast local gate. It runs formatting and
+clippy, the same Rust, Python, and npm dependency audits, and
+immutable-reference checks for workflow actions and container base images.
+The protected CI remains responsible for the long Wasm, SDK, database,
+interoperability, end-to-end, and full test suites. `just push` runs the local
+gate before delegating publication to `jj git push`.
 
 The RustSec audit has one narrowly guarded exception for RUSTSEC-2023-0071.
 SQLx's compile-time migration macro records the vulnerable `rsa` crate through
