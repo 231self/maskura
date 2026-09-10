@@ -2829,7 +2829,7 @@ version = "0.7.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "dirs",
  "hkdf",
@@ -2879,7 +2879,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "crc",
@@ -2967,7 +2967,7 @@ name = "maskura-plugin-crypto-deterministic"
 version = "0.7.1"
 dependencies = [
  "aes-siv",
- "base64 0.22.1",
+ "base64 0.23.1",
  "maskura-plugin-sdk",
  "serde_json",
 ]
@@ -2977,7 +2977,7 @@ name = "maskura-plugin-crypto-envelope"
 version = "0.7.1"
 dependencies = [
  "aes-gcm",
- "base64 0.22.1",
+ "base64 0.23.1",
  "hkdf",
  "maskura-plugin-pii-core",
  "maskura-plugin-sdk",
