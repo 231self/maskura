@@ -52,7 +52,7 @@ hkdf = "0.12"
 
 wasmtime = "47"
 wasmtime-wasi = "47"
-wit-bindgen = "0.60"
+wit-bindgen = "0.61"
 
 addr-spec = "0.9"
 card-validate = "2"
