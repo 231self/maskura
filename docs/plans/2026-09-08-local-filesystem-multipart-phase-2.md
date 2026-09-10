@@ -404,8 +404,8 @@ one change.
   `event_log_rejects_checksum_or_sequence_corruption`,
   `compaction_crashes_replay_exactly_once`, and
   `root_lock_rejects_a_second_owner_and_releases_on_drop`.
-- Gate: `cargo test --locked -p s4-gateway filesystem_persistence::tests` and
-  `cargo clippy --locked -p s4-gateway --all-targets -- -D warnings`.
+- Gate: `cargo test --locked -p maskura-gateway filesystem_persistence::tests` and
+  `cargo clippy --locked -p maskura-gateway --all-targets -- -D warnings`.
 
 ### 2. Locked local-storage runtime
 

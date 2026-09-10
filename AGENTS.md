@@ -31,7 +31,7 @@ owner after an explicit, documented decision.
 - `just check-fmt` — `cargo fmt --check`
 - `just check-lint` — `cargo clippy --all-targets -- -D warnings`
 - `just test` — `cargo test --workspace`
-- `just build-filters` — build the Wasm filter component
+- `just build-plugins` — build the official Wasm plugins
 - `just build-sdks` — generate Python + TypeScript client SDKs from OpenAPI spec
 - `just deny` — run cargo-deny
 - `just audit` — run cargo-audit
@@ -98,8 +98,8 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 ### Hosted MCP
 
-- Shared typed MCP schemas, results, tool definitions/aliases, dispatch, and list parsing live in `maskura-mcp-protocol` and are re-exported as `s4_gateway::mcp`.
-- Hosted adapters authenticate externally and call `s4_gateway::server::invoke_mcp` with an atomically resolved `AuthenticatedMcpPrincipal`, server operation UUID, bounded typed request, timeout, and cancellation token.
+- Shared typed MCP schemas, results, tool definitions/aliases, dispatch, and list parsing live in `maskura-mcp-protocol` and are re-exported as `maskura_gateway::mcp`.
+- Hosted adapters authenticate externally and call `maskura_gateway::server::invoke_mcp` with an atomically resolved `AuthenticatedMcpPrincipal`, server operation UUID, bounded typed request, timeout, and cancellation token.
 - Trusted invocation uses task-local context unavailable to HTTP clients and runs the existing S3 authorization, filtering, storage, transaction, and metering handlers. It never uses loopback HTTP or synthesized auth headers.
 
 ### Storage (Object Data)
@@ -118,7 +118,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
   `BackendRegistry` contract.
 
 - **Tenant storage boundary**: Multi-tenant startup requires non-empty
-  `S4_SERVICE_BUCKETS` and rejects `S3_ENDPOINT`. Missing workspace configuration
+  `MASKURA_SERVICE_BUCKETS` and rejects `S3_ENDPOINT`. Missing workspace configuration
   defaults to managed storage; repository or required-managed failures fail closed.
   Persisted workspace endpoints require an operator-trusted provider allowlist;
   the SDK resolves DNS again, so tenants must not control allowed provider DNS.
@@ -126,13 +126,13 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
   only for source `GET`; presigned `PUT`/`DELETE` stay HTTPS-only. AWS SDK clients
   make one attempt; transaction layers own their bounded retries.
 
-- **Maskura service storage**: "Just works" mode. Users write PII-cleansed data without configuring any backend. Maskura manages dedicated buckets across multiple cloud providers. Objects are distributed via consistent hashing (150 virtual nodes per backend), dual-written to primary + replica, and read from the replica on primary miss. The operator-only `S4_SERVICE_BUCKETS` setting remains unchanged. Implementation: `crates/gateway/src/service_storage.rs`.
+- **Maskura service storage**: "Just works" mode. Users write PII-cleansed data without configuring any backend. Maskura manages dedicated buckets across multiple cloud providers. Objects are distributed via consistent hashing (150 virtual nodes per backend), dual-written to primary + replica, and read from the replica on primary miss. The operator-only `MASKURA_SERVICE_BUCKETS` setting remains unchanged. Implementation: `crates/gateway/src/service_storage.rs`.
 
 - **Multi-cloud write strategies — progress** (how concurrent multi-cloud writes work today, and the variants we track):
 
   | Strategy | Status | Behavior in Maskura today |
   |----------|--------|----------------------|
-  | Dispersed writes across providers | ✅ implemented | Consistent-hash ring (150 vnodes/backend) assigns each key a primary + one replica, so keys spread across all configured backends; a provider is just an S3-compatible endpoint label (`S4_SERVICE_BUCKETS`) |
+  | Dispersed writes across providers | ✅ implemented | Consistent-hash ring (150 vnodes/backend) assigns each key a primary + one replica, so keys spread across all configured backends; a provider is just an S3-compatible endpoint label (`MASKURA_SERVICE_BUCKETS`) |
   | Active-active writes | ✅ implemented | `put` dual-writes primary + replica concurrently (`tokio::join!`); a replica write failure is logged and does not fail the request |
   | Active-read / passive-read (fail-over) | ✅ implemented | `get` reads the primary; on miss/error it falls back to the replica (`"primary miss for {key}, trying replica"`) |
   | Provider-agnostic R/W | ✅ implemented | No cloud-specific code — every backend is a plain S3-compatible endpoint (AWS, R2, B2, MinIO, …); consistent hashing, dual-write, and fail-over all operate on endpoints only |
@@ -147,9 +147,9 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 ### CLI (`maskura`)
 
-- Binary crate at `crates/s4ctl/`. Full-featured CLI for Maskura operations; `s4ctl` remains an alias.
+- Binary crate at `crates/cli/`. Full-featured CLI for Maskura operations.
 - Subcommands: `login`, `logout`, `whoami`, `key {create,list,revoke}`, `backend {get,set-aws,set-r2,set-b2,set-minio,presign}`, `put`, `get`, `list`, `health`, `local {init,down}`, `test upload`. `set-aws` configures an `aws_role` backend (role ARN + region + optional external ID).
-- Auth from the preserved `~/.config/s4/config.json`, `MASKURA_ACCESS_KEY`/`MASKURA_SECRET_KEY` (with permanent `S4_*` aliases), or demo mode.
+- Auth from `~/.config/maskura/config.json`, `MASKURA_ACCESS_KEY`/`MASKURA_SECRET_KEY`, or demo mode.
 - Key expiry support: `--expiry never|30d|90d|1y` (or raw seconds).
 - Backend presign: generates presigned URLs via local AWS CLI for use with the Maskura proxy.
 
@@ -162,7 +162,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 - `just build-sdks` extracts spec, runs `openapi-generator` (Docker) to produce Python and TypeScript SDKs in `sdks/python/` and `sdks/typescript/`.
 - Schema is the single source of truth — SDKs always in sync with server changes.
 - `scripts/generate-sdks.sh` re-applies the hand-written high-level client from `sdks/overlay/<lang>/` after each generation, so it survives regeneration:
-  - `s4_client/highlevel.py` / `highlevel.ts` — `MaskuraClient` with `S4Client` compatibility, `put_object`/`get_object` S3 data-plane helpers, hybrid X25519 + ML-KEM-768 key generation, public-key attachment, and client-side hybrid decryption.
+  - `maskura_client/highlevel.py` / `highlevel.ts` — `MaskuraClient` with `put_object`/`get_object` S3 data-plane helpers, hybrid X25519 + ML-KEM-768 key generation, public-key attachment, and client-side hybrid decryption.
   - The decrypt helpers retain dual-algorithm reads for historical RSA envelopes. New key generation is hybrid by default; explicit legacy RSA generation helpers exist only for pre-hybrid compatibility.
 
 ### Web Dashboard
@@ -173,7 +173,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 ### Deployment
 
-- Single internal Rust binary (`s4-gateway`). No separate frontend server in dev.
+- Single internal Rust binary (`maskura-gateway`). No separate frontend server in dev.
 - **Local**: `restart-dev.sh` builds filters + gateway, kills stale port, nohup-launches.
 
 ### Secrets & Config
@@ -190,8 +190,8 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 ### Key Formats
 
-- API key IDs: `s4_<32-hex>` (UUID without dashes).
-- API key secrets: `s4s_<32-hex>`. Revealed once on creation, hashed with SHA-256 for storage.
+- API key IDs: `maskura_<32-hex>` (UUID without dashes).
+- API key secrets: `maskura_secret_<32-hex>`. Revealed once on creation, hashed with SHA-256 for storage.
 - S3 requests authenticate with the plaintext secret (like AWS SigV4 secret key).
 
 ### Wasm Filter Plugins
@@ -201,14 +201,14 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 - **Runtime import**: `POST /dashboard/api/plugins` with `.wasm` body + `x-maskura-plugin-name` header.
 - **Runtime toggle**: `PUT /dashboard/api/plugins/{id}` with `{"enabled": true/false}`.
 - **Auto-load**: `MASKURA_PLUGINS_DIR` loads all `.wasm` files from a directory at startup.
-- **WIT interface** (`wit/s4-filter/world.wit`): `begin(Context)`, `transform(Vec<u8>) → Decision`, `finish()`. Context carries `format`, `content-type`, `policy-version`. Decision variants: `Emit`, `Drop`, `Reject`.
+- **WIT interface and Rust authoring crate** (`crates/plugin-sdk/`): package `maskura:plugin@0.1.0`, with a `transformer` world providing `begin(Context)`, `transform(Vec<u8>) → Decision`, and `finish()`.
 - **Sandbox**: 64 MiB memory, 10K table entries, 512 KiB stack. No host imports; pure byte-in/byte-out. `MASKURA_WASM_FUEL` (default 1B) sets the per-session instruction budget. The baseline `FilterEngine::new` default is 10M; crypto filters require the larger pipeline budget.
-- **Default plugin**: `filters/pii-default/` — detects emails (via `@`), credit cards (Luhn check, 13-19 digits), SSNs (9 digits, SSA range validation). Redacts to `[REDACTED_EMAIL]`, `[REDACTED_CARD]`, `[REDACTED_SSN]`.
+- **Official plugins**: grouped by capability under `plugins/filters/`, `plugins/crypto/`, and `plugins/transforms/`. Each loadable component declares lifecycle metadata in `plugin.toml`.
 
 ### Envelope encryption per field
 
 - New encrypted writes use the `X25519+ML-KEM-768/AES-256-GCM` envelope in
-  `crates/gateway/src/hybrid.rs` and `filters/envelope-encrypt/`.
+  `crates/gateway/src/hybrid.rs` and `plugins/crypto/envelope/`.
 - Public keys are `MASKURA HYBRID PUBLIC KEY` PEM blocks. Current gateways
   reject legacy RSA public keys for new writes.
 - The client keeps the matching private key; Maskura never receives it.
@@ -221,7 +221,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 - Existing `RSA-OAEP/AES-256-GCM` objects remain a legacy read compatibility
   case. The public high-level SDK helpers decrypt both algorithms and generate
   only hybrid keys by default.
-- `filters/stable-encrypt/` is a separate, opt-in AES-SIV transform for stable
+- `plugins/crypto/deterministic/` is a separate, opt-in AES-SIV transform for stable
   matching keys.
 
 The normative construction, key sizes, client-tooling status, and security

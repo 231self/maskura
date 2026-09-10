@@ -64,7 +64,7 @@ before it is advertised as supported.
   (`s3_bucket_put`/`s3_bucket_delete`, `server.rs:10124`/`10140` return
   `bucket_not_allowed`) — a concrete MinIO-parity gap (`mc mb` / `aws s3 mb`).
 - The single-tenant fallback today lands on `Memory` when there is no `S3_ENDPOINT`
-  and no `S4_SERVICE_BUCKETS` (`backend.rs:435`). `FileStore` slots into this same
+  and no `MASKURA_SERVICE_BUCKETS` (`backend.rs:435`). `FileStore` slots into this same
   fallback when storage mode is `local`.
 - **Layered TOML config landed (PR #110).** `Config` and `StorageConfig`
   (`s3_endpoint`, `s3_region`, `service_buckets`, `single_tenant`) now live in
@@ -76,11 +76,11 @@ before it is advertised as supported.
   binary (`main.rs`) does not load a config file. FileStore settings must be added
   to `StorageConfig` *and* read in `build_state` the same way `s3_endpoint` /
   `service_buckets` are today.
-- **Customer `S4_*` / `x-s4-*` env aliases are abandoned (PR #110).** Every
+- **Customer `MASKURA_*` / `x-maskura-*` env aliases are abandoned (PR #110).** Every
   customer setting is `MASKURA_*` only (`crates/customer-config/src/lib.rs`);
-  operator-only `S4_*` names (`S4_SERVICE_BUCKETS`, `S4_MANAGED_*`,
-  `S4_MULTIPART_STAGING_*`, `S4_SIGV4_*`, `S4_PRESIGNED_HTTP_*`,
-  `S4_WORKSPACE_ENDPOINT_*`) remain canonical. New FileStore env vars must be
+  operator-only `MASKURA_*` names (`MASKURA_SERVICE_BUCKETS`, `MASKURA_MANAGED_*`,
+  `MASKURA_MULTIPART_STAGING_*`, `MASKURA_SIGV4_*`, `MASKURA_PRESIGNED_HTTP_*`,
+  `MASKURA_WORKSPACE_ENDPOINT_*`) remain canonical. New FileStore env vars must be
   `MASKURA_*`.
 - `FeaturesConfig` already carries a `dev_memory_streaming` flag and
   `LimitsConfig.dev_memory_max_object_bytes` — FileStore is a durable, production
@@ -103,7 +103,7 @@ before it is advertised as supported.
    (`transaction/memory.rs`).
 3. **New backend variant** `ResolvedBackend::File(Arc<FileStore>)` and
    `BackendKind::File` (`backend.rs:40`, `backend.rs:159`). Resolution: storage
-   mode `local` (single-tenant, no `S3_ENDPOINT`, no `S4_SERVICE_BUCKETS`) selects
+   mode `local` (single-tenant, no `S3_ENDPOINT`, no `MASKURA_SERVICE_BUCKETS`) selects
    `File` instead of the current `Memory` fallback (`backend.rs:435`).
 4. **Configuration**: `MASKURA_STORAGE_MODE=local` and `MASKURA_LOCAL_STORAGE_DIR`
    (default `./data`; `/data` in the container image). Fails closed at startup if
@@ -199,7 +199,7 @@ a PUT/GET/HEAD/DELETE/LIST round-trip through the HTTP frontdoor against `FileSt
   override in `apply_env_overrides` (`config.rs:218`), registered as a `MASKURA_*`
   alias in `lib.rs`.
 - In `build_state` (`server.rs:10982`), read the same values env-first (matching
-  the current `S3_ENDPOINT`/`S4_SERVICE_BUCKETS` pattern at `server.rs:11002`),
+  the current `S3_ENDPOINT`/`MASKURA_SERVICE_BUCKETS` pattern at `server.rs:11002`),
   construct `FileStore`, and pass it into `BackendResolver::new`
   (`server.rs:1214`); fail closed on an unwritable directory.
 - Set `MASKURA_LOCAL_STORAGE_DIR=/data` and a writable `/data` VOLUME in the image.
@@ -280,5 +280,5 @@ a PUT/GET/HEAD/DELETE/LIST round-trip through the HTTP frontdoor against `FileSt
 - **Default `MASKURA_LOCAL_STORAGE_DIR`** — `./data` in dev vs. `/data` in the
   container (both provisioned in their respective images).
 - **Whether `just dev-up`/`e2e` keep MinIO** as the cloud-storage validation path,
-  or switch fully to File mode (leaving cloud validation to `S4_SERVICE_BUCKETS`
+  or switch fully to File mode (leaving cloud validation to `MASKURA_SERVICE_BUCKETS`
   or the B2 demo).

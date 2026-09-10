@@ -16,7 +16,6 @@ env:
   RUSTFLAGS: -D warnings
   CARGO_BUILD_JOBS: 2
   IMAGE: ghcr.io/${{ github.repository_owner }}/maskura/maskura
-  LEGACY_IMAGE: ghcr.io/${{ github.repository_owner }}/s4/s4
 
 jobs:
   contract:
@@ -57,7 +56,7 @@ jobs:
       - name: Install wasm-tools + build filters
         run: |
           cargo install --locked wasm-tools --version 1.255.0
-          bash scripts/build-filters.sh
+          bash scripts/build-plugins.sh
 
       - name: Test workspace
         run: cargo test --locked --workspace
@@ -65,12 +64,10 @@ jobs:
       - name: Build gateway, CLI, and MCP releases (${{ matrix.suffix }})
         run: |
           mkdir -p dist/components
-          cargo build --locked --release -p s4-gateway -p s4-mcp -p s4ctl
-          cp target/release/s4-gateway dist/s4-gateway
+          cargo build --locked --release -p maskura-gateway -p maskura-mcp -p maskura
+          cp target/release/maskura-gateway dist/maskura-gateway
           cp target/release/maskura-mcp dist/maskura-mcp-linux-${{ matrix.suffix }}
-          cp target/release/s4-mcp dist/s4-mcp-linux-${{ matrix.suffix }}
           cp target/release/maskura dist/maskura-linux-${{ matrix.suffix }}
-          cp target/release/s4ctl dist/s4ctl-linux-${{ matrix.suffix }}
           cp -r target/components/. dist/components/
           version="${{ github.ref_name }}"
           expected="maskura ${version#v}"
@@ -82,9 +79,7 @@ jobs:
           name: maskura-binaries-${{ matrix.suffix }}
           path: |
             dist/maskura-mcp-linux-${{ matrix.suffix }}
-            dist/s4-mcp-linux-${{ matrix.suffix }}
             dist/maskura-linux-${{ matrix.suffix }}
-            dist/s4ctl-linux-${{ matrix.suffix }}
           if-no-files-found: error
 
       - name: Set up Docker Buildx
@@ -100,9 +95,7 @@ jobs:
           file: Dockerfile.release
           platforms: ${{ matrix.platform }}
           load: true
-          tags: |
-            ${{ env.IMAGE }}:${{ github.ref_name }}-${{ matrix.suffix }}
-            ${{ env.LEGACY_IMAGE }}:${{ github.ref_name }}-${{ matrix.suffix }}
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}-${{ matrix.suffix }}
 
       - name: Boot-smoke image (${{ matrix.suffix }})
         env:
@@ -119,10 +112,8 @@ jobs:
       - name: Push image (${{ matrix.suffix }})
         env:
           IMAGE_REF: ${{ env.IMAGE }}:${{ github.ref_name }}-${{ matrix.suffix }}
-          LEGACY_IMAGE_REF: ${{ env.LEGACY_IMAGE }}:${{ github.ref_name }}-${{ matrix.suffix }}
         run: |
           docker push "$IMAGE_REF"
-          docker push "$LEGACY_IMAGE_REF"
 
   build-macos:
     needs: contract
@@ -144,31 +135,26 @@ jobs:
       - name: Install wasm-tools and build filters
         run: |
           cargo install --locked wasm-tools --version 1.255.0
-          bash scripts/build-filters.sh
+          bash scripts/build-plugins.sh
 
       - name: Build native CLI and MCP releases
-        run: cargo build --locked --release -p s4ctl -p s4-mcp
+        run: cargo build --locked --release -p maskura -p maskura-mcp
 
       - name: Smoke native binaries
         run: |
           version="${{ github.ref_name }}"
           expected="maskura ${version#v}"
           test "$(target/release/maskura --version)" = "$expected"
-          target/release/s4ctl --version
+          target/release/maskura --version
           test -x target/release/maskura-mcp
-          test -x target/release/s4-mcp
           file target/release/maskura | grep -q 'Mach-O 64-bit executable arm64'
-          file target/release/s4ctl | grep -q 'Mach-O 64-bit executable arm64'
           file target/release/maskura-mcp | grep -q 'Mach-O 64-bit executable arm64'
-          file target/release/s4-mcp | grep -q 'Mach-O 64-bit executable arm64'
 
       - name: Stage Apple Silicon binaries
         run: |
           mkdir -p dist
           cp target/release/maskura dist/maskura-macos-arm64
-          cp target/release/s4ctl dist/s4ctl-macos-arm64
           cp target/release/maskura-mcp dist/maskura-mcp-macos-arm64
-          cp target/release/s4-mcp dist/s4-mcp-macos-arm64
 
       - name: Upload Apple Silicon binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -176,9 +162,7 @@ jobs:
           name: maskura-binaries-macos-arm64
           path: |
             dist/maskura-macos-arm64
-            dist/s4ctl-macos-arm64
             dist/maskura-mcp-macos-arm64
-            dist/s4-mcp-macos-arm64
           if-no-files-found: error
 
   release:
@@ -199,9 +183,7 @@ jobs:
         run: |
           for suffix in linux-amd64 linux-arm64 macos-arm64; do
             test -s "dist/maskura-${suffix}"
-            test -s "dist/s4ctl-${suffix}"
             test -s "dist/maskura-mcp-${suffix}"
-            test -s "dist/s4-mcp-${suffix}"
           done
 
       - name: Log in to GHCR
@@ -225,7 +207,6 @@ jobs:
         run: |
           docker buildx imagetools create \
             -t ${{ env.IMAGE }}:${{ github.ref_name }} \
-            -t ${{ env.LEGACY_IMAGE }}:${{ github.ref_name }} \
             ${{ env.IMAGE }}:${{ github.ref_name }}-amd64 \
             ${{ env.IMAGE }}:${{ github.ref_name }}-arm64
 
@@ -233,15 +214,9 @@ jobs:
         id: image-digests
         run: |
           canonical=$(docker buildx imagetools inspect "${{ env.IMAGE }}:${{ github.ref_name }}" --format '{{json .Manifest}}' | jq -r '.digest')
-          legacy=$(docker buildx imagetools inspect "${{ env.LEGACY_IMAGE }}:${{ github.ref_name }}" --format '{{json .Manifest}}' | jq -r '.digest')
           test -n "$canonical" && test "$canonical" != "null"
-          test -n "$legacy" && test "$legacy" != "null"
           echo "canonical=$canonical" >> "$GITHUB_OUTPUT"
-          echo "legacy=$legacy" >> "$GITHUB_OUTPUT"
-          printf '%s@%s\n%s@%s\n' \
-            "${{ env.IMAGE }}" "$canonical" \
-            "${{ env.LEGACY_IMAGE }}" "$legacy" \
-            > dist/IMAGE_DIGESTS
+          printf '%s@%s\n' "${{ env.IMAGE }}" "$canonical" > dist/IMAGE_DIGESTS
 
       - name: Install proof dependencies
         run: |
@@ -262,23 +237,14 @@ jobs:
           subject-digest: ${{ steps.image-digests.outputs.canonical }}
           push-to-registry: true
 
-      - name: Attest compatibility container provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
-        with:
-          subject-name: ${{ env.LEGACY_IMAGE }}
-          subject-digest: ${{ steps.image-digests.outputs.legacy }}
-          push-to-registry: true
-
       - name: Extract release artifacts from image
         run: |
-          mkdir -p dist/filters
+          mkdir -p dist/plugins
           docker create --name maskura-extract --platform linux/amd64 "${{ env.IMAGE }}:${{ github.ref_name }}-amd64"
-          docker cp maskura-extract:/usr/local/bin/s4-gateway dist/maskura-gateway-linux-x86_64
-          cp dist/maskura-gateway-linux-x86_64 dist/s4-gateway-linux-x86_64
-          docker cp maskura-extract:/app/components/. dist/filters/
+          docker cp maskura-extract:/usr/local/bin/maskura-gateway dist/maskura-gateway-linux-x86_64
+          docker cp maskura-extract:/app/components/. dist/plugins/
           docker rm maskura-extract
-          tar -czf dist/maskura-filters.tar.gz -C dist filters
-          tar -czf dist/s4-filters.tar.gz -C dist filters
+          tar -czf dist/maskura-plugins.tar.gz -C dist plugins
           npm install --prefix sdks/typescript --no-package-lock
           npm run --prefix sdks/typescript build
           python3 sdks/package-release.py --output-dir dist
@@ -311,18 +277,13 @@ jobs:
           docker buildx imagetools create \
             -t ${{ env.IMAGE }}:latest \
             ${{ env.IMAGE }}:${{ github.ref_name }}
-          docker buildx imagetools create \
-            -t ${{ env.LEGACY_IMAGE }}:latest \
-            ${{ env.LEGACY_IMAGE }}:${{ github.ref_name }}
 
-      - name: Make canonical and legacy images public
+      - name: Make the Maskura image public
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh api -X PATCH "/orgs/${{ github.repository_owner }}/packages/container/maskura%2Fmaskura" \
-            -f visibility=public
-          gh api -X PATCH "/orgs/${{ github.repository_owner }}/packages/container/s4%2Fs4" \
             -f visibility=public
 
       - name: Generate release notes
@@ -345,25 +306,15 @@ jobs:
 
           gh release create "${{ github.ref_name }}" \
              dist/maskura-gateway-linux-x86_64 \
-             dist/s4-gateway-linux-x86_64 \
              dist/maskura-mcp-linux-amd64 \
              dist/maskura-mcp-linux-arm64 \
              dist/maskura-mcp-macos-arm64 \
-             dist/s4-mcp-linux-amd64 \
-             dist/s4-mcp-linux-arm64 \
-             dist/s4-mcp-macos-arm64 \
              dist/maskura-linux-amd64 \
              dist/maskura-linux-arm64 \
              dist/maskura-macos-arm64 \
-             dist/s4ctl-linux-amd64 \
-             dist/s4ctl-linux-arm64 \
-             dist/s4ctl-macos-arm64 \
-             dist/maskura-filters.tar.gz \
-             dist/s4-filters.tar.gz \
+             dist/maskura-plugins.tar.gz \
              dist/maskura-python-sdk.tar.gz \
-             dist/s4-python-sdk.tar.gz \
              dist/maskura-typescript-sdk.tar.gz \
-             dist/s4-typescript-sdk.tar.gz \
              dist/maskura-sbom.spdx.json \
              dist/IMAGE_DIGESTS \
              dist/SHA256SUMS \

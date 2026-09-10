@@ -38,7 +38,7 @@ cold start.
    optional `external_id`.
 
 3. **Bootstrapped gateway key.** `MASKURA_BOOTSTRAP_KEY` / `MASKURA_BOOTSTRAP_SECRET`
-   (with permanent `S4_*` aliases) seed a preconfigured key id/secret pair at
+   (with permanent `MASKURA_*` aliases) seed a preconfigured key id/secret pair at
    startup when the pair is not already present. The secret is SHA-256 hashed and
    encrypted with the same envelope as generated keys. This is scoped to
    operator/headless bootstrap; interactive and production flows keep using the

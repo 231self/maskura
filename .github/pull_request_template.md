@@ -15,7 +15,7 @@ sections that do not.
 
 - [ ] `just pre-push` (fmt/clippy + Rust/Python/npm dependency audits)
 - [ ] `just e2e` (if gateway/data-plane behavior changed)
-- [ ] `cargo check -p s4-gateway` (dashboard/HTML changes — embedded via include_str!)
+- [ ] `cargo check -p maskura-gateway` (dashboard/HTML changes — embedded via include_str!)
 - [ ] `mdbook build docs` (if `docs/` chapters changed)
 
 ## Docs & UI

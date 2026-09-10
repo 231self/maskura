@@ -926,14 +926,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "card-detect"
-version = "0.6.0"
-dependencies = [
- "pii-shared",
- "wit-bindgen 0.60.0",
-]
-
-[[package]]
 name = "cc"
 version = "1.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1754,14 +1746,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "email-detect"
-version = "0.6.0"
-dependencies = [
- "pii-shared",
- "wit-bindgen 0.60.0",
-]
-
-[[package]]
 name = "embedded-io"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1786,23 +1770,6 @@ dependencies = [
  "rustversion",
  "scopeguard",
  "simdutf8",
-]
-
-[[package]]
-name = "envelope-encrypt"
-version = "0.6.0"
-dependencies = [
- "aes-gcm",
- "base64 0.22.1",
- "hkdf",
- "ml-kem",
- "pii-shared",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
- "serde_json",
- "sha2 0.10.9",
- "wit-bindgen 0.60.0",
- "x25519-dalek",
 ]
 
 [[package]]
@@ -2857,8 +2824,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "maskura"
+version = "0.7.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "dirs",
+ "hkdf",
+ "maskura-customer-config",
+ "ml-kem",
+ "rand 0.8.8",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "maskura-customer-config"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -2867,14 +2855,237 @@ dependencies = [
 ]
 
 [[package]]
+name = "maskura-error"
+version = "0.7.0"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "maskura-gateway"
+version = "0.7.0"
+dependencies = [
+ "aes-gcm",
+ "aes-siv",
+ "anyhow",
+ "apache-avro",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "aws-sdk-sts",
+ "aws-sigv4",
+ "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "crc",
+ "csv-core",
+ "dirs",
+ "hex",
+ "hkdf",
+ "hmac 0.12.1",
+ "http-body 1.1.0",
+ "http-body-util",
+ "jsonwebtoken",
+ "libc",
+ "maskura-customer-config",
+ "maskura-error",
+ "maskura-mcp-protocol",
+ "maskura-wasm-runtime",
+ "md-5 0.10.6",
+ "ml-kem",
+ "num-bigint",
+ "pin-project-lite",
+ "pollster",
+ "proptest",
+ "psl",
+ "rand 0.8.8",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
+ "reqwest",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "utoipa",
+ "utoipa-swagger-ui",
+ "uuid",
+ "wasmtime",
+ "x25519-dalek",
+ "xmlparser",
+ "zeroize",
+]
+
+[[package]]
+name = "maskura-mcp"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures-util",
+ "http-body-util",
+ "maskura-customer-config",
+ "maskura-gateway",
+ "maskura-mcp-protocol",
+ "reqwest",
+ "rmcp",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "maskura-mcp-protocol"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "quick-xml",
  "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "maskura-plugin-crypto-deterministic"
+version = "0.7.0"
+dependencies = [
+ "aes-siv",
+ "base64 0.22.1",
+ "maskura-plugin-sdk",
+ "serde_json",
+]
+
+[[package]]
+name = "maskura-plugin-crypto-envelope"
+version = "0.7.0"
+dependencies = [
+ "aes-gcm",
+ "base64 0.22.1",
+ "hkdf",
+ "maskura-plugin-pii-core",
+ "maskura-plugin-sdk",
+ "ml-kem",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
+ "serde_json",
+ "sha2 0.10.9",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "maskura-plugin-filter-email"
+version = "0.7.0"
+dependencies = [
+ "maskura-plugin-pii-core",
+ "maskura-plugin-sdk",
+]
+
+[[package]]
+name = "maskura-plugin-filter-payment-card"
+version = "0.7.0"
+dependencies = [
+ "maskura-plugin-pii-core",
+ "maskura-plugin-sdk",
+]
+
+[[package]]
+name = "maskura-plugin-filter-pii"
+version = "0.7.0"
+dependencies = [
+ "maskura-plugin-pii-core",
+ "maskura-plugin-sdk",
+]
+
+[[package]]
+name = "maskura-plugin-filter-ssn"
+version = "0.7.0"
+dependencies = [
+ "maskura-plugin-pii-core",
+ "maskura-plugin-sdk",
+]
+
+[[package]]
+name = "maskura-plugin-pii-core"
+version = "0.7.0"
+
+[[package]]
+name = "maskura-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "maskura-plugin-transform-noop"
+version = "0.7.0"
+dependencies = [
+ "maskura-plugin-sdk",
+]
+
+[[package]]
+name = "maskura-policy"
+version = "0.7.0"
+dependencies = [
+ "ciborium",
+ "ed25519-dalek",
+ "hex",
+ "maskura-error",
+ "rand 0.8.8",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "maskura-test-plugin-binary-reductor"
+version = "0.7.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "maskura-test-plugin-transformer"
+version = "0.7.0"
+dependencies = [
+ "maskura-plugin-sdk",
+]
+
+[[package]]
+name = "maskura-test-plugin-transformer-context"
+version = "0.7.0"
+dependencies = [
+ "maskura-plugin-sdk",
+]
+
+[[package]]
+name = "maskura-wasm-runtime"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "maskura-error",
+ "rand 0.8.8",
+ "serde",
+ "sha2 0.10.9",
+ "wasmtime",
+ "wasmtime-wasi",
+ "zeroize",
 ]
 
 [[package]]
@@ -3061,13 +3272,6 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
-]
-
-[[package]]
-name = "noop"
-version = "0.6.0"
-dependencies = [
- "wit-bindgen 0.60.0",
 ]
 
 [[package]]
@@ -3349,18 +3553,6 @@ checksum = "3673cba5b9a124916096a423b806a9f29620972c6c97b08db5f2053e9428b481"
 dependencies = [
  "serde",
 ]
-
-[[package]]
-name = "pii-default"
-version = "0.6.0"
-dependencies = [
- "pii-shared",
- "wit-bindgen 0.60.0",
-]
-
-[[package]]
-name = "pii-shared"
-version = "0.6.0"
 
 [[package]]
 name = "pin-project-lite"
@@ -4210,152 +4402,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
-name = "s4-error"
-version = "0.6.0"
-dependencies = [
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "s4-gateway"
-version = "0.6.0"
-dependencies = [
- "aes-gcm",
- "aes-siv",
- "anyhow",
- "apache-avro",
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-s3",
- "aws-sdk-sts",
- "aws-sigv4",
- "aws-smithy-http-client",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "axum",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "crc",
- "csv-core",
- "dirs",
- "hex",
- "hkdf",
- "hmac 0.12.1",
- "http-body 1.1.0",
- "http-body-util",
- "jsonwebtoken",
- "libc",
- "maskura-customer-config",
- "maskura-mcp-protocol",
- "md-5 0.10.6",
- "ml-kem",
- "num-bigint",
- "pin-project-lite",
- "pollster",
- "proptest",
- "psl",
- "rand 0.8.8",
- "rand_chacha 0.3.1",
- "rand_core 0.6.4",
- "reqwest",
- "s4-error",
- "s4-wasm-runtime",
- "sea-orm",
- "serde",
- "serde_json",
- "sha1 0.10.7",
- "sha2 0.10.9",
- "sqlx",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "utoipa",
- "utoipa-swagger-ui",
- "uuid",
- "wasmtime",
- "x25519-dalek",
- "xmlparser",
- "zeroize",
-]
-
-[[package]]
-name = "s4-mcp"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "axum",
- "futures-util",
- "http-body-util",
- "maskura-customer-config",
- "maskura-mcp-protocol",
- "reqwest",
- "rmcp",
- "s4-gateway",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "s4-policy"
-version = "0.6.0"
-dependencies = [
- "ciborium",
- "ed25519-dalek",
- "hex",
- "rand 0.8.8",
- "s4-error",
- "serde",
- "uuid",
-]
-
-[[package]]
-name = "s4-wasm-runtime"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "hex",
- "rand 0.8.8",
- "s4-error",
- "serde",
- "sha2 0.10.9",
- "wasmtime",
- "wasmtime-wasi",
- "zeroize",
-]
-
-[[package]]
-name = "s4ctl"
-version = "0.6.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "base64 0.22.1",
- "clap",
- "dirs",
- "hkdf",
- "maskura-customer-config",
- "ml-kem",
- "rand 0.8.8",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "x25519-dalek",
-]
-
-[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5030,24 +5076,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ssn-detect"
-version = "0.6.0"
-dependencies = [
- "pii-shared",
- "wit-bindgen 0.60.0",
-]
-
-[[package]]
-name = "stable-encrypt"
-version = "0.6.0"
-dependencies = [
- "aes-siv",
- "base64 0.22.1",
- "serde_json",
- "wit-bindgen 0.60.0",
-]
-
-[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5198,27 +5226,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "test-binary-reductor"
-version = "0.6.0"
-dependencies = [
- "wit-bindgen 0.60.0",
-]
-
-[[package]]
-name = "test-filter"
-version = "0.6.0"
-dependencies = [
- "wit-bindgen 0.60.0",
-]
-
-[[package]]
-name = "test-filter-v02"
-version = "0.6.0"
-dependencies = [
- "wit-bindgen 0.60.0",
 ]
 
 [[package]]

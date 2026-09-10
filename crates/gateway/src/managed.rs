@@ -120,7 +120,7 @@ pub fn placement_policy_fingerprint(
     backends: impl IntoIterator<Item = (String, u64, u64)>,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"s4-placement-policy\0");
+    hasher.update(b"maskura-placement-policy\0");
     hasher.update(version.to_be_bytes());
     let mut facts: Vec<_> = backends.into_iter().collect();
     facts.sort();
@@ -144,7 +144,7 @@ pub fn rendezvous_score(
     backend_id: &str,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"s4-rendezvous\0");
+    hasher.update(b"maskura-rendezvous\0");
     hasher.update(placement_version.to_be_bytes());
     hash_field(&mut hasher, tenant_id.as_bytes());
     hash_field(&mut hasher, object_key.as_bytes());
@@ -224,7 +224,7 @@ pub fn generation_physical_key(logical: &LogicalObjectKey, generation: Uuid) -> 
     hash_field(&mut hasher, logical.bucket.as_bytes());
     hash_field(&mut hasher, logical.key.as_bytes());
     format!(
-        "__s4/generations/{}/{}",
+        "__maskura/generations/{}/{}",
         hex::encode(hasher.finalize()),
         generation
     )
@@ -9333,7 +9333,7 @@ mod tests {
         let score = rendezvous_score(1, "tenant-a", "bucket/path/to/object", "b2:bucket-a");
         assert_eq!(
             hex::encode(score),
-            "bdaa1cebd6b1ff544ff1a5821c103391418bdecf94e17d934f8e56b0915c1657"
+            "53836a45ee45575d8b459282a5102e65d80eecef96949663e0fd48feb4032348"
         );
         let placement = rendezvous_placement(
             1,
@@ -9345,7 +9345,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(placement.primary_backend_id, "s3:bucket-b");
-        assert_eq!(placement.replica_backend_id.as_deref(), Some("b2:bucket-a"));
+        assert_eq!(placement.replica_backend_id.as_deref(), Some("r2:bucket-c"));
     }
 
     #[test]
@@ -9470,7 +9470,7 @@ mod tests {
         assert!(output.status.success());
         assert!(
             String::from_utf8_lossy(&output.stdout)
-                .contains("MASKURA_PLACEMENT=s3:bucket-b:b2:bucket-a")
+                .contains("MASKURA_PLACEMENT=s3:bucket-b:r2:bucket-c")
         );
     }
 

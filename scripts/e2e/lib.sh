@@ -23,8 +23,8 @@ export E2E_ROOT
 : "${MASKURA_E2E_GW_PORT:=9010}"
 export MASKURA_E2E_GW_PORT
 E2E_GW_URL="http://127.0.0.1:$MASKURA_E2E_GW_PORT"
-E2E_BUCKET="s4-local"
-E2E_GW_BIN="$E2E_ROOT/target/debug/s4-gateway"
+E2E_BUCKET="maskura-local"
+E2E_GW_BIN="$E2E_ROOT/target/debug/maskura-gateway"
 E2E_MASKURA_BIN="$E2E_ROOT/target/debug/maskura"
 E2E_COMPONENT="$E2E_ROOT/target/components/pii-default.component.wasm"
 E2E_NOOP_COMPONENT="$E2E_ROOT/target/components/noop.component.wasm"

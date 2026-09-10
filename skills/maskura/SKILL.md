@@ -13,7 +13,7 @@ forwarded to any S3-compatible backend (MinIO, AWS, GCS, B2, R2, …).
 ## Core concepts
 
 - **Plugin pipeline** — enabled plugins run in order; output of plugin N feeds
-  plugin N+1. Each plugin is a Wasm component (`wit/s4-filter/world.wit`):
+  plugin N+1. Each plugin is a Wasm component using `maskura-plugin-sdk`:
   `begin(Context)`, `transform(Vec<u8>) -> Decision`, `finish()`.
   Decision variants: `Emit`, `Drop`, `Reject`.
 - **Sandbox** — wasmtime, 64 MiB memory, 10K table entries, 512 KiB stack, no host
@@ -22,13 +22,13 @@ forwarded to any S3-compatible backend (MinIO, AWS, GCS, B2, R2, …).
 - **Plugins are BYO** — write in any Wasm-capable language, `wasm-tools component
   new`, then runtime import via `maskura plugin upload` (no gateway rebuild/restart).
   `MASKURA_PLUGINS_DIR` auto-loads a directory at startup. Default filter:
-  `filters/pii-default/` (redact emails / Luhn-valid cards / validated SSNs).
-- **Envelope encryption** — `filters/envelope-encrypt/` replaces each PII field
+  `plugins/filters/pii/` (redact emails / Luhn-valid cards / validated SSNs).
+- **Envelope encryption** — `plugins/crypto/envelope/` replaces each PII field
   with a `X25519+ML-KEM-768/AES-256-GCM` envelope using the API key's bound
   Maskura hybrid public key. Maskura never holds the private key and falls back
   to redaction without a key. Packaged Python/TypeScript hybrid client support
   is currently a known gap; their encryption helpers cover legacy RSA reads.
-  `filters/stable-encrypt/` is AES-SIV deterministic encryption for JOIN keys
+  `plugins/crypto/deterministic/` is AES-SIV deterministic encryption for JOIN keys
   (opt-in via stable-key/stable-fields context).
 - **Auth** — API keys (`x-maskura-access-key`/`x-maskura-secret-key` headers or
   `Authorization: Bearer <ak>:<sk>`). Key stores: in-memory `KeyStore`,
@@ -37,7 +37,7 @@ forwarded to any S3-compatible backend (MinIO, AWS, GCS, B2, R2, …).
   bypass.
 - **Storage** — resolution is explicit managed override, presigned URL, repository-
   backed per-workspace config, then configured service storage
-  (`S4_SERVICE_BUCKETS`, consistent-hash ring + dual-write + read fail-over).
+  (`MASKURA_SERVICE_BUCKETS`, consistent-hash ring + dual-write + read fail-over).
   Workspace config supports `managed`, static-credential `s3_compatible`, and
   `aws_role` (STS assume-role via the default credential chain, per request).
   Global `S3_ENDPOINT` (static keys, or the AWS default credential chain when
@@ -52,12 +52,12 @@ forwarded to any S3-compatible backend (MinIO, AWS, GCS, B2, R2, …).
 ## Commands
 
 ```bash
-just check            # fmt + clippy (-D warnings) + build filters + workspace tests
+just check            # fmt + clippy (-D warnings) + build plugins + workspace tests
 just e2e              # MinIO data-plane e2e (Docker) + maskura test upload
 just build-sdks       # regenerate Python/TypeScript SDKs (docker openapi-generator)
 just ci-local         # run the real ci.yml locally via act (colima)
 just image-local      # dagger: build the deploy image (cargo-cached)
-just publish-local TAG=x  # dagger: push canonical + legacy image tags
+just publish-local TAG=x  # dagger: push the Maskura image tag
 maskura local init    # run the published gateway image standalone (Docker, in-memory)
 maskura put/get       # S3 data plane through the pipeline
 bash examples/b2-redact-demo.sh    # B2 redaction round-trip (needs B2_* env vars)
@@ -66,15 +66,15 @@ bash examples/b2-redact-demo.sh    # B2 redaction round-trip (needs B2_* env var
 ## Layout
 
 - `crates/gateway/` — the server: S3 data plane + dashboard API (axum, utoipa).
-- `crates/s4ctl/` — shared `maskura` and legacy `s4ctl` CLI implementation.
+- `crates/cli/` — the `maskura` CLI implementation.
 - `crates/wasm-runtime/` — wasmtime sandbox (`FilterEngine`).
 - `crates/policy/`, `crates/error/` — shared policy/error types.
-- `filters/*/` — 7 Wasm filter crates (wasm32, wit-bindgen).
-- `wit/s4-filter/world.wit` — the plugin interface.
+- `plugins/{filters,crypto,transforms}/` — official Wasm components.
+- `crates/plugin-sdk/` — canonical WIT and thin Rust authoring bindings.
 - `sdks/{python,typescript}/` — generated clients + `overlay/` hand-written
-  high-level client (`MaskuraClient`, with `S4Client` compatibility export).
+  high-level client (`MaskuraClient`).
 - `migrations/` — sqlx migrations (run by the gateway at startup via `migrate!`).
-- `scripts/` — build-filters.sh, e2e-local.sh, generate-sdks.sh, check.sh.
+- `scripts/` — build-plugins.sh, e2e-local.sh, generate-sdks.sh, check.sh.
 - `docs/plugins.md`, `docs/adr/` — plugin guide and architecture decisions.
 
 ## Gotchas
@@ -91,7 +91,7 @@ bash examples/b2-redact-demo.sh    # B2 redaction round-trip (needs B2_* env var
   (`.actrc` sets `--container-daemon-socket=-`); docker-dependent steps are guarded
   with `if: ${{ !env.ACT }}`; `CARGO_BUILD_JOBS=2` keeps shared-VM memory bounded.
 - **Local mode keys**: with `AUTH_DISABLED=true` and no `DATABASE_URL`, keys persist
-  to `~/.config/s4/keys.json` (`FileKeyStore`).
+  to `~/.config/maskura/keys.json` (`FileKeyStore`).
 - **Toolchain**: Rust 1.97.0 with `wasm32-wasip1`; wasm-tools 1.255.0. Pins live
   in `rust-toolchain.toml`, Dockerfiles, Dagger, and GitHub Actions.
 - **jj repo**: never use git for mutations (`jj commit -m`, `jj git push -b <bk>`).

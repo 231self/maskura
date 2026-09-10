@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use s4_error::{S4Error, codes};
+use maskura_error::{MaskuraError, codes};
 use sha2::{Digest, Sha256};
 
 use crate::plugin_registry::{PipelineLimits, PluginCapabilities, PluginInfo, PluginRegistry};
@@ -48,14 +48,14 @@ pub struct PipelineStep {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// Bounded canonical JSON configuration (v0.2 steps only).
+    /// Bounded canonical JSON configuration for this plugin step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_json: Option<String>,
     pub capabilities: PluginCapabilities,
     /// Sensitive request context is denied unless the resolver explicitly
     /// grants individual fields to this exact step.
     #[serde(default)]
-    pub sensitive_grant: s4_wasm_runtime::SensitiveGrant,
+    pub sensitive_grant: maskura_wasm_runtime::SensitiveGrant,
 }
 
 const fn enabled_by_default() -> bool {
@@ -102,7 +102,7 @@ struct PersistedPipelineStep {
     config_json: Option<String>,
     capabilities: PluginCapabilities,
     #[serde(default)]
-    sensitive_grant: Option<s4_wasm_runtime::SensitiveGrant>,
+    sensitive_grant: Option<maskura_wasm_runtime::SensitiveGrant>,
 }
 
 impl<'de> serde::Deserialize<'de> for PipelineResolution {
@@ -125,9 +125,9 @@ impl<'de> serde::Deserialize<'de> for PipelineResolution {
                     config_json: step.config_json,
                     capabilities: step.capabilities,
                     sensitive_grant: step.sensitive_grant.unwrap_or(if static_revision {
-                        s4_wasm_runtime::SensitiveGrant::ALL
+                        maskura_wasm_runtime::SensitiveGrant::ALL
                     } else {
-                        s4_wasm_runtime::SensitiveGrant::NONE
+                        maskura_wasm_runtime::SensitiveGrant::NONE
                     }),
                 })
                 .collect(),
@@ -141,7 +141,7 @@ impl<'de> serde::Deserialize<'de> for PipelineResolution {
 impl PipelineResolution {
     /// Verify persisted or externally resolved policy against the canonical
     /// public fingerprint for this request direction.
-    pub fn verify_fingerprint(&self, direction: PipelineDirection) -> Result<(), S4Error> {
+    pub fn verify_fingerprint(&self, direction: PipelineDirection) -> Result<(), MaskuraError> {
         let recomputed = resolution_fingerprint_with_generation(
             direction,
             &self.steps,
@@ -150,7 +150,7 @@ impl PipelineResolution {
             self.policy_generation,
         );
         if recomputed != self.locator.fingerprint {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::CONFIG_INVALID,
                 "pipeline fingerprint does not match its immutable resolution",
             ));
@@ -167,13 +167,13 @@ pub trait PipelineResolver: Send + Sync {
         workspace_id: &str,
         bucket: &str,
         direction: PipelineDirection,
-    ) -> Result<PipelineResolution, S4Error>;
+    ) -> Result<PipelineResolution, MaskuraError>;
 }
 
 /// Loads immutable component bytes by content address.
 #[async_trait]
 pub trait ComponentSource: Send + Sync {
-    async fn load(&self, component_hash: &str) -> Result<bytes::Bytes, S4Error>;
+    async fn load(&self, component_hash: &str) -> Result<bytes::Bytes, MaskuraError>;
 }
 
 /// OSS/self-hosted resolver: the catalog's enabled plugins in order.
@@ -204,7 +204,7 @@ impl StaticPipelineResolver {
                 capabilities,
                 // Preserve the historical self-hosted contract explicitly;
                 // hosted resolutions default to no sensitive grants.
-                sensitive_grant: s4_wasm_runtime::SensitiveGrant::ALL,
+                sensitive_grant: maskura_wasm_runtime::SensitiveGrant::ALL,
             })
             .collect();
         let explicit_passthrough = steps.is_empty();
@@ -230,7 +230,7 @@ impl PipelineResolver for StaticPipelineResolver {
         _workspace_id: &str,
         _bucket: &str,
         direction: PipelineDirection,
-    ) -> Result<PipelineResolution, S4Error> {
+    ) -> Result<PipelineResolution, MaskuraError> {
         Ok(self.resolution(direction))
     }
 }
@@ -315,8 +315,8 @@ pub(crate) fn pipeline_requires_passthrough(resolution: &PipelineResolution) -> 
     !resolution.steps.iter().any(|step| step.enabled) && !resolution.explicit_passthrough
 }
 
-pub(crate) fn missing_component_error(component_hash: &str) -> S4Error {
-    S4Error::new(
+pub(crate) fn missing_component_error(component_hash: &str) -> MaskuraError {
+    MaskuraError::new(
         codes::WASM_INIT,
         format!("component {component_hash} is not available from its component source"),
     )
@@ -337,7 +337,10 @@ mod tests {
         .unwrap();
 
         assert!(step.enabled);
-        assert_eq!(step.sensitive_grant, s4_wasm_runtime::SensitiveGrant::NONE);
+        assert_eq!(
+            step.sensitive_grant,
+            maskura_wasm_runtime::SensitiveGrant::NONE
+        );
         assert_eq!(step.config_json.as_deref(), Some("{\"mode\":\"redact\"}"));
     }
 
@@ -364,7 +367,7 @@ mod tests {
             serde_json::from_value(persisted_resolution_without_grant("static")).unwrap();
         assert_eq!(
             static_resolution.steps[0].sensitive_grant,
-            s4_wasm_runtime::SensitiveGrant::ALL
+            maskura_wasm_runtime::SensitiveGrant::ALL
         );
 
         let hosted_resolution: PipelineResolution =
@@ -372,7 +375,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             hosted_resolution.steps[0].sensitive_grant,
-            s4_wasm_runtime::SensitiveGrant::NONE
+            maskura_wasm_runtime::SensitiveGrant::NONE
         );
     }
 
@@ -412,7 +415,7 @@ mod tests {
             version: None,
             config_json: None,
             capabilities: PluginCapabilities::default(),
-            sensitive_grant: s4_wasm_runtime::SensitiveGrant::NONE,
+            sensitive_grant: maskura_wasm_runtime::SensitiveGrant::NONE,
         };
         let first = component_digest_evidence(&[step("b"), step("a")]);
         let second = component_digest_evidence(&[step("a"), step("b")]);
@@ -430,7 +433,7 @@ mod tests {
             version: Some("same-label".to_string()),
             config_json: None,
             capabilities: PluginCapabilities::default(),
-            sensitive_grant: s4_wasm_runtime::SensitiveGrant::NONE,
+            sensitive_grant: maskura_wasm_runtime::SensitiveGrant::NONE,
         };
         let limits = PipelineLimits::default();
         let first = resolution_fingerprint(

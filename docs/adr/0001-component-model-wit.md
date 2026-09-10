@@ -1,6 +1,6 @@
 # ADR 0001: WebAssembly Component Model and WIT Contract
 
-- Status: Accepted
+- Status: Superseded by [ADR-0016](0016-maskura-plugin-contract-and-namespace.md)
 - Date: 2026-08-09
 
 ## Context
@@ -13,7 +13,7 @@ Maskura needs a contract between the gateway host and tenant-supplied filter plu
 
 ## Decision
 
-Use the Component Model and a versioned WIT world (`package s4:filter@0.1.0`). The guest exports `begin`, `transform`, and `finish` functions with typed parameters. Stateful per-object sessions allow filters to accumulate context across records.
+Use the Component Model and a versioned WIT world (`package maskura:filter@0.1.0`). The guest exports `begin`, `transform`, and `finish` functions with typed parameters. Stateful per-object sessions allow filters to accumulate context across records.
 
 ## Consequences
 

@@ -1,13 +1,13 @@
 # Binary adapters
 
 Typed binary formats such as Avro and Parquet do not pass through the
-byte-oriented `s4:filter` plugin pipeline. A binary encoder needs its complete
+byte-oriented `maskura:plugin/transformer` pipeline. A binary encoder needs its complete
 output schema before it writes the first record. Use a binary reductor when a
 format-specific logical type must be converted to a Maskura-supported type before a
 typed transform, then reconstructed for output.
 
-The contract is `s4:binary-reductor@0.1.0` in
-[`wit/s4-binary-reductor/world.wit`](https://github.com/231self/maskura/blob/main/wit/s4-binary-reductor/world.wit).
+The `binary-reductor` world is part of `maskura:plugin@0.1.0` in
+[`crates/plugin-sdk/wit/world.wit`](https://github.com/231self/maskura/blob/main/crates/plugin-sdk/wit/world.wit).
 
 ## Lifecycle
 
@@ -41,7 +41,7 @@ IR. The definitive Rust types and validators are in
   best-effort result.
 
 The test fixture in
-[`filters/test-binary-reductor/src/lib.rs`](https://github.com/231self/maskura/blob/main/filters/test-binary-reductor/src/lib.rs)
+[`tests/plugins/binary-reductor/src/lib.rs`](https://github.com/231self/maskura/blob/main/tests/plugins/binary-reductor/src/lib.rs)
 is the smallest complete example. It reduces `vendor.money` from a custom value
 to a string and restores it after the typed transform.
 
@@ -62,7 +62,7 @@ Generate bindings and implement the exported `Guest` trait:
 ```rust
 wit_bindgen::generate!({
     world: "binary-reductor",
-    path: "path/to/maskura/wit/s4-binary-reductor/world.wit",
+    path: "path/to/maskura/crates/plugin-sdk/wit",
 });
 
 struct MyReductor;
@@ -101,9 +101,9 @@ wasm-tools component new target/wasm32-unknown-unknown/release/my_reductor.wasm 
 From a Maskura checkout:
 
 ```bash
-bash scripts/build-filters.sh
-cargo test -p s4-wasm-runtime binary_reductor
-cargo test -p s4-gateway binary_reductor::tests
+bash scripts/build-plugins.sh
+cargo test -p maskura-wasm-runtime binary_reductor
+cargo test -p maskura-gateway binary_reductor::tests
 ```
 
 Add conformance vectors beside the fixture for each new logical type. Cover

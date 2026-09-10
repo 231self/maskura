@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use s4_error::{S4Error, codes};
+use maskura_error::{MaskuraError, codes};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 
@@ -56,13 +56,13 @@ impl Default for BinaryIrLimits {
 }
 
 impl BinaryIrLimits {
-    fn validate(self) -> Result<(), S4Error> {
+    fn validate(self) -> Result<(), MaskuraError> {
         if self.max_encoded_schema_bytes == 0
             || self.max_fields == 0
             || self.max_nesting_depth == 0
             || self.max_encoded_value_bytes == 0
         {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::CONFIG_INVALID,
                 "binary IR limits must be greater than zero",
             ));
@@ -86,7 +86,7 @@ impl SchemaIr {
         }
     }
 
-    pub fn validate(&self, limits: BinaryIrLimits) -> Result<(), S4Error> {
+    pub fn validate(&self, limits: BinaryIrLimits) -> Result<(), MaskuraError> {
         limits.validate()?;
         validate_version("schema", self.version, SCHEMA_IR_VERSION)?;
         let mut field_count = 0;
@@ -95,11 +95,14 @@ impl SchemaIr {
             .validate_inner(limits, 0, &mut field_count, &mut path)
     }
 
-    pub fn to_canonical_json(&self, limits: BinaryIrLimits) -> Result<Vec<u8>, S4Error> {
+    pub fn to_canonical_json(&self, limits: BinaryIrLimits) -> Result<Vec<u8>, MaskuraError> {
         encode_schema_canonical_json(self, limits)
     }
 
-    pub fn from_canonical_json(encoded: &[u8], limits: BinaryIrLimits) -> Result<Self, S4Error> {
+    pub fn from_canonical_json(
+        encoded: &[u8],
+        limits: BinaryIrLimits,
+    ) -> Result<Self, MaskuraError> {
         decode_schema_canonical_json(encoded, limits)
     }
 
@@ -182,7 +185,7 @@ impl SchemaNode {
         depth: usize,
         field_count: &mut usize,
         path: &mut SchemaPath,
-    ) -> Result<(), S4Error> {
+    ) -> Result<(), MaskuraError> {
         if depth > limits.max_nesting_depth {
             return Err(schema_error(
                 path,
@@ -425,7 +428,7 @@ impl ValueIr {
         }
     }
 
-    pub fn validate(&self, schema: &SchemaIr, limits: BinaryIrLimits) -> Result<(), S4Error> {
+    pub fn validate(&self, schema: &SchemaIr, limits: BinaryIrLimits) -> Result<(), MaskuraError> {
         limits.validate()?;
         validate_version("value", self.version, VALUE_IR_VERSION)?;
         schema.validate(limits)?;
@@ -439,7 +442,7 @@ impl ValueIr {
         &self,
         schema: &SchemaIr,
         limits: BinaryIrLimits,
-    ) -> Result<Vec<u8>, S4Error> {
+    ) -> Result<Vec<u8>, MaskuraError> {
         encode_value_canonical_json(self, schema, limits)
     }
 
@@ -447,7 +450,7 @@ impl ValueIr {
         encoded: &[u8],
         schema: &SchemaIr,
         limits: BinaryIrLimits,
-    ) -> Result<Self, S4Error> {
+    ) -> Result<Self, MaskuraError> {
         decode_value_canonical_json(encoded, schema, limits)
     }
 }
@@ -580,7 +583,7 @@ impl Value {
         limits: BinaryIrLimits,
         depth: usize,
         path: &mut ValuePath,
-    ) -> Result<(), S4Error> {
+    ) -> Result<(), MaskuraError> {
         if depth > limits.max_nesting_depth {
             return Err(value_error(
                 path,
@@ -731,7 +734,7 @@ pub enum ValuePathSegment {
 pub fn encode_schema_canonical_json(
     schema: &SchemaIr,
     limits: BinaryIrLimits,
-) -> Result<Vec<u8>, S4Error> {
+) -> Result<Vec<u8>, MaskuraError> {
     schema.validate(limits)?;
     let encoded = serialize_json(schema)?;
     ensure_size(
@@ -746,7 +749,7 @@ pub fn encode_schema_canonical_json(
 pub fn decode_schema_canonical_json(
     encoded: &[u8],
     limits: BinaryIrLimits,
-) -> Result<SchemaIr, S4Error> {
+) -> Result<SchemaIr, MaskuraError> {
     limits.validate()?;
     ensure_size(
         "encoded schema",
@@ -782,7 +785,7 @@ pub fn encode_value_canonical_json(
     value: &ValueIr,
     schema: &SchemaIr,
     limits: BinaryIrLimits,
-) -> Result<Vec<u8>, S4Error> {
+) -> Result<Vec<u8>, MaskuraError> {
     value.validate(schema, limits)?;
     let encoded = serialize_json(value)?;
     ensure_size(
@@ -798,7 +801,7 @@ pub fn decode_value_canonical_json(
     encoded: &[u8],
     schema: &SchemaIr,
     limits: BinaryIrLimits,
-) -> Result<ValueIr, S4Error> {
+) -> Result<ValueIr, MaskuraError> {
     limits.validate()?;
     ensure_size(
         "encoded value",
@@ -817,7 +820,7 @@ fn validate_value_against_schema(
     value: &Value,
     schema: &SchemaNode,
     path: &mut ValuePath,
-) -> Result<(), S4Error> {
+) -> Result<(), MaskuraError> {
     if matches!(value, Value::Null) {
         return if schema.nullable || matches!(schema.kind, SchemaKind::Null) {
             Ok(())
@@ -1085,9 +1088,9 @@ fn visit_claim_matches_mut_inner<F>(
     }
 }
 
-fn validate_version(kind: &str, actual: u32, expected: u32) -> Result<(), S4Error> {
+fn validate_version(kind: &str, actual: u32, expected: u32) -> Result<(), MaskuraError> {
     if actual != expected {
-        return Err(S4Error::new(
+        return Err(MaskuraError::new(
             ERROR_VERSION_UNSUPPORTED,
             format!("unsupported {kind} IR version {actual}; expected {expected}"),
         ));
@@ -1095,25 +1098,28 @@ fn validate_version(kind: &str, actual: u32, expected: u32) -> Result<(), S4Erro
     Ok(())
 }
 
-fn serialize_json<T: Serialize>(value: &T) -> Result<Vec<u8>, S4Error> {
-    let value = serde_json::to_value(value)
-        .map_err(|error| S4Error::new(codes::INTERNAL, format!("JSON encoding failed: {error}")))?;
-    serde_json::to_vec(&value)
-        .map_err(|error| S4Error::new(codes::INTERNAL, format!("JSON encoding failed: {error}")))
+fn serialize_json<T: Serialize>(value: &T) -> Result<Vec<u8>, MaskuraError> {
+    let value = serde_json::to_value(value).map_err(|error| {
+        MaskuraError::new(codes::INTERNAL, format!("JSON encoding failed: {error}"))
+    })?;
+    serde_json::to_vec(&value).map_err(|error| {
+        MaskuraError::new(codes::INTERNAL, format!("JSON encoding failed: {error}"))
+    })
 }
 
-fn deserialize_json<T: DeserializeOwned>(value: JsonValue) -> Result<T, S4Error> {
+fn deserialize_json<T: DeserializeOwned>(value: JsonValue) -> Result<T, MaskuraError> {
     serde_json::from_value(value)
-        .map_err(|error| S4Error::new(codes::DECODE_JSON, error.to_string()))
+        .map_err(|error| MaskuraError::new(codes::DECODE_JSON, error.to_string()))
 }
 
-fn parse_canonical_json(encoded: &[u8], kind: &str) -> Result<JsonValue, S4Error> {
+fn parse_canonical_json(encoded: &[u8], kind: &str) -> Result<JsonValue, MaskuraError> {
     let value: JsonValue = serde_json::from_slice(encoded)
-        .map_err(|error| S4Error::new(codes::DECODE_JSON, error.to_string()))?;
-    let canonical = serde_json::to_vec(&value)
-        .map_err(|error| S4Error::new(codes::INTERNAL, format!("JSON encoding failed: {error}")))?;
+        .map_err(|error| MaskuraError::new(codes::DECODE_JSON, error.to_string()))?;
+    let canonical = serde_json::to_vec(&value).map_err(|error| {
+        MaskuraError::new(codes::INTERNAL, format!("JSON encoding failed: {error}"))
+    })?;
     if encoded != canonical {
-        return Err(S4Error::new(
+        return Err(MaskuraError::new(
             ERROR_NON_CANONICAL,
             format!("{kind} IR JSON is not in canonical form"),
         ));
@@ -1125,7 +1131,7 @@ fn reject_unit_variant_extras(
     value: &JsonValue,
     unit_variants: &[&str],
     kind: &str,
-) -> Result<(), S4Error> {
+) -> Result<(), MaskuraError> {
     match value {
         JsonValue::Array(values) => {
             for value in values {
@@ -1139,7 +1145,7 @@ fn reject_unit_variant_extras(
                 .is_some_and(|tag| unit_variants.contains(&tag))
                 && object.len() != 1
             {
-                return Err(S4Error::new(
+                return Err(MaskuraError::new(
                     codes::DECODE_JSON,
                     format!("{kind} unit variant contains unknown fields"),
                 ));
@@ -1153,9 +1159,14 @@ fn reject_unit_variant_extras(
     Ok(())
 }
 
-fn ensure_size(kind: &str, actual: usize, limit: usize, code: &'static str) -> Result<(), S4Error> {
+fn ensure_size(
+    kind: &str,
+    actual: usize,
+    limit: usize,
+    code: &'static str,
+) -> Result<(), MaskuraError> {
     if actual > limit {
-        return Err(S4Error::new(
+        return Err(MaskuraError::new(
             code,
             format!("{kind} size {actual} exceeds limit {limit}"),
         ));
@@ -1163,12 +1174,12 @@ fn ensure_size(kind: &str, actual: usize, limit: usize, code: &'static str) -> R
     Ok(())
 }
 
-fn schema_error(path: &SchemaPath, message: impl fmt::Display) -> S4Error {
-    S4Error::new(ERROR_SCHEMA_INVALID, format!("schema at {path}: {message}"))
+fn schema_error(path: &SchemaPath, message: impl fmt::Display) -> MaskuraError {
+    MaskuraError::new(ERROR_SCHEMA_INVALID, format!("schema at {path}: {message}"))
 }
 
-fn value_error(path: &ValuePath, message: impl fmt::Display) -> S4Error {
-    S4Error::new(ERROR_VALUE_INVALID, format!("value at {path}: {message}"))
+fn value_error(path: &ValuePath, message: impl fmt::Display) -> MaskuraError {
+    MaskuraError::new(ERROR_VALUE_INVALID, format!("value at {path}: {message}"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

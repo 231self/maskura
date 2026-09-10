@@ -6,9 +6,9 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use maskura_error::{MaskuraError, codes};
 use rand::RngCore;
 use rand::rngs::OsRng;
-use s4_error::{S4Error, codes};
 use zeroize::Zeroize;
 
 use crate::hybrid::{ENVELOPE_ALG, HybridPublicKey};
@@ -24,7 +24,7 @@ use crate::binary_reductor::{BinaryReductionPlan, BinaryReductor, BinaryRestoreP
 /// This intentionally differs from the byte-oriented text filter contract: an
 /// encoder must know the resulting binary schema before it can accept records.
 pub trait BinaryTransform {
-    fn output_schema(&mut self, input_schema: &SchemaIr) -> Result<SchemaIr, S4Error>;
+    fn output_schema(&mut self, input_schema: &SchemaIr) -> Result<SchemaIr, MaskuraError>;
 
     /// Returns `None` when the record is deliberately dropped.
     fn transform(
@@ -32,14 +32,14 @@ pub trait BinaryTransform {
         value: ValueIr,
         input_schema: &SchemaIr,
         output_schema: &SchemaIr,
-    ) -> Result<Option<ValueIr>, S4Error>;
+    ) -> Result<Option<ValueIr>, MaskuraError>;
 }
 
 #[derive(Default)]
 pub struct IdentityBinaryTransform;
 
 impl BinaryTransform for IdentityBinaryTransform {
-    fn output_schema(&mut self, input_schema: &SchemaIr) -> Result<SchemaIr, S4Error> {
+    fn output_schema(&mut self, input_schema: &SchemaIr) -> Result<SchemaIr, MaskuraError> {
         Ok(input_schema.clone())
     }
 
@@ -48,7 +48,7 @@ impl BinaryTransform for IdentityBinaryTransform {
         value: ValueIr,
         _input_schema: &SchemaIr,
         _output_schema: &SchemaIr,
-    ) -> Result<Option<ValueIr>, S4Error> {
+    ) -> Result<Option<ValueIr>, MaskuraError> {
         Ok(Some(value))
     }
 }
@@ -64,7 +64,10 @@ pub struct EnvelopeBinaryTransform {
 }
 
 impl EnvelopeBinaryTransform {
-    pub fn new(targets: Vec<SchemaPath>, public_key_pem: Option<&str>) -> Result<Self, S4Error> {
+    pub fn new(
+        targets: Vec<SchemaPath>,
+        public_key_pem: Option<&str>,
+    ) -> Result<Self, MaskuraError> {
         let targets = canonicalize_targets(targets)?;
         let public_key = public_key_pem.map(parse_public_key).transpose()?;
         Ok(Self {
@@ -80,7 +83,7 @@ impl EnvelopeBinaryTransform {
 
 /// Parses `x-maskura-encrypt-fields` (or its legacy alias): comma-separated paths such as
 /// `email,contacts[*].email` or `$.email`.
-pub fn parse_envelope_targets(value: &str) -> Result<Vec<SchemaPath>, S4Error> {
+pub fn parse_envelope_targets(value: &str) -> Result<Vec<SchemaPath>, MaskuraError> {
     let mut paths = Vec::new();
     for raw_path in value
         .split(',')
@@ -116,7 +119,7 @@ pub fn parse_envelope_targets(value: &str) -> Result<Vec<SchemaPath>, S4Error> {
 }
 
 impl BinaryTransform for EnvelopeBinaryTransform {
-    fn output_schema(&mut self, input_schema: &SchemaIr) -> Result<SchemaIr, S4Error> {
+    fn output_schema(&mut self, input_schema: &SchemaIr) -> Result<SchemaIr, MaskuraError> {
         let mut output = input_schema.clone();
         if self.public_key.is_none() {
             return Ok(output);
@@ -132,7 +135,7 @@ impl BinaryTransform for EnvelopeBinaryTransform {
         mut value: ValueIr,
         input_schema: &SchemaIr,
         _output_schema: &SchemaIr,
-    ) -> Result<Option<ValueIr>, S4Error> {
+    ) -> Result<Option<ValueIr>, MaskuraError> {
         for target in &self.targets {
             let node = input_schema.node_at_path(target).ok_or_else(|| {
                 transform_error(format!("envelope target {target} does not exist"))
@@ -167,7 +170,7 @@ fn replace_schema_at_path(
     node: &mut SchemaNode,
     segments: &[SchemaPathSegment],
     target: &SchemaPath,
-) -> Result<(), S4Error> {
+) -> Result<(), MaskuraError> {
     let Some((segment, remaining)) = segments.split_first() else {
         if !matches!(&node.kind, SchemaKind::String) {
             return Err(transform_error(format!(
@@ -207,7 +210,7 @@ fn transform_values_at_path(
     segments: &[SchemaPathSegment],
     target: &SchemaPath,
     public_key: &Option<HybridPublicKey>,
-) -> Result<(), S4Error> {
+) -> Result<(), MaskuraError> {
     let Some((segment, remaining)) = segments.split_first() else {
         let Value::String { value: plaintext } = value else {
             if matches!(value, Value::Null) {
@@ -258,7 +261,7 @@ fn transform_values_at_path(
     }
 }
 
-fn encrypt_string(plaintext: &str, public_key: &HybridPublicKey) -> Result<Value, S4Error> {
+fn encrypt_string(plaintext: &str, public_key: &HybridPublicKey) -> Result<Value, MaskuraError> {
     let mut iv = [0_u8; 12];
     let mut x25519_eph = [0_u8; 32];
     let mut m = [0_u8; 32];
@@ -300,7 +303,7 @@ fn string_field(name: &str, value: String) -> ValueField {
     }
 }
 
-fn parse_public_key(pem: &str) -> Result<HybridPublicKey, S4Error> {
+fn parse_public_key(pem: &str) -> Result<HybridPublicKey, MaskuraError> {
     let pem = pem.trim();
     if pem.is_empty() {
         return Err(transform_error("envelope public key must not be empty"));
@@ -309,7 +312,7 @@ fn parse_public_key(pem: &str) -> Result<HybridPublicKey, S4Error> {
         .map_err(|e| transform_error(format!("envelope public key must be a hybrid key PEM: {e}")))
 }
 
-fn canonicalize_targets(mut targets: Vec<SchemaPath>) -> Result<Vec<SchemaPath>, S4Error> {
+fn canonicalize_targets(mut targets: Vec<SchemaPath>) -> Result<Vec<SchemaPath>, MaskuraError> {
     targets.sort_by(compare_paths);
     for pair in targets.windows(2) {
         if path_is_prefix(&pair[0], &pair[1]) {
@@ -347,8 +350,8 @@ fn path_is_prefix(prefix: &SchemaPath, path: &SchemaPath) -> bool {
             .all(|(left, right)| left == right)
 }
 
-fn transform_error(message: impl Into<String>) -> S4Error {
-    S4Error::new(codes::CONFIG_INVALID, message)
+fn transform_error(message: impl Into<String>) -> MaskuraError {
+    MaskuraError::new(codes::CONFIG_INVALID, message)
 }
 
 pub struct BinaryPump<R, T> {
@@ -373,7 +376,7 @@ where
     }
 
     /// Freezes all schemas before the first value is accepted.
-    pub fn plan(&mut self, source_schema: &SchemaIr) -> Result<&SchemaIr, S4Error> {
+    pub fn plan(&mut self, source_schema: &SchemaIr) -> Result<&SchemaIr, MaskuraError> {
         source_schema.validate(self.limits)?;
         let reduction = self.reductor.plan(source_schema)?;
         let transformed = self.transform.output_schema(reduction.reduced_schema())?;
@@ -388,9 +391,9 @@ where
             .output_schema())
     }
 
-    pub fn process(&mut self, source_value: ValueIr) -> Result<Option<ValueIr>, S4Error> {
+    pub fn process(&mut self, source_value: ValueIr) -> Result<Option<ValueIr>, MaskuraError> {
         let (reduction, restoration) = self.plans.clone().ok_or_else(|| {
-            S4Error::new(
+            MaskuraError::new(
                 codes::CONFIG_INVALID,
                 "binary pump must be planned before processing values",
             )
@@ -440,7 +443,7 @@ mod tests {
     struct Uppercase;
 
     impl BinaryTransform for Uppercase {
-        fn output_schema(&mut self, input_schema: &SchemaIr) -> Result<SchemaIr, S4Error> {
+        fn output_schema(&mut self, input_schema: &SchemaIr) -> Result<SchemaIr, MaskuraError> {
             Ok(input_schema.clone())
         }
 
@@ -449,9 +452,9 @@ mod tests {
             value: ValueIr,
             _input_schema: &SchemaIr,
             _output_schema: &SchemaIr,
-        ) -> Result<Option<ValueIr>, S4Error> {
+        ) -> Result<Option<ValueIr>, MaskuraError> {
             let Value::String { value } = value.root else {
-                return Err(S4Error::new(codes::INTERNAL, "test expects a string"));
+                return Err(MaskuraError::new(codes::INTERNAL, "test expects a string"));
             };
             Ok(Some(ValueIr::new(Value::String {
                 value: value.to_uppercase(),
@@ -462,7 +465,7 @@ mod tests {
     struct InvalidTransform;
 
     impl BinaryTransform for InvalidTransform {
-        fn output_schema(&mut self, input_schema: &SchemaIr) -> Result<SchemaIr, S4Error> {
+        fn output_schema(&mut self, input_schema: &SchemaIr) -> Result<SchemaIr, MaskuraError> {
             Ok(input_schema.clone())
         }
 
@@ -471,7 +474,7 @@ mod tests {
             _value: ValueIr,
             _input_schema: &SchemaIr,
             _output_schema: &SchemaIr,
-        ) -> Result<Option<ValueIr>, S4Error> {
+        ) -> Result<Option<ValueIr>, MaskuraError> {
             Ok(Some(ValueIr::new(Value::I64 { value: 1 })))
         }
     }

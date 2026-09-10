@@ -33,9 +33,9 @@ jobs:
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build Wasm filters
-        run: bash scripts/build-filters.sh
+        run: bash scripts/build-plugins.sh
       - name: Soak streaming round-trips (500 iterations)
-        run: MASKURA_SOAK_ITERATIONS=500 cargo test --locked -p s4-gateway --test s3_frontdoor_test soak_streaming_roundtrip_holds_under_repetition -- --ignored --nocapture
+        run: MASKURA_SOAK_ITERATIONS=500 cargo test --locked -p maskura-gateway --test s3_frontdoor_test soak_streaming_roundtrip_holds_under_repetition -- --ignored --nocapture
 
   property:
     runs-on: ubuntu-latest
@@ -50,6 +50,6 @@ jobs:
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build Wasm filters
-        run: bash scripts/build-filters.sh
+        run: bash scripts/build-plugins.sh
       - name: High-case property tests (50k cases)
-        run: PROPTEST_CASES=50000 cargo test --locked -p s4-gateway --test property --test record_decoder
+        run: PROPTEST_CASES=50000 cargo test --locked -p maskura-gateway --test property --test record_decoder

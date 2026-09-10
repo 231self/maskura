@@ -17,7 +17,7 @@ schema (via serde flatten) and extends it with SaaS-only fields.
 - Configuration is read almost entirely from environment variables. There are
   ~50 distinct names in the gateway, split across three kinds: feature gates
   (safe "off" defaults), storage/identity, and operator/SaaS-only controls.
-- The `MASKURA_*`/`S4_*` alias pairs are centralized in
+- The `MASKURA_*`/`MASKURA_*` alias pairs are centralized in
   `crates/customer-config/src/lib.rs` (`EnvAlias`, `resolve`, `validate`,
   `GATEWAY_CUSTOMER_SETTINGS`, `CLIENT_CUSTOMER_SETTINGS`). But many reads bypass
   this crate and call `std::env::var` directly.
@@ -25,8 +25,8 @@ schema (via serde flatten) and extends it with SaaS-only fields.
   `build_state_with_pipeline_template` (`:10999`) read the non-secret settings
   inline: `S3_ENDPOINT`/`S3_REGION`/`S3_*` creds (`11006`, `11038`–`11047`),
   `SUPABASE_URL`/`SUPABASE_JWT_SECRET` (`11089`–`11091`),
-  `S4_MANAGED_STREAMING_MODE`/`S4_MANAGED_PLACEMENT_VERSION` (`11096`–`11099`),
-  multipart quotas (`11104`–`11117`), `S4_MULTIPART_STAGING_*` (`11256`–`11289`),
+  `MASKURA_MANAGED_STREAMING_MODE`/`MASKURA_MANAGED_PLACEMENT_VERSION` (`11096`–`11099`),
+  multipart quotas (`11104`–`11117`), `MASKURA_MULTIPART_STAGING_*` (`11256`–`11289`),
   `DATABASE_URL` key store (`11180`), and spool/dev-memory settings
   (`11143`–`11173`).
 - Helper readers: `enabled_env_flag` (`10839`), `multipart_mode` (`974`),
@@ -40,16 +40,16 @@ schema (via serde flatten) and extends it with SaaS-only fields.
   (`backend.rs:880`), `SigV4Policy::from_env` (`sigv4.rs:104`),
   `WorkspaceEndpointPolicy::from_env` (`backend.rs:656`).
 - Secrets are read where used and stay env-only: `default_wrapping` /
-  `LocalKeyWrapping::from_env` (`key_cipher.rs:129`/`62`) reads `S4_SECRET_KEK`;
+  `LocalKeyWrapping::from_env` (`key_cipher.rs:129`/`62`) reads `MASKURA_SECRET_KEK`;
   `DATABASE_URL`, `S3_*` creds, and `SUPABASE_JWT_SECRET` are read inside
   `build_state`.
 - The OSS binary (`crates/gateway/src/main.rs`) reads only `LISTEN_ADDR` and
   injects `NoopControlPlane`, `default_wrapping()`, and
   `InMemoryWorkspaceStorageRepository` into `build_state`.
 - The private binary (`s4-private/crates/s4-control/src/main.rs`) reads its own
-  env surface (`DATABASE_URL`, `PADDLE_*`, `S4_VAULT_*`, `S4_KMS_KEY_ID`,
-  `S4_FILTER_ARTIFACT_*`, `S4_CUSTOM_FILTER_UPLOADS_*`,
-  `S4_HOSTED_PIPELINES_ENABLED`, `S4_UNSAFE_LOCAL_FILTER_VALIDATION`, …) and
+  env surface (`DATABASE_URL`, `PADDLE_*`, `MASKURA_VAULT_*`, `MASKURA_KMS_KEY_ID`,
+  `MASKURA_FILTER_ARTIFACT_*`, `MASKURA_CUSTOM_FILTER_UPLOADS_*`,
+  `MASKURA_HOSTED_PIPELINES_ENABLED`, `MASKURA_UNSAFE_LOCAL_FILTER_VALIDATION`, …) and
   injects `SaaSControlPlane`, KMS/Vault wrapping, and
   `HostedWorkspaceStorageRepository` into the same `build_state` (`main.rs:695`).
 
@@ -62,8 +62,8 @@ schema (via serde flatten) and extends it with SaaS-only fields.
    literal superset of the OSS TOML.
 2. **Config file is canonical for non-secret settings; secrets stay env-only.**
    Secrets (`S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY`, `DATABASE_URL`,
-   `SUPABASE_JWT_SECRET`/`SUPABASE_ANON_KEY`, `S4_SECRET_KEK`,
-   `S4_MULTIPART_STAGING_*_KEY_ID/SECRET`, `MASKURA_BOOTSTRAP_SECRET`) are not
+   `SUPABASE_JWT_SECRET`/`SUPABASE_ANON_KEY`, `MASKURA_SECRET_KEK`,
+   `MASKURA_MULTIPART_STAGING_*_KEY_ID/SECRET`, `MASKURA_BOOTSTRAP_SECRET`) are not
    fields in `Config`. With `deny_unknown_fields`, a secret in the file is a
    hard startup error — the property is enforced structurally.
 3. **Precedence: defaults < file < env.** Compiled defaults via
@@ -80,14 +80,14 @@ schema (via serde flatten) and extends it with SaaS-only fields.
    `build_state(control, wrapping, workspace_storage, config: &Config)`; the
    scattered non-secret env reads move to `config` field reads. Secrets keep
    their current env reads.
-7. **Abandon the `S4_*` env aliases.** The customer-facing `MASKURA_*`/`S4_*`
+7. **Abandon the `MASKURA_*` env aliases.** The customer-facing `MASKURA_*`/`MASKURA_*`
    alias pairs collapse to the single `MASKURA_*` name; `EnvAlias::legacy` and
-   its conflict handling are removed. A repo-wide sweep removes leftover `S4_*`
-   alias references (code, tests, docs, scripts, `s4ctl`, examples, compose
-   files). Operator-only `S4_*` names (`S4_SECRET_KEK`, `S4_SERVICE_BUCKETS`,
-   `S4_SIGV4_*`, `S4_MANAGED_*`, `S4_MULTIPART_STAGING_*`, `S4_PRESIGNED_HTTP_*`,
-   `S4_WORKSPACE_ENDPOINT_*`) are canonical, not aliases, and remain.
-8. **Add `maskura config --check`** (`s4ctl`) to load a config file and report
+   its conflict handling are removed. A repo-wide sweep removes leftover `MASKURA_*`
+   alias references (code, tests, docs, scripts, `maskura`, examples, compose
+   files). Operator-only `MASKURA_*` names (`MASKURA_SECRET_KEK`, `MASKURA_SERVICE_BUCKETS`,
+   `MASKURA_SIGV4_*`, `MASKURA_MANAGED_*`, `MASKURA_MULTIPART_STAGING_*`, `MASKURA_PRESIGNED_HTTP_*`,
+   `MASKURA_WORKSPACE_ENDPOINT_*`) are canonical, not aliases, and remain.
+8. **Add `maskura config --check`** (`maskura`) to load a config file and report
    validation without booting the gateway.
 
 ## Ordered Implementation
@@ -125,19 +125,19 @@ A dedicated validation test matrix covers, per field: malformed, missing,
 schema-invalid (URL/key-length/encoding), and contradictory-combination inputs,
 each asserting a specific error and that the config is rejected.
 
-### 2. Abandon the `S4_*` env aliases
+### 2. Abandon the `MASKURA_*` env aliases
 
 **Files:** `crates/customer-config/src/lib.rs` plus repo-wide sweep.
 
 - Remove `EnvAlias::legacy` and its conflict handling; collapse each alias pair
   to a single `MASKURA_*` name. `resolve` becomes a single-name read.
-- Sweep every `S4_*` reference that was a customer-settings alias (code, tests,
+- Sweep every `MASKURA_*` reference that was a customer-settings alias (code, tests,
   docs, `README.md`, `restart-dev.sh`, `justfile`, `local/docker-compose.yml`,
-  `s4ctl`, examples) and remove/rename. Operator-only `S4_*` names stay.
+  `maskura`, examples) and remove/rename. Operator-only `MASKURA_*` names stay.
 
-**Verify:** `rg -n "S4_[A-Z]"` returns only operator-only names
-(`S4_SECRET_KEK`, `S4_SERVICE_BUCKETS`, `S4_SIGV4_*`, `S4_MANAGED_*`,
-`S4_MULTIPART_STAGING_*`, `S4_PRESIGNED_HTTP_*`, `S4_WORKSPACE_ENDPOINT_*`) and
+**Verify:** `rg -n "MASKURA_[A-Z]"` returns only operator-only names
+(`MASKURA_SECRET_KEK`, `MASKURA_SERVICE_BUCKETS`, `MASKURA_SIGV4_*`, `MASKURA_MANAGED_*`,
+`MASKURA_MULTIPART_STAGING_*`, `MASKURA_PRESIGNED_HTTP_*`, `MASKURA_WORKSPACE_ENDPOINT_*`) and
 no customer-setting aliases; `just check` green.
 
 ### 3. Thread `config: &Config` through `build_state`
@@ -157,11 +157,11 @@ layer keeps env-driven tests green.
 
 ### 4. Wire the OSS binary + `maskura config --check`
 
-**Files:** `crates/gateway/src/main.rs`, `crates/s4ctl/src/main.rs`.
+**Files:** `crates/gateway/src/main.rs`, `crates/maskura/src/main.rs`.
 
 - Gateway: resolve config (default `./maskura.toml`, `--config`/`MASKURA_CONFIG`
   override), then call `build_state(…, &config)`.
-- `s4ctl`: add `config --check [--config <path>]` that loads and validates a file
+- `maskura`: add `config --check [--config <path>]` that loads and validates a file
   (defaults, file, env override, secret rejection) and prints a pass/fail report
   without booting.
 
@@ -204,7 +204,7 @@ invalid file and exit 0 for a valid one.
 - Validation test matrix is exhaustive per field: malformed input, missing
   required, schema-invalid (bad URL / key length / encoding), and contradictory
   combinations each produce a specific error and reject the config.
-- No customer-setting `S4_*` alias remains in the repo (sweep is exhaustive).
+- No customer-setting `MASKURA_*` alias remains in the repo (sweep is exhaustive).
 - `maskura config --check` exits 0 on a valid file and non-zero on an invalid one.
 - Private binary boots from `maskura-control.toml` with `base` fields honoured.
 
@@ -216,11 +216,11 @@ invalid file and exit 0 for a valid one.
 - One reference doc lists every setting, its default, its file key, and its env
   override name.
 - Secrets are impossible to put in the config file.
-- The `S4_*` customer-setting alias layer is fully removed; only operator-only
-  `S4_*` names remain.
+- The `MASKURA_*` customer-setting alias layer is fully removed; only operator-only
+  `MASKURA_*` names remain.
 
 ## Open Decisions
 
 - Whether `maskura config --check` also validates the private
   `maskura-control.toml` schema (requires the private crate to expose its schema
-  to `s4ctl`, likely out of scope for the OSS binary).
+  to `maskura`, likely out of scope for the OSS binary).

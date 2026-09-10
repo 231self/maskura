@@ -12,7 +12,7 @@ stages:
   script:
    - pip install -r requirements.txt
    - pip install -r test-requirements.txt
-   - pytest --cov=s4_client
+   - pytest --cov=maskura_client
 
 pytest-3.9:
   extends: .pytest

@@ -272,7 +272,7 @@ curl http://localhost:9000/ingest/data.jsonl \
     <div class="feature-card">
       <div class="feature-icon">&#x1F511;</div>
       <div class="feature-title">Simple ACL</div>
-      <div class="feature-desc">Maskura API keys (s4_xxx / s4s_xxx) authenticate S3 requests. Create, revoke, set expiry per key. No IAM policy complexity.</div>
+      <div class="feature-desc">Maskura API keys (maskura_xxx / maskura_secret_xxx) authenticate S3 requests. Create, revoke, set expiry per key. No IAM policy complexity.</div>
     </div>
     <div class="feature-card">
       <div class="feature-icon">&#x1F310;</div>
@@ -507,8 +507,8 @@ echo "https://s3.us-west-004.backblazeb2.com"</div>
   <div class="tab-content active" id="tab-bash">
     <div class="code-wrapper">
       <button class="copy-btn" onclick="copyBlock(this)">Copy</button>
-      <div class="code-block">export MASKURA_KEY=s4_YOUR_KEY_ID
-export MASKURA_SECRET=s4s_YOUR_SECRET
+      <div class="code-block">export MASKURA_KEY=maskura_YOUR_KEY_ID
+export MASKURA_SECRET=maskura_secret_YOUR_SECRET
 export MASKURA=http://localhost:9000
 
 # Generate a presigned PUT URL using your AWS credentials
@@ -540,8 +540,8 @@ presigned = s3.generate_presigned_url(
 r = requests.put(
     'http://localhost:9000/my-bucket/uploads/data.jsonl',
     headers={
-        'x-maskura-access-key': 's4_YOUR_KEY_ID',
-        'x-maskura-secret-key': 's4s_YOUR_SECRET',
+        'x-maskura-access-key': 'maskura_YOUR_KEY_ID',
+        'x-maskura-secret-key': 'maskura_secret_YOUR_SECRET',
         'x-maskura-backend-url': presigned
     },
     data=open('data.jsonl', 'rb')
@@ -567,8 +567,8 @@ let presigned = s3.put_object()
 // Send through Maskura
 let client = reqwest::Client::new();
 let resp = client.put("http://localhost:9000/my-bucket/uploads/data.jsonl")
-    .header("x-maskura-access-key", "s4_YOUR_KEY_ID")
-    .header("x-maskura-secret-key", "s4s_YOUR_SECRET")
+    .header("x-maskura-access-key", "maskura_YOUR_KEY_ID")
+    .header("x-maskura-secret-key", "maskura_secret_YOUR_SECRET")
     .header("x-maskura-backend-url", presigned.uri())
     .body(std::fs::read("data.jsonl")?)
     .send().await?;</div>
@@ -595,8 +595,8 @@ var presigned = presigner.presignPutObject(p -> p
 var client = HttpClient.newHttpClient();
 var httpReq = HttpRequest.newBuilder()
     .uri(URI.create("http://localhost:9000/my-bucket/uploads/data.jsonl"))
-    .header("x-maskura-access-key", "s4_YOUR_KEY_ID")
-    .header("x-maskura-secret-key", "s4s_YOUR_SECRET")
+    .header("x-maskura-access-key", "maskura_YOUR_KEY_ID")
+    .header("x-maskura-secret-key", "maskura_secret_YOUR_SECRET")
     .header("x-maskura-backend-url", presigned.url().toString())
     .PUT(HttpRequest.BodyPublishers.ofFile(Path.of("data.jsonl")))
     .build();

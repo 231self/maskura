@@ -10,7 +10,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib.sh"
 begin_feature "Plugin import / list / enable / reorder / remove over HTTP"
 
 if [ ! -f "$E2E_NOOP_COMPONENT" ]; then
-    fail "noop component missing at $E2E_NOOP_COMPONENT (run scripts/build-filters.sh first)"
+    fail "noop component missing at $E2E_NOOP_COMPONENT (run scripts/build-plugins.sh first)"
     end_feature "Plugin management over HTTP"
 fi
 

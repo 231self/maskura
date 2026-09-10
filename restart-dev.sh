@@ -31,24 +31,24 @@ echo "Port: $GATEWAY_PORT"
 
 echo ""
 echo "[1/3] Building Wasm filter components..."
-just build-filters
+just build-plugins
 
 echo ""
 echo "[2/3] Building gateway..."
-cargo build -p s4-gateway
+cargo build -p maskura-gateway
 
 echo ""
 echo "[3/3] Starting services..."
 kill_port "$GATEWAY_PORT"
 
-nohup env LISTEN_ADDR="0.0.0.0:$GATEWAY_PORT" AUTH_DISABLED="${AUTH_DISABLED:-true}" ./target/debug/s4-gateway > /tmp/s4-gateway.log 2>&1 &
+nohup env LISTEN_ADDR="0.0.0.0:$GATEWAY_PORT" AUTH_DISABLED="${AUTH_DISABLED:-true}" ./target/debug/maskura-gateway > /tmp/maskura-gateway.log 2>&1 &
 GATEWAY_PID=$!
 
 sleep 2
 
 if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
-  echo "ERROR: Gateway failed to start. Check /tmp/s4-gateway.log"
-  cat /tmp/s4-gateway.log
+  echo "ERROR: Gateway failed to start. Check /tmp/maskura-gateway.log"
+  cat /tmp/maskura-gateway.log
   exit 1
 fi
 
@@ -57,6 +57,6 @@ echo "=== All services started ==="
 echo "Dashboard: http://localhost:$GATEWAY_PORT"
 echo "Health:    http://localhost:$GATEWAY_PORT/health"
 echo "PID:       $GATEWAY_PID"
-echo "Logs:      /tmp/s4-gateway.log"
+echo "Logs:      /tmp/maskura-gateway.log"
 echo ""
 echo "Stop:      kill $GATEWAY_PID"

@@ -4,7 +4,7 @@ All URIs are relative to *http://localhost*
 
 Method | HTTP request | Description
 ------------- | ------------- | -------------
-[**createMcpToken**](McpApi.md#createMcpToken) | **POST** /dashboard/api/mcp-tokens | Create an MCP bearer token (&#x60;s4m_...&#x60;). The plaintext token is returned once and only its hash is stored.
+[**createMcpToken**](McpApi.md#createMcpToken) | **POST** /dashboard/api/mcp-tokens | Create an MCP bearer token (&#x60;maskura_mcp_...&#x60;). The plaintext token is returned once and only its hash is stored.
 [**deleteMcpToken**](McpApi.md#deleteMcpToken) | **DELETE** /dashboard/api/mcp-tokens | Revoke an MCP bearer token.
 [**getMcpTokens**](McpApi.md#getMcpTokens) | **GET** /dashboard/api/mcp-tokens | List MCP bearer tokens for the authenticated user (hashes only).
 

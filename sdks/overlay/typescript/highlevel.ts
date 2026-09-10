@@ -276,6 +276,3 @@ interface HybridPrivateKey {
   x25519Secret: Uint8Array;
   mlkemSecret: Uint8Array;
 }
-
-export type S4ClientOptions = MaskuraClientOptions;
-export class S4Client extends MaskuraClient {}

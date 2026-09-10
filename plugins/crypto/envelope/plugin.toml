@@ -1,0 +1,9 @@
+schema_version = 1
+id = "maskura.crypto.envelope"
+name = "Post-quantum envelope encryption"
+category = "crypto"
+status = "official"
+version = "0.1.0"
+world = "maskura:plugin/transformer@0.1.0"
+capabilities = ["public_key_pem", "entropy_seed"]
+

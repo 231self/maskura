@@ -19,19 +19,19 @@ only for literal loopback hosts (`localhost`, `127.0.0.0/8`, or `::1`).
 Build and install from the public source:
 
 ```bash
-cargo install --git https://github.com/231self/maskura --bin maskura-mcp s4-mcp
+cargo install --git https://github.com/231self/maskura --bin maskura-mcp maskura-mcp
 ```
 
 Linux x86_64 and arm64, plus native Apple Silicon, binaries are attached to each
 [Maskura GitHub release](https://github.com/231self/maskura/releases) as
 `maskura-mcp-linux-amd64`, `maskura-mcp-linux-arm64`, and
-`maskura-mcp-macos-arm64`. The `s4-mcp` binary and `s4_*` tools remain permanent
+`maskura-mcp-macos-arm64`. The `maskura-mcp` binary and `maskura_*` tools remain permanent
 compatibility aliases.
 
 There is currently no npm package or public hosted MCP endpoint. The public
 gateway does provide the foundation used by a hosted transport: shared typed
-contracts in `maskura-mcp-protocol` (re-exported as `s4_gateway::mcp`) and trusted in-process execution through
-`s4_gateway::server::invoke_mcp`.
+contracts in `maskura-mcp-protocol` (re-exported as `maskura_gateway::mcp`) and trusted in-process execution through
+`maskura_gateway::server::invoke_mcp`.
 
 ## Run locally
 
@@ -100,7 +100,7 @@ curl --fail-with-body \
   --data '{"label":"desktop-agent","expires_in":2592000}'
 ```
 
-The response reveals the `s4m_...` token once. Store it in a secret manager,
+The response reveals the `maskura_mcp_...` token once. Store it in a secret manager,
 not in source control. The token remains bound to the workspace selected when
 it was created.
 
@@ -112,8 +112,8 @@ Claude Desktop and Cursor use the standard `mcpServers` shape:
     "maskura": {
       "command": "maskura-mcp",
       "env": {
-        "MASKURA_GATEWAY_URL": "https://api.s4.231self.com",
-        "MASKURA_MCP_TOKEN": "s4m_your_token"
+        "MASKURA_GATEWAY_URL": "https://maskura.dev",
+        "MASKURA_MCP_TOKEN": "maskura_mcp_your_token"
       }
     }
   }
@@ -133,8 +133,8 @@ Kilo uses its local-process MCP configuration shape in `kilo.json`:
       "type": "local",
       "command": ["maskura-mcp"],
       "environment": {
-        "MASKURA_GATEWAY_URL": "https://api.s4.231self.com",
-        "MASKURA_MCP_TOKEN": "s4m_your_token"
+        "MASKURA_GATEWAY_URL": "https://maskura.dev",
+        "MASKURA_MCP_TOKEN": "maskura_mcp_your_token"
       },
       "enabled": true
     }
@@ -150,15 +150,15 @@ A Maskura API key pair can be used instead:
 
 ```json
 {
-  "MASKURA_GATEWAY_URL": "https://api.s4.231self.com",
-  "MASKURA_ACCESS_KEY": "s4_your_access_key",
-  "MASKURA_SECRET_KEY": "s4s_your_secret_key"
+  "MASKURA_GATEWAY_URL": "https://maskura.dev",
+  "MASKURA_ACCESS_KEY": "maskura_your_access_key",
+  "MASKURA_SECRET_KEY": "maskura_secret_your_secret_key"
 }
 ```
 
 `MASKURA_MCP_TOKEN` takes precedence when both credential forms are present. Secret
 values are validated at startup and are omitted from debug output.
-Legacy `S4_*` names remain accepted. If both forms are set, their values must
+Legacy `MASKURA_*` names remain accepted. If both forms are set, their values must
 match exactly, including empty values, or startup fails closed.
 
 ## Try it locally

@@ -1,0 +1,11 @@
+[package]
+name = "maskura-plugin-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Thin Rust bindings for the Maskura WebAssembly plugin contract"
+
+[dependencies]
+wit-bindgen.workspace = true
+

@@ -7,12 +7,12 @@ FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY dist/s4-gateway /usr/local/bin/s4-gateway
+COPY dist/maskura-gateway /usr/local/bin/maskura-gateway
 COPY dist/components /app/components
-ENV MASKURA_FILTER_COMPONENT=/app/components/pii-default.component.wasm
+ENV MASKURA_DEFAULT_PLUGIN=/app/components/pii-default.component.wasm
 ENV MASKURA_PLUGINS_DIR=/app/components
 ENV MASKURA_KEYS_FILE=/data/keys.json
 ENV LISTEN_ADDR=0.0.0.0:8080
 VOLUME ["/data"]
 EXPOSE 8080
-ENTRYPOINT ["s4-gateway"]
+ENTRYPOINT ["maskura-gateway"]

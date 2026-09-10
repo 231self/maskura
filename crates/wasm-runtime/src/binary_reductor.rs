@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use s4_error::{S4Error, codes};
+use maskura_error::{MaskuraError, codes};
 use sha2::{Digest, Sha256};
 
 use super::binary_reductor_bindings::{
@@ -114,11 +114,11 @@ pub struct BinaryReductorSession {
 }
 
 impl BinaryReductorEngine {
-    pub fn new(component_bytes: &[u8]) -> Result<Self, S4Error> {
+    pub fn new(component_bytes: &[u8]) -> Result<Self, MaskuraError> {
         Self::with_fuel(component_bytes, DEFAULT_FUEL)
     }
 
-    pub fn with_fuel(component_bytes: &[u8], fuel: u64) -> Result<Self, S4Error> {
+    pub fn with_fuel(component_bytes: &[u8], fuel: u64) -> Result<Self, MaskuraError> {
         Self::with_config(
             component_bytes,
             BinaryReductorConfig {
@@ -135,7 +135,7 @@ impl BinaryReductorEngine {
     pub fn with_limits(
         component_bytes: &[u8],
         runtime_limits: RuntimeLimits,
-    ) -> Result<Self, S4Error> {
+    ) -> Result<Self, MaskuraError> {
         Self::with_config(
             component_bytes,
             BinaryReductorConfig {
@@ -148,7 +148,7 @@ impl BinaryReductorEngine {
     pub fn with_config(
         component_bytes: &[u8],
         config: BinaryReductorConfig,
-    ) -> Result<Self, S4Error> {
+    ) -> Result<Self, MaskuraError> {
         validate_config(&config)?;
         validate_component_bytes(component_bytes, config.max_component_bytes)?;
         let boundary_limits = BinaryReductorBoundaryLimits::from(&config);
@@ -157,7 +157,7 @@ impl BinaryReductorEngine {
             config.runtime_limits,
             RuntimeCapabilityProfile::NoHostImports,
         )
-        .map_err(|error| S4Error::new(codes::COMPONENT_LOAD, error.to_string()))?;
+        .map_err(|error| MaskuraError::new(codes::COMPONENT_LOAD, error.to_string()))?;
         Ok(Self {
             runtime,
             boundary_limits,
@@ -177,14 +177,14 @@ impl BinaryReductorEngine {
         self.runtime.limits.cumulative_fuel
     }
 
-    pub fn start_session(&self) -> Result<BinaryReductorSession, S4Error> {
+    pub fn start_session(&self) -> Result<BinaryReductorSession, MaskuraError> {
         self.start_session_with_cancellation(CancellationToken::new())
     }
 
     pub fn start_session_with_cancellation(
         &self,
         cancellation: CancellationToken,
-    ) -> Result<BinaryReductorSession, S4Error> {
+    ) -> Result<BinaryReductorSession, MaskuraError> {
         self.start_session_with_control(
             cancellation,
             Instant::now() + self.runtime.limits.object_timeout,
@@ -195,7 +195,7 @@ impl BinaryReductorEngine {
         &self,
         cancellation: CancellationToken,
         object_deadline: Instant,
-    ) -> Result<BinaryReductorSession, S4Error> {
+    ) -> Result<BinaryReductorSession, MaskuraError> {
         let initial_fuel = self.runtime.limits.cumulative_fuel;
         let (mut runtime, instance) = self.runtime.instantiate(
             cancellation,
@@ -222,7 +222,7 @@ impl BinaryReductorEngine {
 }
 
 impl BinaryReductorSession {
-    pub fn plan(&mut self, source_schema_ir: &[u8]) -> Result<BinaryReductorPlan, S4Error> {
+    pub fn plan(&mut self, source_schema_ir: &[u8]) -> Result<BinaryReductorPlan, MaskuraError> {
         self.plan_with_fuel_limit(source_schema_ir, u64::MAX)
     }
 
@@ -230,7 +230,7 @@ impl BinaryReductorSession {
         &mut self,
         source_schema_ir: &[u8],
         fuel_limit: u64,
-    ) -> Result<BinaryReductorPlan, S4Error> {
+    ) -> Result<BinaryReductorPlan, MaskuraError> {
         validate_ir_bytes(
             "source Schema IR",
             source_schema_ir,
@@ -272,7 +272,7 @@ impl BinaryReductorSession {
         source_schema_ir: &[u8],
         transformed_reduced_schema_ir: &[u8],
         plan: &[u8],
-    ) -> Result<BinaryReductorRestorationPlan, S4Error> {
+    ) -> Result<BinaryReductorRestorationPlan, MaskuraError> {
         self.plan_restore_with_fuel_limit(
             source_schema_ir,
             transformed_reduced_schema_ir,
@@ -287,7 +287,7 @@ impl BinaryReductorSession {
         transformed_reduced_schema_ir: &[u8],
         plan: &[u8],
         fuel_limit: u64,
-    ) -> Result<BinaryReductorRestorationPlan, S4Error> {
+    ) -> Result<BinaryReductorRestorationPlan, MaskuraError> {
         validate_ir_bytes(
             "source Schema IR",
             source_schema_ir,
@@ -325,7 +325,7 @@ impl BinaryReductorSession {
         Ok(convert_restoration_plan(planned))
     }
 
-    pub fn reduce(&mut self, plan: &[u8], source_value_ir: &[u8]) -> Result<Vec<u8>, S4Error> {
+    pub fn reduce(&mut self, plan: &[u8], source_value_ir: &[u8]) -> Result<Vec<u8>, MaskuraError> {
         self.reduce_with_fuel_limit(plan, source_value_ir, u64::MAX)
     }
 
@@ -334,7 +334,7 @@ impl BinaryReductorSession {
         plan: &[u8],
         source_value_ir: &[u8],
         fuel_limit: u64,
-    ) -> Result<Vec<u8>, S4Error> {
+    ) -> Result<Vec<u8>, MaskuraError> {
         validate_plan_blob(plan, self.boundary_limits.max_plan_bytes)?;
         validate_ir_bytes(
             "source Value IR",
@@ -367,7 +367,7 @@ impl BinaryReductorSession {
         &mut self,
         restore_plan: &[u8],
         transformed_value_ir: &[u8],
-    ) -> Result<Vec<u8>, S4Error> {
+    ) -> Result<Vec<u8>, MaskuraError> {
         self.restore_with_fuel_limit(restore_plan, transformed_value_ir, u64::MAX)
     }
 
@@ -376,7 +376,7 @@ impl BinaryReductorSession {
         restore_plan: &[u8],
         transformed_value_ir: &[u8],
         fuel_limit: u64,
-    ) -> Result<Vec<u8>, S4Error> {
+    ) -> Result<Vec<u8>, MaskuraError> {
         validate_plan_blob(restore_plan, self.boundary_limits.max_plan_bytes)?;
         validate_ir_bytes(
             "transformed Value IR",
@@ -410,9 +410,9 @@ impl BinaryReductorSession {
     }
 }
 
-fn validate_config(config: &BinaryReductorConfig) -> Result<(), S4Error> {
+fn validate_config(config: &BinaryReductorConfig) -> Result<(), MaskuraError> {
     validate_runtime_limits(&config.runtime_limits)
-        .map_err(|error| S4Error::new(codes::CONFIG_INVALID, error.to_string()))?;
+        .map_err(|error| MaskuraError::new(codes::CONFIG_INVALID, error.to_string()))?;
     let limits = [
         ("component bytes", config.max_component_bytes),
         ("plan bytes", config.max_plan_bytes),
@@ -424,7 +424,7 @@ fn validate_config(config: &BinaryReductorConfig) -> Result<(), S4Error> {
         ("guest diagnostic bytes", config.max_guest_diagnostic_bytes),
     ];
     if let Some((name, _)) = limits.into_iter().find(|(_, value)| *value == 0) {
-        return Err(S4Error::new(
+        return Err(MaskuraError::new(
             codes::CONFIG_INVALID,
             format!("Wasm binary reductor {name} limit must be greater than zero"),
         ));
@@ -432,9 +432,12 @@ fn validate_config(config: &BinaryReductorConfig) -> Result<(), S4Error> {
     Ok(())
 }
 
-fn validate_component_bytes(component: &[u8], max_component_bytes: usize) -> Result<(), S4Error> {
+fn validate_component_bytes(
+    component: &[u8],
+    max_component_bytes: usize,
+) -> Result<(), MaskuraError> {
     if component.len() > max_component_bytes {
-        return Err(S4Error::new(
+        return Err(MaskuraError::new(
             codes::WASM_REDUCTOR_LIMIT,
             format!(
                 "Wasm binary reductor component is {} bytes; limit is {max_component_bytes}",
@@ -445,9 +448,9 @@ fn validate_component_bytes(component: &[u8], max_component_bytes: usize) -> Res
     Ok(())
 }
 
-fn validate_plan_blob(plan: &[u8], max_plan_bytes: usize) -> Result<(), S4Error> {
+fn validate_plan_blob(plan: &[u8], max_plan_bytes: usize) -> Result<(), MaskuraError> {
     if plan.len() > max_plan_bytes {
-        return Err(S4Error::new(
+        return Err(MaskuraError::new(
             codes::WASM_REDUCTOR_PLAN,
             format!(
                 "Wasm binary reductor plan is {} bytes; limit is {max_plan_bytes}",
@@ -458,9 +461,9 @@ fn validate_plan_blob(plan: &[u8], max_plan_bytes: usize) -> Result<(), S4Error>
     Ok(())
 }
 
-fn validate_ir_bytes(kind: &str, bytes: &[u8], max_bytes: usize) -> Result<(), S4Error> {
+fn validate_ir_bytes(kind: &str, bytes: &[u8], max_bytes: usize) -> Result<(), MaskuraError> {
     if bytes.len() > max_bytes {
-        return Err(S4Error::new(
+        return Err(MaskuraError::new(
             codes::WASM_REDUCTOR_LIMIT,
             format!(
                 "Wasm binary reductor {kind} is {} bytes; limit is {max_bytes}",
@@ -474,7 +477,7 @@ fn validate_ir_bytes(kind: &str, bytes: &[u8], max_bytes: usize) -> Result<(), S
 fn validate_claims(
     claims: &[BinaryReductorClaim],
     limits: BinaryReductorBoundaryLimits,
-) -> Result<(), S4Error> {
+) -> Result<(), MaskuraError> {
     if claims.len() > limits.max_claims {
         return Err(claim_limit_error(claims.len(), limits.max_claims));
     }
@@ -487,7 +490,7 @@ fn validate_claims(
             index,
         )?;
         if claim.path.len() > limits.max_claim_path_depth {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::WASM_REDUCTOR_CLAIM,
                 format!(
                     "Wasm binary reductor claim {index} path depth is {}; limit is {}",
@@ -508,13 +511,13 @@ fn validate_claims(
     paths.sort_unstable();
     for pair in paths.windows(2) {
         if pair[0] == pair[1] {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::WASM_REDUCTOR_CLAIM,
                 "Wasm binary reductor returned duplicate claim paths",
             ));
         }
         if pair[1].starts_with(pair[0]) {
-            return Err(S4Error::new(
+            return Err(MaskuraError::new(
                 codes::WASM_REDUCTOR_CLAIM,
                 "Wasm binary reductor returned prefix-overlapping claim paths",
             ));
@@ -523,8 +526,8 @@ fn validate_claims(
     Ok(())
 }
 
-fn claim_limit_error(actual: usize, limit: usize) -> S4Error {
-    S4Error::new(
+fn claim_limit_error(actual: usize, limit: usize) -> MaskuraError {
+    MaskuraError::new(
         codes::WASM_REDUCTOR_CLAIM,
         format!("Wasm binary reductor returned {actual} claims; limit is {limit}"),
     )
@@ -535,15 +538,15 @@ fn validate_identifier(
     identifier: &str,
     max_bytes: usize,
     claim_index: usize,
-) -> Result<(), S4Error> {
+) -> Result<(), MaskuraError> {
     if identifier.is_empty() {
-        return Err(S4Error::new(
+        return Err(MaskuraError::new(
             codes::WASM_REDUCTOR_CLAIM,
             format!("Wasm binary reductor claim {claim_index} has an empty {kind}"),
         ));
     }
     if identifier.len() > max_bytes {
-        return Err(S4Error::new(
+        return Err(MaskuraError::new(
             codes::WASM_REDUCTOR_CLAIM,
             format!(
                 "Wasm binary reductor claim {claim_index} {kind} is {} bytes; limit is {max_bytes}",
@@ -554,22 +557,22 @@ fn validate_identifier(
     Ok(())
 }
 
-fn guest_error(stage: &str, error: ReductorError, max_diagnostic_bytes: usize) -> S4Error {
+fn guest_error(stage: &str, error: ReductorError, max_diagnostic_bytes: usize) -> MaskuraError {
     if error.code.is_empty() {
-        return S4Error::new(
+        return MaskuraError::new(
             codes::WIT_INVALID,
             format!("{stage}: binary reductor returned an empty guest error code"),
         );
     }
     if error.code.len() > max_diagnostic_bytes || error.message.len() > max_diagnostic_bytes {
-        return S4Error::new(
+        return MaskuraError::new(
             codes::WIT_INVALID,
             format!(
                 "{stage}: binary reductor guest diagnostic exceeds {max_diagnostic_bytes} bytes"
             ),
         );
     }
-    S4Error::new(
+    MaskuraError::new(
         codes::WASM_REDUCTOR,
         format!("{stage}: {}: {}", error.code, error.message),
     )
@@ -638,7 +641,7 @@ mod tests {
             .join("target")
             .join("test-components")
             .join(name);
-        std::fs::read(path).expect("test component missing; run just build-filters")
+        std::fs::read(path).expect("test component missing; run just build-plugins")
     }
 
     fn reductor_component() -> Vec<u8> {
@@ -652,7 +655,7 @@ mod tests {
             .join("target")
             .join("components")
             .join("noop.component.wasm");
-        std::fs::read(path).expect("noop component missing; run just build-filters")
+        std::fs::read(path).expect("noop component missing; run just build-plugins")
     }
 
     fn boundary_limits() -> BinaryReductorBoundaryLimits {

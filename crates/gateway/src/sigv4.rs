@@ -98,8 +98,8 @@ impl SigV4Policy {
 
     pub fn from_env() -> Self {
         let expected_region =
-            std::env::var("S4_SIGV4_REGION").unwrap_or_else(|_| DEFAULT_REGION.to_string());
-        let trusted_tls_termination = std::env::var("S4_SIGV4_TRUSTED_TLS")
+            std::env::var("MASKURA_SIGV4_REGION").unwrap_or_else(|_| DEFAULT_REGION.to_string());
+        let trusted_tls_termination = std::env::var("MASKURA_SIGV4_TRUSTED_TLS")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         Self::new(expected_region, trusted_tls_termination)

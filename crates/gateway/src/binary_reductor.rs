@@ -7,8 +7,8 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use s4_error::{S4Error, codes};
-use s4_wasm_runtime::{
+use maskura_error::{MaskuraError, codes};
+use maskura_wasm_runtime::{
     BinaryReductorEngine as WasmBinaryReductorEngine,
     BinaryReductorPathSegment as WasmBinaryReductorPathSegment,
     BinaryReductorSession as WasmBinaryReductorSession, CancellationToken,
@@ -19,9 +19,9 @@ use crate::binary_ir::{
     BinaryIrLimits, SchemaIr, SchemaKind, SchemaPath, SchemaPathSegment, ValueIr,
 };
 
-const COMMON_IDENTITY_ID: &str = "s4:common-type-identity@1";
-const PLAN_HASH_DOMAIN: &[u8] = b"s4.binary-reductor.plan.v1";
-const RESTORE_PLAN_HASH_DOMAIN: &[u8] = b"s4.binary-reductor.restore-plan.v1";
+const COMMON_IDENTITY_ID: &str = "maskura:common-type-identity@1";
+const PLAN_HASH_DOMAIN: &[u8] = b"maskura.binary-reductor.plan.v1";
+const RESTORE_PLAN_HASH_DOMAIN: &[u8] = b"maskura.binary-reductor.restore-plan.v1";
 
 /// One logical schema subtree owned by a custom reductor.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,7 +89,7 @@ impl BinaryReductionPlan {
         custom_coverage: Vec<BinaryReductorClaim>,
         opaque_plan: Vec<u8>,
         limits: BinaryIrLimits,
-    ) -> Result<Self, S4Error> {
+    ) -> Result<Self, MaskuraError> {
         let claims = canonicalize_claims(claims)?;
         let custom_coverage = canonicalize_claims(custom_coverage)?;
         let source_encoded = source_schema.to_canonical_json(limits)?;
@@ -159,7 +159,7 @@ impl BinaryRestorePlan {
         output_schema: SchemaIr,
         opaque_restore_plan: Vec<u8>,
         limits: BinaryIrLimits,
-    ) -> Result<Self, S4Error> {
+    ) -> Result<Self, MaskuraError> {
         let transformed_encoded = transformed_reduced_schema.to_canonical_json(limits)?;
         let output_encoded = output_schema.to_canonical_json(limits)?;
         let plan_hash = hash_parts(
@@ -214,25 +214,25 @@ impl BinaryRestorePlan {
 /// Plans own all schema and opaque state needed by later calls, so callers only
 /// pass immutable plan references after planning succeeds.
 pub trait BinaryReductor {
-    fn plan(&mut self, source_schema: &SchemaIr) -> Result<BinaryReductionPlan, S4Error>;
+    fn plan(&mut self, source_schema: &SchemaIr) -> Result<BinaryReductionPlan, MaskuraError>;
 
     fn plan_restore(
         &mut self,
         plan: &BinaryReductionPlan,
         transformed_reduced_schema: &SchemaIr,
-    ) -> Result<BinaryRestorePlan, S4Error>;
+    ) -> Result<BinaryRestorePlan, MaskuraError>;
 
     fn reduce(
         &mut self,
         plan: &BinaryReductionPlan,
         source_value: &ValueIr,
-    ) -> Result<ValueIr, S4Error>;
+    ) -> Result<ValueIr, MaskuraError>;
 
     fn restore(
         &mut self,
         plan: &BinaryRestorePlan,
         transformed_value: &ValueIr,
-    ) -> Result<ValueIr, S4Error>;
+    ) -> Result<ValueIr, MaskuraError>;
 }
 
 /// Built-in identity reductor for the approved common Schema IR type set.
@@ -249,7 +249,7 @@ impl CommonTypeBinaryReductor {
         &mut self,
         source_schema: &SchemaIr,
         owned_claims: &[BinaryReductorClaim],
-    ) -> Result<BinaryReductionPlan, S4Error> {
+    ) -> Result<BinaryReductionPlan, MaskuraError> {
         source_schema.validate(self.limits)?;
         reject_unclaimed_custom_nodes(source_schema, owned_claims)?;
         BinaryReductionPlan::new(
@@ -271,7 +271,7 @@ impl Default for CommonTypeBinaryReductor {
 }
 
 impl BinaryReductor for CommonTypeBinaryReductor {
-    fn plan(&mut self, source_schema: &SchemaIr) -> Result<BinaryReductionPlan, S4Error> {
+    fn plan(&mut self, source_schema: &SchemaIr) -> Result<BinaryReductionPlan, MaskuraError> {
         self.plan_with_coverage(source_schema, &[])
     }
 
@@ -279,7 +279,7 @@ impl BinaryReductor for CommonTypeBinaryReductor {
         &mut self,
         plan: &BinaryReductionPlan,
         transformed_reduced_schema: &SchemaIr,
-    ) -> Result<BinaryRestorePlan, S4Error> {
+    ) -> Result<BinaryRestorePlan, MaskuraError> {
         ensure_owner(plan, &ReductorOwner::common_identity())?;
         transformed_reduced_schema.validate(self.limits)?;
         reject_unclaimed_custom_nodes(transformed_reduced_schema, plan.custom_coverage.as_ref())?;
@@ -296,7 +296,7 @@ impl BinaryReductor for CommonTypeBinaryReductor {
         &mut self,
         plan: &BinaryReductionPlan,
         source_value: &ValueIr,
-    ) -> Result<ValueIr, S4Error> {
+    ) -> Result<ValueIr, MaskuraError> {
         ensure_owner(plan, &ReductorOwner::common_identity())?;
         source_value.validate(plan.source_schema(), self.limits)?;
         let reduced = source_value.clone();
@@ -308,7 +308,7 @@ impl BinaryReductor for CommonTypeBinaryReductor {
         &mut self,
         plan: &BinaryRestorePlan,
         transformed_value: &ValueIr,
-    ) -> Result<ValueIr, S4Error> {
+    ) -> Result<ValueIr, MaskuraError> {
         ensure_owner(&plan.reduction, &ReductorOwner::common_identity())?;
         transformed_value.validate(&plan.transformed_reduced_schema, self.limits)?;
         let restored = transformed_value.clone();
@@ -317,7 +317,7 @@ impl BinaryReductor for CommonTypeBinaryReductor {
     }
 }
 
-/// Adapter from the bounded `s4:binary-reductor` runtime world to the typed
+/// Adapter from the bounded `maskura:binary-reductor` runtime world to the typed
 /// gateway contract used by binary codecs.
 ///
 /// The runtime bounds byte-oriented guest calls. This adapter is responsible
@@ -333,7 +333,7 @@ impl WasmBinaryReductor {
     pub fn start(
         engine: &WasmBinaryReductorEngine,
         limits: BinaryIrLimits,
-    ) -> Result<Self, S4Error> {
+    ) -> Result<Self, MaskuraError> {
         Self::start_with_cancellation(engine, limits, CancellationToken::new())
     }
 
@@ -341,7 +341,7 @@ impl WasmBinaryReductor {
         engine: &WasmBinaryReductorEngine,
         limits: BinaryIrLimits,
         cancellation: CancellationToken,
-    ) -> Result<Self, S4Error> {
+    ) -> Result<Self, MaskuraError> {
         let session = engine.start_session_with_cancellation(cancellation)?;
         Ok(Self {
             session,
@@ -355,7 +355,7 @@ impl WasmBinaryReductor {
         limits: BinaryIrLimits,
         cancellation: CancellationToken,
         object_deadline: Instant,
-    ) -> Result<Self, S4Error> {
+    ) -> Result<Self, MaskuraError> {
         let session = engine.start_session_with_control(cancellation, object_deadline)?;
         Ok(Self {
             session,
@@ -376,7 +376,7 @@ impl WasmBinaryReductor {
 }
 
 impl BinaryReductor for WasmBinaryReductor {
-    fn plan(&mut self, source_schema: &SchemaIr) -> Result<BinaryReductionPlan, S4Error> {
+    fn plan(&mut self, source_schema: &SchemaIr) -> Result<BinaryReductionPlan, MaskuraError> {
         source_schema.validate(self.limits)?;
         let source_encoded = source_schema.to_canonical_json(self.limits)?;
         let planned = self.session.plan(&source_encoded)?;
@@ -401,7 +401,7 @@ impl BinaryReductor for WasmBinaryReductor {
         &mut self,
         plan: &BinaryReductionPlan,
         transformed_reduced_schema: &SchemaIr,
-    ) -> Result<BinaryRestorePlan, S4Error> {
+    ) -> Result<BinaryRestorePlan, MaskuraError> {
         ensure_owner(plan, &self.owner)?;
         transformed_reduced_schema.validate(self.limits)?;
         let source_encoded = plan.source_schema().to_canonical_json(self.limits)?;
@@ -429,7 +429,7 @@ impl BinaryReductor for WasmBinaryReductor {
         &mut self,
         plan: &BinaryReductionPlan,
         source_value: &ValueIr,
-    ) -> Result<ValueIr, S4Error> {
+    ) -> Result<ValueIr, MaskuraError> {
         ensure_owner(plan, &self.owner)?;
         source_value.validate(plan.source_schema(), self.limits)?;
         let source_encoded = source_value.to_canonical_json(plan.source_schema(), self.limits)?;
@@ -441,7 +441,7 @@ impl BinaryReductor for WasmBinaryReductor {
         &mut self,
         plan: &BinaryRestorePlan,
         transformed_value: &ValueIr,
-    ) -> Result<ValueIr, S4Error> {
+    ) -> Result<ValueIr, MaskuraError> {
         ensure_owner(&plan.reduction, &self.owner)?;
         transformed_value.validate(plan.transformed_reduced_schema(), self.limits)?;
         let transformed_encoded =
@@ -454,7 +454,7 @@ impl BinaryReductor for WasmBinaryReductor {
 }
 
 fn convert_wasm_claims(
-    claims: Vec<s4_wasm_runtime::BinaryReductorClaim>,
+    claims: Vec<maskura_wasm_runtime::BinaryReductorClaim>,
 ) -> Vec<BinaryReductorClaim> {
     claims
         .into_iter()
@@ -487,7 +487,7 @@ fn convert_wasm_claims(
 fn validate_claims_against_schema(
     schema: &SchemaIr,
     claims: &[BinaryReductorClaim],
-) -> Result<(), S4Error> {
+) -> Result<(), MaskuraError> {
     for claim in claims {
         let node = schema.node_at_path(claim.path()).ok_or_else(|| {
             claim_error(format!(
@@ -521,7 +521,7 @@ fn ensure_schema_changes_are_claimed(
     source: &SchemaIr,
     transformed: &SchemaIr,
     claims: &[BinaryReductorClaim],
-) -> Result<(), S4Error> {
+) -> Result<(), MaskuraError> {
     let mut path = SchemaPath::root();
     ensure_node_changes_are_claimed(&source.root, &transformed.root, claims, &mut path)
 }
@@ -531,7 +531,7 @@ fn ensure_node_changes_are_claimed(
     transformed: &crate::binary_ir::SchemaNode,
     claims: &[BinaryReductorClaim],
     path: &mut SchemaPath,
-) -> Result<(), S4Error> {
+) -> Result<(), MaskuraError> {
     if claims
         .iter()
         .any(|claim| path_is_prefix(claim.path(), path))
@@ -608,7 +608,7 @@ fn ensure_node_changes_are_claimed(
     }
 }
 
-fn unclaimed_schema_change(path: &SchemaPath) -> S4Error {
+fn unclaimed_schema_change(path: &SchemaPath) -> MaskuraError {
     plan_error(format!(
         "reductor changed schema outside its declared claims at {path}"
     ))
@@ -617,7 +617,7 @@ fn unclaimed_schema_change(path: &SchemaPath) -> S4Error {
 fn reject_unclaimed_custom_nodes(
     schema: &SchemaIr,
     claims: &[BinaryReductorClaim],
-) -> Result<(), S4Error> {
+) -> Result<(), MaskuraError> {
     let mut unclaimed = None;
     schema.visit_paths(|path, node| {
         if unclaimed.is_none()
@@ -637,7 +637,7 @@ fn reject_unclaimed_custom_nodes(
 
 fn canonicalize_claims(
     mut claims: Vec<BinaryReductorClaim>,
-) -> Result<Vec<BinaryReductorClaim>, S4Error> {
+) -> Result<Vec<BinaryReductorClaim>, MaskuraError> {
     claims.sort_by(compare_claims);
     for pair in claims.windows(2) {
         if pair[0].path == pair[1].path {
@@ -690,7 +690,7 @@ fn path_is_prefix(prefix: &SchemaPath, path: &SchemaPath) -> bool {
     path.segments().starts_with(prefix.segments())
 }
 
-fn ensure_owner(plan: &BinaryReductionPlan, expected: &ReductorOwner) -> Result<(), S4Error> {
+fn ensure_owner(plan: &BinaryReductionPlan, expected: &ReductorOwner) -> Result<(), MaskuraError> {
     if &plan.owner != expected {
         return Err(plan_error(format!(
             "plan belongs to {} instead of {}",
@@ -701,12 +701,12 @@ fn ensure_owner(plan: &BinaryReductionPlan, expected: &ReductorOwner) -> Result<
     Ok(())
 }
 
-fn claim_error(message: impl Into<String>) -> S4Error {
-    S4Error::new(codes::WASM_REDUCTOR_CLAIM, message)
+fn claim_error(message: impl Into<String>) -> MaskuraError {
+    MaskuraError::new(codes::WASM_REDUCTOR_CLAIM, message)
 }
 
-fn plan_error(message: impl Into<String>) -> S4Error {
-    S4Error::new(codes::WASM_REDUCTOR_PLAN, message)
+fn plan_error(message: impl Into<String>) -> MaskuraError {
+    MaskuraError::new(codes::WASM_REDUCTOR_PLAN, message)
 }
 
 fn hash_reduction_plan(
@@ -881,7 +881,7 @@ mod tests {
             .join("target")
             .join("test-components")
             .join("test-binary-reductor.component.wasm");
-        std::fs::read(path).expect("test component missing; run just build-filters")
+        std::fs::read(path).expect("test component missing; run just build-plugins")
     }
 
     #[test]

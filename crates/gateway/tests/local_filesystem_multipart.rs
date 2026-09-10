@@ -9,17 +9,17 @@
 //! `FileMultipartRepository`, file wrapping key, operation journal, file
 //! artifacts, and the `MultipartCompletionCoordinator` with file proofs.
 //!
-//! The Wasm filter component must be built first (`just build-filters`).
+//! The Wasm filter component must be built first (`just build-plugins`).
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use s4_gateway::control::NoopControlPlane;
-use s4_gateway::key_cipher::default_wrapping;
-use s4_gateway::server::{
+use maskura_gateway::control::NoopControlPlane;
+use maskura_gateway::key_cipher::default_wrapping;
+use maskura_gateway::server::{
     AppState, StatePipelineTemplate, build_router, build_state_with_pipeline_template,
 };
-use s4_gateway::workspace_storage::{InMemoryWorkspaceStorageRepository, WorkspaceId};
+use maskura_gateway::workspace_storage::{InMemoryWorkspaceStorageRepository, WorkspaceId};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
@@ -96,8 +96,8 @@ fn remove_host_configuration(env: &mut EnvRestore) {
     for name in [
         "DATABASE_URL",
         "S3_ENDPOINT",
-        "S4_SECRET_KEK",
-        "S4_SERVICE_BUCKETS",
+        "MASKURA_SECRET_KEK",
+        "MASKURA_SERVICE_BUCKETS",
         "S3_ACCESS_KEY_ID",
         "S3_SECRET_ACCESS_KEY",
         "AWS_ACCESS_KEY_ID",
@@ -105,20 +105,20 @@ fn remove_host_configuration(env: &mut EnvRestore) {
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
         "MASKURA_KEYS_FILE",
-        "MASKURA_FILTER_COMPONENT",
-        "S4_MULTIPART_STAGING_DIR",
-        "S4_MULTIPART_STAGING_ENDPOINT",
-        "S4_MULTIPART_STAGING_BUCKET",
-        "S4_MULTIPART_STAGING_ACCESS_KEY_ID",
-        "S4_MULTIPART_STAGING_SECRET_ACCESS_KEY",
-        "S4_MULTIPART_STAGING_REGION",
-        "S4_MULTIPART_STAGING_TENANT_QUOTA_BYTES",
-        "S4_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES",
+        "MASKURA_DEFAULT_PLUGIN",
+        "MASKURA_MULTIPART_STAGING_DIR",
+        "MASKURA_MULTIPART_STAGING_ENDPOINT",
+        "MASKURA_MULTIPART_STAGING_BUCKET",
+        "MASKURA_MULTIPART_STAGING_ACCESS_KEY_ID",
+        "MASKURA_MULTIPART_STAGING_SECRET_ACCESS_KEY",
+        "MASKURA_MULTIPART_STAGING_REGION",
+        "MASKURA_MULTIPART_STAGING_TENANT_QUOTA_BYTES",
+        "MASKURA_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES",
         "MASKURA_DEV_MEMORY_STREAMING",
         "MASKURA_SPOOL_DIR",
         "MASKURA_TRANSFORMED_READ_SPOOL",
-        "S4_MANAGED_STREAMING_MODE",
-        "S4_MANAGED_STREAMING_TRANSACTIONAL",
+        "MASKURA_MANAGED_STREAMING_MODE",
+        "MASKURA_MANAGED_STREAMING_TRANSACTIONAL",
     ] {
         env.remove(name);
     }
@@ -474,7 +474,7 @@ async fn run_single_lifecycle() {
     let components = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/components");
     assert!(
         components.is_dir(),
-        "built filter components missing at {}; run `just build-filters`",
+        "built filter components missing at {}; run `just build-plugins`",
         components.display()
     );
 
@@ -1071,7 +1071,7 @@ async fn run_restart_matrix() {
     let components = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/components");
     assert!(
         components.is_dir(),
-        "built filter components missing at {}; run `just build-filters`",
+        "built filter components missing at {}; run `just build-plugins`",
         components.display()
     );
 

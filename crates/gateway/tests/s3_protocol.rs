@@ -1,5 +1,5 @@
 use axum::http::{StatusCode, header};
-use s4_gateway::s3_error;
+use maskura_gateway::s3_error;
 
 fn body_of(resp: axum::response::Response) -> String {
     let body = resp.into_body();

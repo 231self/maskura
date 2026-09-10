@@ -1,8 +1,8 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::{Router, response::Html, routing::get};
-use s4_gateway::Gateway;
-use s4_gateway::store::{KeyStore, MemoryStore};
+use maskura_gateway::Gateway;
+use maskura_gateway::store::{KeyStore, MemoryStore};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;

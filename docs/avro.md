@@ -39,7 +39,7 @@ Avro OCF -> Schema/Value IR -> BinaryReductor -> BinaryTransform
          -> BinaryReductor restore -> validated Schema/Value IR -> Avro OCF
 ```
 
-Text `s4:filter` plugins are not inserted in this flow. They receive opaque
+Text `maskura:filter` plugins are not inserted in this flow. They receive opaque
 bytes and cannot declare an output schema.
 
 ## Envelope encryption
@@ -63,8 +63,8 @@ before disclosure. Processed read failures never disclose raw source bytes.
 ## Verify codec work
 
 ```bash
-cargo test -p s4-gateway avro::tests
-cargo test -p s4-gateway binary_pump::tests
+cargo test -p maskura-gateway avro::tests
+cargo test -p maskura-gateway binary_pump::tests
 ```
 
 The suite covers OCF schema/value round trips, nullable/container records,

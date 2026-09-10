@@ -6,7 +6,7 @@ use axum::body::Body;
 use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use http_body_util::BodyExt;
-use s4_gateway::object::{BodyLimits, ObjectMetadata, OpenedObject};
+use maskura_gateway::object::{BodyLimits, ObjectMetadata, OpenedObject};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const FRAME_BYTES: usize = 64 * 1024;

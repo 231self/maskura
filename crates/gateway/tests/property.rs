@@ -1,8 +1,8 @@
 mod common;
 
+use maskura_gateway::Format;
+use maskura_gateway::plugin_registry::PluginRegistry;
 use proptest::prelude::*;
-use s4_gateway::Format;
-use s4_gateway::plugin_registry::PluginRegistry;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -20,7 +20,7 @@ fn registry() -> &'static PluginRegistry {
     static REGISTRY: OnceLock<PluginRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         let component = fs::read(component_path())
-            .expect("filter component not found; run `just build-filters` first");
+            .expect("filter component not found; run `just build-plugins` first");
         let registry = PluginRegistry::new();
         registry.import("pii-default", &component).unwrap();
         registry

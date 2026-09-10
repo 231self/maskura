@@ -1,7 +1,7 @@
 # Gateway Filter Pipeline Performance Benchmark
 
 Status: planned
-Scope: self-hosted OSS `s4:filter` plugin pipeline only
+Scope: self-hosted OSS `maskura:filter` plugin pipeline only
 Repositories: public `231self/maskura` (gateway + Wasm runtime + filters)
 
 ## Objective
@@ -40,11 +40,11 @@ headline is a "cost multiplier vs. noop" per plugin.
   and `PipelineSession` exposes `fuel_consumed()`, `input_bytes()`, and
   `output_bytes()`. Wasmtime fuel is a deterministic, hardware-independent proxy
   for guest CPU, so it is the primary cross-machine metric.
-- `scripts/build-filters.sh` builds seven components into
+- `scripts/build-plugins.sh` builds seven components into
   `target/components/*.component.wasm`: `noop`, `pii-default`, `email-detect`,
   `ssn-detect`, `card-detect`, `envelope-encrypt`, `stable-encrypt`.
 - The self-hosted plugin set is controlled by `MASKURA_PLUGINS_DIR` (legacy
-  `S4_PLUGINS_DIR`), loaded at startup (`server.rs:725`); an empty directory is
+  `MASKURA_PLUGINS_DIR`), loaded at startup (`server.rs:725`); an empty directory is
   the operator's explicit pass-through choice.
 - `just bench-rss` already runs `tests/streaming_rss.rs`, which asserts a 1 GiB
   source grows peak RSS by at most 128 MiB — the memory-bound harness to reuse.
@@ -67,13 +67,13 @@ headline is a "cost multiplier vs. noop" per plugin.
    (`text/plain`, `jsonl`, `csv`), and — e2e only — executor concurrency.
 5. Add a dedicated release-like benchmark profile with `opt-level = 3` (the
    production `release` profile is `opt-level = "s"`); benchmark Wasm guests are
-   built with the production `build-filters.sh` path unchanged so numbers reflect
+   built with the production `build-plugins.sh` path unchanged so numbers reflect
    shipped artifacts.
 6. Report fuel-exhaustion and memory/expansion limits as first-class results for
    high-density `envelope-encrypt` payloads, not as afterthoughts.
 7. Keep the harness self-contained: it must not require a cloud account, Supabase,
    or the private control plane. Local MinIO via `local/docker-compose.yml` and
-   `s4ctl` are the only infra.
+   `maskura` are the only infra.
 
 ## Ordered Implementation
 
@@ -106,7 +106,7 @@ table-rendering step.
 - Baseline runs: direct-to-MinIO (no gateway), gateway pass-through, and gateway
   `noop`. Then each real filter and the two-stage chain.
 - Generate payloads with configurable PII density/format/size; drive uploads with
-  `s4ctl` (or curl + SigV4) at fixed concurrency, timing each object.
+  `maskura` (or curl + SigV4) at fixed concurrency, timing each object.
 - Collect the gateway's emitted `PipelineEvidence` (fuel + duration) from usage
   events/logs and emit CSV + markdown tables.
 
@@ -124,7 +124,7 @@ emerges).
   plus fixed-overhead, expansion, and fuel-exhaustion notes.
 
 **Verify:** a reviewer can reproduce the tables from a clean checkout with
-`just build-filters` + the benchmark commands, with no cloud credentials.
+`just build-plugins` + the benchmark commands, with no cloud credentials.
 
 ## Verification Gates
 

@@ -214,33 +214,17 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     ];
     definitions
         .into_iter()
-        .flat_map(|(name, description, input_schema)| {
-            let legacy = match name {
-                "maskura_put_object" => "s4_put_object",
-                "maskura_get_object" => "s4_get_object",
-                "maskura_list_objects" => "s4_list_objects",
-                "maskura_delete_object" => "s4_delete_object",
-                _ => unreachable!("tool definitions are static"),
-            };
-            [
-                ToolDefinition {
-                    name,
-                    description,
-                    input_schema: input_schema.clone(),
-                },
-                ToolDefinition {
-                    name: legacy,
-                    description,
-                    input_schema,
-                },
-            ]
+        .map(|(name, description, input_schema)| ToolDefinition {
+            name,
+            description,
+            input_schema,
         })
         .collect()
 }
 
 pub fn dispatch(name: &str, arguments: serde_json::Value) -> Result<ToolRequest, DispatchError> {
     let canonical = name
-        .strip_prefix("s4_")
+        .strip_prefix("maskura_")
         .map_or(name, |suffix| match suffix {
             "put_object" => "maskura_put_object",
             "get_object" => "maskura_get_object",
@@ -374,7 +358,7 @@ mod tests {
         let hash = document.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
         });
-        assert_eq!(hash, 1_844_581_680_589_375_509);
+        assert_eq!(hash, 11_986_271_160_452_919_954);
     }
 
     #[test]

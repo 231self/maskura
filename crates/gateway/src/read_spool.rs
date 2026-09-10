@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::transaction::{READ_FILE_PREFIX, SpoolQuota, TransactionError};
-use s4_wasm_runtime::CancellationToken;
+use maskura_wasm_runtime::CancellationToken;
 
 const NONCE_BYTES: usize = 12;
 const PLAINTEXT_FRAME_BYTES: usize = 64 * 1024;

@@ -27,12 +27,12 @@ expect_status 200 "$code" "POST /dashboard/api/keys"
 KEY_ID="$(json_field "$E2E_TMP/30-key.json" '["key_id"]')"
 SECRET="$(json_field "$E2E_TMP/30-key.json" '["secret"]')"
 case "$KEY_ID" in
-    s4_*) pass "created key id uses the s4_ prefix ($KEY_ID)" ;;
-    *) fail "created key id '$KEY_ID' does not start with s4_" ;;
+    maskura_*) pass "created key id uses the maskura_ prefix ($KEY_ID)" ;;
+    *) fail "created key id '$KEY_ID' does not start with maskura_" ;;
 esac
 case "$SECRET" in
-    s4s_*) pass "created key secret uses the s4s_ prefix" ;;
-    *) fail "created key secret does not start with s4s_" ;;
+    maskura_secret_*) pass "created key secret uses the maskura_secret_ prefix" ;;
+    *) fail "created key secret does not start with maskura_secret_" ;;
 esac
 
 # 2. GET /dashboard/api/keys lists the new key (without the secret).

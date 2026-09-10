@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use s4_gateway::control::NoopControlPlane;
-use s4_gateway::key_cipher::default_wrapping;
-use s4_gateway::server::{build_router, build_state};
-use s4_gateway::workspace_storage::InMemoryWorkspaceStorageRepository;
+use maskura_gateway::control::NoopControlPlane;
+use maskura_gateway::key_cipher::default_wrapping;
+use maskura_gateway::server::{build_router, build_state};
+use maskura_gateway::workspace_storage::InMemoryWorkspaceStorageRepository;
 use tracing::info;
 
 #[tokio::main]

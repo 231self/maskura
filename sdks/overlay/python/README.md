@@ -1,8 +1,7 @@
 # Maskura Python SDK (`maskura-client`)
 
-Generated Python client for the Maskura Gateway API. The canonical import is
-`maskura_client`; the permanent <code>s4&#95;client</code> compatibility namespace is included
-in the same distribution.
+Generated Python client for the Maskura Gateway API. Import it as
+`maskura_client`.
 
 ## Requirements
 
@@ -27,11 +26,11 @@ pip install https://github.com/231self/maskura/releases/latest/download/maskura-
 ```python
 from maskura_client import Configuration, MaskuraClient
 
-configuration = Configuration(host="https://api.s4.231self.com")
+configuration = Configuration(host="https://maskura.dev")
 client = MaskuraClient(
     endpoint=configuration.host,
-    access_key="s4_example",
-    secret_key="s4s_example",
+    access_key="maskura_example",
+    secret_key="maskura_secret_example",
 )
 ```
 

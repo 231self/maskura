@@ -270,7 +270,9 @@ impl BackendResolver {
         // workspace cannot be redirected into Maskura-managed storage by a header.
         if self.explicit_single_tenant && managed_requested {
             if self.managed.is_empty() {
-                return Err("managed storage is not configured (no S4_SERVICE_BUCKETS)".to_string());
+                return Err(
+                    "managed storage is not configured (no MASKURA_SERVICE_BUCKETS)".to_string(),
+                );
             }
             return Ok(ResolvedBackendSelection {
                 backend: ResolvedBackend::Managed(self.managed.clone()),
@@ -304,7 +306,7 @@ impl BackendResolver {
             Some(RuntimeBackendConfig::Managed) => {
                 if self.managed.is_empty() {
                     return Err(
-                        "workspace requires managed storage, but S4_SERVICE_BUCKETS is not configured"
+                        "workspace requires managed storage, but MASKURA_SERVICE_BUCKETS is not configured"
                             .to_string(),
                     );
                 }
@@ -658,7 +660,7 @@ impl WorkspaceEndpointPolicy {
             .collect::<Result<HashSet<_>, _>>()?;
         if !explicit_single_tenant && !private_allowed_hosts.is_empty() {
             return Err(
-                "S4_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST requires explicit single-tenant mode"
+                "MASKURA_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST requires explicit single-tenant mode"
                     .to_string(),
             );
         }
@@ -671,8 +673,9 @@ impl WorkspaceEndpointPolicy {
     }
 
     pub fn from_env(explicit_single_tenant: bool) -> Result<Self, String> {
-        let trusted_hosts = parse_allowlist_env("S4_WORKSPACE_ENDPOINT_ALLOWLIST")?;
-        let private_allowed_hosts = parse_allowlist_env("S4_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST")?;
+        let trusted_hosts = parse_allowlist_env("MASKURA_WORKSPACE_ENDPOINT_ALLOWLIST")?;
+        let private_allowed_hosts =
+            parse_allowlist_env("MASKURA_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST")?;
         Self::new(
             explicit_single_tenant,
             trusted_hosts,
@@ -735,7 +738,8 @@ impl WorkspaceEndpointPolicy {
                 .any(|allowed| allowed.matches(&host))
             {
                 return Err(
-                    "workspace endpoint host is not in S4_WORKSPACE_ENDPOINT_ALLOWLIST".to_string(),
+                    "workspace endpoint host is not in MASKURA_WORKSPACE_ENDPOINT_ALLOWLIST"
+                        .to_string(),
                 );
             }
         }
@@ -895,15 +899,15 @@ impl PresignedHttpPolicy {
     }
 
     pub fn from_env() -> Result<Self, String> {
-        let allowed_hosts = parse_allowlist_env("S4_PRESIGNED_HTTP_ALLOWLIST")?;
-        let allow_http = std::env::var("S4_PRESIGNED_HTTP_ALLOW_HTTP")
+        let allowed_hosts = parse_allowlist_env("MASKURA_PRESIGNED_HTTP_ALLOWLIST")?;
+        let allow_http = std::env::var("MASKURA_PRESIGNED_HTTP_ALLOW_HTTP")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-        let minimum_validity = std::env::var("S4_PRESIGNED_HTTP_MIN_VALIDITY_SECS")
+        let minimum_validity = std::env::var("MASKURA_PRESIGNED_HTTP_MIN_VALIDITY_SECS")
             .ok()
             .and_then(|value| value.parse().ok())
             .map(Duration::from_secs)
             .unwrap_or(Duration::from_secs(30));
-        let private_allowed_hosts = std::env::var("S4_PRESIGNED_HTTP_PRIVATE_ALLOWLIST")
+        let private_allowed_hosts = std::env::var("MASKURA_PRESIGNED_HTTP_PRIVATE_ALLOWLIST")
             .unwrap_or_default()
             .split(',')
             .map(str::trim)
@@ -962,7 +966,9 @@ impl PresignedHttpPolicy {
             .ok_or_else(|| "presigned URL must have a host".to_string())?
             .to_ascii_lowercase();
         if !self.host_allowed(&host) {
-            return Err("presigned URL host is not in S4_PRESIGNED_HTTP_ALLOWLIST".to_string());
+            return Err(
+                "presigned URL host is not in MASKURA_PRESIGNED_HTTP_ALLOWLIST".to_string(),
+            );
         }
         match url.scheme() {
             "https" => {}

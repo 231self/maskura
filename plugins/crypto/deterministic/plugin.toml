@@ -1,0 +1,9 @@
+schema_version = 1
+id = "maskura.crypto.deterministic"
+name = "Deterministic field encryption"
+category = "crypto"
+status = "experimental"
+version = "0.1.0"
+world = "maskura:plugin/transformer@0.1.0"
+capabilities = ["stable_key", "stable_fields"]
+

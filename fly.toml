@@ -2,10 +2,10 @@
 #
 #   fly launch --no-deploy
 #   fly secrets set SUPABASE_URL=... SUPABASE_ANON_KEY=... SUPABASE_JWT_SECRET=... \
-#     DATABASE_URL=... S4_SERVICE_BUCKETS=... AUTH_DISABLED=false
+#     DATABASE_URL=... MASKURA_SERVICE_BUCKETS=... AUTH_DISABLED=false
 #   fly deploy
 
-app = "s4"
+app = "maskura"
 
 [build]
   image = "ghcr.io/231self/maskura/maskura:latest"

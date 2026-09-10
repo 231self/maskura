@@ -358,8 +358,8 @@ mod tests {
             .await
             .unwrap();
         let temporary = runtime.staging_artifacts().temporary_root().to_path_buf();
-        let owned = temporary.join(format!("s4-multipart-{}.enc", Uuid::now_v7()));
-        let prefix_only = temporary.join("s4-multipart-not-owned");
+        let owned = temporary.join(format!("maskura-multipart-{}.enc", Uuid::now_v7()));
+        let prefix_only = temporary.join("maskura-multipart-not-owned");
         let unrelated = temporary.join("operator-file");
         std::fs::write(&owned, b"owned").unwrap();
         std::fs::write(&prefix_only, b"keep").unwrap();

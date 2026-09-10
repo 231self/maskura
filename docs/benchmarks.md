@@ -9,7 +9,7 @@ indicative for one Apple Silicon machine.
 ## Run it
 
 ```bash
-just bench-filters
+just bench-plugins
 ```
 
 This builds the filter components and prints the full sweep. It writes machine

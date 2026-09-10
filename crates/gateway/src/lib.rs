@@ -35,8 +35,8 @@ pub mod store;
 pub mod transaction;
 pub mod workspace_storage;
 
+use maskura_wasm_runtime::FilterEngine;
 use plugin_registry::PluginRegistry;
-use s4_wasm_runtime::FilterEngine;
 use std::sync::Arc;
 
 pub use format::Format;
@@ -110,10 +110,10 @@ impl Gateway {
         workspace_id: &str,
         bucket: &str,
         direction: PipelineDirection,
-    ) -> Result<pipeline::PipelineResolution, s4_error::S4Error> {
+    ) -> Result<pipeline::PipelineResolution, maskura_error::MaskuraError> {
         let resolver = self.resolver.as_ref().ok_or_else(|| {
-            s4_error::S4Error::new(
-                s4_error::codes::CONFIG_INVALID,
+            maskura_error::MaskuraError::new(
+                maskura_error::codes::CONFIG_INVALID,
                 "no pipeline resolver is configured",
             )
         })?;
@@ -130,7 +130,7 @@ impl Gateway {
         workspace_id: &str,
         bucket: &str,
         direction: PipelineDirection,
-    ) -> Result<plugin_registry::PipelineSnapshot, s4_error::S4Error> {
+    ) -> Result<plugin_registry::PipelineSnapshot, maskura_error::MaskuraError> {
         let resolution = self.resolve(workspace_id, bucket, direction).await?;
         self.snapshot_for(&resolution).await
     }
@@ -141,16 +141,16 @@ impl Gateway {
     pub async fn snapshot_for(
         &self,
         resolution: &pipeline::PipelineResolution,
-    ) -> Result<plugin_registry::PipelineSnapshot, s4_error::S4Error> {
+    ) -> Result<plugin_registry::PipelineSnapshot, maskura_error::MaskuraError> {
         let source = self.component_source.as_ref().ok_or_else(|| {
-            s4_error::S4Error::new(
-                s4_error::codes::CONFIG_INVALID,
+            maskura_error::MaskuraError::new(
+                maskura_error::codes::CONFIG_INVALID,
                 "no component source is configured",
             )
         })?;
         let registry = self.plugins.as_ref().ok_or_else(|| {
-            s4_error::S4Error::new(
-                s4_error::codes::CONFIG_INVALID,
+            maskura_error::MaskuraError::new(
+                maskura_error::codes::CONFIG_INVALID,
                 "no plugin registry is configured",
             )
         })?;

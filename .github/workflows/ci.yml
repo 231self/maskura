@@ -34,7 +34,7 @@ jobs:
         run: cargo fmt --check
       - name: Proof harness syntax
         run: |
-          bash -n examples/prove-maskura.sh examples/local-quickstart.sh examples/maskura-demo.sh scripts/bench-filters.sh scripts/release-notes.sh scripts/post-release-discord.sh scripts/test-release-notifications.sh
+          bash -n examples/prove-maskura.sh examples/local-quickstart.sh examples/maskura-demo.sh scripts/bench-plugins.sh scripts/release-notes.sh scripts/post-release-discord.sh scripts/test-release-notifications.sh
           python3 -c 'import ast, pathlib; [ast.parse(path.read_text()) for path in map(pathlib.Path, ["examples/python-hybrid-roundtrip.py", "scripts/check-release-contract.py"])]'
           python3 scripts/check-release-contract.py
           bash scripts/test-release-notifications.sh
@@ -65,7 +65,7 @@ jobs:
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build Wasm filters
-        run: bash scripts/build-filters.sh
+        run: bash scripts/build-plugins.sh
       - name: Test
         run: cargo test --locked --workspace
 
@@ -85,7 +85,7 @@ jobs:
         if: ${{ !env.ACT }}
         run: |
           bash scripts/generate-sdks.sh
-          python3 -m compileall -q sdks/python/maskura_client sdks/python/s4_client
+          python3 -m compileall -q sdks/python/maskura_client sdks/python/maskura_client
           python3 -m pip install -r sdks/python/requirements.txt pytest
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=sdks/python python3 -m pytest -q \
             sdks/python/test/test_highlevel_attach.py \
@@ -144,9 +144,9 @@ jobs:
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build Wasm filters
-        run: bash scripts/build-filters.sh
+        run: bash scripts/build-plugins.sh
       - name: Test Postgres migrations and secret envelopes
-        run: cargo test --locked -p s4-gateway --test db_keys_test
+        run: cargo test --locked -p maskura-gateway --test db_keys_test
 
   interop:
     runs-on: ubuntu-latest
@@ -161,7 +161,7 @@ jobs:
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build Wasm filters
-        run: bash scripts/build-filters.sh
+        run: bash scripts/build-plugins.sh
       - name: Install AWS CLI and boto3
         run: |
           python3 -m pip install --user awscli boto3
@@ -169,7 +169,7 @@ jobs:
       - name: Unmodified-client interop (AWS CLI + boto3)
         env:
           MASKURA_RUN_EXTERNAL_CLIENT_INTEROP: "1"
-        run: cargo test --locked -p s4-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
+        run: cargo test --locked -p maskura-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
 
   security:
     runs-on: ubuntu-latest
