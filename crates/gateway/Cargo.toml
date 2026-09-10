@@ -66,7 +66,7 @@ num-bigint = "0.4"
 
 [dev-dependencies]
 proptest.workspace = true
-pollster = "0.4"
+pollster = "1.0"
 tower = "0.5"
 sha2 = "0.10"
 sha1 = "0.10"
