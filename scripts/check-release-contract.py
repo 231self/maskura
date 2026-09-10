@@ -153,6 +153,18 @@ def main() -> None:
         raise SystemExit(
             "release.yml must use RELEASE_TAG everywhere except its push-trigger fallback"
         )
+    if (
+        "Make the Maskura image public" in release_workflow
+        or "visibility=public" in release_workflow
+    ):
+        raise SystemExit(
+            "release.yml must verify anonymous GHCR access instead of mutating package visibility"
+        )
+    verify_job = release_workflow.split("  verify-release:", maxsplit=1)[1]
+    if "docker/login-action" in verify_job:
+        raise SystemExit(
+            "verify-release must remain logged out so image inspection proves anonymous access"
+        )
 
     print(f"release contract passed for v{version}")
 
