@@ -17,9 +17,15 @@ origin and dependency inventory of a downloaded release.
 Every external GitHub Action is referenced by a full commit SHA, with the
 human-readable release line retained as a comment for update tooling and
 reviewers. The aggregate `check` required on `main` includes `cargo audit`,
-`cargo deny`, dependency-diff review, and CodeQL analysis of Rust, Python,
-JavaScript/TypeScript, and GitHub Actions workflows in addition to the existing
-format, lint, test, SDK, database, interoperability, and end-to-end jobs.
+`cargo deny`, `pip-audit`, `npm audit`, dependency-diff review, and CodeQL
+analysis of Rust, Python, JavaScript/TypeScript, and GitHub Actions workflows in
+addition to the existing format, lint, test, SDK, database, interoperability,
+and end-to-end jobs.
+
+`just pre-push` is the canonical local gate. It runs the correctness suite, the
+same Rust, Python, and npm dependency audits, and immutable-reference checks for
+workflow actions and container base images. `just push` runs that gate before
+delegating publication to `jj git push`.
 
 The RustSec audit has one narrowly guarded exception for RUSTSEC-2023-0071.
 SQLx's compile-time migration macro records the vulnerable `rsa` crate through
@@ -44,8 +50,9 @@ set as the Linux binaries. The release also includes the repository SBOM.
 behavior; dependency updates require an explicit reviewed SHA change.
 - Dependabot proposes grouped weekly updates for Rust, both generated SDKs,
   GitHub Actions, and container images; security updates remain enabled.
-- Newly disclosed Rust advisories or dependency-policy violations block the
-  aggregate merge check rather than remaining a local-only command.
+- Newly disclosed Rust, Python, or npm advisories and dependency-policy
+  violations block the aggregate merge check rather than remaining a
+  local-only command.
 - Code scanning covers source, generated clients, and workflow code and
   publishes findings through GitHub's security surface.
 - Release consumers can verify file hashes, inspect the SBOM, and validate

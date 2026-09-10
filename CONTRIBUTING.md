@@ -7,8 +7,10 @@ Thanks for considering a contribution to Maskura.
 1. Fork [Maskura on GitHub](https://github.com/231self/maskura/fork) and clone your fork.
 2. Install Rust 1.97.0 (see `rust-toolchain.toml`) with the `wasm32-wasip1` target:
    `rustup target add wasm32-wasip1`
-3. Install `wasm-tools` (`cargo install --locked wasm-tools --version 1.255.0`) and `just`.
-4. Run `just check` — it must pass locally before opening a PR.
+3. Install `wasm-tools` (`cargo install --locked wasm-tools --version 1.255.0`),
+   `cargo-audit`, `cargo-deny`, `just`, `uv`, and Node.js/npm.
+4. Run `just pre-push` — it must pass locally before publishing a bookmark or
+   opening a PR. `just push` runs that gate and then `jj git push`.
 
 ## Conventions
 
@@ -45,8 +47,10 @@ Thanks for considering a contribution to Maskura.
 ## Testing
 
 ```bash
-just check        # full gate
-just e2e          # MinIO end-to-end (Docker)
+just check          # correctness gate
+just pre-push       # correctness + dependency/security policy
+just push           # pre-push gate + jj git push
+just e2e            # MinIO end-to-end (Docker)
 cargo test --workspace
 ```
 
