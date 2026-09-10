@@ -11,12 +11,12 @@ keywords = ["OpenAPI", "OpenAPI-Generator", "Maskura Gateway API"]
 requires-python = ">=3.9"
 
 dependencies = [
-  "urllib3 (>=2.1.0,<3.0.0)",
-  "python-dateutil (>=2.8.2)",
-  "pydantic (>=2)",
-  "typing-extensions (>=4.7.1)",
-  "requests (>=2.31)",
-  "cryptography (>=47)"
+  "urllib3 (>=2.7.0,<3.0.0)",
+  "python-dateutil (>=2.9.0.post0)",
+  "pydantic (>=2.13.5)",
+  "typing-extensions (>=4.16.0)",
+  "requests (>=2.34.2)",
+  "cryptography (>=50.0.1)"
 ]
 
 [project.urls]
@@ -26,12 +26,12 @@ Repository = "https://github.com/231self/maskura"
 requires-poetry = ">=2.0"
 
 [tool.poetry.group.dev.dependencies]
-pytest = ">= 7.2.1"
-pytest-cov = ">= 2.8.1"
-tox = ">= 3.9.0"
-flake8 = ">= 4.0.0"
-types-python-dateutil = ">= 2.8.19.14"
-mypy = ">= 1.5"
+pytest = ">=9.1.1"
+pytest-cov = ">=7.1.0"
+tox = ">=4.61.2"
+flake8 = ">=7.3.0"
+types-python-dateutil = ">=2.9.0.20260807"
+mypy = ">=2.3.1"
 
 
 [build-system]
