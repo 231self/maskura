@@ -21,9 +21,13 @@ check-lint:
 
 # Keep the public evidence entry points executable and parseable without
 # starting Docker or reaching the network.
-check-evidence:
+check-evidence: check-release
   bash -n examples/prove-maskura.sh examples/local-quickstart.sh examples/maskura-demo.sh scripts/bench-filters.sh
   python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("examples/python-hybrid-roundtrip.py").read_text())'
+
+# Ensure every public version surface agrees before a release tag can be cut.
+check-release:
+  python3 scripts/check-release-contract.py
 
 test:
   cargo test --locked --workspace
@@ -101,8 +105,8 @@ soak-streaming:
   MASKURA_SOAK_ITERATIONS=500 cargo test -p s4-gateway --test s3_frontdoor_test soak_streaming_roundtrip_holds_under_repetition -- --ignored
 
 # Release image smoke (boot smoke against the built OCI image)
-release-smoke:
-  bash scripts/release-image-smoke.sh
+release-smoke IMAGE_REF:
+  bash scripts/release-image-smoke.sh {{IMAGE_REF}}
 
 # Run the CI workflow locally with act (no GitHub minutes)
 ci-local:

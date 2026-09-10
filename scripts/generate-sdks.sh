@@ -14,6 +14,14 @@ GATEWAY_PID=""
 # ephemeral/secret key) can never abort gateway startup.
 KEYS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/maskura-sdkgen-keys.XXXXXX")"
 KEYS_FILE="$KEYS_DIR/keys.json"
+SDK_VERSION="$(python3 - "$PROJECT_DIR/Cargo.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as manifest:
+    print(tomllib.load(manifest)["workspace"]["package"]["version"])
+PY
+)"
 
 cleanup() {
     if [ -n "$GATEWAY_PID" ]; then
@@ -74,10 +82,10 @@ generate() {
         python)
             # Keep the shipped s4_client module as a permanent facade target;
             # the overlay adds the canonical maskura_client namespace.
-            properties="packageName=s4_client,projectName=maskura-client,gitUserId=231self,gitRepoId=maskura"
+            properties="packageName=s4_client,projectName=maskura-client,packageVersion=$SDK_VERSION,gitUserId=231self,gitRepoId=maskura"
             ;;
         typescript)
-            properties="npmName=maskura-client,npmVersion=1.0.0,gitUserId=231self,gitRepoId=maskura"
+            properties="npmName=maskura-client,npmVersion=$SDK_VERSION,gitUserId=231self,gitRepoId=maskura"
             ;;
         *)
             echo "ERROR: unsupported SDK language: $lang" >&2
@@ -88,6 +96,7 @@ generate() {
     rm -rf "$dir"
     docker run --rm \
         -u "$(id -u):$(id -g)" \
+        -e JAVA_OPTS=-Xmx256m \
         -v "$SDK_DIR:/local" \
         "$GENERATOR_IMAGE" generate \
         -i /local/openapi.json \
@@ -175,13 +184,14 @@ PYTHON_PACKAGE
 generate typescript
 apply_overlay typescript
 printf '\nexport * from "./highlevel";\n' >> "$SDK_DIR/typescript/index.ts"
-python3 - "$SDK_DIR/typescript/package.json" <<'TYPESCRIPT_PACKAGE'
+python3 - "$SDK_DIR/typescript/package.json" "$SDK_VERSION" <<'TYPESCRIPT_PACKAGE'
 import json
 from pathlib import Path
 import sys
 
 path = Path(sys.argv[1])
 package = json.loads(path.read_text())
+package["version"] = sys.argv[2]
 package["description"] = "OpenAPI client for the Maskura Gateway"
 package["repository"] = {
     "type": "git",

@@ -142,7 +142,7 @@ maskura get ingest/data.csv --bucket maskura-local \
 ```
 
 `maskura local init` pulls the gateway image tagged with the CLI version
-(`ghcr.io/231self/maskura/maskura:v0.5.3` for `maskura` 0.5.3; CLI and gateway always
+(`ghcr.io/231self/maskura/maskura:v0.6.0` for `maskura` 0.6.0; CLI and gateway always
 match, never `:latest`) and runs a durable single-node local FileStore
 (`AUTH_DISABLED=true`, staged multipart enabled, all state on one volume). It picks
 a free port (8080+) and only listens on localhost. `maskura local down` stops it.
