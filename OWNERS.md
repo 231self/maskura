@@ -17,7 +17,9 @@ here, extend `CODEOWNERS`, and then enable required CODEOWNERS reviews on
   Architecture Decision Records in `docs/adr/` and merged with their change.
 - Releases are cut from `main` by the release workflow and published as
   GitHub Releases with prebuilt binaries and the canonical/legacy container
-  images.
+  images. Release notes are authored in CI (DeepSeek, with a GitHub-generated
+  fallback) and announced to Discord; see
+  `docs/adr/0015-release-notes-and-discord-notifications.md`.
 
 ## Architecture Decision Records
 

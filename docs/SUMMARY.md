@@ -31,3 +31,4 @@
 - [ADR 0012: Local filesystem object storage](adr/0012-local-filesystem-object-storage.md)
 - [ADR 0013: Durable local multipart storage](adr/0013-durable-local-multipart-storage.md)
 - [ADR 0014: Supply-chain security and release provenance](adr/0014-supply-chain-security.md)
+- [ADR 0015: LLM-authored release notes and Discord announcements](adr/0015-release-notes-and-discord-notifications.md)

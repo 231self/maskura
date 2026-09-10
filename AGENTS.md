@@ -181,6 +181,12 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 - All secrets via environment variables, never in source or committed config.
 - `LISTEN_ADDR`, `S3_ENDPOINT`, `DATABASE_URL`, `SUPABASE_JWT_SECRET`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and the explicit customer/operator settings documented in `docs/security.md`.
 - Local dev uses Supabase CLI default credentials.
+- **Release automation** (`.github/workflows/release.yml`): `DEEPSEEK_API_KEY`
+  (optional; authors release notes with a GitHub-generated fallback),
+  `DISCORD_WEBHOOK_URL` (announces new releases), and `RELEASE_TOKEN` (the
+  fine-grained PAT used by `.github/workflows/tag-on-version-bump.yml` to push
+  `v*` tags so the release workflow fires). Maintainers configure these as
+  GitHub Actions repository secrets. See ADR 0015.
 
 ### Key Formats
 
