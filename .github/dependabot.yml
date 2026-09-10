@@ -11,26 +11,27 @@ updates:
         update-types:
           - minor
           - patch
+    # sha2 0.11 and hmac 0.13 use digest 0.11, while hkdf and the rest of the
+    # current crypto stack still require digest 0.10. Re-enable these majors as
+    # a coordinated migration once the dependency graph can move together.
+    ignore:
+      - dependency-name: sha2
+        versions:
+          - "0.11.x"
+      - dependency-name: hmac
+        versions:
+          - "0.13.x"
 
   - package-ecosystem: npm
-    directory: /sdks/typescript
+    # Generated SDK output is replaced by `just build-sdks`. The overlay is the
+    # maintained source and is copied into every generated client.
+    directory: /sdks/overlay/typescript
     schedule:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
     groups:
       typescript-dependencies:
-        patterns:
-          - "*"
-
-  - package-ecosystem: pip
-    directory: /sdks/python
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
-    groups:
-      python-dependencies:
         patterns:
           - "*"
 
