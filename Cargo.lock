@@ -2887,7 +2887,7 @@ dependencies = [
  "dirs",
  "hex",
  "hkdf",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "http-body 1.1.0",
  "http-body-util",
  "jsonwebtoken",
