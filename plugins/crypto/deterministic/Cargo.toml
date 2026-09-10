@@ -10,5 +10,5 @@ crate-type = ["cdylib"]
 [dependencies]
 maskura-plugin-sdk = { path = "../../../crates/plugin-sdk" }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 aes-siv = { version = "0.7", default-features = false, features = ["alloc"] }
