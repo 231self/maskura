@@ -15,417 +15,191 @@
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" /></a>
 </p>
 
-Maskura is a privacy boundary between agents and object data. Run it locally as an
-S3-compatible endpoint backed by Docker storage, or put it in front of your existing
-object store. It redacts or encrypts sensitive data on the way through, so agents get
-the view you allow and the raw object never leaves your storage boundary.
+Maskura is the open-source policy boundary between AI agents and object storage.
+It gives existing S3 clients one place to decide which representation may cross
+that boundary—and to bind the decision to the exact policy code that ran.
 
-**Read path** — agents see the view you allow; the raw object stays in storage.
+An ordered Wasm component pipeline can validate, reject, reshape, redact, or
+encrypt object data. Maskura runs locally as an S3-compatible Docker service or
+in front of storage you already use.
 
-![Read path](docs/assets/read-flow.gif)
+## Capabilities
 
-**Write path** — protection is applied before the object reaches storage.
+- **Protected matching.** `stable-encrypt` applies deterministic AES-SIV to
+  selected fields. The same value under the same key produces the same protected
+  value, so datasets can be joined and deduplicated without exposing the
+  original field. Equality is intentionally visible; the feature is opt-in.
+- **Content-addressed policy.** A request resolves one immutable pipeline
+  revision with ordered component hashes, configuration, capabilities, and
+  execution limits. Imported read components are not trusted for direct
+  streaming until an operator allowlists their exact digest.
+- **Client-held decryption keys.** Recoverable fields use hybrid X25519 +
+  ML-KEM-768 encapsulation and AES-256-GCM. Maskura receives the public key; the
+  private key stays with the client.
+- **An open policy runtime.** Bring built-in or custom Wasm components through a
+  small WIT contract. Plugins run in fresh wasmtime instances with bounded
+  memory, fuel, deadlines, and no host access to storage or credentials.
+- **Storage neutrality.** Maskura is itself an S3 endpoint with durable local
+  storage and can front S3-compatible providers. Its optional service-storage
+  engine distributes keys across providers, dual-writes primary and replica,
+  and fails reads over without making one cloud the control point.
+- **Evidence follows execution.** The gateway binds operation evidence to the
+  pipeline revision, fingerprint, component digests, byte counts, fuel, and
+  duration. Release binaries and container manifests ship with checksums, an
+  SBOM, and provenance attestations.
 
-![Write path](docs/assets/write-flow.gif)
-
-- **Pluggable pipeline** — plugins run in order; each can emit, drop, or reject. A tiny
-  WIT interface (`begin` / `transform` / `finish`), pure byte-in/byte-out.
-- **Sandboxed** — wasmtime, 64 MiB memory, fuel-limited, no host imports.
-- **BYO plugins** — write in Rust (or any Wasm-capable language), wrap with
-  `wasm-tools component`, `maskura plugin upload`. See [docs/plugins.md](docs/plugins.md).
-- **Any S3-compatible storage** — Maskura is itself an S3-compatible endpoint for
-  zero-dependency local Docker runs. Point it at MinIO, AWS S3, Google Cloud Storage,
-  Backblaze B2, Cloudflare R2, or Vultr Object Storage when you want external storage —
-  single or multi-cloud (consistent-hash ring, dual-write, read fail-over). MinIO is
-  covered by the CI end-to-end suite;
-  the B2 example verifies redaction against a real bucket.
-- **Agent-safe reads** — read data through Maskura with `x-maskura-process: read`: the pipeline
-  runs on the way *out*, so AI agents get redacted/encrypted output while the object
-  at rest stays raw. No second cleaned copy to keep in sync.
-- **Optional auth** — run with auth disabled locally, or enable API keys (in-memory,
-  a JSON file, or Postgres).
-- **Typed SDKs** — generated Python and TypeScript clients, published with every release.
-
-Filters shipped in-tree (as examples to learn from): `noop`, `pii-default` (redact
-emails / SSNs / credit cards), `email-detect`, `ssn-detect`, `card-detect`,
-`envelope-encrypt` (per-field hybrid post-quantum encryption), `stable-encrypt`
-(deterministic encryption).
-
-## Contents
-
-- [Quickstart](#quickstart)
-- [Install the CLI (optional)](#install-the-cli-optional)
-- [Run your own plugin](#run-your-own-plugin)
-- [Usage examples](#usage-examples)
-- [Evidence you can run](#evidence-you-can-run)
-- [Demo](#demo)
-- [How it works](#how-it-works)
-- [Development](#development)
-- [Security](#security)
-- [Documentation](#documentation)
-- [LLM agents](#llm-agents)
-- [License](#license)
+Official plugins include PII redaction, focused email/SSN/payment-card filters,
+hybrid envelope encryption, deterministic encryption, and a no-op baseline. The
+same data path is available to AWS-compatible tools, the `maskura` CLI, Python
+and TypeScript clients, and the local MCP server.
 
 ## Quickstart
 
-No cloud account, database, MinIO service, or repo clone is needed. Run the
-published Maskura gateway image with its own local S3-compatible API and one
-durable Docker volume:
+No cloud account, database, or repository clone is required:
 
 ```bash
-docker run --rm -p 127.0.0.1:8791:8080 -v maskura-local-keys:/data \
+docker run --rm -p 127.0.0.1:8791:8080 -v maskura-data:/data \
   -e AUTH_DISABLED=true \
-  -e MASKURA_KEYS_FILE=/data/keys.json \
   -e MASKURA_STORAGE_MODE=local \
   -e MASKURA_LOCAL_STORAGE_DIR=/data \
   -e MASKURA_MULTIPART_MODE=staged \
-  -e MASKURA_STREAMING_READ_MODE=passthrough \
-  ghcr.io/231self/maskura/maskura:latest
-# open http://localhost:8791 -> demo dashboard (no sign-up)
+  ghcr.io/231self/maskura/maskura:v0.7.1
 ```
 
-The gateway speaks SigV4, so your existing `aws s3` CLI works as-is:
+Maskura is now an S3-compatible endpoint at `http://localhost:8791`. Use any
+non-empty credentials when auth is disabled:
 
 ```bash
 export AWS_ACCESS_KEY_ID=demo AWS_SECRET_ACCESS_KEY=demo
 printf '{"email":"jane@example.com","card":"4111111111111111"}\n' > data.jsonl
 
-# Write through the pipeline; pii-default redacts on the way in:
 aws s3 --endpoint-url http://localhost:8791 \
-  cp data.jsonl s3://maskura-local/ingest/data.jsonl --content-type application/x-ndjson
+  cp data.jsonl s3://maskura-local/ingest/data.jsonl \
+  --content-type application/x-ndjson
 
-# Read it back:
-aws s3 --endpoint-url http://localhost:8791 cp s3://maskura-local/ingest/data.jsonl -
-# → {"email":"[REDACTED_EMAIL]","card":"[REDACTED_CARD]"}
+aws s3 --endpoint-url http://localhost:8791 \
+  cp s3://maskura-local/ingest/data.jsonl -
+# {"email":"[REDACTED_EMAIL]","card":"[REDACTED_CARD]"}
 ```
 
-`curl` works too — `x-maskura-*` headers are the non-SigV4 alternative:
+Open <http://localhost:8791> for the local dashboard.
 
-```bash
-echo "jane.doe@example.com 4111111111111111" > data.txt
-curl -X PUT http://localhost:8791/maskura-local/ingest/data.txt \
-  -H "Content-Type: text/plain" --data-binary @data.txt
-curl http://localhost:8791/maskura-local/ingest/data.txt
-# → [REDACTED_EMAIL] [REDACTED_CARD]
-```
+## CLI
 
-We map the container's `8080` to `8791` on your host so it doesn't collide with
-anything you already run. The dashboard's copy-paste snippets use whatever
-`host:port` you opened, so they just work.
-
-## Install the CLI (optional)
-
-Prefer the CLI? Install it with `cargo install`, or grab a prebuilt Linux
-(amd64/arm64) or native Apple Silicon binary attached to each
-[GitHub Release](https://github.com/231self/maskura/releases):
+Install with Cargo, or download a prebuilt Linux amd64/arm64 or native Apple
+Silicon binary from [GitHub Releases](https://github.com/231self/maskura/releases):
 
 ```bash
 cargo install --git https://github.com/231self/maskura --bin maskura
-maskura local init                  # runs the published gateway image (Docker)
-maskura plugin list                 # the pii-default plugin is preloaded
-
-# A sample file to push through the pipeline:
-echo "jane.doe@example.com 4111111111111111" > data.csv
-
-# Write data through the pipeline; it is transformed before it reaches storage
-maskura put ./data.csv ingest/data.csv --bucket maskura-local
-
-# Read it back
-maskura get ingest/data.csv --bucket maskura-local
-
-# For recoverable PII, create a hybrid key with the API key and keep the
-# private key locally. New encrypted objects can then be decrypted on read.
-maskura key create --label recoverable --generate-encryption-key \
-  --private-key-out ./maskura-private-key.pem
-maskura get ingest/data.csv --bucket maskura-local \
-  --decrypt ./maskura-private-key.pem
-```
-
-`maskura local init` pulls the gateway image tagged with the CLI version
-(`ghcr.io/231self/maskura/maskura:v0.7.1` for `maskura` 0.7.1; CLI and gateway always
-match, never `:latest`) and runs a durable single-node local FileStore
-(`AUTH_DISABLED=true`, staged multipart enabled, all state on one volume). It picks
-a free port (8080+) and only listens on localhost. `maskura local down` stops it.
-Use `just dev-up` when you specifically need the MinIO-backed cloud-storage path.
-
-### Standalone durable local storage
-
-The gateway can persist objects and restart-safe multipart state directly to a
-mounted filesystem volume without MinIO, Postgres, or cloud credentials. This is
-a single-node S3-compatible deployment. The same volume contains objects, API
-keys, encrypted multipart artifacts, event logs, commit proofs, and the local
-wrapping key.
-
-```bash
-docker run --rm -p 8080:8080 -v maskura-data:/data \
-  -e AUTH_DISABLED=true \
-  -e MASKURA_STORAGE_MODE=local \
-  -e MASKURA_LOCAL_STORAGE_DIR=/data \
-  -e MASKURA_MULTIPART_MODE=staged \
-  ghcr.io/231self/maskura/maskura:latest
-```
-
-With `AUTH_DISABLED=true`, clients can use any non-empty placeholder credentials;
-the quickstart uses `demo`. The gateway never prints generated key secrets to its
-logs. Objects, local API keys, and in-progress staged
-multipart uploads survive container restarts through the mounted volume. Keep
-the `.maskura/wrapping.key` file with the volume backup; losing it makes
-encrypted incomplete uploads unrecoverable.
-
-## Run your own plugin
-
-```bash
-# 1. Write a filter in Rust or any Wasm component-capable language
-# 2. Build it:
-cargo build --release --target wasm32-unknown-unknown
-wasm-tools component new target/wasm32-unknown-unknown/release/my_filter.wasm \
-  -o my-filter.component.wasm
-# 3. Upload and enable it:
-maskura plugin upload my-filter.component.wasm
-maskura plugin enable <id>
-# 4. Reorder the pipeline — output of one feeds the next:
-maskura plugin reorder pii-default my-filter
-```
-
-Full guide: [docs/plugins.md](docs/plugins.md).
-
-Typed binary codecs use a separate schema-aware reductor contract, not the
-byte-oriented plugin pipeline. See [docs/binary-adapters.md](docs/binary-adapters.md)
-when adding a custom logical-type adapter.
-
-Opt-in Avro OCF processing (`MASKURA_ENABLE_AVRO=true`) and its supported subset are
-documented in [docs/avro.md](docs/avro.md). A runnable PUT/read example is in
-[examples/avro-demo.py](examples/avro-demo.py).
-
-The local stdio MCP server exposes put, get, list, and delete tools to agent
-clients while preserving the gateway's normal auth, pipeline, and metering path.
-See [docs/mcp.md](docs/mcp.md) for Claude Desktop, Cursor, and Kilo setup, plus
-the runnable [`examples/mcp-client.py`](examples/mcp-client.py) lifecycle.
-
-## Usage examples
-
-Everything below is copy-paste runnable.
-
-**Redaction — PII filtered on write**
-
-```bash
-# Local gateway (Maskura-managed Docker container, durable FileStore):
 maskura local init
-maskura put ./data.csv ingest/data.csv --bucket maskura-local
-maskura get ingest/data.csv --bucket maskura-local     # emails/SSNs/cards redacted
-
-# Optional external-backend validation path (MinIO + Docker Compose):
-just dev-up
-maskura put ./data.csv ingest/data.csv --bucket maskura-local
-
-# End-to-end validation:
-just e2e                # see docs/e2e.md for the feature-by-feature breakdown
+maskura put ./data.jsonl ingest/data.jsonl --bucket maskura-local
+maskura get ingest/data.jsonl --bucket maskura-local
+maskura local down
 ```
 
-**Agent-safe reads — raw at rest, scrubbed on the way out**
+`maskura local init` uses the gateway image matching the CLI version, stores data
+in a Docker volume, and binds only to localhost. Run `maskura --help` for keys,
+external storage, plugins, and MCP commands.
+
+## Bring your own Wasm pipeline
+
+Plugins are runtime-loaded components; adding one does not require rebuilding the
+gateway:
 
 ```bash
-# Data at rest stays raw (your app owns the originals).
-maskura put ./customers.json customers/c1.json --bucket maskura-local
-
-# Transformed reads are deliberately opt-in. Unsafe component snapshots are
-# staged encrypted before any response bytes are disclosed.
-export MASKURA_STREAMING_READ_MODE=transformed
-export MASKURA_TRANSFORMED_READ_SPOOL=encrypted
-# Set this to the SHA-256 component digests reviewed for prefix-safe disclosure.
-# Imported components are unsafe unless listed here.
-export MASKURA_PREFIX_SAFE_COMPONENT_HASHES=<comma-separated-component-sha256-digests>
-
-# An AI agent reads through Maskura: PII is redacted before the agent sees it.
-curl -H "x-maskura-process: read" http://localhost:8080/customers/c1.json
-# → {"email":"[REDACTED_EMAIL]","card":"[REDACTED_CARD]","note":"hi"}
-
-# Same object, no header: the raw bytes your app owns.
-curl http://localhost:8080/customers/c1.json
-# → {"email":"alice@example.com","card":"4111111111111111","note":"hi"}
-```
-
-One source of truth, two projections: the app gets full fidelity, the agent
-gets only what you allow. Transformed reads require stored, version-bound
-metadata and work with S3, managed storage, and in-memory backends. Presigned
-backend URLs remain raw-only because they cannot provide a safe metadata
-preflight.
-
-Transformed reads reject `Range`, `partNumber`, non-identity source encodings,
-unknown mandatory formats, and `HEAD`. They never fall back to raw bytes.
-`MASKURA_STREAMING_READ_MODE=off` (the default) rejects transformed reads;
-`passthrough` enables only raw streaming. `transformed` enables this path.
-Without `MASKURA_TRANSFORMED_READ_SPOOL=encrypted`, a snapshot containing any
-component not listed in `MASKURA_PREFIX_SAFE_COMPONENT_HASHES` is rejected before
-its source body is consumed. Set `MASKURA_SPOOL_DIR`, `MASKURA_SPOOL_MAX_OBJECT_BYTES`,
-and `MASKURA_SPOOL_QUOTA_BYTES` to a private, capacity-reserved volume; the quota
-must cover encrypted framing overhead as well as plaintext output.
-
-**Encryption — per-field envelope encryption, decryptable only by you**
-
-```bash
-# Starts the published image, creates a scoped key, uploads encrypted PII with
-# the Python SDK, verifies the stored bytes, and decrypts with the local key:
-just proof python
-```
-
-New writes use hybrid X25519 + ML-KEM-768 key encapsulation with AES-256-GCM.
-The CLI and the Python and TypeScript high-level clients generate compatible
-hybrid keypairs, attach only the public key, and decrypt locally with the
-client-held private key. Legacy RSA envelopes remain readable through explicit
-SDK compatibility helpers. See [Encryption](docs/encryption.md#client-tooling-status).
-
-**Plugins — bring your own transform**
-
-```bash
-maskura plugin list                              # pipeline order
-maskura plugin upload my-filter.component.wasm   # runtime import, no rebuild
+maskura plugin upload my-plugin.component.wasm
 maskura plugin enable <id>
-maskura plugin reorder pii-default my-filter     # output of one feeds the next
+maskura plugin reorder pii-default my-plugin
 ```
 
-**SDKs — Python**
+The output of each plugin becomes the input of the next. The SDK, WIT contract,
+sandbox limits, and a minimal component are documented in
+[Build a plugin](docs/plugins.md). Schema-aware binary adapters use a separate
+[binary reductor contract](docs/binary-adapters.md).
+
+## Python client
+
+Generated Python and TypeScript clients ship with every release. The Python
+high-level client can use the S3 data plane directly:
 
 ```python
-import os
-
 from maskura_client import MaskuraClient
 
-client = MaskuraClient(
-    "http://localhost:8080",
-    os.environ["MASKURA_ACCESS_KEY"],
-    os.environ["MASKURA_SECRET_KEY"],
+client = MaskuraClient("http://localhost:8791", "demo", "demo")
+client.put_object(
+    "maskura-local",
+    "ingest/data.txt",
+    b"jane@example.com 4111111111111111",
 )
-priv, pub = client.generate_keypair()                  # X25519 + ML-KEM-768
-client.attach_public_key(pub)                          # bind to your API key
-client.put_object("bucket", "key", b"jane@example.com 4111111111111111")
-blob = client.get_object("bucket", "key")
-assert "jane@example.com" not in blob.decode()          # stored encrypted
-print(client.decrypt_payload(blob, priv))              # you hold the key
+print(client.get_object("maskura-local", "ingest/data.txt").decode())
+# [REDACTED_EMAIL] [REDACTED_CARD]
 ```
 
-Full details: [examples/README.md](examples/README.md) and
-[docs/plugins.md](docs/plugins.md).
+For recoverable PII, the clients generate a hybrid X25519 + ML-KEM-768 keypair,
+attach only the public key, and decrypt locally. Run `just proof python` for the
+complete assertion-backed flow, or read [Encryption](docs/encryption.md).
 
-## Evidence you can run
+## Read projections
+
+Maskura can also transform on read. The original remains in storage while a
+caller opting into `x-maskura-process: read` receives the pipeline output. The
+path is fail-closed and deliberately disabled until its spool and reviewed plugin
+policy are configured. See [Security](docs/security.md) for the deployment rules.
+
+## Run the proof
 
 ```bash
 just proof
 ```
 
-This runs three black-box checks against the published container: an
-unmodified AWS CLI redaction round trip, a live Wasm component import with no
-gateway rebuild, and Python hybrid encryption with client-only decryption. It
-prints the container digest and fails on a missing assertion. See
-[Run the claims](docs/proofs.md) for the exact checks and what they do not
-establish. Reproducible filter cost data and run metadata come from
-`just bench-plugins`; see [Benchmarks](docs/benchmarks.md).
+The proof runs against the published container and checks an AWS CLI redaction
+round trip, live Wasm import without a gateway rebuild, and Python hybrid
+encryption with client-only decryption. It prints the tested image digest and
+fails when an assertion is missing. [Proof contract](docs/proofs.md) states the
+exact checks and their limits.
 
-## Demo
-
-![The same PII file written three ways — raw, redacted, and deterministic-encrypted — through Maskura](docs/assets/demo.gif)
-
-The same PII file, three ways — raw, redacted, and deterministic-encrypted — pushed
-through `aws s3` pointed at Maskura. [Watch the interactive demo (pause, scrub, speed) →](https://231self.github.io/maskura/demo.html)
-
-## How it works
-
-```
-S3 SDK / CLI / tool ──▶ Maskura Gateway (Wasm plugin pipeline) ──▶ storage
+```text
+S3 SDK / CLI / agent ──▶ Maskura ──▶ storage
                             │
-                            ├─ filter  → redact emails, SSNs, credit cards
-                            ├─ encrypt → per-field envelope / deterministic encryption
-                            └─ ...     → your plugins, in order
+                            └─ Wasm pipeline
+                               ├─ redact
+                               ├─ encrypt
+                               └─ your plugins, in order
 ```
 
-## Development
+## Develop
 
 ```bash
-just check          # fmt + clippy + build filters + tests
-just pre-push       # fmt/clippy + Rust/Python/npm advisories + pin policy
-just push           # run pre-push, then publish the current jj bookmark
-just e2e            # end-to-end against MinIO (Docker)
-just proof          # black-box public claims against the published image
-just build-sdks     # regenerate Python/TypeScript SDKs from the OpenAPI spec
+just check          # format, lint, build plugins, and test
+just pre-push       # fast local trust and dependency gate
+just e2e            # S3 interoperability against MinIO
+just proof          # black-box checks against a published image
+just build-sdks     # regenerate clients from OpenAPI
 ```
 
-`just pre-push` is the fast local trust gate: it runs formatting and clippy,
-mirrors the dependency-security checks that would otherwise first appear in
-GitHub, and verifies that Actions and Docker base images remain pinned to
-immutable revisions. It requires `cargo-audit`, `cargo-deny`, `uvx`, and `npm`.
-Dependabot still handles scheduled update discovery; protected CI runs the long
-Wasm, test, SDK, database, interoperability, and end-to-end suites.
-
-### Run CI/release locally (no GitHub minutes)
-
-Two local pipeline runners, both with persistent caches:
-
-- **`just ci-local`** — runs the real `.github/workflows/ci.yml` via
-  [act](https://github.com/nektos/act) (local Docker; `actions/cache` backed by act's
-  cache server, so cargo deps are reused across runs).
-- **`just build-local` / `just image-local` / `just publish-local TAG=x`** — dagger
-  pipeline (`dagger/main.py`) with cargo registry + target dirs on persistent cache
-  volumes; `publish-local` pushes the image to
-  `ghcr.io/231self/maskura/maskura` (needs `docker login ghcr.io` once).
-
-See `CONTRIBUTING.md`.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, local CI runners, and the pull
+request process. Architecture decisions live in [docs/adr/](docs/adr/).
 
 ## Security
 
-Maskura transforms sensitive data before it reaches storage and applies strict,
-fail-closed guarantees on the streaming data plane. See
-[docs/security.md](docs/security.md) for the full model — what's guaranteed and
-what's on you.
+Read [the security model](docs/security.md) before exposing Maskura beyond a
+local machine. Vulnerabilities should be reported through
+[private vulnerability reporting](https://github.com/231self/maskura/security/advisories/new)
+or security@231self.com, never a public issue.
 
-Found a vulnerability? Report it **privately** — via
-[Maskura private vulnerability reporting](https://github.com/231self/maskura/security/advisories/new)
-or security@231self.com — and never through a
-[public issue](https://github.com/231self/maskura/issues/new/choose). See
-[SECURITY.md](SECURITY.md) for the supported-version policy,
-response timeline, and what to include in a report.
+Releases include checksums, an SPDX JSON SBOM, and GitHub build-provenance
+attestations. CI runs RustSec, dependency policy and diff review, plus CodeQL for
+Rust, Python, JavaScript/TypeScript, and workflow code.
 
-CI runs RustSec and dependency-policy audits, dependency-diff review, and
-CodeQL for Rust, Python, TypeScript/JavaScript, and workflow code. External
-Actions are pinned to immutable commits. Releases include `SHA256SUMS`, an SPDX
-JSON SBOM, and GitHub build-provenance attestations for downloadable artifacts
-and published container manifests. This includes the native
-`maskura-macos-arm64` and `maskura-mcp-macos-arm64` Apple Silicon builds. Verify
-a downloaded artifact with:
+## More
 
-```bash
-sha256sum --check SHA256SUMS --ignore-missing
-gh attestation verify --repo 231self/maskura ./maskura-linux-amd64
-```
-
-## Documentation
-
-- **Docs site** — the same docs, rendered:
-  <https://231self.github.io/maskura/>.
-- `examples/` — assertion-backed local proofs and external-storage examples.
-- `docs/proofs.md` — claim-to-command map, including explicit limits.
-- `docs/plugins.md` — create and consume your own plugins.
-- `docs/security.md` — the security model of the gateway.
-- `docs/adr/` — architecture decision records.
-- `AGENTS.md` — development conventions.
-- `CONTRIBUTING.md` — contribution guide, tests, and author identity policy.
-- `OWNERS.md` — maintainers and decision process.
-
-## LLM agents
-
-Coding agents (Claude Code, Kilo, Cursor, …) read `AGENTS.md` from the repo root
-automatically. For project-specific Maskura context, install the bundled skill:
-
-```bash
-# Claude Code (user-global):
-mkdir -p ~/.claude/skills && ln -s "$(pwd)/skills/maskura" ~/.claude/skills/maskura
-# Kilo (user-global):
-mkdir -p ~/.kilo/skills && ln -s "$(pwd)/skills/maskura" ~/.kilo/skills/maskura
-```
-
-The skill teaches agents what Maskura is, the plugin pipeline, build/test/run commands,
-crate layout, and the CI/release gotchas (BuildKit cache mounts, act/colima,
-multi-arch builds).
+- [Documentation](https://231self.github.io/maskura/)
+- [Runnable examples](examples/README.md)
+- [MCP server](docs/mcp.md)
+- [Avro support](docs/avro.md)
+- [Benchmarks](docs/benchmarks.md)
+- [Open-source and hosted Maskura](https://maskura.dev/open-source/)
 
 ## License
 
-Apache-2.0. See `LICENSE`.
+Apache-2.0. See [LICENSE](LICENSE).
