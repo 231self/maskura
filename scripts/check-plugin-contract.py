@@ -108,6 +108,42 @@ def check_wit_ownership() -> None:
         fail(f"WIT contract exists outside plugin-sdk: {stray[0].relative_to(ROOT)}")
 
 
+def check_proof_component_source() -> None:
+    proof = (ROOT / "examples" / "prove-maskura.sh").read_text()
+    expected = (
+        'docker cp "$CONTAINER:/app/components/email-detect.component.wasm" '
+        '"$component"'
+    )
+    if expected not in proof:
+        fail("proof harness must import the component shipped in the image under test")
+    if '$ROOT/components/email-detect.component.wasm' in proof:
+        fail("proof harness must not mix checkout components with a published image")
+
+
+def check_bundled_component_context() -> None:
+    required_fields = (
+        b"content-type",
+        b"operation",
+        b"policy-version",
+        b"config-json",
+        b"public-key-pem",
+        b"entropy-seed",
+        b"stable-key",
+        b"stable-fields",
+    )
+    components = sorted((ROOT / "components").glob("*.component.wasm"))
+    if not components:
+        fail("no bundled plugin components were found")
+    for component in components:
+        payload = component.read_bytes()
+        missing = [field.decode() for field in required_fields if field not in payload]
+        if missing:
+            fail(
+                f"{component.relative_to(ROOT)} has a stale context contract; "
+                f"missing {', '.join(missing)}; run just build-plugins and refresh components"
+            )
+
+
 def scan_files(root: Path):
     if root.is_file():
         yield root
@@ -140,6 +176,8 @@ def check_namespace() -> None:
 def main() -> None:
     check_manifests()
     check_wit_ownership()
+    check_proof_component_source()
+    check_bundled_component_context()
     check_namespace()
     print("Plugin contract and Maskura namespace are consistent")
 

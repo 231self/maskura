@@ -30,7 +30,7 @@ write-path result rather than applying a second transform on read.
 | Claim | Command | Assertion |
 |---|---|---|
 | Maskura is an S3-compatible local endpoint | `just proof redaction` | An unmodified AWS CLI writes and reads an object through Maskura. The raw read-back contains the email/card redaction markers and neither plaintext value. |
-| A Wasm component can change the pipeline at runtime | `just proof plugin` | The harness disables the bundled pipeline, imports `email-detect.component.wasm` over the live admin API, and writes the same email/card input. Only the email changes, showing that the imported component—not a hard-coded gateway transform—produced the result. |
+| A Wasm component can change the pipeline at runtime | `just proof plugin` | The harness extracts `email-detect.component.wasm` from the exact image under test, disables the bundled pipeline, imports that component over the live admin API, and writes the same email/card input. Only the email changes, showing that the imported component—not a hard-coded gateway transform—produced the result. |
 | The Python client implements the shipped hybrid envelope | `just proof python` | The SDK creates an X25519 + ML-KEM-768 keypair, confirms only its public key is attached, writes PII, confirms the raw read-back contains hybrid envelopes and no plaintext, then recovers the exact input with the client-held private key. |
 
 The Python step is deliberately a normal script rather than test-only code:
