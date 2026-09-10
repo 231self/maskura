@@ -14,7 +14,7 @@ maskura-plugin-pii-core = { path = "../../shared/pii" }
 ml-kem.workspace = true
 x25519-dalek.workspace = true
 hkdf.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 rand_core = { version = "0.6", default-features = false }
 rand_chacha = { version = "0.3", default-features = false }

@@ -2839,7 +2839,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tokio",
  "x25519-dalek",
 ]
@@ -2911,7 +2911,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1 0.10.7",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlx",
  "thiserror 2.0.20",
  "tokio",
@@ -2985,7 +2985,7 @@ dependencies = [
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "x25519-dalek",
 ]
 
@@ -3082,7 +3082,7 @@ dependencies = [
  "maskura-error",
  "rand 0.8.8",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "wasmtime",
  "wasmtime-wasi",
  "zeroize",

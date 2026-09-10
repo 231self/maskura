@@ -11,6 +11,6 @@ wasmtime-wasi.workspace = true
 anyhow = "1"
 rand.workspace = true
 hex.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 zeroize.workspace = true
 serde = { workspace = true, features = ["derive"] }

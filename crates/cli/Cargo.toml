@@ -22,5 +22,5 @@ base64 = "0.22"
 hkdf.workspace = true
 ml-kem.workspace = true
 rand.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 x25519-dalek.workspace = true
