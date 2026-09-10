@@ -1,47 +1,29 @@
 name: Tag on version bump
 
-# Auto-tags main with v<version> whenever the workspace version in the root
-# Cargo.toml changes, so release.yml (on: push: tags: ['v*']) builds and
-# publishes release artifacts. Tags stopped at v0.3.8 while Cargo.toml climbed
-# to 0.5.2, which is why no release artifacts have built since.
-#
-# SECRET REQUIREMENT
-# ------------------
-# A tag pushed with the default GITHUB_TOKEN does NOT trigger release.yml:
-# GitHub suppresses workflow/event fan-out from GITHUB_TOKEN to prevent loops.
-# The tag must instead be pushed with a Personal Access Token (PAT) that has
-# `contents: write` and `workflows: write` scopes.
-#
-#   1. Create a fine-grained PAT scoped to this repo (231self/maskura) with:
-#        Contents:  Read and write
-#        Workflows: Read and write
-#   2. Add it as an Actions secret named RELEASE_TOKEN
-#      (Settings → Secrets and variables → Actions → New repository secret).
-#
-# The token is referenced via secrets.RELEASE_TOKEN below and is never
-# committed to the repository.
+# Auto-tags main with v<version> whenever the workspace version changes, then
+# calls the reusable release workflow directly. GitHub intentionally suppresses
+# workflow fan-out from tags pushed with GITHUB_TOKEN, so the explicit call is
+# what makes the release reliable without a personal access token.
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
   tag-if-bumped:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      created: ${{ steps.push.outputs.created }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           # Full history (and tags) so we can diff the previous commit's
           # Cargo.toml and check whether the tag already exists.
           fetch-depth: 0
-          # Don't persist the GITHUB_TOKEN credential helper: it would override
-          # the PAT URL below and push the tag as github-actions[bot], which
-          # cannot trigger release.yml.
-          persist-credentials: false
 
       - name: Detect version bump
         id: version
@@ -58,9 +40,8 @@ jobs:
           fi
 
       - name: Push tag
+        id: push
         if: steps.version.outputs.bumped == 'true'
-        env:
-          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           tag="${{ steps.version.outputs.tag }}"
           if [ -z "$tag" ]; then
@@ -70,9 +51,23 @@ jobs:
           python3 scripts/check-release-contract.py --tag "$tag"
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1; then
             echo "tag $tag already exists; skipping"
+            echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git tag "$tag"
-          git config --unset-all http.https://github.com/.extraheader || true
-          git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push origin "refs/tags/$tag"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: tag-if-bumped
+    if: needs.tag-if-bumped.outputs.created == 'true'
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+      packages: write
+    uses: ./.github/workflows/release.yml
+    with:
+      release_tag: ${{ needs.tag-if-bumped.outputs.tag }}
+    secrets: inherit

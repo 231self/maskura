@@ -1,4 +1,4 @@
-# ADR 0015: LLM-authored release notes and Discord announcements
+# ADR 0015: Release orchestration, authored notes, and Discord announcements
 
 - Status: Accepted
 - Date: 2026-09-10
@@ -6,6 +6,10 @@
 ## Context
 
 Releases are cut from `main` by `.github/workflows/release.yml` on `v*` tags.
+The version-bump workflow originally used a personal access token to push the
+tag so GitHub would start the release workflow as a second event. That added a
+maintainer-owned credential whose expiry or permission drift could stop all
+releases after the code had already merged.
 GitHub Releases previously used GitHub's raw list of merged-PR titles. That
 text is accurate but reads as an internal changelog: it has no summary,
 grouping, or upgrade guidance, so it is a weak official note for users.
@@ -50,12 +54,18 @@ does not double-post.
 already-published version, with a dry-run preview. It validates the tag input
 and reads the canonical release body from GitHub before posting.
 
-The three secrets (`DEEPSEEK_API_KEY`, `DISCORD_WEBHOOK_URL`, `RELEASE_TOKEN`)
-are configured as GitHub Actions repository secrets and never appear in the
-repository. `RELEASE_TOKEN` is the PAT that `tag-on-version-bump.yml` uses to
-push `v*` tags because a tag pushed with `GITHUB_TOKEN` does not trigger the
-release workflow. `DEEPSEEK_API_KEY` is optional at runtime; when absent,
-releases ship with GitHub-generated notes.
+`tag-on-version-bump.yml` creates the immutable tag with the scoped
+`GITHUB_TOKEN`, then invokes `release.yml` through `workflow_call` with that tag
+as an explicit input. GitHub does not fan out a new workflow from a tag pushed
+with `GITHUB_TOKEN`; the reusable-workflow call deliberately avoids depending
+on that behavior. Directly pushed `v*` tags remain supported by the release
+workflow's existing `push.tags` trigger.
+
+The two optional integration secrets (`DEEPSEEK_API_KEY` and
+`DISCORD_WEBHOOK_URL`) are configured as GitHub Actions repository secrets and
+never appear in the repository. No personal access token is required for
+tagging or release orchestration. When `DEEPSEEK_API_KEY` is absent, releases
+ship with GitHub-generated notes.
 
 Reddit publishing is deferred, not rejected; the same notes and secrets
 pattern can drive it later if a public community channel is wanted.
@@ -69,6 +79,8 @@ pattern can drive it later if a public community channel is wanted.
   risk; cost is bounded to one request per release with a 90-second timeout.
 - A Discord webhook is a bearer credential that can post to its channel. It is
   stored only as a GitHub Actions secret and rotated in the secret store.
+- Automatic tagging and release execution use short-lived, repository-scoped
+  GitHub tokens; a maintainer PAT cannot expire underneath the release path.
 - Discord announcement failures are non-fatal and may require a manual replay;
   the release itself remains available and verifiable.
 - No `CHANGELOG.md` is committed; GitHub Releases remain the canonical,

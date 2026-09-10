@@ -127,6 +127,33 @@ def main() -> None:
         if expected not in path.read_text():
             raise SystemExit(f"{path.relative_to(ROOT)} does not reference {expected}")
 
+    tag_workflow = (ROOT / ".github/workflows/tag-on-version-bump.yml").read_text()
+    release_workflow = (ROOT / ".github/workflows/release.yml").read_text()
+    if "RELEASE_TOKEN" in tag_workflow:
+        raise SystemExit("version-bump tagging must not depend on a maintainer PAT")
+    for expected in (
+        "contents: write",
+        "uses: ./.github/workflows/release.yml",
+        "release_tag: ${{ needs.tag-if-bumped.outputs.tag }}",
+        "secrets: inherit",
+    ):
+        if expected not in tag_workflow:
+            raise SystemExit(
+                f"tag-on-version-bump.yml is missing reusable-release contract {expected!r}"
+            )
+    for expected in (
+        "workflow_call:",
+        "RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}",
+    ):
+        if expected not in release_workflow:
+            raise SystemExit(
+                f"release.yml is missing reusable-release contract {expected!r}"
+            )
+    if release_workflow.count("github.ref_name") != 1:
+        raise SystemExit(
+            "release.yml must use RELEASE_TAG everywhere except its push-trigger fallback"
+        )
+
     print(f"release contract passed for v{version}")
 
 
