@@ -32,6 +32,10 @@ jobs:
           components: rustfmt
       - name: Format
         run: cargo fmt --check
+      - name: Proof harness syntax
+        run: |
+          bash -n examples/prove-maskura.sh examples/local-quickstart.sh examples/maskura-demo.sh scripts/bench-filters.sh
+          python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("examples/python-hybrid-roundtrip.py").read_text())'
 
   lint:
     runs-on: ubuntu-latest
