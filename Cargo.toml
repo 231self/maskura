@@ -36,7 +36,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 hex = "0.4"
 uuid = { version = "1", features = ["v7", "v5", "v4"] }
-rand = "0.8"
+rand = "0.10"
 zeroize = "1"
 bytes = "1"
 csv-core = "0.1"
