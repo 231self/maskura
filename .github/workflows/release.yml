@@ -19,10 +19,20 @@ env:
   LEGACY_IMAGE: ghcr.io/${{ github.repository_owner }}/s4/s4
 
 jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Verify release tag and version surfaces
+        run: python3 scripts/check-release-contract.py --tag "${{ github.ref_name }}"
+
   # Native per-arch builds: amd64 on the x64 runner, arm64 on the native
   # arm64 runner. No cross-compilation, so ring/aws-lc-sys/openssl-sys build
   # against each runner's own native libs. Both legs run in parallel.
   build:
+    needs: contract
+    timeout-minutes: 90
     strategy:
       matrix:
         include:
@@ -50,18 +60,21 @@ jobs:
           bash scripts/build-filters.sh
 
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Build gateway, CLI, and MCP releases (${{ matrix.suffix }})
         run: |
           mkdir -p dist/components
-          cargo build --release -p s4-gateway -p s4-mcp -p s4ctl
+          cargo build --locked --release -p s4-gateway -p s4-mcp -p s4ctl
           cp target/release/s4-gateway dist/s4-gateway
           cp target/release/maskura-mcp dist/maskura-mcp-linux-${{ matrix.suffix }}
           cp target/release/s4-mcp dist/s4-mcp-linux-${{ matrix.suffix }}
           cp target/release/maskura dist/maskura-linux-${{ matrix.suffix }}
           cp target/release/s4ctl dist/s4ctl-linux-${{ matrix.suffix }}
           cp -r target/components/. dist/components/
+          version="${{ github.ref_name }}"
+          expected="maskura ${version#v}"
+          test "$(dist/maskura-linux-${{ matrix.suffix }} --version)" = "$expected"
 
       - name: Upload CLI and MCP binaries (${{ matrix.suffix }})
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -112,7 +125,9 @@ jobs:
           docker push "$LEGACY_IMAGE_REF"
 
   build-macos:
+    needs: contract
     runs-on: macos-15
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
@@ -136,10 +151,14 @@ jobs:
 
       - name: Smoke native binaries
         run: |
-          target/release/maskura --version
+          version="${{ github.ref_name }}"
+          expected="maskura ${version#v}"
+          test "$(target/release/maskura --version)" = "$expected"
           target/release/s4ctl --version
           test -x target/release/maskura-mcp
           test -x target/release/s4-mcp
+          file target/release/maskura | grep -q 'Mach-O 64-bit executable arm64'
+          file target/release/s4ctl | grep -q 'Mach-O 64-bit executable arm64'
           file target/release/maskura-mcp | grep -q 'Mach-O 64-bit executable arm64'
           file target/release/s4-mcp | grep -q 'Mach-O 64-bit executable arm64'
 
@@ -165,6 +184,7 @@ jobs:
   release:
     needs: [build, build-macos]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
@@ -174,6 +194,15 @@ jobs:
           pattern: maskura-binaries-*
           path: dist
           merge-multiple: true
+
+      - name: Verify native artifact matrix
+        run: |
+          for suffix in linux-amd64 linux-arm64 macos-arm64; do
+            test -s "dist/maskura-${suffix}"
+            test -s "dist/s4ctl-${suffix}"
+            test -s "dist/maskura-mcp-${suffix}"
+            test -s "dist/s4-mcp-${suffix}"
+          done
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -196,9 +225,7 @@ jobs:
         run: |
           docker buildx imagetools create \
             -t ${{ env.IMAGE }}:${{ github.ref_name }} \
-            -t ${{ env.IMAGE }}:latest \
             -t ${{ env.LEGACY_IMAGE }}:${{ github.ref_name }} \
-            -t ${{ env.LEGACY_IMAGE }}:latest \
             ${{ env.IMAGE }}:${{ github.ref_name }}-amd64 \
             ${{ env.IMAGE }}:${{ github.ref_name }}-arm64
 
@@ -211,6 +238,22 @@ jobs:
           test -n "$legacy" && test "$legacy" != "null"
           echo "canonical=$canonical" >> "$GITHUB_OUTPUT"
           echo "legacy=$legacy" >> "$GITHUB_OUTPUT"
+          printf '%s@%s\n%s@%s\n' \
+            "${{ env.IMAGE }}" "$canonical" \
+            "${{ env.LEGACY_IMAGE }}" "$legacy" \
+            > dist/IMAGE_DIGESTS
+
+      - name: Install proof dependencies
+        run: |
+          python3 -m venv .release-venv
+          . .release-venv/bin/activate
+          python3 -m pip install awscli ./sdks/python
+          echo "$PWD/.release-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Prove the versioned image before promotion
+        env:
+          MASKURA_PROOF_IMAGE: ${{ env.IMAGE }}:${{ github.ref_name }}
+        run: bash examples/prove-maskura.sh
 
       - name: Attest canonical container provenance
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
@@ -261,7 +304,16 @@ jobs:
       - name: Attest release artifact provenance
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
-          subject-path: dist/*
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Promote verified images to latest
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE }}:latest \
+            ${{ env.IMAGE }}:${{ github.ref_name }}
+          docker buildx imagetools create \
+            -t ${{ env.LEGACY_IMAGE }}:latest \
+            ${{ env.LEGACY_IMAGE }}:${{ github.ref_name }}
 
       - name: Make canonical and legacy images public
         continue-on-error: true
@@ -277,6 +329,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          notes=()
+          notes_file="docs/releases/${{ github.ref_name }}.md"
+          if [ -f "$notes_file" ]; then
+            # The file's H1 is useful in mdBook; the GitHub Release already
+            # supplies its own title, so prepend the body below that heading.
+            notes=(--notes "$(tail -n +3 "$notes_file")")
+          fi
           gh release create "${{ github.ref_name }}" \
              dist/maskura-gateway-linux-x86_64 \
              dist/s4-gateway-linux-x86_64 \
@@ -299,6 +358,65 @@ jobs:
              dist/maskura-typescript-sdk.tar.gz \
              dist/s4-typescript-sdk.tar.gz \
              dist/maskura-sbom.spdx.json \
+             dist/IMAGE_DIGESTS \
              dist/SHA256SUMS \
              --repo "${{ github.repository }}" \
-            --generate-notes
+             --verify-tag \
+             --fail-on-no-commits \
+             --generate-notes \
+             "${notes[@]}"
+
+  verify-release:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver: docker-container
+
+      - name: Verify published image architectures
+        run: |
+          docker buildx imagetools inspect \
+            "${{ env.IMAGE }}:${{ github.ref_name }}" \
+            --format '{{json .Manifest}}' > manifest.json
+          python3 - <<'PY'
+          import json
+
+          manifest = json.load(open("manifest.json", encoding="utf-8"))
+          platforms = {
+              (entry["platform"]["os"], entry["platform"]["architecture"])
+              for entry in manifest["manifests"]
+          }
+          expected = {("linux", "amd64"), ("linux", "arm64")}
+          if platforms != expected:
+              raise SystemExit(f"published platforms {platforms!r}, expected {expected!r}")
+          PY
+
+      - name: Download and verify release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir verify-dist
+          gh release download "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --dir verify-dist
+          (cd verify-dist && sha256sum --check SHA256SUMS)
+          for suffix in linux-amd64 linux-arm64 macos-arm64; do
+            test -f "verify-dist/maskura-${suffix}"
+            test -f "verify-dist/maskura-mcp-${suffix}"
+          done
+          test -f verify-dist/maskura-python-sdk.tar.gz
+          test -f verify-dist/maskura-typescript-sdk.tar.gz
+          test -f verify-dist/maskura-sbom.spdx.json
+          test -f verify-dist/IMAGE_DIGESTS
+          canonical_digest="$(jq -r .digest manifest.json)"
+          grep -Fx \
+            "${{ env.IMAGE }}@${canonical_digest}" \
+            verify-dist/IMAGE_DIGESTS
+          gh attestation verify \
+            --repo "${{ github.repository }}" \
+            verify-dist/maskura-linux-amd64

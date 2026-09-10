@@ -67,6 +67,7 @@ jobs:
             echo "could not determine workspace version; skipping tag"
             exit 0
           fi
+          python3 scripts/check-release-contract.py --tag "$tag"
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1; then
             echo "tag $tag already exists; skipping"
             exit 0

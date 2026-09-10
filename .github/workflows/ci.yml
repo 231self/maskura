@@ -35,7 +35,8 @@ jobs:
       - name: Proof harness syntax
         run: |
           bash -n examples/prove-maskura.sh examples/local-quickstart.sh examples/maskura-demo.sh scripts/bench-filters.sh
-          python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("examples/python-hybrid-roundtrip.py").read_text())'
+          python3 -c 'import ast, pathlib; [ast.parse(path.read_text()) for path in map(pathlib.Path, ["examples/python-hybrid-roundtrip.py", "scripts/check-release-contract.py"])]'
+          python3 scripts/check-release-contract.py
 
   lint:
     runs-on: ubuntu-latest

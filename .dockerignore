@@ -4,7 +4,12 @@
 target
 .git
 .jj
+.worktrees
 node_modules
+__pycache__
+*.py[cod]
+docs/output
+sdks/typescript/dist
 .actrc
 act
 .env

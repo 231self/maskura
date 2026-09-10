@@ -4,6 +4,7 @@
 - [Open source and hosted boundaries](open-source.md)
 - [Demo](demo.md)
 - [Run the claims](proofs.md)
+- [v0.6.0 release notes](releases/v0.6.0.md)
 - [Plugins](plugins.md)
 - [Encryption](encryption.md)
 - [Post-quantum encryption](post-quantum-crypto.md)
