@@ -163,14 +163,19 @@ impl CompatibilitySpoolTransaction {
             if !is_recognized_spool_file(name) {
                 continue;
             }
-            let metadata = entry.metadata().await.map_err(spool_error)?;
+            let metadata = match entry.metadata().await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(spool_error(error)),
+            };
             if !metadata.is_file() || metadata.modified().map_err(spool_error)? > cutoff {
                 continue;
             }
-            tokio::fs::remove_file(entry.path())
-                .await
-                .map_err(spool_error)?;
-            removed += 1;
+            match tokio::fs::remove_file(entry.path()).await {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(spool_error(error)),
+            }
         }
         Ok(removed)
     }
@@ -436,6 +441,45 @@ mod tests {
         assert!(!stale_read.exists());
         assert!(unrelated.exists());
         let _ = std::fs::remove_file(unrelated);
+        let _ = std::fs::remove_dir(directory);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cleanup_tolerates_files_removed_by_another_sweeper() {
+        let directory = std::env::temp_dir().join(format!(
+            "maskura-spool-concurrent-cleanup-{}",
+            Uuid::now_v7()
+        ));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        for index in 0..128 {
+            tokio::fs::write(
+                directory.join(format!("{FILE_PREFIX}{index}.tmp")),
+                b"stale",
+            )
+            .await
+            .unwrap();
+        }
+
+        let config = config(directory.clone(), 1);
+        let mut cleanups = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let config = config.clone();
+            cleanups
+                .spawn(async move { CompatibilitySpoolTransaction::cleanup_stale(&config).await });
+        }
+        while let Some(result) = cleanups.join_next().await {
+            result.unwrap().unwrap();
+        }
+
+        assert!(
+            tokio::fs::read_dir(&directory)
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none()
+        );
         let _ = std::fs::remove_dir(directory);
     }
 }
