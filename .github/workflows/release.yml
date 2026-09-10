@@ -285,14 +285,6 @@ jobs:
             -t ${{ env.IMAGE }}:latest \
             ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}
 
-      - name: Make the Maskura image public
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api -X PATCH "/orgs/${{ github.repository_owner }}/packages/container/maskura%2Fmaskura" \
-            -f visibility=public
-
       - name: Generate release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -352,6 +344,8 @@ jobs:
           driver: docker-container
 
       - name: Verify published image architectures
+        # This job never logs in to GHCR. A successful inspect therefore proves
+        # that the versioned manifest is anonymously pullable as well as complete.
         run: |
           docker buildx imagetools inspect \
             "${{ env.IMAGE }}:${{ env.RELEASE_TAG }}" \

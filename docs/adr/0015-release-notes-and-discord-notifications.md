@@ -61,6 +61,12 @@ with `GITHUB_TOKEN`; the reusable-workflow call deliberately avoids depending
 on that behavior. Directly pushed `v*` tags remain supported by the release
 workflow's existing `push.tags` trigger.
 
+Container visibility is managed as persistent GHCR package configuration, not
+mutated during every release. The `verify-release` job intentionally does not
+log in to GHCR before inspecting the published manifest. That anonymous pull is
+the release-time proof that the package remains public; a visibility regression
+fails the release instead of being hidden behind a non-fatal API request.
+
 The two optional integration secrets (`DEEPSEEK_API_KEY` and
 `DISCORD_WEBHOOK_URL`) are configured as GitHub Actions repository secrets and
 never appear in the repository. No personal access token is required for
@@ -81,6 +87,8 @@ pattern can drive it later if a public community channel is wanted.
   stored only as a GitHub Actions secret and rotated in the secret store.
 - Automatic tagging and release execution use short-lived, repository-scoped
   GitHub tokens; a maintainer PAT cannot expire underneath the release path.
+- Every release verifies the versioned multi-architecture image without GHCR
+  credentials, covering both manifest contents and public pull access.
 - Discord announcement failures are non-fatal and may require a manual replay;
   the release itself remains available and verifiable.
 - No `CHANGELOG.md` is committed; GitHub Releases remain the canonical,

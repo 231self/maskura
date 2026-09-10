@@ -8,9 +8,10 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_ENTRY_POINTS = (ROOT / "README.md",)
 FORBIDDEN = re.compile(
-    r"not the product|what makes (?:us|maskura) different|we built|the moat|"
+    r"not the product|one built-in policy|what makes (?:us|maskura) different|"
+    r"we built|the moat|the defensible (?:thing|product)|"
     r"commodity (?:feature|product)|strategic problem|under-marketed|"
-    r"defensible product",
+    r"defensible product|marketing the commodity",
     re.IGNORECASE,
 )
 
