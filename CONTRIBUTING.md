@@ -48,7 +48,7 @@ Thanks for considering a contribution to Maskura.
 
 ```bash
 just check          # correctness gate
-just pre-push       # correctness + dependency/security policy
+just pre-push       # fmt/clippy + dependency/security policy
 just push           # pre-push gate + jj git push
 just e2e            # MinIO end-to-end (Docker)
 cargo test --workspace
