@@ -36,7 +36,7 @@ inherit the host filesystem, environment, network, stdout, or stderr.
 crate-type = ["cdylib"]
 
 [dependencies]
-maskura-plugin-sdk = { git = "https://github.com/231self/maskura", tag = "v0.7.0" }
+maskura-plugin-sdk = { git = "https://github.com/231self/maskura", tag = "v0.7.1" }
 ```
 
 ```rust
@@ -128,4 +128,3 @@ data.
 
 Typed binary formats can additionally use the `binary-reductor` world from the
 same WIT package. See [Binary adapters](binary-adapters.md).
-
