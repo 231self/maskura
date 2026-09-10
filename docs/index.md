@@ -6,13 +6,15 @@ through your plugin pipeline — filter, redact, encrypt, convert, validate, rou
 and the result is forwarded to any S3-compatible storage backend.
 
 The quickest way to see it working is the README's
-[60-second Docker demo](https://github.com/231self/maskura#try-it-in-60-seconds):
+[Docker quickstart](https://github.com/231self/maskura#quickstart):
 run the published Maskura image with `AUTH_DISABLED=true` and a durable local
 volume, open the demo dashboard, and push a file through Maskura's own
 S3-compatible API. No MinIO service is involved in this path. This site is the
 deeper documentation:
 
 - **[Plugins](plugins.md)** — write, load, and compose your own Wasm filters.
+- **[Run the claims](proofs.md)** — black-box S3, plugin, and Python encryption
+  proofs with explicit assertions and limits.
 - **[Avro gate](avro.md)** — the typed Avro OCF processing path.
 - **[Binary adapters](binary-adapters.md)** — schema-aware binary reductors for
   typed formats.

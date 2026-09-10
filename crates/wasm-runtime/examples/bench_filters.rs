@@ -1,4 +1,4 @@
-//! Tier-1 micro-benchmark for the `s4:filter` pipeline components.
+//! Tier-1 micro-benchmark for Maskura's filter pipeline components.
 //!
 //! Measures per-object Wasm fuel, wall-clock time, and output expansion for
 //! every built-in component across a record-size / PII-density sweep. Run
@@ -327,14 +327,26 @@ fn print_report(rows: &[Row]) {
 
 fn write_csv(rows: &[Row]) {
     let path = components_dir().parent().unwrap().join("benchmarks.csv");
-    let mut csv = String::from("plugin,bytes,pii,fuel,fuel_per_byte,ms_per_object,expansion\n");
+    let mut csv = String::from(
+        "plugin,bytes,pii,fuel,fuel_per_byte,ms_per_object,mib_per_second,output_bytes,expansion\n",
+    );
     for row in rows {
         let fuel_per_byte = row.fuel as f64 / row.bytes.max(1) as f64;
         let ms = row.median.as_secs_f64() * 1000.0;
+        let mib_per_second =
+            (row.bytes as f64 / (1024.0 * 1024.0)) / row.median.as_secs_f64().max(1e-9);
         let expansion = row.output_bytes as f64 / row.bytes.max(1) as f64;
         csv.push_str(&format!(
-            "{},{},{},{},{:.4},{:.3},{:.3}\n",
-            row.plugin, row.bytes, row.pii, row.fuel, fuel_per_byte, ms, expansion
+            "{},{},{},{},{:.4},{:.3},{:.3},{},{:.3}\n",
+            row.plugin,
+            row.bytes,
+            row.pii,
+            row.fuel,
+            fuel_per_byte,
+            ms,
+            mib_per_second,
+            row.output_bytes,
+            expansion
         ));
     }
     std::fs::write(&path, csv).expect("write benchmarks.csv");

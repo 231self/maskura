@@ -1,21 +1,27 @@
 # Examples
 
-Runnable end-to-end demos. Credentials always come from the environment —
-never committed.
+Runnable end-to-end demonstrations. They create temporary credentials and
+storage, assert their results, and clean up after themselves.
 
-## Local quickstart (`local-quickstart.sh`)
+## Canonical proof suite
 
-The getting-started flow as a testable script: start the gateway from the
-published image (pinned to the `maskura` executable version), push a sample through the
-pipeline, assert redaction, stop.
+Run all three black-box proofs against the published container:
 
 ```bash
-bash examples/local-quickstart.sh
+just proof
 ```
 
-Requires `maskura`
-(`cargo install --git https://github.com/231self/maskura --bin maskura s4ctl`)
-and Docker.
+Or run one claim at a time:
+
+```bash
+just proof redaction  # unmodified AWS CLI + local S3 endpoint
+just proof plugin     # runtime Wasm import, no gateway rebuild
+just proof python     # hybrid encrypted write + client-only decrypt
+```
+
+See [Run the claims](../docs/proofs.md) for prerequisites, exact assertions,
+and the limits of each result. `local-quickstart.sh` remains as a compatible
+entry point for the redaction proof; `maskura-demo.sh` runs the whole suite.
 
 ## B2 redaction demo (`b2-redact-demo.sh`)
 
@@ -40,10 +46,10 @@ bash examples/b2-redact-demo.sh
 The B2 application key needs `readFiles`/`writeFiles`/`deleteFiles` on the
 bucket.
 
-## Envelope-encryption examples
+## Hybrid envelope encryption
 
-The former B2 and Python SDK encryption demos used the legacy RSA envelope and
-were removed when new writes moved to hybrid X25519 + ML-KEM-768. The current
-Rust round-trip is covered by `crates/gateway/tests/encrypt_roundtrip.rs`.
-Packaged Python and TypeScript hybrid client support is still a known gap; see
-[Encryption](../docs/encryption.md#client-tooling-status).
+[`python-hybrid-roundtrip.py`](python-hybrid-roundtrip.py) uses the packaged
+Python client. It creates a scoped API key, generates an X25519 + ML-KEM-768
+keypair, attaches only the public key, confirms no plaintext reached storage,
+and decrypts with the private key held by the process. The Rust wire-level
+round trip remains covered by `crates/gateway/tests/encrypt_roundtrip.rs`.

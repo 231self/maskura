@@ -38,8 +38,7 @@ the view you allow and the raw object never leaves your storage boundary.
   Backblaze B2, Cloudflare R2, or Vultr Object Storage when you want external storage —
   single or multi-cloud (consistent-hash ring, dual-write, read fail-over). MinIO is
   covered by the CI end-to-end suite;
-  Backblaze B2 is tested against a real bucket (redaction and
-  envelope-encryption round-trips).
+  the B2 example verifies redaction against a real bucket.
 - **Agent-safe reads** — read data through Maskura with `x-maskura-process: read`: the pipeline
   runs on the way *out*, so AI agents get redacted/encrypted output while the object
   at rest stays raw. No second cleaned copy to keep in sync.
@@ -58,6 +57,7 @@ emails / SSNs / credit cards), `email-detect`, `ssn-detect`, `card-detect`,
 - [Install the CLI (optional)](#install-the-cli-optional)
 - [Run your own plugin](#run-your-own-plugin)
 - [Usage examples](#usage-examples)
+- [Evidence you can run](#evidence-you-can-run)
 - [Demo](#demo)
 - [How it works](#how-it-works)
 - [Development](#development)
@@ -264,14 +264,9 @@ must cover encrypted framing overhead as well as plaintext output.
 **Encryption — per-field envelope encryption, decryptable only by you**
 
 ```bash
-# Round-trip against any S3-compatible bucket: pre-encrypt fixture →
-# encrypted bytes fetched straight from the bucket → decrypted through Maskura:
-export B2_S3_ENDPOINT=https://s3.us-east-005.backblazeb2.com
-export B2_REGION=us-east-005
-export B2_BUCKET=your-bucket
-export B2_ACCESS_KEY_ID=your-key-id
-export B2_SECRET_ACCESS_KEY=your-application-key
-bash examples/b2-encrypt-demo.sh
+# Starts the published image, creates a scoped key, uploads encrypted PII with
+# the Python SDK, verifies the stored bytes, and decrypts with the local key:
+just proof python
 ```
 
 New writes use hybrid X25519 + ML-KEM-768 key encapsulation with AES-256-GCM.
@@ -312,6 +307,20 @@ print(client.decrypt_payload(blob, priv))              # you hold the key
 Full details: [examples/README.md](examples/README.md) and
 [docs/plugins.md](docs/plugins.md).
 
+## Evidence you can run
+
+```bash
+just proof
+```
+
+This runs three black-box checks against the published container: an
+unmodified AWS CLI redaction round trip, a live Wasm component import with no
+gateway rebuild, and Python hybrid encryption with client-only decryption. It
+prints the container digest and fails on a missing assertion. See
+[Run the claims](docs/proofs.md) for the exact checks and what they do not
+establish. Reproducible filter cost data and run metadata come from
+`just bench-filters`; see [Benchmarks](docs/benchmarks.md).
+
 ## Demo
 
 ![The same PII file written three ways — raw, redacted, and deterministic-encrypted — through Maskura](docs/assets/demo.gif)
@@ -336,6 +345,7 @@ just check          # fmt + clippy + build filters + tests
 just pre-push       # fmt/clippy + Rust/Python/npm advisories + pin policy
 just push           # run pre-push, then publish the current jj bookmark
 just e2e            # end-to-end against MinIO (Docker)
+just proof          # black-box public claims against the published image
 just build-sdks     # regenerate Python/TypeScript SDKs from the OpenAPI spec
 ```
 
@@ -391,7 +401,8 @@ gh attestation verify --repo 231self/maskura ./maskura-linux-amd64
 
 - **Docs site** — the same docs, rendered:
   <https://231self.github.io/maskura/>.
-- `examples/` — runnable end-to-end demos (B2 encryption round-trip).
+- `examples/` — assertion-backed local proofs and external-storage examples.
+- `docs/proofs.md` — claim-to-command map, including explicit limits.
 - `docs/plugins.md` — create and consume your own plugins.
 - `docs/security.md` — the security model of the gateway.
 - `docs/adr/` — architecture decision records.

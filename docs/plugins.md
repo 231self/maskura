@@ -86,6 +86,13 @@ maskura plugin disable <id>                        # remove from the pipeline
 maskura plugin delete <id>                         # drop the plugin
 ```
 
+To verify runtime import against the published container, including an
+observable transform produced only by the imported component:
+
+```bash
+just proof plugin
+```
+
 Or auto-load a directory of plugins at gateway startup:
 
 ```bash

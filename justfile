@@ -19,6 +19,12 @@ check-fmt:
 check-lint:
   cargo clippy --locked --all-targets -- -D warnings
 
+# Keep the public evidence entry points executable and parseable without
+# starting Docker or reaching the network.
+check-evidence:
+  bash -n examples/prove-maskura.sh examples/local-quickstart.sh examples/maskura-demo.sh scripts/bench-filters.sh
+  python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("examples/python-hybrid-roundtrip.py").read_text())'
+
 test:
   cargo test --locked --workspace
 
@@ -37,7 +43,7 @@ audit-dependencies:
 
 # Canonical fast local gate before publishing a jj bookmark. The protected CI
 # remains responsible for the long Wasm, SDK, database, interop, and E2E suites.
-pre-push: check-fast audit-dependencies
+pre-push: check-fast check-evidence audit-dependencies
   @echo "Pre-push checks passed"
 
 # Safe publishing path for this jj repository. Extra arguments are passed to jj.
@@ -68,6 +74,12 @@ e2e-streaming:
 interop:
   cargo test -p s4-gateway --test s3_frontdoor_test available_aws_cli_and_boto3_interoperate
 
+# Public, black-box evidence: AWS CLI redaction, runtime Wasm import, and the
+# Python X25519 + ML-KEM-768 encrypted round trip. Optional mode: redaction,
+# plugin, or python (default: all).
+proof *args:
+  bash examples/prove-maskura.sh {{args}}
+
 # Fault-injection suite: multipart staging fault matrix + streaming failure paths
 fault-streaming:
   cargo test -p s4-gateway multipart_staging::tests
@@ -81,7 +93,7 @@ bench-rss:
 
 # Micro-benchmark: per-plugin Wasm fuel, latency, and expansion (Tier 1)
 bench-filters: build-filters
-  cargo run --release -p s4-wasm-runtime --example bench_filters
+  bash scripts/bench-filters.sh
 
 # Soak: high-case-count property tests + repeated streaming round-trips
 soak-streaming:
