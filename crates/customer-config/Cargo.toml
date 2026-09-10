@@ -9,5 +9,5 @@ publish = false
 [dependencies]
 serde = { workspace = true }
 thiserror.workspace = true
-toml = "0.8"
+toml = "0.9"
 url = "2"
