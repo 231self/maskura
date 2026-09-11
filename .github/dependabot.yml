@@ -39,6 +39,12 @@ updates:
       - dependency-name: "*"
         update-types:
           - version-update:semver-major
+      # Dependabot classifies pre-1 0.x jumps as minor even when the library's
+      # API is breaking. Keep the post-quantum client upgrade coordinated with
+      # its high-level key and envelope interoperability migration.
+      - dependency-name: "@noble/post-quantum"
+        versions:
+          - ">=0.5.0"
 
   - package-ecosystem: github-actions
     directory: /
