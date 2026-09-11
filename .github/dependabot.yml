@@ -11,16 +11,12 @@ updates:
         update-types:
           - minor
           - patch
-    # sha2 0.11 and hmac 0.13 use digest 0.11, while hkdf and the rest of the
-    # current crypto stack still require digest 0.10. Re-enable these majors as
-    # a coordinated migration once the dependency graph can move together.
+    # Breaking Rust releases frequently require coordinated ecosystem and code
+    # migrations. Keep advisory scanning active, but schedule majors manually.
     ignore:
-      - dependency-name: sha2
-        versions:
-          - "0.11.x"
-      - dependency-name: hmac
-        versions:
-          - "0.13.x"
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
 
   - package-ecosystem: npm
     # Generated SDK output is replaced by `just build-sdks`. The overlay is the
@@ -34,6 +30,15 @@ updates:
       typescript-dependencies:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
+    # Major SDK crypto/toolchain upgrades need API migration and explicit
+    # interoperability tests rather than an automated manifest-only bump.
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
 
   - package-ecosystem: github-actions
     directory: /
