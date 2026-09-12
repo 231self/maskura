@@ -36,6 +36,12 @@ SCAN_ROOTS = (
     ROOT / "AGENTS.md",
 )
 OLD_NAMESPACE = re.compile(r"\bs4\b|(?<!aw)s4[-_:]|s4m_|S4Client", re.IGNORECASE)
+FROZEN_PROTOCOL_LITERALS = {
+    Path("crates/gateway/src/managed.rs"): (
+        'b"s4-placement-policy\\0"',
+        'b"s4-rendezvous\\0"',
+    ),
+}
 TEXT_SUFFIXES = {
     "",
     ".cjs",
@@ -160,11 +166,15 @@ def check_namespace() -> None:
         for path in scan_files(root):
             if path == Path(__file__).resolve():
                 continue
-            match = OLD_NAMESPACE.search(path.read_text(errors="ignore"))
+            relative_path = path.relative_to(ROOT)
+            contents = path.read_text(errors="ignore")
+            for literal in FROZEN_PROTOCOL_LITERALS.get(relative_path, ()):
+                contents = contents.replace(literal, "")
+            match = OLD_NAMESPACE.search(contents)
             if match:
                 fail(
                     f"old namespace {match.group(0)!r} remains in "
-                    f"{path.relative_to(ROOT)}"
+                    f"{relative_path}"
                 )
     for path in ROOT.rglob("*"):
         if "target" in path.parts or ".jj" in path.parts:
