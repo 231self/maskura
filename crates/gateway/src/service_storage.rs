@@ -357,15 +357,15 @@ impl ServiceStorage {
         }
         if self.backends.is_empty() {
             return Err(
-                "transactional managed mode requires one or more managed B2 backends at launch"
+                "transactional managed mode requires one or more managed B2 or AWS backends at launch"
                     .to_string(),
             );
         }
         let mut backend_ids = HashSet::with_capacity(self.backends.len());
         for backend in &self.backends {
-            if !backend.is_b2() {
+            if !matches!(backend.provider_kind(), "b2" | "aws") {
                 return Err(
-                    "transactional managed mode supports only B2 backend pools at launch"
+                    "transactional managed mode supports only B2 and AWS backend pools at launch"
                         .to_string(),
                 );
             }
@@ -374,7 +374,7 @@ impl ServiceStorage {
                 .is_none_or(|endpoint| endpoint.scheme() != "https")
             {
                 return Err(
-                    "transactional managed B2 requires HTTPS provider endpoints".to_string()
+                    "transactional managed storage requires HTTPS provider endpoints".to_string(),
                 );
             }
             if backend.storage_identity().is_none()
@@ -382,19 +382,19 @@ impl ServiceStorage {
                 || !backend.credential_epoch().is_some_and(|epoch| epoch > 0)
             {
                 return Err(
-                    "transactional managed B2 requires explicit provider instance/account identity and a positive credential epoch"
+                    "transactional managed storage requires explicit provider instance/account identity and a positive credential epoch"
                         .to_string(),
                 );
             }
             if backend.placement_weight().is_none_or(|weight| weight == 0) {
                 return Err(
-                    "transactional managed B2 requires positive static placement weight and capacity units"
+                    "transactional managed storage requires positive static placement weight and capacity units"
                         .to_string(),
                 );
             }
             if !backend_ids.insert(backend.id()) {
                 return Err(
-                    "transactional managed B2 requires unique stable backend IDs".to_string(),
+                    "transactional managed storage requires unique stable backend IDs".to_string(),
                 );
             }
         }
@@ -2819,7 +2819,7 @@ mod tests {
     }
 
     #[test]
-    fn transactional_managed_launch_requires_identified_b2_pool_with_static_policy() {
+    fn transactional_managed_launch_requires_identified_b2_or_aws_pool_with_static_policy() {
         let repository = Arc::new(InMemoryManagedRepository::new());
         let managed = parse_service_backends(
             "b2|managed-primary|account-123|1|https://s3.us-east-005.backblazeb2.com|us-east-005|managed-bucket|key|secret",
@@ -2833,13 +2833,13 @@ mod tests {
         );
         assert!(storage.validate_managed_launch_configuration().is_ok());
 
-        let multi_b2 = parse_service_backends(
-            "b2|managed-primary|account-123|1|1|1|https://s3.us-east-005.backblazeb2.com|us-east-005|managed-bucket|key|secret;b2|managed-replica|account-123|1|3|2|https://s3.us-east-005.backblazeb2.com|us-east-005|managed-bucket-two|key|secret",
+        let mixed_pool = parse_service_backends(
+            "b2|managed-primary|account-123|1|1|1|https://s3.us-east-005.backblazeb2.com|us-east-005|managed-bucket|key|secret;aws|managed-replica|account-456|2|3|2|https://s3.us-east-1.amazonaws.com|us-east-1|managed-bucket-two|key|secret",
         )
         .unwrap();
         assert!(
             ServiceStorage::with_management(
-                multi_b2,
+                mixed_pool,
                 repository.clone(),
                 ManagedStreamingMode::Enforce,
                 PLACEMENT_VERSION_V1,
@@ -2848,10 +2848,37 @@ mod tests {
             .is_ok()
         );
 
+        let mut missing_epoch = parse_service_backends(
+            "aws|managed-primary|account-123|1|https://s3.us-east-1.amazonaws.com|us-east-1|bucket|key|secret",
+        )
+        .unwrap();
+        missing_epoch[0].credential_epoch = None;
+        let mut invalid_placement = parse_service_backends(
+            "b2|managed-primary|account-123|1|https://s3.us-east-005.backblazeb2.com|us-east-005|bucket|key|secret",
+        )
+        .unwrap();
+        invalid_placement[0].placement_weight = 0;
+
         for invalid in [
             Vec::new(),
             parse_service_backends(
-                "aws|provider-one|account-123|1|https://s3.example|us-east-1|bucket|key|secret",
+                "r2|provider-one|account-123|1|https://s3.example|us-east-1|bucket|key|secret",
+            )
+            .unwrap(),
+            parse_service_backends(
+                "minio|provider-one|account-123|1|https://s3.example|us-east-1|bucket|key|secret",
+            )
+            .unwrap(),
+            parse_service_backends(
+                "custom|provider-one|account-123|1|https://s3.example|us-east-1|bucket|key|secret",
+            )
+            .unwrap(),
+            parse_service_backends(
+                "AWS|provider-one|account-123|1|https://s3.example|us-east-1|bucket|key|secret",
+            )
+            .unwrap(),
+            parse_service_backends(
+                "B2|provider-one|account-123|1|https://s3.example|us-east-1|bucket|key|secret",
             )
             .unwrap(),
             parse_service_backends(
@@ -2863,13 +2890,15 @@ mod tests {
             )
             .unwrap(),
             parse_service_backends(
-                "b2|one|account-1|1|1|1|https://s3.example|us-east-1|bucket-one|key|secret;aws|two|account-2|1|1|1|https://s3.example|us-east-1|bucket-two|key|secret",
+                "aws|managed-primary|account-123|1|http://s3.example|us-east-1|bucket|key|secret",
             )
             .unwrap(),
             parse_service_backends(
                 "b2|duplicate|account-1|1|1|1|https://s3.example|us-east-1|bucket-one|key|secret;b2|duplicate|account-2|1|1|1|https://s3.example|us-east-1|bucket-two|key|secret",
             )
             .unwrap(),
+            missing_epoch,
+            invalid_placement,
         ] {
             let storage = ServiceStorage::with_management(
                 invalid,

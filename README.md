@@ -63,7 +63,7 @@ docker run --rm -p 127.0.0.1:8791:8080 -v maskura-data:/data \
   -e MASKURA_STORAGE_MODE=local \
   -e MASKURA_LOCAL_STORAGE_DIR=/data \
   -e MASKURA_MULTIPART_MODE=staged \
-  ghcr.io/231self/maskura/maskura:v0.7.1
+  ghcr.io/231self/maskura/maskura:v0.7.2
 ```
 
 Maskura is now an S3-compatible endpoint at `http://localhost:8791`. Use any

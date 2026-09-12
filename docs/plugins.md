@@ -36,7 +36,7 @@ inherit the host filesystem, environment, network, stdout, or stderr.
 crate-type = ["cdylib"]
 
 [dependencies]
-maskura-plugin-sdk = { git = "https://github.com/231self/maskura", tag = "v0.7.1" }
+maskura-plugin-sdk = { git = "https://github.com/231self/maskura", tag = "v0.7.2" }
 ```
 
 ```rust
