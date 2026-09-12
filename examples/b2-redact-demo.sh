@@ -23,7 +23,7 @@ GATEWAY_URL="http://127.0.0.1:${PORT}"
 INPUT="$ROOT/tests/fixtures/pii/sample1.txt"
 OBJ_KEY="demo/redacted-sample.txt"
 MC_CONF="maskura-mc-redact-demo"
-MC_IMAGE="minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
+MC_IMAGE="quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
 GW_LOG="/tmp/maskura-b2-redact-demo.log"
 RAW="/tmp/maskura-b2-redact-raw.txt"
 
