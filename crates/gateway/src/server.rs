@@ -12004,6 +12004,36 @@ fn source_body_limits_from_env() -> anyhow::Result<BodyLimits> {
     })
 }
 
+fn validate_managed_storage_at_launch(storage: &ServiceStorage) -> anyhow::Result<()> {
+    storage
+        .validate_managed_launch_configuration()
+        .map_err(|detail| {
+            anyhow::anyhow!("managed streaming configuration is invalid at launch: {detail}")
+        })
+}
+
+#[cfg(test)]
+#[test]
+fn managed_storage_launch_validation_rejects_unsupported_provider_before_serving() {
+    let backends = parse_service_backends(
+        "r2|managed-primary|account-123|1|https://s3.example|us-east-1|bucket|key|secret",
+    )
+    .unwrap();
+    let storage = ServiceStorage::with_management(
+        backends,
+        Arc::new(InMemoryManagedRepository::new()),
+        ManagedStreamingMode::Enforce,
+        PLACEMENT_VERSION_V1,
+    );
+
+    assert!(
+        validate_managed_storage_at_launch(&storage)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid at launch")
+    );
+}
+
 /// Build the engine state from environment variables, injecting the given
 /// control plane and key-wrapping backend. This is the shared construction
 /// path for both the OSS self-host binary (`NoopControlPlane` +
@@ -12307,12 +12337,22 @@ pub async fn build_state_with_pipeline_template(
     } else {
         Arc::new(InMemoryManagedRepository::new())
     };
-    if !service_backends.is_empty() {
+    let service_storage = Arc::new(
+        ServiceStorage::with_management(
+            service_backends,
+            managed_repository.clone(),
+            managed_mode,
+            managed_placement_version,
+        )
+        .with_managed_capabilities(managed_streaming_capabilities),
+    );
+    validate_managed_storage_at_launch(&service_storage)?;
+    if !service_storage.is_empty() {
         let policy = ManagedPlacementPolicy {
             version: managed_placement_version,
             fingerprint: placement_policy_fingerprint(
                 managed_placement_version,
-                service_backends.iter().map(|backend| {
+                service_storage.backends.iter().map(|backend| {
                     (
                         backend.id(),
                         backend.placement_weight,
@@ -12320,7 +12360,8 @@ pub async fn build_state_with_pipeline_template(
                     )
                 }),
             ),
-            backend_facts: service_backends
+            backend_facts: service_storage
+                .backends
                 .iter()
                 .map(|backend| ManagedPlacementBackendFact {
                     backend_id: backend.id(),
@@ -12415,15 +12456,6 @@ pub async fn build_state_with_pipeline_template(
             "managed observe/enforce mode requires MASKURA_MANAGED_STREAMING_TRANSACTIONAL=true"
         );
     }
-    let service_storage = Arc::new(
-        ServiceStorage::with_management(
-            service_backends,
-            managed_repository,
-            managed_mode,
-            managed_placement_version,
-        )
-        .with_managed_capabilities(managed_streaming_capabilities),
-    );
     let multipart_coordinator = match (&multipart_staging, &operation_journal) {
         (Some(staging), Some(journal)) => {
             let coordinator =

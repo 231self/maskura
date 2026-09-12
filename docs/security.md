@@ -380,6 +380,12 @@ Streaming writes (single-part `PUT`, and staged multipart when
 `MASKURA_MANAGED_STREAMING_TRANSACTIONAL=true` and a durable repository) adds
 authoritative metadata over the consistent-hash placement:
 
+- **Launch admission.** Transactional `enforce` mode accepts only exact lowercase
+  `b2` and `aws` provider kinds. Every backend must use HTTPS, have an explicit
+  stable provider instance/account identity and positive credential epoch, have
+  a unique stable backend ID, and participate in a positive static placement
+  policy. The complete pool is checked before its placement policy is recorded
+  and again before each managed streaming write begins.
 - **Placement.** Deterministic rendezvous hashing (versioned,
   `MASKURA_MANAGED_PLACEMENT_VERSION`) selects a primary and one replica backend per
   logical object, independent of backend input order.

@@ -18,7 +18,7 @@ The default is the current published image. Pin a release when you want the
 same bytes on a later run:
 
 ```bash
-MASKURA_PROOF_IMAGE=ghcr.io/231self/maskura/maskura:v0.7.1 just proof
+MASKURA_PROOF_IMAGE=ghcr.io/231self/maskura/maskura:v0.7.2 just proof
 ```
 
 The harness prints the pulled image digest before it starts its assertions. It
