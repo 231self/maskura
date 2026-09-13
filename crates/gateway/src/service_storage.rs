@@ -2425,6 +2425,13 @@ impl ObjectSinkTransaction for ManagedLogicalSink {
         Some(self.operation_id)
     }
 
+    fn usage_journal_operation_id(&self) -> Option<uuid::Uuid> {
+        // The canonical managed operation lives in the authority ledger, not
+        // the child object-operation journal. Claiming its ID for usage makes
+        // the server look for a journal row that deliberately does not exist.
+        None
+    }
+
     async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError> {
         if self.committed {
             return Err(TransactionError::Finished);
@@ -3919,6 +3926,26 @@ mod tests {
             repository.get(&logical).await.unwrap().unwrap().generation,
             winner.generation
         );
+    }
+
+    #[test]
+    fn managed_logical_sink_separates_commit_and_usage_journal_identities() {
+        let repository = Arc::new(InMemoryManagedRepository::new());
+        let logical = LogicalObjectKey::new("tenant", "bucket", "key");
+        let (inner, _, _, _) = fake_managed_sink(repository.clone(), logical, None, None, None);
+        let operation_id = uuid::Uuid::now_v7();
+        let sink = ManagedLogicalSink {
+            inner: Box::new(inner),
+            repository,
+            operation_id,
+            expected_output_size: None,
+            expected_output_digest: None,
+            usage_recorded: false,
+            committed: false,
+        };
+
+        assert_eq!(sink.durable_operation_id(), Some(operation_id));
+        assert_eq!(sink.usage_journal_operation_id(), None);
     }
 
     #[tokio::test]

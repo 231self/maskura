@@ -747,6 +747,12 @@ pub trait ObjectSinkTransaction: Send {
     fn durable_operation_id(&self) -> Option<Uuid> {
         None
     }
+    /// Operation-journal identity that receives canonical usage evidence.
+    /// Most sinks use their durable operation identity. Managed logical sinks
+    /// persist that evidence in their separate authority ledger instead.
+    fn usage_journal_operation_id(&self) -> Option<Uuid> {
+        self.durable_operation_id()
+    }
     async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError>;
     async fn verify_output(
         &mut self,
