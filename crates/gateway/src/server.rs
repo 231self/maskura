@@ -3945,7 +3945,7 @@ async fn streaming_single_put(
         }
         persist_transaction_usage_evidence(
             state.operation_journal.as_ref(),
-            sink.durable_operation_id(),
+            sink.usage_journal_operation_id(),
             &usage_event,
         )
         .await
@@ -4147,7 +4147,7 @@ async fn streaming_avro_single_put(
             let usage_event = UsageEvent::from_grant(grant, input_bytes, output_bytes);
             persist_transaction_usage_evidence(
                 state.operation_journal.as_ref(),
-                sink.durable_operation_id(),
+                sink.usage_journal_operation_id(),
                 &usage_event,
             )
             .await
