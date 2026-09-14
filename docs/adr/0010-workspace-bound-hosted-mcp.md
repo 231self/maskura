@@ -62,3 +62,8 @@ authentication, metering, backend, or presigned URL headers.
 - Cancellation reaches active Wasm work and waits for gateway settlement;
   provider SDK calls that do not expose cooperative cancellation may complete
   before the invocation returns its committed outcome.
+- On 2026-09-14, the operated service enabled the hosted transport after a
+  release-bound production canary passed protected write/read, workspace and
+  credential denial cases, health, cleanup, and sanitized attestation checks.
+  This deployment status does not widen the trust boundary above or add OAuth
+  or agent-payment authorization.

@@ -28,9 +28,10 @@ Linux x86_64 and arm64, plus native Apple Silicon, binaries are attached to each
 `maskura-mcp-macos-arm64`. The `maskura-mcp` binary and `maskura_*` tools remain permanent
 compatibility aliases.
 
-There is currently no npm package or public hosted MCP endpoint. The public
-gateway does provide the foundation used by a hosted transport: shared typed
-contracts in `maskura-mcp-protocol` (re-exported as `maskura_gateway::mcp`) and trusted in-process execution through
+There is currently no npm package. The operated Maskura service provides a
+hosted Streamable HTTP endpoint, while the public gateway provides its shared
+typed contracts in `maskura-mcp-protocol` (re-exported as
+`maskura_gateway::mcp`) and trusted in-process execution through
 `maskura_gateway::server::invoke_mcp`.
 
 ## Run locally
@@ -87,7 +88,32 @@ For Kilo, the equivalent local entry in `kilo.json` is:
 }
 ```
 
-## Connect to a hosted gateway
+## Connect directly over Streamable HTTP
+
+Create an MCP token in the Maskura dashboard. A remote MCP client that supports
+Streamable HTTP needs these connection values:
+
+```text
+URL: https://api.s4.231self.com/mcp/workspaces/<workspace-id>
+Authorization: Bearer maskura_mcp_<token>
+```
+
+Use the immutable workspace ID associated with the token. The workspace in the
+URL must match exactly; Maskura never resolves a current or default workspace
+at request time. Native clients should omit `Origin`. Browser clients are
+accepted only from the operated dashboard's exact configured origin.
+
+The endpoint is stateless and accepts JSON-RPC over `POST`. It enforces bounded
+request and response envelopes, canonical `Host`, workspace-bound credentials,
+durable audit preflight, usage authorization, and per-user concurrency and rate
+limits. Supabase JWTs, S3 API keys, forwarded identity headers, and caller-chosen
+operation or policy identities are not accepted by this route.
+
+Client configuration shapes differ. Set the URL as the client's remote or
+Streamable HTTP MCP URL and send the token only in the `Authorization` header;
+keep it in the client's secret storage rather than source control.
+
+## Connect the local server to a hosted gateway
 
 Create an MCP token in the Maskura dashboard, or through the dashboard API with
 a signed-in session JWT:
@@ -112,7 +138,7 @@ Claude Desktop and Cursor use the standard `mcpServers` shape:
     "maskura": {
       "command": "maskura-mcp",
       "env": {
-        "MASKURA_GATEWAY_URL": "https://maskura.dev",
+        "MASKURA_GATEWAY_URL": "https://api.s4.231self.com",
         "MASKURA_MCP_TOKEN": "maskura_mcp_your_token"
       }
     }
@@ -133,7 +159,7 @@ Kilo uses its local-process MCP configuration shape in `kilo.json`:
       "type": "local",
       "command": ["maskura-mcp"],
       "environment": {
-        "MASKURA_GATEWAY_URL": "https://maskura.dev",
+        "MASKURA_GATEWAY_URL": "https://api.s4.231self.com",
         "MASKURA_MCP_TOKEN": "maskura_mcp_your_token"
       },
       "enabled": true
@@ -206,8 +232,8 @@ the MCP client receives the object.
 decoded object keys. `maskura_delete_object` deletes one bucket/key pair.
 
 MCP text responses are limited to 8 MiB. Binary request/response bodies,
-presigning, hosted Streamable HTTP transport, and agent payment protocols are
-not part of this stdio release.
+presigning, and agent payment protocols are not part of the stdio or hosted
+transport.
 
 ## Hosted adapter boundary
 
