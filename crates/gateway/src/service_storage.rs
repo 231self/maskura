@@ -1480,10 +1480,6 @@ impl ServiceStorage {
         let repository = self
             .authority_repository_required()
             .map_err(|error| TransactionError::Publication(error.to_string()))?;
-        repository
-            .assert_namespace_active(&logical.tenant_id)
-            .await
-            .map_err(|error| TransactionError::Publication(error.to_string()))?;
         let fence = repository
             .route_fence(&logical.tenant_id)
             .await

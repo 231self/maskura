@@ -1799,6 +1799,14 @@ async fn locked_namespace<C>(
 where
     C: ConnectionTrait,
 {
+    if let Some(namespace) = managed_namespace::Entity::find_by_id(tenant_id.to_string())
+        .lock(LockType::Update)
+        .one(db)
+        .await
+        .map_err(persistence)?
+    {
+        return Ok(namespace);
+    }
     let now = crate::transaction::unix_time_ms();
     managed_namespace::Entity::insert(managed_namespace::ActiveModel {
         tenant_id: Set(tenant_id.to_string()),
@@ -1872,6 +1880,14 @@ async fn locked_workspace_usage<C>(
 where
     C: ConnectionTrait,
 {
+    if let Some(usage) = managed_workspace_usage::Entity::find_by_id(tenant_id.to_string())
+        .lock(LockType::Update)
+        .one(db)
+        .await
+        .map_err(persistence)?
+    {
+        return Ok(usage);
+    }
     let now = crate::transaction::unix_time_ms();
     managed_workspace_usage::Entity::insert(managed_workspace_usage::ActiveModel {
         tenant_id: Set(tenant_id.to_string()),
@@ -2478,17 +2494,14 @@ impl ManagedRepository for PostgresManagedRepository {
     }
 
     async fn route_fence(&self, tenant_id: &str) -> Result<ManagedRouteFence, ManagedError> {
-        let txn = self.db.begin().await.map_err(persistence)?;
-        let namespace = locked_namespace(&txn, tenant_id).await?;
+        let namespace = locked_namespace(&self.db, tenant_id).await?;
         if namespace.state != "ACTIVE" {
             return Err(ManagedError::NamespaceFenced);
         }
-        let fence = ManagedRouteFence {
+        Ok(ManagedRouteFence {
             namespace_epoch: u64_from_i64(namespace.epoch, "managed namespace epoch")?,
             routing_epoch: u64_from_i64(namespace.routing_epoch, "managed routing epoch")?,
-        };
-        txn.commit().await.map_err(persistence)?;
-        Ok(fence)
+        })
     }
 
     async fn advance_routing_epoch(
