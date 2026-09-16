@@ -2496,16 +2496,7 @@ impl ObjectSinkTransaction for ManagedLogicalSink {
             }),
         };
         self.repository
-            .record_logical_usage(self.operation_id, evidence)
-            .await
-            .map_err(|error| TransactionError::Publication(error.to_string()))?;
-        self.repository
-            .transition_logical_operation(
-                self.operation_id,
-                ManagedLogicalOperationState::Open,
-                ManagedLogicalOperationState::Completing,
-                None,
-            )
+            .record_logical_usage_and_begin_completion(self.operation_id, evidence)
             .await
             .map_err(|error| TransactionError::Publication(error.to_string()))?;
         self.usage_recorded = true;

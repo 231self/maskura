@@ -958,6 +958,13 @@ pub trait ManagedRepository: Send + Sync {
         to: ManagedLogicalOperationState,
         error_class: Option<&str>,
     ) -> Result<ManagedLogicalOperation, ManagedError>;
+    /// Record usage evidence and advance the operation from `Open` to
+    /// `Completing` in one transaction (one database round trip instead of two).
+    async fn record_logical_usage_and_begin_completion(
+        &self,
+        operation_id: Uuid,
+        evidence: ManagedUsageEvidence,
+    ) -> Result<ManagedLogicalOperation, ManagedError>;
     async fn commit_logical_put(
         &self,
         operation_id: Uuid,
@@ -2782,7 +2789,7 @@ impl ManagedRepository for PostgresManagedRepository {
             return Err(ManagedError::Conflict);
         }
         let now = crate::transaction::unix_time_ms();
-        managed_logical_operation::Entity::update_many()
+        let updated = managed_logical_operation::Entity::update_many()
             .col_expr(
                 managed_logical_operation::Column::ExpectedOutputDigest,
                 Expr::value(evidence.expected_output_digest.clone()),
@@ -2817,13 +2824,11 @@ impl ManagedRepository for PostgresManagedRepository {
                 Expr::value(now),
             )
             .filter(managed_logical_operation::Column::OperationId.eq(operation_id))
-            .exec(&txn)
-            .await
-            .map_err(persistence)?;
-        let updated = managed_logical_operation::Entity::find_by_id(operation_id)
-            .one(&txn)
+            .exec_with_returning(&txn)
             .await
             .map_err(persistence)?
+            .into_iter()
+            .next()
             .ok_or(ManagedError::Conflict)
             .and_then(logical_operation_from_model)?;
         txn.commit().await.map_err(persistence)?;
@@ -2841,7 +2846,7 @@ impl ManagedRepository for PostgresManagedRepository {
             return Err(ManagedError::InvalidTransition { from, to });
         }
         let now = crate::transaction::unix_time_ms();
-        let result = managed_logical_operation::Entity::update_many()
+        let updated = managed_logical_operation::Entity::update_many()
             .col_expr(
                 managed_logical_operation::Column::State,
                 Expr::value(to.as_str()),
@@ -2856,15 +2861,111 @@ impl ManagedRepository for PostgresManagedRepository {
             )
             .filter(managed_logical_operation::Column::OperationId.eq(operation_id))
             .filter(managed_logical_operation::Column::State.eq(from.as_str()))
-            .exec(&self.db)
+            .exec_with_returning(&self.db)
             .await
             .map_err(persistence)?;
-        if result.rows_affected != 1 {
+        if updated.len() != 1 {
             return Err(ManagedError::Conflict);
         }
-        self.logical_operation(operation_id)
-            .await?
-            .ok_or(ManagedError::Conflict)
+        logical_operation_from_model(updated.into_iter().next().ok_or(ManagedError::Conflict)?)
+    }
+
+    async fn record_logical_usage_and_begin_completion(
+        &self,
+        operation_id: Uuid,
+        evidence: ManagedUsageEvidence,
+    ) -> Result<ManagedLogicalOperation, ManagedError> {
+        if evidence.processed_bytes != evidence.source_bytes.max(evidence.expected_output_size) {
+            return Err(ManagedError::Conflict);
+        }
+        let txn = self.db.begin().await.map_err(persistence)?;
+        let model = managed_logical_operation::Entity::find_by_id(operation_id)
+            .lock(LockType::Update)
+            .one(&txn)
+            .await
+            .map_err(persistence)?
+            .ok_or(ManagedError::Conflict)?;
+        let existing = logical_operation_from_model(model)?;
+        if existing.evidence.as_ref() == Some(&evidence) {
+            // Idempotent retry: only an operation still in `Open` advances,
+            // matching the two-step `record` then `Open -> Completing` behavior.
+            if existing.state != ManagedLogicalOperationState::Open {
+                return Err(ManagedError::Conflict);
+            }
+        } else {
+            if existing.evidence.is_some()
+                || existing.state == ManagedLogicalOperationState::Intent
+                || existing.state.terminal()
+                || evidence.processed_bytes > existing.intent.max_processed_bytes
+                || (existing.intent.kind == ManagedMutationKind::Put
+                    && evidence.expected_output_digest.is_none())
+                || (existing.intent.kind == ManagedMutationKind::Delete
+                    && (evidence.expected_output_size != 0
+                        || evidence.source_bytes != 0
+                        || evidence.processed_bytes != 0))
+            {
+                return Err(ManagedError::Conflict);
+            }
+        }
+        let now = crate::transaction::unix_time_ms();
+        let updated = managed_logical_operation::Entity::update_many()
+            .col_expr(
+                managed_logical_operation::Column::ExpectedOutputDigest,
+                Expr::value(evidence.expected_output_digest.clone()),
+            )
+            .col_expr(
+                managed_logical_operation::Column::ExpectedOutputSize,
+                Expr::value(Some(i64_from_u64(
+                    evidence.expected_output_size,
+                    "managed expected output size",
+                )?)),
+            )
+            .col_expr(
+                managed_logical_operation::Column::SourceBytes,
+                Expr::value(Some(i64_from_u64(
+                    evidence.source_bytes,
+                    "managed source bytes",
+                )?)),
+            )
+            .col_expr(
+                managed_logical_operation::Column::ProcessedBytes,
+                Expr::value(Some(i64_from_u64(
+                    evidence.processed_bytes,
+                    "managed processed bytes",
+                )?)),
+            )
+            .col_expr(
+                managed_logical_operation::Column::UsageEvidence,
+                Expr::value(evidence.payload),
+            )
+            .col_expr(
+                managed_logical_operation::Column::State,
+                Expr::value(ManagedLogicalOperationState::Completing.as_str()),
+            )
+            .col_expr(
+                managed_logical_operation::Column::LastErrorClass,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                managed_logical_operation::Column::UpdatedAtMs,
+                Expr::value(now),
+            )
+            .filter(managed_logical_operation::Column::OperationId.eq(operation_id))
+            .filter(
+                managed_logical_operation::Column::State
+                    .eq(ManagedLogicalOperationState::Open.as_str()),
+            )
+            .exec_with_returning(&txn)
+            .await
+            .map_err(persistence)?;
+        if updated.len() != 1 {
+            return Err(ManagedError::Conflict);
+        }
+        let operation = logical_operation_from_model(
+            updated.into_iter().next().ok_or(ManagedError::Conflict)?,
+        )?;
+        txn.commit().await.map_err(persistence)?;
+        Ok(operation)
     }
 
     async fn commit_logical_put(
@@ -6594,6 +6695,21 @@ impl ManagedRepository for InMemoryManagedRepository {
             error_class.map(|value| value.chars().take(128).collect::<String>());
         operation.updated_at_ms = crate::transaction::unix_time_ms();
         Ok(operation.clone())
+    }
+
+    async fn record_logical_usage_and_begin_completion(
+        &self,
+        operation_id: Uuid,
+        evidence: ManagedUsageEvidence,
+    ) -> Result<ManagedLogicalOperation, ManagedError> {
+        self.record_logical_usage(operation_id, evidence).await?;
+        self.transition_logical_operation(
+            operation_id,
+            ManagedLogicalOperationState::Open,
+            ManagedLogicalOperationState::Completing,
+            None,
+        )
+        .await
     }
 
     async fn prove_logical_abort(
