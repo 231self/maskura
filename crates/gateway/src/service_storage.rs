@@ -1530,42 +1530,21 @@ impl ServiceStorage {
             request_kind: RequestKind::Write,
             max_processed_bytes,
         };
-        if let Err(error) = repository.insert_logical_operation(intent.clone()).await {
-            return Err(TransactionError::Publication(format!(
-                "managed logical admission failed: {error}"
-            )));
-        }
-        // Reserve the maximum exposure this request could publish, bounded by
-        // the workspace's physical headroom so an arbitrary per-object limit
-        // can never overflow the launch usage budget. The workspace admits one
-        // managed mutation at a time, so the reservation is always released
-        // before the next operation reserves again.
-        let usage = repository
-            .workspace_usage(&logical.tenant_id)
-            .await
-            .map_err(|error| TransactionError::Publication(error.to_string()))?;
-        let available = usage
-            .map(|usage| {
-                usage
-                    .visible_limit_bytes
-                    .saturating_add(usage.replacement_headroom_bytes)
-                    .saturating_sub(usage.physical_allocated_bytes)
-                    .saturating_sub(usage.reserved_bytes)
-            })
-            .unwrap_or(crate::managed::MANAGED_VISIBLE_LIMIT_BYTES)
-            .max(1);
-        let reservation = max_processed_bytes
-            .saturating_mul(MANAGED_STREAMING_PUT_HEADROOM)
-            .min(available);
+        // Admit the logical operation and reserve the maximum exposure this
+        // request could publish in one transaction. The reservation is bounded
+        // by the workspace's physical headroom so an arbitrary per-object limit
+        // can never overflow the launch usage budget, and the workspace admits
+        // one managed mutation at a time. Admission is atomic, so a failed
+        // reservation leaves no logical operation for reconciliation to abort.
         if let Err(error) = repository
-            .reserve_logical_operation(operation_id, reservation)
+            .admit_logical_operation(
+                intent,
+                max_processed_bytes.saturating_mul(MANAGED_STREAMING_PUT_HEADROOM),
+            )
             .await
         {
-            let _ = repository
-                .prove_logical_abort(operation_id, "reservation_failed", None)
-                .await;
             return Err(TransactionError::Publication(format!(
-                "managed physical reservation failed: {error}"
+                "managed logical admission failed: {error}"
             )));
         }
         let sink = match self

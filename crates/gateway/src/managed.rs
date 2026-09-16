@@ -946,6 +946,15 @@ pub trait ManagedRepository: Send + Sync {
         operation_id: Uuid,
         physical_bytes: u64,
     ) -> Result<ManagedWorkspaceUsage, ManagedError>;
+    /// Admit a logical operation and reserve its provider exposure in one
+    /// transaction, clamping the reservation to the workspace's available
+    /// physical headroom. Admission is atomic: on failure no logical operation
+    /// is committed, so nothing is left for reconciliation to abort.
+    async fn admit_logical_operation(
+        &self,
+        intent: ManagedLogicalOperationIntent,
+        reservation_cap: u64,
+    ) -> Result<(ManagedLogicalOperation, ManagedWorkspaceUsage), ManagedError>;
     async fn record_logical_usage(
         &self,
         operation_id: Uuid,
@@ -2753,6 +2762,171 @@ impl ManagedRepository for PostgresManagedRepository {
             .map_err(persistence)?;
         txn.commit().await.map_err(persistence)?;
         workspace_usage_from_model(usage)
+    }
+
+    async fn admit_logical_operation(
+        &self,
+        intent: ManagedLogicalOperationIntent,
+        reservation_cap: u64,
+    ) -> Result<(ManagedLogicalOperation, ManagedWorkspaceUsage), ManagedError> {
+        validate_logical_intent(&intent)?;
+        let txn = self.db.begin().await.map_err(persistence)?;
+        let namespace = locked_namespace(&txn, &intent.logical.tenant_id).await?;
+        if namespace.state != "ACTIVE" {
+            return Err(ManagedError::NamespaceFenced);
+        }
+        if u64_from_i64(namespace.epoch, "managed namespace epoch")? != intent.fence.namespace_epoch
+            || u64_from_i64(namespace.routing_epoch, "managed routing epoch")?
+                != intent.fence.routing_epoch
+        {
+            return Err(ManagedError::Conflict);
+        }
+        let mut operation = if let Some(existing) =
+            managed_logical_operation::Entity::find_by_id(intent.operation_id)
+                .one(&txn)
+                .await
+                .map_err(persistence)?
+        {
+            let operation = logical_operation_from_model(existing)?;
+            if operation.intent != intent {
+                return Err(ManagedError::Conflict);
+            }
+            operation
+        } else {
+            let child_intents = managed_physical_write_intent::Entity::find_by_id(
+                intent.primary_child_operation_id,
+            )
+            .count(&txn)
+            .await
+            .map_err(persistence)?;
+            let child_versions = managed_physical_object_version::Entity::find()
+                .filter(
+                    managed_physical_object_version::Column::WriteOperationId
+                        .eq(intent.primary_child_operation_id),
+                )
+                .count(&txn)
+                .await
+                .map_err(persistence)?;
+            if child_intents != 0 || child_versions != 0 {
+                return Err(ManagedError::Conflict);
+            }
+            let now = crate::transaction::unix_time_ms();
+            managed_logical_operation::Entity::insert(logical_operation_active(&intent, now)?)
+                .on_conflict(
+                    OnConflict::column(managed_logical_operation::Column::OperationId)
+                        .do_nothing()
+                        .to_owned(),
+                )
+                .exec_without_returning(&txn)
+                .await
+                .map_err(|_| ManagedError::Conflict)?;
+            let inserted = managed_logical_operation::Entity::find_by_id(intent.operation_id)
+                .one(&txn)
+                .await
+                .map_err(persistence)?
+                .ok_or(ManagedError::Conflict)?;
+            let operation = logical_operation_from_model(inserted)?;
+            if operation.intent != intent {
+                return Err(ManagedError::Conflict);
+            }
+            operation
+        };
+        let mut usage = locked_workspace_usage(&txn, &intent.logical.tenant_id).await?;
+        let available = usage
+            .visible_limit_bytes
+            .saturating_add(usage.replacement_headroom_bytes)
+            .saturating_sub(usage.physical_allocated_bytes)
+            .saturating_sub(usage.reserved_bytes);
+        let available = u64::try_from(available).unwrap_or(u64::MAX).max(1);
+        let physical_bytes = reservation_cap.min(available);
+        if operation.state == ManagedLogicalOperationState::Open
+            && operation.reserved_physical_bytes == physical_bytes
+            && usage.active_operation_id == Some(intent.operation_id)
+        {
+            txn.commit().await.map_err(persistence)?;
+            return Ok((operation, workspace_usage_from_model(usage)?));
+        }
+        if operation.state != ManagedLogicalOperationState::Intent {
+            return Err(ManagedError::InvalidTransition {
+                from: operation.state,
+                to: ManagedLogicalOperationState::Open,
+            });
+        }
+        if usage.active_operation_id.is_some() {
+            return Err(ManagedError::MutationInProgress);
+        }
+        let physical = i64_from_u64(physical_bytes, "managed physical reservation")?;
+        let next_reserved = usage
+            .reserved_bytes
+            .checked_add(physical)
+            .ok_or(ManagedError::QuotaExceeded)?;
+        let physical_bound = usage
+            .visible_limit_bytes
+            .checked_add(usage.replacement_headroom_bytes)
+            .ok_or(ManagedError::QuotaExceeded)?;
+        if usage
+            .physical_allocated_bytes
+            .checked_add(next_reserved)
+            .is_none_or(|value| value > physical_bound)
+        {
+            return Err(ManagedError::QuotaExceeded);
+        }
+        let now = crate::transaction::unix_time_ms();
+        usage.reserved_bytes = next_reserved;
+        usage.active_operation_id = Some(intent.operation_id);
+        usage.version = usage.version.saturating_add(1);
+        usage.updated_at_ms = now;
+        managed_workspace_usage::Entity::update_many()
+            .col_expr(
+                managed_workspace_usage::Column::ReservedBytes,
+                Expr::value(usage.reserved_bytes),
+            )
+            .col_expr(
+                managed_workspace_usage::Column::ActiveOperationId,
+                Expr::value(Some(intent.operation_id)),
+            )
+            .col_expr(
+                managed_workspace_usage::Column::Version,
+                Expr::value(usage.version),
+            )
+            .col_expr(
+                managed_workspace_usage::Column::UpdatedAtMs,
+                Expr::value(now),
+            )
+            .filter(managed_workspace_usage::Column::TenantId.eq(&intent.logical.tenant_id))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        let updated = managed_logical_operation::Entity::update_many()
+            .col_expr(
+                managed_logical_operation::Column::State,
+                Expr::value(ManagedLogicalOperationState::Open.as_str()),
+            )
+            .col_expr(
+                managed_logical_operation::Column::ReservedPhysicalBytes,
+                Expr::value(physical),
+            )
+            .col_expr(
+                managed_logical_operation::Column::UpdatedAtMs,
+                Expr::value(now),
+            )
+            .filter(managed_logical_operation::Column::OperationId.eq(intent.operation_id))
+            .filter(
+                managed_logical_operation::Column::State
+                    .eq(ManagedLogicalOperationState::Intent.as_str()),
+            )
+            .exec_with_returning(&txn)
+            .await
+            .map_err(persistence)?;
+        if updated.len() != 1 {
+            return Err(ManagedError::Conflict);
+        }
+        operation = logical_operation_from_model(
+            updated.into_iter().next().ok_or(ManagedError::Conflict)?,
+        )?;
+        txn.commit().await.map_err(persistence)?;
+        let usage = workspace_usage_from_model(usage)?;
+        Ok((operation, usage))
     }
 
     async fn record_logical_usage(
@@ -6338,6 +6512,33 @@ impl ManagedRepository for InMemoryManagedRepository {
         operation.state = ManagedLogicalOperationState::Open;
         operation.updated_at_ms = now;
         Ok(result)
+    }
+
+    async fn admit_logical_operation(
+        &self,
+        intent: ManagedLogicalOperationIntent,
+        reservation_cap: u64,
+    ) -> Result<(ManagedLogicalOperation, ManagedWorkspaceUsage), ManagedError> {
+        self.insert_logical_operation(intent.clone()).await?;
+        let reserved = {
+            let mut state = self.state.lock().await;
+            let usage = Self::workspace_usage(&mut state, &intent.logical.tenant_id);
+            let available = usage
+                .visible_limit_bytes
+                .saturating_add(usage.replacement_headroom_bytes)
+                .saturating_sub(usage.physical_allocated_bytes)
+                .saturating_sub(usage.reserved_bytes)
+                .max(1);
+            reservation_cap.min(available)
+        };
+        let usage = self
+            .reserve_logical_operation(intent.operation_id, reserved)
+            .await?;
+        let operation = self
+            .logical_operation(intent.operation_id)
+            .await?
+            .ok_or(ManagedError::Conflict)?;
+        Ok((operation, usage))
     }
 
     async fn record_logical_usage(

@@ -2205,6 +2205,85 @@ fn postgres_managed_zero_byte_put_is_ledgered_and_committed() {
 }
 
 #[test]
+fn postgres_managed_admission_is_atomic() {
+    with_pool(|pool| async move {
+        let db = sea_db(pool.clone());
+        let repository = PostgresManagedRepository::new(pool);
+        let tenant = format!("managed-admit-unit-{}", uuid::Uuid::new_v4());
+        let fence = repository.route_fence(&tenant).await.unwrap();
+        let intent = |key: &str| {
+            let logical = LogicalObjectKey::new(&tenant, "bucket", key);
+            let generation = uuid::Uuid::now_v7();
+            ManagedLogicalOperationIntent {
+                operation_id: uuid::Uuid::now_v7(),
+                receipt_id: uuid::Uuid::now_v7(),
+                logical: logical.clone(),
+                kind: ManagedMutationKind::Put,
+                generation,
+                fence,
+                expected_authority_cas: None,
+                prior_logical_size: 0,
+                primary_child_operation_id: uuid::Uuid::now_v7(),
+                backend_id: "primary".to_string(),
+                provider_bucket: "provider-bucket".to_string(),
+                physical_key: generation_physical_key(&logical, generation),
+                occurred_at_ms: unix_time_ms(),
+                rate_version: 1,
+                route: UsageRoute::PutObject,
+                request_kind: RequestKind::Write,
+                max_processed_bytes: 0,
+            }
+        };
+        let first = intent("first");
+        let second = intent("second");
+        let (admitted, usage) = repository
+            .admit_logical_operation(first.clone(), 0)
+            .await
+            .unwrap();
+        assert_eq!(admitted.state, ManagedLogicalOperationState::Open);
+        assert_eq!(usage.active_operation_id, Some(first.operation_id));
+        // The workspace admits one managed mutation at a time, so a second
+        // admission must fail...
+        assert!(matches!(
+            repository.admit_logical_operation(second.clone(), 0).await,
+            Err(maskura_gateway::managed::ManagedError::MutationInProgress)
+        ));
+        // ...and must leave no logical operation behind (atomic admission).
+        assert!(
+            repository
+                .logical_operation(second.operation_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a failed admission must not commit a dangling Intent row"
+        );
+        assert_eq!(
+            repository
+                .workspace_usage(&tenant)
+                .await
+                .unwrap()
+                .unwrap()
+                .active_operation_id,
+            Some(first.operation_id)
+        );
+
+        managed_workspace_usage::Entity::delete_by_id(&tenant)
+            .exec(&db)
+            .await
+            .unwrap();
+        managed_logical_operation::Entity::delete_many()
+            .filter(managed_logical_operation::Column::TenantId.eq(&tenant))
+            .exec(&db)
+            .await
+            .unwrap();
+        managed_namespace::Entity::delete_by_id(&tenant)
+            .exec(&db)
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
 fn postgres_proven_abort_rejects_under_counted_physical_allocation() {
     with_pool(|pool| async move {
         let db = sea_db(pool.clone());
