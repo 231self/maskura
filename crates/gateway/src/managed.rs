@@ -6,7 +6,7 @@ use sea_orm::sea_query::extension::postgres::PgFunc;
 use sea_orm::sea_query::{Expr, LockType, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
-    IsolationLevel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    IsolationLevel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set,
     SqlxPostgresConnector, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
@@ -449,6 +449,8 @@ pub enum ManagedError {
     MutationInProgress,
     #[error("managed workspace capacity is exhausted")]
     QuotaExceeded,
+    #[error("managed recovery evidence is deterministically blocked: {0}")]
+    RecoveryBlocked(&'static str),
     #[error("managed list cursor is expired")]
     CursorExpired,
     #[error("managed list cursor does not match this query")]
@@ -488,6 +490,7 @@ pub enum ManagedLogicalOperationState {
     Open,
     Completing,
     CommitUnknown,
+    RecoveryBlocked,
     Committed,
     ProvenAborted,
 }
@@ -499,6 +502,7 @@ impl ManagedLogicalOperationState {
             Self::Open => "OPEN",
             Self::Completing => "COMPLETING",
             Self::CommitUnknown => "COMMIT_UNKNOWN",
+            Self::RecoveryBlocked => "RECOVERY_BLOCKED",
             Self::Committed => "COMMITTED",
             Self::ProvenAborted => "PROVEN_ABORTED",
         }
@@ -510,6 +514,7 @@ impl ManagedLogicalOperationState {
             "OPEN" => Ok(Self::Open),
             "COMPLETING" => Ok(Self::Completing),
             "COMMIT_UNKNOWN" => Ok(Self::CommitUnknown),
+            "RECOVERY_BLOCKED" => Ok(Self::RecoveryBlocked),
             "COMMITTED" => Ok(Self::Committed),
             "PROVEN_ABORTED" => Ok(Self::ProvenAborted),
             _ => Err(ManagedError::Corrupt(format!(
@@ -579,6 +584,42 @@ pub struct ManagedRouteFence {
     pub routing_epoch: u64,
 }
 
+pub const MANAGED_PUBLICATION_RECIPE_VERSION: i32 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedPublicationRecipe {
+    pub version: i32,
+    pub placement_version: u32,
+    pub primary_backend_id: String,
+    pub replica_backend_id: Option<String>,
+    pub metadata: BTreeMap<String, String>,
+    pub primary_status: CopyStatus,
+    pub replica_status: CopyStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactPhysicalCommit {
+    pub selected_version_id: Option<String>,
+    pub superseded_version_ids: Vec<String>,
+    pub version_history_complete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedRecoveryClaim {
+    pub operation: ManagedLogicalOperation,
+    pub owner: String,
+    pub token: Uuid,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogicalAbortProof {
+    /// No physical child was admitted and no provider mutation could start.
+    NoChildStarted,
+    /// The durable child journal reached `PROVEN_ABORTED` after exact absence.
+    ChildProvenAborted,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedLogicalOperationIntent {
     pub operation_id: Uuid,
@@ -598,6 +639,7 @@ pub struct ManagedLogicalOperationIntent {
     pub route: UsageRoute,
     pub request_kind: RequestKind,
     pub max_processed_bytes: u64,
+    pub publication_recipe: Option<ManagedPublicationRecipe>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -620,6 +662,9 @@ pub struct ManagedLogicalOperation {
     pub committed_authority_version: Option<u64>,
     pub settlement_state: ManagedSettlementState,
     pub last_error_class: Option<String>,
+    pub recovery_owner: Option<String>,
+    pub recovery_token: Option<Uuid>,
+    pub recovery_expires_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub committed_at_ms: Option<i64>,
@@ -939,6 +984,23 @@ pub trait ManagedRepository: Send + Sync {
         &self,
         limit: u64,
     ) -> Result<Vec<ManagedLogicalOperation>, ManagedError>;
+    async fn claim_stale_logical_operations(
+        &self,
+        owner: &str,
+        stale_before_ms: i64,
+        claim_expires_at_ms: i64,
+        limit: u64,
+    ) -> Result<Vec<ManagedRecoveryClaim>, ManagedError>;
+    async fn mark_logical_recovery_blocked(
+        &self,
+        claim: &ManagedRecoveryClaim,
+        reason: &str,
+    ) -> Result<ManagedLogicalOperation, ManagedError>;
+    async fn renew_logical_recovery_claim(
+        &self,
+        claim: &ManagedRecoveryClaim,
+        claim_expires_at_ms: i64,
+    ) -> Result<ManagedRecoveryClaim, ManagedError>;
     /// Reserve maximum provider exposure and acquire the workspace's only
     /// managed-mutation slot before a physical child may be created.
     async fn reserve_logical_operation(
@@ -974,11 +1036,12 @@ pub trait ManagedRepository: Send + Sync {
         operation_id: Uuid,
         evidence: ManagedUsageEvidence,
     ) -> Result<ManagedLogicalOperation, ManagedError>;
-    async fn commit_logical_put(
+    async fn finalize_logical_put(
         &self,
         operation_id: Uuid,
-        authority: ObjectAuthority,
-        physical_allocated_bytes: u64,
+        physical_lease: &PhysicalWriteLease,
+        result: ExactPhysicalCommit,
+        recovery_claim: Option<&ManagedRecoveryClaim>,
     ) -> Result<ManagedOperationCommit, ManagedError>;
     async fn commit_logical_delete(
         &self,
@@ -993,6 +1056,18 @@ pub trait ManagedRepository: Send + Sync {
         operation_id: Uuid,
         error_class: &str,
         physical: Option<ManagedProvenPhysicalAllocation>,
+    ) -> Result<ManagedLogicalOperation, ManagedError>;
+    /// Atomically consume a logical PUT child intent after exact non-mutation
+    /// evidence, release its reservation/active slot, and mark the parent
+    /// `PROVEN_ABORTED`. Logical children must never use the standalone physical
+    /// abort path.
+    async fn abort_logical_put(
+        &self,
+        operation_id: Uuid,
+        physical_lease: Option<&PhysicalWriteLease>,
+        proof: LogicalAbortProof,
+        error_class: &str,
+        recovery_claim: Option<&ManagedRecoveryClaim>,
     ) -> Result<ManagedLogicalOperation, ManagedError>;
     async fn workspace_usage(
         &self,
@@ -1141,6 +1216,12 @@ pub trait ManagedRepository: Send + Sync {
     ) -> Result<Vec<DurablePhysicalWriteIntent>, ManagedError> {
         Ok(Vec::new())
     }
+    async fn physical_write_intent(
+        &self,
+        _intent_id: Uuid,
+    ) -> Result<Option<DurablePhysicalWriteIntent>, ManagedError> {
+        Ok(None)
+    }
     async fn renew_physical_write_intent(
         &self,
         _lease: &PhysicalWriteLease,
@@ -1154,6 +1235,13 @@ pub trait ManagedRepository: Send + Sync {
         &self,
         _intent_id: Uuid,
         _owner: &str,
+        _lease_expires_at_ms: i64,
+    ) -> Result<Option<PhysicalWriteLease>, ManagedError> {
+        Ok(None)
+    }
+    async fn claim_logical_physical_write_intent(
+        &self,
+        _claim: &ManagedRecoveryClaim,
         _lease_expires_at_ms: i64,
     ) -> Result<Option<PhysicalWriteLease>, ManagedError> {
         Ok(None)
@@ -1441,6 +1529,139 @@ fn physical_allocation(expected_size: u64, exact_version_count: u64) -> Result<u
         .ok_or(ManagedError::QuotaExceeded)
 }
 
+fn validate_exact_physical_commit(result: &ExactPhysicalCommit) -> Result<(), ManagedError> {
+    if !result.version_history_complete
+        || result.selected_version_id.as_deref() == Some("")
+        || result.superseded_version_ids.iter().any(String::is_empty)
+    {
+        return Err(ManagedError::RecoveryBlocked(
+            "invalid_exact_version_history",
+        ));
+    }
+    let versions = exact_version_ids(result);
+    (versions.iter().collect::<HashSet<_>>().len() == versions.len())
+        .then_some(())
+        .ok_or(ManagedError::RecoveryBlocked("duplicate_exact_version"))
+}
+
+fn validate_physical_commit_versioning(
+    intent: &PhysicalWriteIntent,
+    result: &ExactPhysicalCommit,
+) -> Result<(), ManagedError> {
+    let versionless = result.selected_version_id.is_none();
+    let provably_unversioned = intent.versioning_mode == BackendVersioningMode::Unversioned
+        && intent.versioning_capability == BackendVersioningCapability::Unsupported;
+    if intent.versioning_mode == BackendVersioningMode::Unknown
+        || versionless != provably_unversioned
+        || (versionless && !result.superseded_version_ids.is_empty())
+    {
+        return Err(ManagedError::RecoveryBlocked(
+            "physical_versioning_contract_mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn physical_intent_supports_exact_history(intent: &PhysicalWriteIntent) -> bool {
+    intent.versioning_mode != BackendVersioningMode::Unknown
+        && (intent.versioning_mode != BackendVersioningMode::Unversioned
+            || intent.versioning_capability == BackendVersioningCapability::Unsupported)
+}
+
+fn validate_durable_child_commit(
+    child: Option<&object_operation::Model>,
+    operation: &ManagedLogicalOperation,
+    result: &ExactPhysicalCommit,
+) -> Result<(), ManagedError> {
+    let Some(child) = child else {
+        return Err(ManagedError::RecoveryBlocked("missing_child_journal"));
+    };
+    let superseded =
+        serde_json::from_value::<Vec<String>>(child.committed_superseded_version_ids.clone())
+            .map_err(|_| ManagedError::RecoveryBlocked("corrupt_child_commit"))?;
+    let evidence = operation
+        .evidence
+        .as_ref()
+        .ok_or(ManagedError::RecoveryBlocked("missing_usage_evidence"))?;
+    if child.state != "COMMITTED"
+        || !child.committed_version_history_complete
+        || child.tenant_id.as_deref() != Some(operation.intent.logical.tenant_id.as_str())
+        || child.namespace_epoch != i64::try_from(operation.intent.fence.namespace_epoch).ok()
+        || child.backend_id != operation.intent.backend_id
+        || child.bucket != operation.intent.provider_bucket
+        || child.logical_key != operation.intent.logical.object_key()
+        || child.physical_key != operation.intent.physical_key
+        || child.expected_digest != evidence.expected_output_digest
+        || child.expected_size != i64::try_from(evidence.expected_output_size).ok()
+        || child.committed_version_id != result.selected_version_id
+        || superseded.len() != result.superseded_version_ids.len()
+        || superseded.iter().collect::<HashSet<_>>()
+            != result.superseded_version_ids.iter().collect::<HashSet<_>>()
+    {
+        return Err(ManagedError::RecoveryBlocked("child_commit_mismatch"));
+    }
+    Ok(())
+}
+
+fn exact_version_ids(result: &ExactPhysicalCommit) -> Vec<String> {
+    result
+        .superseded_version_ids
+        .iter()
+        .cloned()
+        .chain(std::iter::once(
+            result.selected_version_id.clone().unwrap_or_default(),
+        ))
+        .collect()
+}
+
+fn expected_physical_targets(
+    intent: &PhysicalWriteIntent,
+    namespace_epoch: u64,
+    result: &ExactPhysicalCommit,
+) -> Vec<PhysicalVersionTarget> {
+    exact_version_ids(result)
+        .into_iter()
+        .map(|version_id| PhysicalVersionTarget {
+            tenant_id: intent.tenant_id.clone(),
+            namespace_epoch,
+            backend_id: intent.backend_id.clone(),
+            storage_identity: intent.storage_identity.clone(),
+            credential_epoch: intent.credential_epoch,
+            provider_bucket: intent.provider_bucket.clone(),
+            physical_key: intent.physical_key.clone(),
+            version_id: (!version_id.is_empty()).then_some(version_id),
+            versioning_mode: intent.versioning_mode,
+            versioning_capability: intent.versioning_capability,
+            write_operation_id: intent.intent_id,
+        })
+        .collect()
+}
+
+fn validate_recovery_authority(
+    operation: &ManagedLogicalOperation,
+    claim: Option<&ManagedRecoveryClaim>,
+    now: i64,
+) -> Result<(), ManagedError> {
+    match claim {
+        Some(claim)
+            if claim.operation.intent.operation_id == operation.intent.operation_id
+                && operation.recovery_owner.as_deref() == Some(claim.owner.as_str())
+                && operation.recovery_token == Some(claim.token)
+                && operation.recovery_expires_at_ms == Some(claim.expires_at_ms)
+                && claim.expires_at_ms > now =>
+        {
+            Ok(())
+        }
+        None if operation.recovery_owner.is_none()
+            && operation.recovery_token.is_none()
+            && operation.recovery_expires_at_ms.is_none() =>
+        {
+            Ok(())
+        }
+        _ => Err(ManagedError::Conflict),
+    }
+}
+
 fn serialize_cursor_response_state(
     response_state: &serde_json::Value,
 ) -> Result<Vec<u8>, ManagedError> {
@@ -1488,6 +1709,40 @@ fn usage_route_from_str(value: &str) -> Result<UsageRoute, ManagedError> {
 fn logical_operation_from_model(
     model: managed_logical_operation::Model,
 ) -> Result<ManagedLogicalOperation, ManagedError> {
+    let publication_recipe = match (
+        model.publication_recipe_version,
+        model.admitted_placement_version,
+        model.recipe_primary_backend_id,
+        model.authority_metadata,
+        model.intended_primary_status,
+        model.intended_replica_status,
+    ) {
+        (None, None, None, None, None, None) => None,
+        (
+            Some(version),
+            Some(placement),
+            Some(primary),
+            Some(metadata),
+            Some(primary_status),
+            Some(replica_status),
+        ) => Some(ManagedPublicationRecipe {
+            version,
+            placement_version: u32::try_from(placement).map_err(|_| {
+                ManagedError::Corrupt("invalid admitted placement version".to_string())
+            })?,
+            primary_backend_id: primary,
+            replica_backend_id: model.recipe_replica_backend_id,
+            metadata: serde_json::from_value(metadata)
+                .map_err(|_| ManagedError::Corrupt("invalid authority metadata".to_string()))?,
+            primary_status: CopyStatus::parse(&primary_status)?,
+            replica_status: CopyStatus::parse(&replica_status)?,
+        }),
+        _ => {
+            return Err(ManagedError::Corrupt(
+                "managed publication recipe is partially populated".to_string(),
+            ));
+        }
+    };
     let evidence = match (
         model.expected_output_size,
         model.source_bytes,
@@ -1542,6 +1797,7 @@ fn logical_operation_from_model(
                 model.max_processed_bytes,
                 "managed maximum processed bytes",
             )?,
+            publication_recipe,
         },
         evidence,
         reserved_physical_bytes: u64_from_i64(
@@ -1563,6 +1819,9 @@ fn logical_operation_from_model(
             .transpose()?,
         settlement_state: ManagedSettlementState::parse(&model.settlement_state)?,
         last_error_class: model.last_error_class,
+        recovery_owner: model.recovery_owner,
+        recovery_token: model.recovery_token,
+        recovery_expires_at_ms: model.recovery_expires_at_ms,
         created_at_ms: model.created_at_ms,
         updated_at_ms: model.updated_at_ms,
         committed_at_ms: model.committed_at_ms,
@@ -1574,6 +1833,7 @@ fn logical_operation_active(
     intent: &ManagedLogicalOperationIntent,
     now: i64,
 ) -> Result<managed_logical_operation::ActiveModel, ManagedError> {
+    let recipe = intent.publication_recipe.as_ref();
     Ok(managed_logical_operation::ActiveModel {
         operation_id: Set(intent.operation_id),
         receipt_id: Set(intent.receipt_id),
@@ -1619,9 +1879,26 @@ fn logical_operation_active(
             intent.max_processed_bytes,
             "managed maximum processed bytes",
         )?),
+        publication_recipe_version: Set(recipe.map(|recipe| recipe.version)),
+        admitted_placement_version: Set(recipe.map(|recipe| i64::from(recipe.placement_version))),
+        recipe_primary_backend_id: Set(recipe.map(|recipe| recipe.primary_backend_id.clone())),
+        recipe_replica_backend_id: Set(recipe.and_then(|recipe| recipe.replica_backend_id.clone())),
+        authority_metadata: Set(recipe
+            .map(|recipe| serde_json::to_value(&recipe.metadata))
+            .transpose()
+            .map_err(|_| ManagedError::Conflict)?),
+        intended_primary_status: Set(
+            recipe.map(|recipe| recipe.primary_status.as_str().to_string())
+        ),
+        intended_replica_status: Set(
+            recipe.map(|recipe| recipe.replica_status.as_str().to_string())
+        ),
         usage_evidence: Set(serde_json::json!({})),
         settlement_state: Set(ManagedSettlementState::Pending.as_str().to_string()),
         last_error_class: Set(None),
+        recovery_owner: Set(None),
+        recovery_token: Set(None),
+        recovery_expires_at_ms: Set(None),
         created_at_ms: Set(now),
         updated_at_ms: Set(now),
         committed_at_ms: Set(None),
@@ -1865,6 +2142,21 @@ fn validate_logical_intent(intent: &ManagedLogicalOperationIntent) -> Result<(),
             (ManagedMutationKind::Put, UsageRoute::PutObject)
                 | (ManagedMutationKind::Delete, UsageRoute::DeleteObject)
         )
+        || match intent.kind {
+            ManagedMutationKind::Put => intent.publication_recipe.as_ref().is_none_or(|recipe| {
+                recipe.version != MANAGED_PUBLICATION_RECIPE_VERSION
+                    || recipe.placement_version == 0
+                    || recipe.primary_backend_id != intent.backend_id
+                    || recipe.primary_backend_id.is_empty()
+                    || recipe.replica_backend_id.as_deref() == Some("")
+                    || recipe.primary_status != CopyStatus::Ready
+                    || (recipe.replica_backend_id.is_none()
+                        && recipe.replica_status != CopyStatus::Absent)
+                    || (recipe.replica_backend_id.is_some()
+                        && recipe.replica_status != CopyStatus::RepairPending)
+            }),
+            ManagedMutationKind::Delete => intent.publication_recipe.is_some(),
+        }
     {
         return Err(ManagedError::Conflict);
     }
@@ -1996,6 +2288,47 @@ fn physical_target_from_model(
         versioning_mode: BackendVersioningMode::parse(&model.versioning_mode)?,
         versioning_capability: BackendVersioningCapability::parse(&model.versioning_capability)?,
         write_operation_id: model.write_operation_id,
+    })
+}
+
+fn durable_physical_intent_from_model(
+    intent: managed_physical_write_intent::Model,
+) -> Result<DurablePhysicalWriteIntent, ManagedError> {
+    let namespace_epoch = u64::try_from(intent.epoch)
+        .map_err(|_| ManagedError::Corrupt("physical write intent epoch is invalid".to_string()))?;
+    Ok(DurablePhysicalWriteIntent {
+        namespace_epoch,
+        blocked_reason: intent.last_error,
+        lease_expires_at_ms: intent.lease_expires_at_ms,
+        lease: PhysicalWriteLease {
+            intent_id: intent.intent_id,
+            namespace_epoch,
+            owner: intent.lease_owner.clone(),
+            token: intent.lease_token,
+        },
+        intent: PhysicalWriteIntent {
+            intent_id: intent.intent_id,
+            tenant_id: intent.tenant_id,
+            backend_id: intent.backend_id,
+            storage_identity: ProviderStorageIdentity {
+                provider_kind: intent.provider_kind,
+                provider_instance_id: intent.provider_instance_id,
+                provider_account_id: intent.provider_account_id,
+                canonical_endpoint: intent.canonical_endpoint,
+                region: intent.provider_region,
+            },
+            credential_epoch: u64_from_i64(
+                intent.credential_epoch,
+                "physical write credential epoch",
+            )?,
+            provider_bucket: intent.provider_bucket,
+            physical_key: intent.physical_key,
+            versioning_mode: BackendVersioningMode::parse(&intent.versioning_mode)?,
+            versioning_capability: BackendVersioningCapability::parse(
+                &intent.versioning_capability,
+            )?,
+            lease_owner: intent.lease_owner,
+        },
     })
 }
 
@@ -2656,12 +2989,181 @@ impl ManagedRepository for PostgresManagedRepository {
             .collect()
     }
 
+    async fn claim_stale_logical_operations(
+        &self,
+        owner: &str,
+        stale_before_ms: i64,
+        claim_expires_at_ms: i64,
+        limit: u64,
+    ) -> Result<Vec<ManagedRecoveryClaim>, ManagedError> {
+        let now = crate::transaction::unix_time_ms();
+        if owner.is_empty() || owner.len() > 256 || claim_expires_at_ms <= now {
+            return Err(ManagedError::Conflict);
+        }
+        let candidates = managed_logical_operation::Entity::find()
+            .filter(managed_logical_operation::Column::OperationKind.eq("PUT"))
+            .filter(managed_logical_operation::Column::State.is_not_in([
+                ManagedLogicalOperationState::Committed.as_str(),
+                ManagedLogicalOperationState::ProvenAborted.as_str(),
+            ]))
+            .filter(managed_logical_operation::Column::UpdatedAtMs.lte(stale_before_ms))
+            .filter(
+                Condition::any()
+                    .add(managed_logical_operation::Column::RecoveryExpiresAtMs.is_null())
+                    .add(managed_logical_operation::Column::RecoveryExpiresAtMs.lte(now)),
+            )
+            .order_by_asc(managed_logical_operation::Column::UpdatedAtMs)
+            .limit(limit)
+            .all(&self.db)
+            .await
+            .map_err(persistence)?;
+        let mut claims = Vec::new();
+        for candidate in candidates {
+            let token = Uuid::now_v7();
+            let updated = managed_logical_operation::Entity::update_many()
+                .col_expr(
+                    managed_logical_operation::Column::RecoveryOwner,
+                    Expr::value(Some(owner.to_string())),
+                )
+                .col_expr(
+                    managed_logical_operation::Column::RecoveryToken,
+                    Expr::value(Some(token)),
+                )
+                .col_expr(
+                    managed_logical_operation::Column::RecoveryExpiresAtMs,
+                    Expr::value(Some(claim_expires_at_ms)),
+                )
+                .filter(managed_logical_operation::Column::OperationId.eq(candidate.operation_id))
+                .filter(managed_logical_operation::Column::OperationKind.eq("PUT"))
+                .filter(managed_logical_operation::Column::State.eq(&candidate.state))
+                .filter(managed_logical_operation::Column::UpdatedAtMs.eq(candidate.updated_at_ms))
+                .filter(managed_logical_operation::Column::UpdatedAtMs.lte(stale_before_ms))
+                .filter(managed_logical_operation::Column::State.is_not_in([
+                    ManagedLogicalOperationState::Committed.as_str(),
+                    ManagedLogicalOperationState::ProvenAborted.as_str(),
+                ]))
+                .filter(
+                    Condition::any()
+                        .add(managed_logical_operation::Column::RecoveryExpiresAtMs.is_null())
+                        .add(managed_logical_operation::Column::RecoveryExpiresAtMs.lte(now)),
+                )
+                .exec_with_returning(&self.db)
+                .await
+                .map_err(persistence)?;
+            if let Some(model) = updated.into_iter().next() {
+                claims.push(ManagedRecoveryClaim {
+                    operation: logical_operation_from_model(model)?,
+                    owner: owner.to_string(),
+                    token,
+                    expires_at_ms: claim_expires_at_ms,
+                });
+            }
+        }
+        Ok(claims)
+    }
+
+    async fn mark_logical_recovery_blocked(
+        &self,
+        claim: &ManagedRecoveryClaim,
+        reason: &str,
+    ) -> Result<ManagedLogicalOperation, ManagedError> {
+        let updated = managed_logical_operation::Entity::update_many()
+            .col_expr(
+                managed_logical_operation::Column::State,
+                Expr::value(ManagedLogicalOperationState::RecoveryBlocked.as_str()),
+            )
+            .col_expr(
+                managed_logical_operation::Column::LastErrorClass,
+                Expr::value(Some(reason.chars().take(128).collect::<String>())),
+            )
+            .col_expr(
+                managed_logical_operation::Column::RecoveryOwner,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                managed_logical_operation::Column::RecoveryToken,
+                Expr::value(Option::<Uuid>::None),
+            )
+            .col_expr(
+                managed_logical_operation::Column::RecoveryExpiresAtMs,
+                Expr::value(Option::<i64>::None),
+            )
+            .col_expr(
+                managed_logical_operation::Column::UpdatedAtMs,
+                Expr::value(crate::transaction::unix_time_ms()),
+            )
+            .filter(
+                managed_logical_operation::Column::OperationId
+                    .eq(claim.operation.intent.operation_id),
+            )
+            .filter(managed_logical_operation::Column::RecoveryOwner.eq(&claim.owner))
+            .filter(managed_logical_operation::Column::RecoveryToken.eq(claim.token))
+            .filter(managed_logical_operation::Column::RecoveryExpiresAtMs.eq(claim.expires_at_ms))
+            .filter(
+                managed_logical_operation::Column::RecoveryExpiresAtMs
+                    .gt(crate::transaction::unix_time_ms()),
+            )
+            .exec_with_returning(&self.db)
+            .await
+            .map_err(persistence)?
+            .into_iter()
+            .next()
+            .ok_or(ManagedError::Conflict)?;
+        logical_operation_from_model(updated)
+    }
+
+    async fn renew_logical_recovery_claim(
+        &self,
+        claim: &ManagedRecoveryClaim,
+        claim_expires_at_ms: i64,
+    ) -> Result<ManagedRecoveryClaim, ManagedError> {
+        let now = crate::transaction::unix_time_ms();
+        if claim_expires_at_ms <= now {
+            return Err(ManagedError::Conflict);
+        }
+        let updated = managed_logical_operation::Entity::update_many()
+            .col_expr(
+                managed_logical_operation::Column::RecoveryExpiresAtMs,
+                Expr::value(Some(claim_expires_at_ms)),
+            )
+            .filter(
+                managed_logical_operation::Column::OperationId
+                    .eq(claim.operation.intent.operation_id),
+            )
+            .filter(managed_logical_operation::Column::RecoveryOwner.eq(&claim.owner))
+            .filter(managed_logical_operation::Column::RecoveryToken.eq(claim.token))
+            .filter(managed_logical_operation::Column::RecoveryExpiresAtMs.eq(claim.expires_at_ms))
+            .filter(managed_logical_operation::Column::RecoveryExpiresAtMs.gt(now))
+            .filter(managed_logical_operation::Column::State.is_not_in([
+                ManagedLogicalOperationState::Committed.as_str(),
+                ManagedLogicalOperationState::ProvenAborted.as_str(),
+            ]))
+            .exec_with_returning(&self.db)
+            .await
+            .map_err(persistence)?
+            .into_iter()
+            .next()
+            .ok_or(ManagedError::Conflict)?;
+        Ok(ManagedRecoveryClaim {
+            operation: logical_operation_from_model(updated)?,
+            owner: claim.owner.clone(),
+            token: claim.token,
+            expires_at_ms: claim_expires_at_ms,
+        })
+    }
+
     async fn reserve_logical_operation(
         &self,
         operation_id: Uuid,
         physical_bytes: u64,
     ) -> Result<ManagedWorkspaceUsage, ManagedError> {
+        let identity = managed_logical_operation::Entity::find_by_id(operation_id)
+            .one(&self.db)
+            .await
+            .map_err(persistence)?
+            .ok_or(ManagedError::Conflict)?;
         let txn = self.db.begin().await.map_err(persistence)?;
+        let namespace = locked_namespace(&txn, &identity.tenant_id).await?;
         let model = managed_logical_operation::Entity::find_by_id(operation_id)
             .lock(LockType::Update)
             .one(&txn)
@@ -2669,7 +3171,6 @@ impl ManagedRepository for PostgresManagedRepository {
             .map_err(persistence)?
             .ok_or(ManagedError::Conflict)?;
         let operation = logical_operation_from_model(model.clone())?;
-        let namespace = locked_namespace(&txn, &operation.intent.logical.tenant_id).await?;
         if namespace.state != "ACTIVE"
             || u64_from_i64(namespace.epoch, "managed namespace epoch")?
                 != operation.intent.fence.namespace_epoch
@@ -3142,13 +3643,21 @@ impl ManagedRepository for PostgresManagedRepository {
         Ok(operation)
     }
 
-    async fn commit_logical_put(
+    async fn finalize_logical_put(
         &self,
         operation_id: Uuid,
-        mut authority: ObjectAuthority,
-        physical_allocated_bytes: u64,
+        physical_lease: &PhysicalWriteLease,
+        result: ExactPhysicalCommit,
+        recovery_claim: Option<&ManagedRecoveryClaim>,
     ) -> Result<ManagedOperationCommit, ManagedError> {
+        validate_exact_physical_commit(&result)?;
+        let identity = managed_logical_operation::Entity::find_by_id(operation_id)
+            .one(&self.db)
+            .await
+            .map_err(persistence)?
+            .ok_or(ManagedError::Conflict)?;
         let txn = self.db.begin().await.map_err(persistence)?;
+        let namespace = locked_namespace(&txn, &identity.tenant_id).await?;
         let operation_model = managed_logical_operation::Entity::find_by_id(operation_id)
             .lock(LockType::Update)
             .one(&txn)
@@ -3156,6 +3665,7 @@ impl ManagedRepository for PostgresManagedRepository {
             .map_err(persistence)?
             .ok_or(ManagedError::Conflict)?;
         let operation = logical_operation_from_model(operation_model)?;
+        let now = crate::transaction::unix_time_ms();
         if operation.state == ManagedLogicalOperationState::Committed {
             let persisted_authority = managed_object_authority::Entity::find_by_id((
                 operation.intent.logical.tenant_id.clone(),
@@ -3167,8 +3677,80 @@ impl ManagedRepository for PostgresManagedRepository {
             .map_err(persistence)?
             .ok_or(ManagedError::Conflict)
             .and_then(authority_from_model)?;
-            if persisted_authority.generation != operation.intent.generation
-                || operation.committed_physical_bytes != physical_allocated_bytes
+            let expected_versions = exact_version_ids(&result);
+            let persisted_versions = managed_physical_object_version::Entity::find()
+                .filter(
+                    managed_physical_object_version::Column::WriteOperationId
+                        .eq(operation.intent.primary_child_operation_id),
+                )
+                .all(&txn)
+                .await
+                .map_err(persistence)?;
+            let persisted_ids = persisted_versions
+                .iter()
+                .map(|version| version.version_id.clone())
+                .collect::<HashSet<_>>();
+            let persisted_targets = persisted_versions
+                .iter()
+                .cloned()
+                .map(physical_target_from_model)
+                .collect::<Result<Vec<_>, _>>()?;
+            let canonical_target = persisted_targets.first().ok_or(ManagedError::Conflict)?;
+            let evidence = operation.evidence.as_ref().ok_or(ManagedError::Conflict)?;
+            let recipe = operation
+                .intent
+                .publication_recipe
+                .as_ref()
+                .ok_or(ManagedError::Conflict)?;
+            let committed_authority_version = operation
+                .committed_authority_version
+                .ok_or(ManagedError::Conflict)?;
+            let original_authority_matches = persisted_authority.generation
+                == operation.intent.generation
+                && persisted_authority.digest
+                    == evidence
+                        .expected_output_digest
+                        .clone()
+                        .ok_or(ManagedError::Conflict)?
+                && persisted_authority.size == evidence.expected_output_size
+                && persisted_authority.metadata == recipe.metadata
+                && persisted_authority.placement_version == recipe.placement_version
+                && persisted_authority.primary_backend_id == recipe.primary_backend_id
+                && persisted_authority.primary_version_id == result.selected_version_id
+                && persisted_authority.replica_backend_id == recipe.replica_backend_id
+                && persisted_authority.primary_status == recipe.primary_status
+                && persisted_authority.replica_status == recipe.replica_status
+                && !persisted_authority.tombstone;
+            if persisted_authority.logical != operation.intent.logical
+                || committed_authority_version
+                    != operation
+                        .intent
+                        .expected_authority_cas
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                || persisted_authority.cas_version < committed_authority_version
+                || (persisted_authority.cas_version == committed_authority_version
+                    && !original_authority_matches)
+                || persisted_ids != expected_versions.into_iter().collect()
+                || persisted_versions
+                    .iter()
+                    .any(|version| version.state != "LIVE")
+                || persisted_targets.iter().any(|target| {
+                    target.tenant_id != operation.intent.logical.tenant_id
+                        || target.namespace_epoch != operation.intent.fence.namespace_epoch
+                        || target.backend_id != operation.intent.backend_id
+                        || target.provider_bucket != operation.intent.provider_bucket
+                        || target.physical_key != operation.intent.physical_key
+                        || target.storage_identity != canonical_target.storage_identity
+                        || target.credential_epoch != canonical_target.credential_epoch
+                        || target.versioning_mode != canonical_target.versioning_mode
+                        || target.versioning_capability != canonical_target.versioning_capability
+                })
+                || operation.committed_physical_bytes
+                    != physical_allocation(
+                        evidence.expected_output_size,
+                        persisted_versions.len() as u64,
+                    )?
             {
                 return Err(ManagedError::Conflict);
             }
@@ -3180,12 +3762,16 @@ impl ManagedRepository for PostgresManagedRepository {
                 usage: workspace_usage_from_model(usage)?,
             });
         }
+        validate_recovery_authority(&operation, recovery_claim, now)?;
         if operation.intent.kind != ManagedMutationKind::Put
             || !matches!(
                 operation.state,
                 ManagedLogicalOperationState::Completing
                     | ManagedLogicalOperationState::CommitUnknown
+                    | ManagedLogicalOperationState::RecoveryBlocked
             )
+            || (operation.state == ManagedLogicalOperationState::RecoveryBlocked
+                && recovery_claim.is_none())
         {
             return Err(ManagedError::InvalidTransition {
                 from: operation.state,
@@ -3193,25 +3779,127 @@ impl ManagedRepository for PostgresManagedRepository {
             });
         }
         let evidence = operation.evidence.clone().ok_or(ManagedError::Conflict)?;
-        if authority.logical != operation.intent.logical
-            || authority.generation != operation.intent.generation
-            || authority.primary_backend_id != operation.intent.backend_id
-            || authority.tombstone
-            || evidence.expected_output_digest.as_deref() != Some(authority.digest.as_str())
-            || evidence.expected_output_size != authority.size
+        let recipe = operation
+            .intent
+            .publication_recipe
+            .clone()
+            .ok_or(ManagedError::Conflict)?;
+        if recipe.version != MANAGED_PUBLICATION_RECIPE_VERSION
+            || recipe.primary_backend_id != operation.intent.backend_id
         {
             return Err(ManagedError::Conflict);
         }
-        let namespace = locked_namespace(&txn, &operation.intent.logical.tenant_id).await?;
         if namespace.state != "ACTIVE"
             || u64_from_i64(namespace.epoch, "managed namespace epoch")?
                 != operation.intent.fence.namespace_epoch
             || u64_from_i64(namespace.routing_epoch, "managed routing epoch")?
                 != operation.intent.fence.routing_epoch
         {
-            return Err(ManagedError::NamespaceFenced);
+            return Err(ManagedError::RecoveryBlocked("namespace_fence_changed"));
         }
-        let child_versions = managed_physical_object_version::Entity::find()
+        let mut usage = locked_workspace_usage(&txn, &operation.intent.logical.tenant_id).await?;
+        let existing_model = managed_object_authority::Entity::find_by_id((
+            operation.intent.logical.tenant_id.clone(),
+            operation.intent.logical.bucket.clone(),
+            operation.intent.logical.key.clone(),
+        ))
+        .lock(LockType::Update)
+        .one(&txn)
+        .await
+        .map_err(persistence)?;
+        let existing = existing_model
+            .clone()
+            .map(authority_from_model)
+            .transpose()?;
+        if physical_lease.intent_id != operation.intent.primary_child_operation_id {
+            return Err(ManagedError::RecoveryBlocked("physical_intent_mismatch"));
+        }
+        let intent = managed_physical_write_intent::Entity::find_by_id(
+            operation.intent.primary_child_operation_id,
+        )
+        .lock(LockType::Update)
+        .one(&txn)
+        .await
+        .map_err(persistence)?
+        .ok_or(ManagedError::RecoveryBlocked("missing_physical_intent"))?;
+        if intent.intent_id != operation.intent.primary_child_operation_id
+            || intent.tenant_id != operation.intent.logical.tenant_id
+            || intent.backend_id != operation.intent.backend_id
+            || intent.provider_bucket != operation.intent.provider_bucket
+            || intent.physical_key != operation.intent.physical_key
+            || intent.epoch
+                != i64_from_u64(
+                    operation.intent.fence.namespace_epoch,
+                    "managed namespace epoch",
+                )?
+        {
+            return Err(ManagedError::RecoveryBlocked("physical_intent_mismatch"));
+        }
+        if intent.lease_owner != physical_lease.owner
+            || intent.lease_token != physical_lease.token
+            || intent.lease_expires_at_ms <= crate::transaction::unix_time_ms()
+            || operation
+                .recovery_owner
+                .as_ref()
+                .is_some_and(|owner| owner != &physical_lease.owner)
+        {
+            return Err(ManagedError::Conflict);
+        }
+        let durable_intent = durable_physical_intent_from_model(intent.clone())?;
+        validate_physical_commit_versioning(&durable_intent.intent, &result)?;
+        let child =
+            object_operation::Entity::find_by_id(operation.intent.primary_child_operation_id)
+                .lock(LockType::Update)
+                .one(&txn)
+                .await
+                .map_err(persistence)?;
+        validate_durable_child_commit(child.as_ref(), &operation, &result)?;
+        let expected_targets = expected_physical_targets(
+            &durable_intent.intent,
+            physical_lease.namespace_epoch,
+            &result,
+        );
+        for version_id in exact_version_ids(&result) {
+            managed_physical_object_version::Entity::insert(
+                managed_physical_object_version::ActiveModel {
+                    tenant_id: Set(intent.tenant_id.clone()),
+                    backend_id: Set(intent.backend_id.clone()),
+                    provider_kind: Set(intent.provider_kind.clone()),
+                    provider_instance_id: Set(intent.provider_instance_id.clone()),
+                    provider_account_id: Set(intent.provider_account_id.clone()),
+                    canonical_endpoint: Set(intent.canonical_endpoint.clone()),
+                    provider_region: Set(intent.provider_region.clone()),
+                    credential_epoch: Set(intent.credential_epoch),
+                    provider_bucket: Set(intent.provider_bucket.clone()),
+                    physical_key: Set(intent.physical_key.clone()),
+                    versioning_mode: Set(intent.versioning_mode.clone()),
+                    versioning_capability: Set(intent.versioning_capability.clone()),
+                    write_operation_id: Set(intent.intent_id),
+                    version_id: Set(version_id),
+                    epoch: Set(intent.epoch),
+                    state: Set("LIVE".to_string()),
+                    purge_operation_id: Set(None),
+                    last_error: Set(None),
+                    created_at_ms: Set(now),
+                    updated_at_ms: Set(now),
+                },
+            )
+            .on_conflict(
+                OnConflict::columns([
+                    managed_physical_object_version::Column::TenantId,
+                    managed_physical_object_version::Column::BackendId,
+                    managed_physical_object_version::Column::ProviderBucket,
+                    managed_physical_object_version::Column::PhysicalKey,
+                    managed_physical_object_version::Column::VersionId,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec_without_returning(&txn)
+            .await
+            .map_err(persistence)?;
+        }
+        let child_version_models = managed_physical_object_version::Entity::find()
             .filter(
                 managed_physical_object_version::Column::WriteOperationId
                     .eq(operation.intent.primary_child_operation_id),
@@ -3231,28 +3919,27 @@ impl ManagedRepository for PostgresManagedRepository {
                 managed_physical_object_version::Column::PhysicalKey
                     .eq(&operation.intent.physical_key),
             )
-            .count(&txn)
+            .all(&txn)
             .await
             .map_err(persistence)?;
-        let derived_physical_allocation = physical_allocation(authority.size, child_versions)?;
-        if physical_allocated_bytes != derived_physical_allocation
+        let child_versions = child_version_models
+            .iter()
+            .cloned()
+            .map(physical_target_from_model)
+            .collect::<Result<Vec<_>, _>>()?;
+        let derived_physical_allocation =
+            physical_allocation(evidence.expected_output_size, child_versions.len() as u64)?;
+        if child_version_models
+            .iter()
+            .any(|version| version.state != "LIVE")
+            || child_versions.len() != expected_targets.len()
+            || expected_targets
+                .iter()
+                .any(|expected| !child_versions.contains(expected))
             || derived_physical_allocation > operation.reserved_physical_bytes
         {
-            return Err(ManagedError::Conflict);
+            return Err(ManagedError::RecoveryBlocked("physical_version_mismatch"));
         }
-        let existing_model = managed_object_authority::Entity::find_by_id((
-            operation.intent.logical.tenant_id.clone(),
-            operation.intent.logical.bucket.clone(),
-            operation.intent.logical.key.clone(),
-        ))
-        .lock(LockType::Update)
-        .one(&txn)
-        .await
-        .map_err(persistence)?;
-        let existing = existing_model
-            .clone()
-            .map(authority_from_model)
-            .transpose()?;
         if existing.as_ref().map(|value| value.cas_version)
             != operation.intent.expected_authority_cas
             || existing
@@ -3261,9 +3948,8 @@ impl ManagedRepository for PostgresManagedRepository {
                 .map_or(0, |value| value.size)
                 != operation.intent.prior_logical_size
         {
-            return Err(ManagedError::Conflict);
+            return Err(ManagedError::RecoveryBlocked("authority_fence_changed"));
         }
-        let mut usage = locked_workspace_usage(&txn, &operation.intent.logical.tenant_id).await?;
         if usage.active_operation_id != Some(operation_id)
             || usage.reserved_bytes
                 < i64_from_u64(
@@ -3274,7 +3960,7 @@ impl ManagedRepository for PostgresManagedRepository {
             return Err(ManagedError::Conflict);
         }
         let prior_size = i64_from_u64(operation.intent.prior_logical_size, "managed prior size")?;
-        let output_size = i64_from_u64(authority.size, "managed output size")?;
+        let output_size = i64_from_u64(evidence.expected_output_size, "managed output size")?;
         let visible = usage
             .visible_logical_bytes
             .checked_sub(prior_size)
@@ -3288,7 +3974,26 @@ impl ManagedRepository for PostgresManagedRepository {
             "managed physical reservation",
         )?;
         let allocated = i64_from_u64(derived_physical_allocation, "managed physical allocation")?;
-        let now = crate::transaction::unix_time_ms();
+        let mut authority = ObjectAuthority {
+            logical: operation.intent.logical.clone(),
+            generation: operation.intent.generation,
+            digest: evidence
+                .expected_output_digest
+                .clone()
+                .ok_or(ManagedError::Conflict)?,
+            size: evidence.expected_output_size,
+            metadata: recipe.metadata,
+            placement_version: recipe.placement_version,
+            primary_backend_id: recipe.primary_backend_id,
+            primary_version_id: result.selected_version_id.clone(),
+            replica_backend_id: recipe.replica_backend_id,
+            primary_status: recipe.primary_status,
+            replica_status: recipe.replica_status,
+            tombstone: false,
+            cas_version: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
         authority.cas_version = operation
             .intent
             .expected_authority_cas
@@ -3424,6 +4129,18 @@ impl ManagedRepository for PostgresManagedRepository {
                 managed_logical_operation::Column::CommittedAtMs,
                 Expr::value(Some(now)),
             )
+            .col_expr(
+                managed_logical_operation::Column::RecoveryOwner,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                managed_logical_operation::Column::RecoveryToken,
+                Expr::value(Option::<Uuid>::None),
+            )
+            .col_expr(
+                managed_logical_operation::Column::RecoveryExpiresAtMs,
+                Expr::value(Option::<i64>::None),
+            )
             .filter(managed_logical_operation::Column::OperationId.eq(operation_id))
             .exec(&txn)
             .await
@@ -3434,6 +4151,16 @@ impl ManagedRepository for PostgresManagedRepository {
             .map_err(persistence)?
             .ok_or(ManagedError::Conflict)
             .and_then(logical_operation_from_model)?;
+        let deleted = managed_physical_write_intent::Entity::delete_many()
+            .filter(managed_physical_write_intent::Column::IntentId.eq(physical_lease.intent_id))
+            .filter(managed_physical_write_intent::Column::LeaseOwner.eq(&physical_lease.owner))
+            .filter(managed_physical_write_intent::Column::LeaseToken.eq(physical_lease.token))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        if deleted.rows_affected != 1 {
+            return Err(ManagedError::Conflict);
+        }
         txn.commit().await.map_err(persistence)?;
         Ok(ManagedOperationCommit {
             operation: committed,
@@ -3862,6 +4589,214 @@ impl ManagedRepository for PostgresManagedRepository {
             .exec(&txn)
             .await
             .map_err(persistence)?;
+        let aborted = managed_logical_operation::Entity::find_by_id(operation_id)
+            .one(&txn)
+            .await
+            .map_err(persistence)?
+            .ok_or(ManagedError::Conflict)
+            .and_then(logical_operation_from_model)?;
+        txn.commit().await.map_err(persistence)?;
+        Ok(aborted)
+    }
+
+    async fn abort_logical_put(
+        &self,
+        operation_id: Uuid,
+        physical_lease: Option<&PhysicalWriteLease>,
+        proof: LogicalAbortProof,
+        error_class: &str,
+        recovery_claim: Option<&ManagedRecoveryClaim>,
+    ) -> Result<ManagedLogicalOperation, ManagedError> {
+        let identity = managed_logical_operation::Entity::find_by_id(operation_id)
+            .one(&self.db)
+            .await
+            .map_err(persistence)?
+            .ok_or(ManagedError::Conflict)?;
+        let txn = self.db.begin().await.map_err(persistence)?;
+        // All managed mutation transactions lock namespace -> logical -> usage
+        // and current authority/physical intent last.
+        let namespace = locked_namespace(&txn, &identity.tenant_id).await?;
+        let model = managed_logical_operation::Entity::find_by_id(operation_id)
+            .lock(LockType::Update)
+            .one(&txn)
+            .await
+            .map_err(persistence)?
+            .ok_or(ManagedError::Conflict)?;
+        let operation = logical_operation_from_model(model)?;
+        if operation.state == ManagedLogicalOperationState::ProvenAborted {
+            txn.commit().await.map_err(persistence)?;
+            return Ok(operation);
+        }
+        let now = crate::transaction::unix_time_ms();
+        validate_recovery_authority(&operation, recovery_claim, now)?;
+        if operation.intent.kind != ManagedMutationKind::Put
+            || operation.state == ManagedLogicalOperationState::Committed
+        {
+            return Err(ManagedError::Conflict);
+        }
+        if namespace.epoch
+            != i64_from_u64(
+                operation.intent.fence.namespace_epoch,
+                "managed namespace epoch",
+            )?
+        {
+            return Err(ManagedError::RecoveryBlocked("namespace_fence_changed"));
+        }
+        let mut usage = locked_workspace_usage(&txn, &operation.intent.logical.tenant_id).await?;
+        let intent = managed_physical_write_intent::Entity::find_by_id(
+            operation.intent.primary_child_operation_id,
+        )
+        .lock(LockType::Update)
+        .one(&txn)
+        .await
+        .map_err(persistence)?;
+        let child_versions = managed_physical_object_version::Entity::find()
+            .filter(
+                managed_physical_object_version::Column::WriteOperationId
+                    .eq(operation.intent.primary_child_operation_id),
+            )
+            .count(&txn)
+            .await
+            .map_err(persistence)?;
+        if child_versions != 0 {
+            return Err(ManagedError::Conflict);
+        }
+        let child_journal =
+            object_operation::Entity::find_by_id(operation.intent.primary_child_operation_id)
+                .lock(LockType::Update)
+                .one(&txn)
+                .await
+                .map_err(persistence)?;
+        let child_proves_absence = child_journal.as_ref().is_some_and(|child| {
+            child.state == "PROVEN_ABORTED"
+                && child.exact_absence_observed_at_ms.is_some()
+                && child.tenant_id.as_deref() == Some(operation.intent.logical.tenant_id.as_str())
+                && child.namespace_epoch
+                    == i64::try_from(operation.intent.fence.namespace_epoch).ok()
+                && child.backend_id == operation.intent.backend_id
+                && child.bucket == operation.intent.provider_bucket
+                && child.logical_key == operation.intent.logical.object_key()
+                && child.physical_key == operation.intent.physical_key
+                && operation.evidence.as_ref().is_none_or(|evidence| {
+                    child.expected_digest == evidence.expected_output_digest
+                        && child.expected_size == i64::try_from(evidence.expected_output_size).ok()
+                })
+        });
+        match (
+            proof,
+            physical_lease,
+            intent.as_ref(),
+            child_journal.as_ref(),
+        ) {
+            (LogicalAbortProof::NoChildStarted, None, None, None)
+                if matches!(
+                    operation.state,
+                    ManagedLogicalOperationState::Intent | ManagedLogicalOperationState::Open
+                ) => {}
+            (LogicalAbortProof::NoChildStarted, Some(lease), Some(intent), None)
+                if lease.intent_id == operation.intent.primary_child_operation_id
+                    && intent.lease_owner == lease.owner
+                    && intent.lease_token == lease.token
+                    && intent.lease_expires_at_ms > now
+                    && lease.namespace_epoch == operation.intent.fence.namespace_epoch => {}
+            (LogicalAbortProof::ChildProvenAborted, Some(lease), Some(intent), Some(_))
+                if child_proves_absence
+                    && lease.intent_id == operation.intent.primary_child_operation_id
+                    && intent.lease_owner == lease.owner
+                    && intent.lease_token == lease.token
+                    && intent.lease_expires_at_ms > now
+                    && lease.namespace_epoch == operation.intent.fence.namespace_epoch => {}
+            _ => return Err(ManagedError::Conflict),
+        }
+        if operation.state != ManagedLogicalOperationState::Intent
+            && usage.active_operation_id != Some(operation_id)
+        {
+            return Err(ManagedError::Conflict);
+        }
+        let reserved = i64_from_u64(
+            operation.reserved_physical_bytes,
+            "managed physical reservation",
+        )?;
+        usage.reserved_bytes = usage
+            .reserved_bytes
+            .checked_sub(reserved)
+            .ok_or(ManagedError::Conflict)?;
+        if usage.active_operation_id == Some(operation_id) {
+            usage.active_operation_id = None;
+        }
+        usage.version = usage.version.saturating_add(1);
+        usage.updated_at_ms = now;
+        managed_workspace_usage::Entity::update_many()
+            .col_expr(
+                managed_workspace_usage::Column::ReservedBytes,
+                Expr::value(usage.reserved_bytes),
+            )
+            .col_expr(
+                managed_workspace_usage::Column::ActiveOperationId,
+                Expr::value(usage.active_operation_id),
+            )
+            .col_expr(
+                managed_workspace_usage::Column::Version,
+                Expr::value(usage.version),
+            )
+            .col_expr(
+                managed_workspace_usage::Column::UpdatedAtMs,
+                Expr::value(now),
+            )
+            .filter(
+                managed_workspace_usage::Column::TenantId.eq(&operation.intent.logical.tenant_id),
+            )
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        managed_logical_operation::Entity::update_many()
+            .col_expr(
+                managed_logical_operation::Column::State,
+                Expr::value(ManagedLogicalOperationState::ProvenAborted.as_str()),
+            )
+            .col_expr(
+                managed_logical_operation::Column::SettlementState,
+                Expr::value(ManagedSettlementState::Released.as_str()),
+            )
+            .col_expr(
+                managed_logical_operation::Column::LastErrorClass,
+                Expr::value(Some(error_class.chars().take(128).collect::<String>())),
+            )
+            .col_expr(
+                managed_logical_operation::Column::RecoveryOwner,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                managed_logical_operation::Column::RecoveryToken,
+                Expr::value(Option::<Uuid>::None),
+            )
+            .col_expr(
+                managed_logical_operation::Column::RecoveryExpiresAtMs,
+                Expr::value(Option::<i64>::None),
+            )
+            .col_expr(
+                managed_logical_operation::Column::UpdatedAtMs,
+                Expr::value(now),
+            )
+            .col_expr(
+                managed_logical_operation::Column::AbortedAtMs,
+                Expr::value(Some(now)),
+            )
+            .filter(managed_logical_operation::Column::OperationId.eq(operation_id))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        if intent.is_some() {
+            let deleted = managed_physical_write_intent::Entity::delete_by_id(
+                operation.intent.primary_child_operation_id,
+            )
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+            if deleted.rows_affected != 1 {
+                return Err(ManagedError::Conflict);
+            }
+        }
         let aborted = managed_logical_operation::Entity::find_by_id(operation_id)
             .one(&txn)
             .await
@@ -5158,6 +6093,7 @@ impl ManagedRepository for PostgresManagedRepository {
     ) -> Result<PhysicalWriteLease, ManagedError> {
         validate_physical_intent(&intent)?;
         let txn = self.db.begin().await.map_err(persistence)?;
+        let namespace = locked_namespace(&txn, &intent.tenant_id).await?;
         let parent = managed_logical_operation::Entity::find()
             .filter(managed_logical_operation::Column::PrimaryChildOperationId.eq(intent.intent_id))
             .lock(LockType::Update)
@@ -5167,8 +6103,12 @@ impl ManagedRepository for PostgresManagedRepository {
             .map(logical_operation_from_model)
             .transpose()?;
         let epoch = if let Some(parent) = &parent {
-            let namespace = locked_namespace(&txn, &intent.tenant_id).await?;
             let usage = locked_workspace_usage(&txn, &intent.tenant_id).await?;
+            let recipe = parent
+                .intent
+                .publication_recipe
+                .as_ref()
+                .ok_or(ManagedError::Conflict)?;
             if namespace.state != "ACTIVE"
                 || parent.state != ManagedLogicalOperationState::Open
                 || usage.active_operation_id != Some(parent.intent.operation_id)
@@ -5176,6 +6116,15 @@ impl ManagedRepository for PostgresManagedRepository {
                 || parent.intent.backend_id != intent.backend_id
                 || parent.intent.provider_bucket != intent.provider_bucket
                 || parent.intent.physical_key != intent.physical_key
+                || recipe.version != MANAGED_PUBLICATION_RECIPE_VERSION
+                || recipe.placement_version == 0
+                || recipe.primary_backend_id != parent.intent.backend_id
+                || !physical_intent_supports_exact_history(&intent)
+                || recipe.primary_status != CopyStatus::Ready
+                || (recipe.replica_backend_id.is_none()
+                    && recipe.replica_status != CopyStatus::Absent)
+                || (recipe.replica_backend_id.is_some()
+                    && recipe.replica_status != CopyStatus::RepairPending)
                 || u64_from_i64(namespace.epoch, "managed namespace epoch")?
                     != parent.intent.fence.namespace_epoch
                 || u64_from_i64(namespace.routing_epoch, "managed routing epoch")?
@@ -5185,7 +6134,10 @@ impl ManagedRepository for PostgresManagedRepository {
             }
             namespace.epoch
         } else {
-            require_active_namespace(&txn, &intent.tenant_id).await?
+            if namespace.state != "ACTIVE" {
+                return Err(ManagedError::NamespaceFenced);
+            }
+            namespace.epoch
         };
         let now = crate::transaction::unix_time_ms();
         let lease_token = Uuid::now_v7();
@@ -5248,7 +6200,7 @@ impl ManagedRepository for PostgresManagedRepository {
                 || existing.versioning_capability != expected.versioning_capability.as_str()
                 || existing.lease_owner != expected.lease_owner
             {
-                return Err(ManagedError::Conflict);
+                return Err(ManagedError::RecoveryBlocked("physical_intent_mismatch"));
             }
             txn.commit().await.map_err(persistence)?;
             return Ok(PhysicalWriteLease {
@@ -5273,56 +6225,38 @@ impl ManagedRepository for PostgresManagedRepository {
         &self,
         limit: u64,
     ) -> Result<Vec<DurablePhysicalWriteIntent>, ManagedError> {
+        let logical_children = managed_logical_operation::Entity::find()
+            .select_only()
+            .column(managed_logical_operation::Column::PrimaryChildOperationId)
+            .filter(managed_logical_operation::Column::State.is_not_in([
+                ManagedLogicalOperationState::Committed.as_str(),
+                ManagedLogicalOperationState::ProvenAborted.as_str(),
+            ]))
+            .into_query();
         managed_physical_write_intent::Entity::find()
+            .filter(
+                managed_physical_write_intent::Column::IntentId.not_in_subquery(logical_children),
+            )
             .order_by_asc(managed_physical_write_intent::Column::UpdatedAtMs)
             .limit(limit)
             .all(&self.db)
             .await
             .map_err(persistence)?
             .into_iter()
-            .map(|intent| {
-                Ok(DurablePhysicalWriteIntent {
-                    namespace_epoch: u64::try_from(intent.epoch).map_err(|_| {
-                        ManagedError::Corrupt("physical write intent epoch is invalid".to_string())
-                    })?,
-                    blocked_reason: intent.last_error,
-                    lease_expires_at_ms: intent.lease_expires_at_ms,
-                    lease: PhysicalWriteLease {
-                        intent_id: intent.intent_id,
-                        namespace_epoch: u64::try_from(intent.epoch).map_err(|_| {
-                            ManagedError::Corrupt(
-                                "physical write intent epoch is invalid".to_string(),
-                            )
-                        })?,
-                        owner: intent.lease_owner.clone(),
-                        token: intent.lease_token,
-                    },
-                    intent: PhysicalWriteIntent {
-                        intent_id: intent.intent_id,
-                        tenant_id: intent.tenant_id,
-                        backend_id: intent.backend_id,
-                        storage_identity: ProviderStorageIdentity {
-                            provider_kind: intent.provider_kind,
-                            provider_instance_id: intent.provider_instance_id,
-                            provider_account_id: intent.provider_account_id,
-                            canonical_endpoint: intent.canonical_endpoint,
-                            region: intent.provider_region,
-                        },
-                        credential_epoch: u64_from_i64(
-                            intent.credential_epoch,
-                            "physical write credential epoch",
-                        )?,
-                        provider_bucket: intent.provider_bucket,
-                        physical_key: intent.physical_key,
-                        versioning_mode: BackendVersioningMode::parse(&intent.versioning_mode)?,
-                        versioning_capability: BackendVersioningCapability::parse(
-                            &intent.versioning_capability,
-                        )?,
-                        lease_owner: intent.lease_owner,
-                    },
-                })
-            })
+            .map(durable_physical_intent_from_model)
             .collect()
+    }
+
+    async fn physical_write_intent(
+        &self,
+        intent_id: Uuid,
+    ) -> Result<Option<DurablePhysicalWriteIntent>, ManagedError> {
+        managed_physical_write_intent::Entity::find_by_id(intent_id)
+            .one(&self.db)
+            .await
+            .map_err(persistence)?
+            .map(durable_physical_intent_from_model)
+            .transpose()
     }
 
     async fn renew_physical_write_intent(
@@ -5361,6 +6295,27 @@ impl ManagedRepository for PostgresManagedRepository {
         owner: &str,
         lease_expires_at_ms: i64,
     ) -> Result<Option<PhysicalWriteLease>, ManagedError> {
+        let candidate = managed_physical_write_intent::Entity::find_by_id(intent_id)
+            .one(&self.db)
+            .await
+            .map_err(persistence)?;
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let txn = self.db.begin().await.map_err(persistence)?;
+        let _namespace = locked_namespace(&txn, &candidate.tenant_id).await?;
+        let protected_parent = managed_logical_operation::Entity::find()
+            .filter(managed_logical_operation::Column::PrimaryChildOperationId.eq(intent_id))
+            .filter(managed_logical_operation::Column::State.is_not_in([
+                ManagedLogicalOperationState::Committed.as_str(),
+                ManagedLogicalOperationState::ProvenAborted.as_str(),
+            ]))
+            .count(&txn)
+            .await
+            .map_err(persistence)?;
+        if protected_parent != 0 {
+            return Ok(None);
+        }
         let token = Uuid::now_v7();
         let result = managed_physical_write_intent::Entity::update_many()
             .col_expr(
@@ -5380,21 +6335,88 @@ impl ManagedRepository for PostgresManagedRepository {
                 managed_physical_write_intent::Column::LeaseExpiresAtMs
                     .lte(crate::transaction::unix_time_ms()),
             )
-            .exec(&self.db)
+            .exec(&txn)
             .await
             .map_err(persistence)?;
         if result.rows_affected != 1 {
             return Ok(None);
         }
         let intent = managed_physical_write_intent::Entity::find_by_id(intent_id)
-            .one(&self.db)
+            .one(&txn)
             .await
             .map_err(persistence)?
             .ok_or(ManagedError::Conflict)?;
+        txn.commit().await.map_err(persistence)?;
         Ok(Some(PhysicalWriteLease {
             intent_id,
             namespace_epoch: u64::try_from(intent.epoch).map_err(|_| ManagedError::Conflict)?,
             owner: owner.to_string(),
+            token,
+        }))
+    }
+
+    async fn claim_logical_physical_write_intent(
+        &self,
+        claim: &ManagedRecoveryClaim,
+        lease_expires_at_ms: i64,
+    ) -> Result<Option<PhysicalWriteLease>, ManagedError> {
+        let now = crate::transaction::unix_time_ms();
+        if lease_expires_at_ms <= now {
+            return Err(ManagedError::Conflict);
+        }
+        let txn = self.db.begin().await.map_err(persistence)?;
+        // Lock order for managed mutation transactions is namespace -> logical
+        // operation -> workspace usage/current authority -> physical intent.
+        let namespace = locked_namespace(&txn, &claim.operation.intent.logical.tenant_id).await?;
+        let model =
+            managed_logical_operation::Entity::find_by_id(claim.operation.intent.operation_id)
+                .lock(LockType::Update)
+                .one(&txn)
+                .await
+                .map_err(persistence)?
+                .ok_or(ManagedError::Conflict)?;
+        let operation = logical_operation_from_model(model)?;
+        validate_recovery_authority(&operation, Some(claim), now)?;
+        if operation.intent.kind != ManagedMutationKind::Put
+            || namespace.epoch
+                != i64_from_u64(
+                    operation.intent.fence.namespace_epoch,
+                    "managed namespace epoch",
+                )?
+        {
+            return Err(ManagedError::Conflict);
+        }
+        let token = Uuid::now_v7();
+        let updated = managed_physical_write_intent::Entity::update_many()
+            .col_expr(
+                managed_physical_write_intent::Column::LeaseOwner,
+                Expr::value(claim.owner.clone()),
+            )
+            .col_expr(
+                managed_physical_write_intent::Column::LeaseToken,
+                Expr::value(token),
+            )
+            .col_expr(
+                managed_physical_write_intent::Column::LeaseExpiresAtMs,
+                Expr::value(lease_expires_at_ms),
+            )
+            .filter(
+                managed_physical_write_intent::Column::IntentId
+                    .eq(operation.intent.primary_child_operation_id),
+            )
+            .filter(managed_physical_write_intent::Column::LeaseExpiresAtMs.lte(now))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        if updated.rows_affected != 1 {
+            txn.commit().await.map_err(persistence)?;
+            return Ok(None);
+        }
+        txn.commit().await.map_err(persistence)?;
+        Ok(Some(PhysicalWriteLease {
+            intent_id: operation.intent.primary_child_operation_id,
+            namespace_epoch: operation.intent.fence.namespace_epoch,
+            owner: claim.owner.clone(),
             token,
         }))
     }
@@ -5411,6 +6433,19 @@ impl ManagedRepository for PostgresManagedRepository {
             return Err(ManagedError::Conflict);
         }
         let txn = self.db.begin().await.map_err(persistence)?;
+        if managed_logical_operation::Entity::find()
+            .filter(managed_logical_operation::Column::PrimaryChildOperationId.eq(lease.intent_id))
+            .filter(managed_logical_operation::Column::State.is_not_in([
+                ManagedLogicalOperationState::Committed.as_str(),
+                ManagedLogicalOperationState::ProvenAborted.as_str(),
+            ]))
+            .count(&txn)
+            .await
+            .map_err(persistence)?
+            != 0
+        {
+            return Err(ManagedError::Conflict);
+        }
         let Some(intent) = managed_physical_write_intent::Entity::find_by_id(lease.intent_id)
             .lock(LockType::Update)
             .one(&txn)
@@ -5491,6 +6526,19 @@ impl ManagedRepository for PostgresManagedRepository {
     }
 
     async fn abort_physical_write(&self, lease: &PhysicalWriteLease) -> Result<(), ManagedError> {
+        if managed_logical_operation::Entity::find()
+            .filter(managed_logical_operation::Column::PrimaryChildOperationId.eq(lease.intent_id))
+            .filter(managed_logical_operation::Column::State.is_not_in([
+                ManagedLogicalOperationState::Committed.as_str(),
+                ManagedLogicalOperationState::ProvenAborted.as_str(),
+            ]))
+            .count(&self.db)
+            .await
+            .map_err(persistence)?
+            != 0
+        {
+            return Err(ManagedError::Conflict);
+        }
         let result = managed_physical_write_intent::Entity::delete_many()
             .filter(managed_physical_write_intent::Column::IntentId.eq(lease.intent_id))
             .filter(managed_physical_write_intent::Column::LeaseOwner.eq(&lease.owner))
@@ -6399,6 +7447,9 @@ impl ManagedRepository for InMemoryManagedRepository {
             committed_authority_version: None,
             settlement_state: ManagedSettlementState::Pending,
             last_error_class: None,
+            recovery_owner: None,
+            recovery_token: None,
+            recovery_expires_at_ms: None,
             created_at_ms: now,
             updated_at_ms: now,
             committed_at_ms: None,
@@ -6439,6 +7490,109 @@ impl ManagedRepository for InMemoryManagedRepository {
         operations.sort_by_key(|operation| operation.updated_at_ms);
         operations.truncate(limit as usize);
         Ok(operations)
+    }
+
+    async fn claim_stale_logical_operations(
+        &self,
+        owner: &str,
+        stale_before_ms: i64,
+        claim_expires_at_ms: i64,
+        limit: u64,
+    ) -> Result<Vec<ManagedRecoveryClaim>, ManagedError> {
+        let now = crate::transaction::unix_time_ms();
+        if owner.is_empty() || owner.len() > 256 || claim_expires_at_ms <= now {
+            return Err(ManagedError::Conflict);
+        }
+        let mut state = self.state.lock().await;
+        let mut ids = state
+            .logical_operations
+            .values()
+            .filter(|operation| {
+                !operation.state.terminal()
+                    && operation.intent.kind == ManagedMutationKind::Put
+                    && operation.updated_at_ms <= stale_before_ms
+                    && operation
+                        .recovery_expires_at_ms
+                        .is_none_or(|expires| expires <= now)
+            })
+            .map(|operation| (operation.updated_at_ms, operation.intent.operation_id))
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.truncate(limit as usize);
+        Ok(ids
+            .into_iter()
+            .map(|(_, operation_id)| {
+                let token = Uuid::now_v7();
+                let operation = state.logical_operations.get_mut(&operation_id).unwrap();
+                operation.recovery_owner = Some(owner.to_string());
+                operation.recovery_token = Some(token);
+                operation.recovery_expires_at_ms = Some(claim_expires_at_ms);
+                ManagedRecoveryClaim {
+                    operation: operation.clone(),
+                    owner: owner.to_string(),
+                    token,
+                    expires_at_ms: claim_expires_at_ms,
+                }
+            })
+            .collect())
+    }
+
+    async fn mark_logical_recovery_blocked(
+        &self,
+        claim: &ManagedRecoveryClaim,
+        reason: &str,
+    ) -> Result<ManagedLogicalOperation, ManagedError> {
+        let mut state = self.state.lock().await;
+        let operation = state
+            .logical_operations
+            .get_mut(&claim.operation.intent.operation_id)
+            .ok_or(ManagedError::Conflict)?;
+        if operation.recovery_owner.as_deref() != Some(&claim.owner)
+            || operation.recovery_token != Some(claim.token)
+            || operation.recovery_expires_at_ms != Some(claim.expires_at_ms)
+            || claim.expires_at_ms <= crate::transaction::unix_time_ms()
+            || operation.state.terminal()
+        {
+            return Err(ManagedError::Conflict);
+        }
+        operation.state = ManagedLogicalOperationState::RecoveryBlocked;
+        operation.last_error_class = Some(reason.chars().take(128).collect());
+        operation.recovery_owner = None;
+        operation.recovery_token = None;
+        operation.recovery_expires_at_ms = None;
+        operation.updated_at_ms = crate::transaction::unix_time_ms();
+        Ok(operation.clone())
+    }
+
+    async fn renew_logical_recovery_claim(
+        &self,
+        claim: &ManagedRecoveryClaim,
+        claim_expires_at_ms: i64,
+    ) -> Result<ManagedRecoveryClaim, ManagedError> {
+        let now = crate::transaction::unix_time_ms();
+        if claim_expires_at_ms <= now {
+            return Err(ManagedError::Conflict);
+        }
+        let mut state = self.state.lock().await;
+        let operation = state
+            .logical_operations
+            .get_mut(&claim.operation.intent.operation_id)
+            .ok_or(ManagedError::Conflict)?;
+        if operation.state.terminal()
+            || operation.recovery_owner.as_deref() != Some(&claim.owner)
+            || operation.recovery_token != Some(claim.token)
+            || operation.recovery_expires_at_ms != Some(claim.expires_at_ms)
+            || claim.expires_at_ms <= now
+        {
+            return Err(ManagedError::Conflict);
+        }
+        operation.recovery_expires_at_ms = Some(claim_expires_at_ms);
+        Ok(ManagedRecoveryClaim {
+            operation: operation.clone(),
+            owner: claim.owner.clone(),
+            token: claim.token,
+            expires_at_ms: claim_expires_at_ms,
+        })
     }
 
     async fn reserve_logical_operation(
@@ -6575,26 +7729,95 @@ impl ManagedRepository for InMemoryManagedRepository {
         Ok(operation.clone())
     }
 
-    async fn commit_logical_put(
+    async fn finalize_logical_put(
         &self,
         operation_id: Uuid,
-        mut authority: ObjectAuthority,
-        physical_allocated_bytes: u64,
+        physical_lease: &PhysicalWriteLease,
+        result: ExactPhysicalCommit,
+        recovery_claim: Option<&ManagedRecoveryClaim>,
     ) -> Result<ManagedOperationCommit, ManagedError> {
+        validate_exact_physical_commit(&result)?;
         let mut state = self.state.lock().await;
         let operation = state
             .logical_operations
             .get(&operation_id)
             .cloned()
             .ok_or(ManagedError::Conflict)?;
+        let now = crate::transaction::unix_time_ms();
         if operation.state == ManagedLogicalOperationState::Committed {
             let persisted = state
                 .authorities
                 .get(&operation.intent.logical)
                 .cloned()
                 .ok_or(ManagedError::Conflict)?;
-            if persisted.generation != operation.intent.generation
-                || operation.committed_physical_bytes != physical_allocated_bytes
+            let persisted_ids = state
+                .physical_versions
+                .iter()
+                .filter(|version| {
+                    version.write_operation_id == operation.intent.primary_child_operation_id
+                })
+                .map(|version| version.version_id.clone().unwrap_or_default())
+                .collect::<HashSet<_>>();
+            let persisted_targets = state
+                .physical_versions
+                .iter()
+                .filter(|version| {
+                    version.write_operation_id == operation.intent.primary_child_operation_id
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let canonical_target = persisted_targets.first().ok_or(ManagedError::Conflict)?;
+            let evidence = operation.evidence.as_ref().ok_or(ManagedError::Conflict)?;
+            let recipe = operation
+                .intent
+                .publication_recipe
+                .as_ref()
+                .ok_or(ManagedError::Conflict)?;
+            let committed_authority_version = operation
+                .committed_authority_version
+                .ok_or(ManagedError::Conflict)?;
+            let original_authority_matches = persisted.generation == operation.intent.generation
+                && persisted.digest
+                    == evidence
+                        .expected_output_digest
+                        .clone()
+                        .ok_or(ManagedError::Conflict)?
+                && persisted.size == evidence.expected_output_size
+                && persisted.metadata == recipe.metadata
+                && persisted.placement_version == recipe.placement_version
+                && persisted.primary_backend_id == recipe.primary_backend_id
+                && persisted.primary_version_id == result.selected_version_id
+                && persisted.replica_backend_id == recipe.replica_backend_id
+                && persisted.primary_status == recipe.primary_status
+                && persisted.replica_status == recipe.replica_status
+                && !persisted.tombstone;
+            if persisted.logical != operation.intent.logical
+                || committed_authority_version
+                    != operation
+                        .intent
+                        .expected_authority_cas
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                || persisted.cas_version < committed_authority_version
+                || (persisted.cas_version == committed_authority_version
+                    && !original_authority_matches)
+                || persisted_ids != exact_version_ids(&result).into_iter().collect()
+                || persisted_targets.iter().any(|target| {
+                    target.tenant_id != operation.intent.logical.tenant_id
+                        || target.namespace_epoch != operation.intent.fence.namespace_epoch
+                        || target.backend_id != operation.intent.backend_id
+                        || target.provider_bucket != operation.intent.provider_bucket
+                        || target.physical_key != operation.intent.physical_key
+                        || target.storage_identity != canonical_target.storage_identity
+                        || target.credential_epoch != canonical_target.credential_epoch
+                        || target.versioning_mode != canonical_target.versioning_mode
+                        || target.versioning_capability != canonical_target.versioning_capability
+                })
+                || operation.committed_physical_bytes
+                    != physical_allocation(
+                        evidence.expected_output_size,
+                        persisted_ids.len() as u64,
+                    )?
             {
                 return Err(ManagedError::Conflict);
             }
@@ -6605,19 +7828,24 @@ impl ManagedRepository for InMemoryManagedRepository {
                 usage: usage.clone(),
             });
         }
+        validate_recovery_authority(&operation, recovery_claim, now)?;
         let evidence = operation.evidence.clone().ok_or(ManagedError::Conflict)?;
+        let recipe = operation
+            .intent
+            .publication_recipe
+            .clone()
+            .ok_or(ManagedError::Conflict)?;
         if operation.intent.kind != ManagedMutationKind::Put
             || !matches!(
                 operation.state,
                 ManagedLogicalOperationState::Completing
                     | ManagedLogicalOperationState::CommitUnknown
+                    | ManagedLogicalOperationState::RecoveryBlocked
             )
-            || authority.logical != operation.intent.logical
-            || authority.generation != operation.intent.generation
-            || authority.primary_backend_id != operation.intent.backend_id
-            || authority.tombstone
-            || evidence.expected_output_digest.as_deref() != Some(authority.digest.as_str())
-            || evidence.expected_output_size != authority.size
+            || (operation.state == ManagedLogicalOperationState::RecoveryBlocked
+                && recovery_claim.is_none())
+            || recipe.version != MANAGED_PUBLICATION_RECIPE_VERSION
+            || recipe.primary_backend_id != operation.intent.backend_id
         {
             return Err(ManagedError::Conflict);
         }
@@ -6637,9 +7865,63 @@ impl ManagedRepository for InMemoryManagedRepository {
                 .unwrap_or(1)
                 != operation.intent.fence.routing_epoch
         {
-            return Err(ManagedError::NamespaceFenced);
+            return Err(ManagedError::RecoveryBlocked("namespace_fence_changed"));
         }
-        let child_version_count = state
+        let physical_intent = state
+            .physical_write_intents
+            .get(&physical_lease.intent_id)
+            .cloned()
+            .ok_or(ManagedError::Conflict)?;
+        validate_physical_commit_versioning(&physical_intent, &result)?;
+        if physical_lease.intent_id != operation.intent.primary_child_operation_id
+            || physical_intent.tenant_id != operation.intent.logical.tenant_id
+            || physical_intent.backend_id != operation.intent.backend_id
+            || physical_intent.provider_bucket != operation.intent.provider_bucket
+            || physical_intent.physical_key != operation.intent.physical_key
+            || physical_intent.lease_owner != physical_lease.owner
+            || state.physical_write_tokens.get(&physical_lease.intent_id)
+                != Some(&physical_lease.token)
+            || state.physical_write_epochs.get(&physical_lease.intent_id)
+                != Some(&physical_lease.namespace_epoch)
+            || state
+                .physical_write_leases
+                .get(&physical_lease.intent_id)
+                .is_none_or(|expiry| *expiry <= crate::transaction::unix_time_ms())
+            || operation
+                .recovery_owner
+                .as_ref()
+                .is_some_and(|owner| owner != &physical_lease.owner)
+        {
+            return Err(ManagedError::Conflict);
+        }
+        let expected_targets =
+            expected_physical_targets(&physical_intent, physical_lease.namespace_epoch, &result);
+        let preexisting_targets = state
+            .physical_versions
+            .iter()
+            .filter(|target| {
+                target.write_operation_id == operation.intent.primary_child_operation_id
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if preexisting_targets
+            .iter()
+            .any(|existing| !expected_targets.contains(existing))
+        {
+            return Err(ManagedError::RecoveryBlocked("physical_version_mismatch"));
+        }
+        for target in &expected_targets {
+            if !state.physical_versions.iter().any(|existing| {
+                existing.tenant_id == target.tenant_id
+                    && existing.backend_id == target.backend_id
+                    && existing.provider_bucket == target.provider_bucket
+                    && existing.physical_key == target.physical_key
+                    && existing.version_id == target.version_id
+            }) {
+                state.physical_versions.push(target.clone());
+            }
+        }
+        let child_versions = state
             .physical_versions
             .iter()
             .filter(|target| {
@@ -6649,14 +7931,19 @@ impl ManagedRepository for InMemoryManagedRepository {
                     && target.provider_bucket == operation.intent.provider_bucket
                     && target.physical_key == operation.intent.physical_key
             })
-            .count() as u64;
-        let derived_physical_allocation = physical_allocation(authority.size, child_version_count)?;
-        if physical_allocated_bytes != derived_physical_allocation
+            .cloned()
+            .collect::<Vec<_>>();
+        let derived_physical_allocation =
+            physical_allocation(evidence.expected_output_size, child_versions.len() as u64)?;
+        if child_versions.len() != expected_targets.len()
+            || expected_targets
+                .iter()
+                .any(|expected| !child_versions.contains(expected))
             || derived_physical_allocation > operation.reserved_physical_bytes
         {
-            return Err(ManagedError::Conflict);
+            return Err(ManagedError::RecoveryBlocked("physical_version_mismatch"));
         }
-        let existing = state.authorities.get(&authority.logical).cloned();
+        let existing = state.authorities.get(&operation.intent.logical).cloned();
         if existing.as_ref().map(|value| value.cas_version)
             != operation.intent.expected_authority_cas
             || existing
@@ -6665,7 +7952,7 @@ impl ManagedRepository for InMemoryManagedRepository {
                 .map_or(0, |value| value.size)
                 != operation.intent.prior_logical_size
         {
-            return Err(ManagedError::Conflict);
+            return Err(ManagedError::RecoveryBlocked("authority_fence_changed"));
         }
         let usage = Self::workspace_usage(&mut state, &operation.intent.logical.tenant_id);
         if usage.active_operation_id != Some(operation_id)
@@ -6676,12 +7963,31 @@ impl ManagedRepository for InMemoryManagedRepository {
         let visible = usage
             .visible_logical_bytes
             .checked_sub(operation.intent.prior_logical_size)
-            .and_then(|value| value.checked_add(authority.size))
+            .and_then(|value| value.checked_add(evidence.expected_output_size))
             .ok_or(ManagedError::QuotaExceeded)?;
         if visible > usage.visible_limit_bytes {
             return Err(ManagedError::QuotaExceeded);
         }
-        let now = crate::transaction::unix_time_ms();
+        let mut authority = ObjectAuthority {
+            logical: operation.intent.logical.clone(),
+            generation: operation.intent.generation,
+            digest: evidence
+                .expected_output_digest
+                .clone()
+                .ok_or(ManagedError::Conflict)?,
+            size: evidence.expected_output_size,
+            metadata: recipe.metadata,
+            placement_version: recipe.placement_version,
+            primary_backend_id: recipe.primary_backend_id,
+            primary_version_id: result.selected_version_id,
+            replica_backend_id: recipe.replica_backend_id,
+            primary_status: recipe.primary_status,
+            replica_status: recipe.replica_status,
+            tombstone: false,
+            cas_version: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
         authority.cas_version = operation
             .intent
             .expected_authority_cas
@@ -6729,8 +8035,27 @@ impl ManagedRepository for InMemoryManagedRepository {
         operation.committed_authority_version = Some(authority.cas_version);
         operation.updated_at_ms = now;
         operation.committed_at_ms = Some(now);
+        operation.recovery_owner = None;
+        operation.recovery_token = None;
+        operation.recovery_expires_at_ms = None;
+        let committed_operation = operation.clone();
+        state
+            .physical_write_intents
+            .remove(&physical_lease.intent_id);
+        state
+            .blocked_write_intents
+            .remove(&physical_lease.intent_id);
+        state
+            .physical_write_leases
+            .remove(&physical_lease.intent_id);
+        state
+            .physical_write_tokens
+            .remove(&physical_lease.intent_id);
+        state
+            .physical_write_epochs
+            .remove(&physical_lease.intent_id);
         Ok(ManagedOperationCommit {
-            operation: operation.clone(),
+            operation: committed_operation,
             authority,
             usage: committed_usage,
         })
@@ -7018,6 +8343,105 @@ impl ManagedRepository for InMemoryManagedRepository {
         operation.updated_at_ms = now;
         operation.aborted_at_ms = Some(now);
         Ok(operation.clone())
+    }
+
+    async fn abort_logical_put(
+        &self,
+        operation_id: Uuid,
+        physical_lease: Option<&PhysicalWriteLease>,
+        proof: LogicalAbortProof,
+        error_class: &str,
+        recovery_claim: Option<&ManagedRecoveryClaim>,
+    ) -> Result<ManagedLogicalOperation, ManagedError> {
+        let mut state = self.state.lock().await;
+        let operation = state
+            .logical_operations
+            .get(&operation_id)
+            .cloned()
+            .ok_or(ManagedError::Conflict)?;
+        if operation.state == ManagedLogicalOperationState::ProvenAborted {
+            return Ok(operation);
+        }
+        let now = crate::transaction::unix_time_ms();
+        validate_recovery_authority(&operation, recovery_claim, now)?;
+        if operation.intent.kind != ManagedMutationKind::Put
+            || operation.state == ManagedLogicalOperationState::Committed
+        {
+            return Err(ManagedError::Conflict);
+        }
+        if state
+            .namespace_epochs
+            .get(&operation.intent.logical.tenant_id)
+            .copied()
+            .unwrap_or(1)
+            != operation.intent.fence.namespace_epoch
+        {
+            return Err(ManagedError::RecoveryBlocked("namespace_fence_changed"));
+        }
+        if state
+            .physical_versions
+            .iter()
+            .any(|target| target.write_operation_id == operation.intent.primary_child_operation_id)
+        {
+            return Err(ManagedError::Conflict);
+        }
+        let intent = state
+            .physical_write_intents
+            .get(&operation.intent.primary_child_operation_id);
+        match (proof, physical_lease, intent) {
+            (LogicalAbortProof::NoChildStarted, None, None)
+                if matches!(
+                    operation.state,
+                    ManagedLogicalOperationState::Intent | ManagedLogicalOperationState::Open
+                ) => {}
+            (
+                LogicalAbortProof::NoChildStarted | LogicalAbortProof::ChildProvenAborted,
+                Some(lease),
+                Some(intent),
+            ) if lease.intent_id == operation.intent.primary_child_operation_id
+                && intent.lease_owner == lease.owner
+                && state.physical_write_tokens.get(&lease.intent_id) == Some(&lease.token)
+                && state.physical_write_epochs.get(&lease.intent_id)
+                    == Some(&lease.namespace_epoch)
+                && state
+                    .physical_write_leases
+                    .get(&lease.intent_id)
+                    .is_some_and(|expiry| *expiry > now) => {}
+            _ => return Err(ManagedError::Conflict),
+        }
+        let usage = Self::workspace_usage(&mut state, &operation.intent.logical.tenant_id);
+        if operation.state != ManagedLogicalOperationState::Intent
+            && usage.active_operation_id != Some(operation_id)
+        {
+            return Err(ManagedError::Conflict);
+        }
+        usage.reserved_bytes = usage
+            .reserved_bytes
+            .checked_sub(operation.reserved_physical_bytes)
+            .ok_or(ManagedError::Conflict)?;
+        if usage.active_operation_id == Some(operation_id) {
+            usage.active_operation_id = None;
+        }
+        usage.version = usage.version.saturating_add(1);
+        usage.updated_at_ms = now;
+        let child_operation_id = operation.intent.primary_child_operation_id;
+        let operation = state.logical_operations.get_mut(&operation_id).unwrap();
+        operation.state = ManagedLogicalOperationState::ProvenAborted;
+        operation.settlement_state = ManagedSettlementState::Released;
+        operation.last_error_class = Some(error_class.chars().take(128).collect());
+        operation.recovery_owner = None;
+        operation.recovery_token = None;
+        operation.recovery_expires_at_ms = None;
+        operation.updated_at_ms = now;
+        operation.aborted_at_ms = Some(now);
+        let aborted = operation.clone();
+        let _ = operation;
+        state.physical_write_intents.remove(&child_operation_id);
+        state.blocked_write_intents.remove(&child_operation_id);
+        state.physical_write_leases.remove(&child_operation_id);
+        state.physical_write_tokens.remove(&child_operation_id);
+        state.physical_write_epochs.remove(&child_operation_id);
+        Ok(aborted)
     }
 
     async fn workspace_usage(
@@ -7784,6 +9208,20 @@ impl ManagedRepository for InMemoryManagedRepository {
             .values()
             .find(|operation| operation.intent.primary_child_operation_id == intent.intent_id)
             && (parent.state != ManagedLogicalOperationState::Open
+                || parent
+                    .intent
+                    .publication_recipe
+                    .as_ref()
+                    .is_none_or(|recipe| {
+                        recipe.version != MANAGED_PUBLICATION_RECIPE_VERSION
+                            || recipe.placement_version == 0
+                            || recipe.primary_backend_id != parent.intent.backend_id
+                            || recipe.primary_status != CopyStatus::Ready
+                            || (recipe.replica_backend_id.is_none()
+                                && recipe.replica_status != CopyStatus::Absent)
+                            || (recipe.replica_backend_id.is_some()
+                                && recipe.replica_status != CopyStatus::RepairPending)
+                    })
                 || state
                     .workspace_usage
                     .get(&intent.tenant_id)
@@ -7794,6 +9232,7 @@ impl ManagedRepository for InMemoryManagedRepository {
                 || parent.intent.backend_id != intent.backend_id
                 || parent.intent.provider_bucket != intent.provider_bucket
                 || parent.intent.physical_key != intent.physical_key
+                || !physical_intent_supports_exact_history(&intent)
                 || namespace_epoch != parent.intent.fence.namespace_epoch
                 || routing_epoch != parent.intent.fence.routing_epoch)
         {
@@ -7803,7 +9242,7 @@ impl ManagedRepository for InMemoryManagedRepository {
             if existing != &intent
                 || state.physical_write_epochs.get(&intent.intent_id) != Some(&namespace_epoch)
             {
-                return Err(ManagedError::Conflict);
+                return Err(ManagedError::RecoveryBlocked("physical_intent_mismatch"));
             }
             return Ok(PhysicalWriteLease {
                 intent_id: intent.intent_id,
@@ -7844,6 +9283,12 @@ impl ManagedRepository for InMemoryManagedRepository {
         Ok(state
             .physical_write_intents
             .values()
+            .filter(|intent| {
+                !state.logical_operations.values().any(|operation| {
+                    !operation.state.terminal()
+                        && operation.intent.primary_child_operation_id == intent.intent_id
+                })
+            })
             .take(limit as usize)
             .map(|intent| DurablePhysicalWriteIntent {
                 intent: intent.clone(),
@@ -7874,6 +9319,40 @@ impl ManagedRepository for InMemoryManagedRepository {
                 },
             })
             .collect())
+    }
+
+    async fn physical_write_intent(
+        &self,
+        intent_id: Uuid,
+    ) -> Result<Option<DurablePhysicalWriteIntent>, ManagedError> {
+        let state = self.state.lock().await;
+        Ok(state.physical_write_intents.get(&intent_id).map(|intent| {
+            let namespace_epoch = state
+                .physical_write_epochs
+                .get(&intent_id)
+                .copied()
+                .unwrap_or(1);
+            DurablePhysicalWriteIntent {
+                intent: intent.clone(),
+                namespace_epoch,
+                blocked_reason: state.blocked_write_intents.get(&intent_id).cloned(),
+                lease_expires_at_ms: state
+                    .physical_write_leases
+                    .get(&intent_id)
+                    .copied()
+                    .unwrap_or(0),
+                lease: PhysicalWriteLease {
+                    intent_id,
+                    namespace_epoch,
+                    owner: intent.lease_owner.clone(),
+                    token: state
+                        .physical_write_tokens
+                        .get(&intent_id)
+                        .copied()
+                        .unwrap_or(Uuid::nil()),
+                },
+            }
+        }))
     }
 
     async fn renew_physical_write_intent(
@@ -7908,6 +9387,11 @@ impl ManagedRepository for InMemoryManagedRepository {
         lease_expires_at_ms: i64,
     ) -> Result<Option<PhysicalWriteLease>, ManagedError> {
         let mut state = self.state.lock().await;
+        if state.logical_operations.values().any(|operation| {
+            !operation.state.terminal() && operation.intent.primary_child_operation_id == intent_id
+        }) {
+            return Ok(None);
+        }
         if state
             .physical_write_leases
             .get(&intent_id)
@@ -7938,6 +9422,48 @@ impl ManagedRepository for InMemoryManagedRepository {
         }))
     }
 
+    async fn claim_logical_physical_write_intent(
+        &self,
+        claim: &ManagedRecoveryClaim,
+        lease_expires_at_ms: i64,
+    ) -> Result<Option<PhysicalWriteLease>, ManagedError> {
+        let now = crate::transaction::unix_time_ms();
+        if lease_expires_at_ms <= now {
+            return Err(ManagedError::Conflict);
+        }
+        let mut state = self.state.lock().await;
+        let operation = state
+            .logical_operations
+            .get(&claim.operation.intent.operation_id)
+            .cloned()
+            .ok_or(ManagedError::Conflict)?;
+        validate_recovery_authority(&operation, Some(claim), now)?;
+        let intent_id = operation.intent.primary_child_operation_id;
+        if state
+            .physical_write_leases
+            .get(&intent_id)
+            .is_none_or(|expires| *expires > now)
+        {
+            return Ok(None);
+        }
+        let intent = state
+            .physical_write_intents
+            .get_mut(&intent_id)
+            .ok_or(ManagedError::Conflict)?;
+        intent.lease_owner = claim.owner.clone();
+        let token = Uuid::now_v7();
+        state.physical_write_tokens.insert(intent_id, token);
+        state
+            .physical_write_leases
+            .insert(intent_id, lease_expires_at_ms);
+        Ok(Some(PhysicalWriteLease {
+            intent_id,
+            namespace_epoch: operation.intent.fence.namespace_epoch,
+            owner: claim.owner.clone(),
+            token,
+        }))
+    }
+
     async fn commit_physical_write(
         &self,
         lease: &PhysicalWriteLease,
@@ -7950,6 +9476,12 @@ impl ManagedRepository for InMemoryManagedRepository {
             return Err(ManagedError::Conflict);
         }
         let mut state = self.state.lock().await;
+        if state.logical_operations.values().any(|operation| {
+            !operation.state.terminal()
+                && operation.intent.primary_child_operation_id == lease.intent_id
+        }) {
+            return Err(ManagedError::Conflict);
+        }
         if state
             .physical_write_intents
             .get(&lease.intent_id)
@@ -8005,6 +9537,12 @@ impl ManagedRepository for InMemoryManagedRepository {
 
     async fn abort_physical_write(&self, lease: &PhysicalWriteLease) -> Result<(), ManagedError> {
         let mut state = self.state.lock().await;
+        if state.logical_operations.values().any(|operation| {
+            !operation.state.terminal()
+                && operation.intent.primary_child_operation_id == lease.intent_id
+        }) {
+            return Err(ManagedError::Conflict);
+        }
         if state.physical_write_tokens.get(&lease.intent_id) != Some(&lease.token)
             || state.physical_write_epochs.get(&lease.intent_id) != Some(&lease.namespace_epoch)
             || state
@@ -8320,6 +9858,17 @@ mod tests {
             },
             request_kind: RequestKind::Write,
             max_processed_bytes: 64,
+            publication_recipe: (kind == ManagedMutationKind::Put).then(|| {
+                ManagedPublicationRecipe {
+                    version: MANAGED_PUBLICATION_RECIPE_VERSION,
+                    placement_version: 1,
+                    primary_backend_id: "a".to_string(),
+                    replica_backend_id: None,
+                    metadata: BTreeMap::new(),
+                    primary_status: CopyStatus::Ready,
+                    replica_status: CopyStatus::Absent,
+                }
+            }),
         }
     }
 
@@ -8345,27 +9894,6 @@ mod tests {
             provider_account_id: "provider-account".to_string(),
             canonical_endpoint: "https://provider.example/".to_string(),
             region: "test-region-1".to_string(),
-        }
-    }
-
-    fn put_authority(intent: &ManagedLogicalOperationIntent, size: u64) -> ObjectAuthority {
-        let now = crate::transaction::unix_time_ms();
-        ObjectAuthority {
-            logical: intent.logical.clone(),
-            generation: intent.generation,
-            digest: "output-digest".to_string(),
-            size,
-            metadata: BTreeMap::new(),
-            placement_version: 1,
-            primary_backend_id: intent.backend_id.clone(),
-            primary_version_id: None,
-            replica_backend_id: None,
-            primary_status: CopyStatus::Ready,
-            replica_status: CopyStatus::Absent,
-            tombstone: false,
-            cas_version: 0,
-            created_at_ms: now,
-            updated_at_ms: now,
         }
     }
 
@@ -8456,25 +9984,34 @@ mod tests {
             .begin_physical_write(child_intent(&intent))
             .await
             .unwrap();
-        repository
-            .commit_physical_write(
-                &lease,
-                &["retry-version".to_string(), "retry-version".to_string()],
-                Some("final-version"),
-            )
-            .await
-            .unwrap();
         record_put_evidence(&repository, &intent, 3).await;
 
-        let authority = put_authority(&intent, 3);
         assert!(matches!(
             repository
-                .commit_logical_put(intent.operation_id, authority.clone(), 3)
+                .finalize_logical_put(
+                    intent.operation_id,
+                    &lease,
+                    ExactPhysicalCommit {
+                        selected_version_id: Some("final-version".to_string()),
+                        superseded_version_ids: vec!["retry-version".to_string()],
+                        version_history_complete: false,
+                    },
+                    None,
+                )
                 .await,
-            Err(ManagedError::Conflict)
+            Err(ManagedError::RecoveryBlocked(_))
         ));
         let committed = repository
-            .commit_logical_put(intent.operation_id, authority.clone(), 6)
+            .finalize_logical_put(
+                intent.operation_id,
+                &lease,
+                ExactPhysicalCommit {
+                    selected_version_id: Some("final-version".to_string()),
+                    superseded_version_ids: vec!["retry-version".to_string()],
+                    version_history_complete: true,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -8488,7 +10025,16 @@ mod tests {
         assert_eq!(committed.usage.reserved_bytes, 0);
         assert_eq!(committed.usage.active_operation_id, None);
         repository
-            .commit_logical_put(intent.operation_id, authority, 6)
+            .finalize_logical_put(
+                intent.operation_id,
+                &lease,
+                ExactPhysicalCommit {
+                    selected_version_id: Some("final-version".to_string()),
+                    superseded_version_ids: vec!["retry-version".to_string()],
+                    version_history_complete: true,
+                },
+                None,
+            )
             .await
             .unwrap();
 
@@ -8602,13 +10148,18 @@ mod tests {
             .begin_physical_write(child_intent(&intent))
             .await
             .unwrap();
-        repository
-            .commit_physical_write(&lease, &[], Some("empty-version"))
-            .await
-            .unwrap();
         record_put_evidence(&repository, &intent, 0).await;
         let committed = repository
-            .commit_logical_put(intent.operation_id, put_authority(&intent, 0), 0)
+            .finalize_logical_put(
+                intent.operation_id,
+                &lease,
+                ExactPhysicalCommit {
+                    selected_version_id: Some("empty-version".to_string()),
+                    superseded_version_ids: Vec::new(),
+                    version_history_complete: true,
+                },
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(committed.usage.visible_logical_bytes, 0);
@@ -8625,6 +10176,217 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn logical_child_is_hidden_from_standalone_reconciliation_but_exactly_addressable() {
+        let repository = InMemoryManagedRepository::new();
+        let tenant = "tenant-child-selection";
+        let intent = logical_intent(
+            tenant,
+            "key",
+            ManagedMutationKind::Put,
+            repository.route_fence(tenant).await.unwrap(),
+        );
+        repository
+            .admit_logical_operation(intent.clone(), 3)
+            .await
+            .unwrap();
+        let lease = repository
+            .begin_physical_write(child_intent(&intent))
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .pending_physical_write_intents(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            repository
+                .physical_write_intent(intent.primary_child_operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lease,
+            lease
+        );
+        assert!(matches!(
+            repository
+                .commit_physical_write(&lease, &[], Some("forbidden"))
+                .await,
+            Err(ManagedError::Conflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_claim_fences_request_and_competing_recovery_then_finalizes_exactly_once() {
+        let repository = InMemoryManagedRepository::new();
+        let tenant = "tenant-recovery-race";
+        let mut intent = logical_intent(
+            tenant,
+            "key",
+            ManagedMutationKind::Put,
+            repository.route_fence(tenant).await.unwrap(),
+        );
+        intent
+            .publication_recipe
+            .as_mut()
+            .unwrap()
+            .placement_version = 9;
+        repository
+            .admit_logical_operation(intent.clone(), 6)
+            .await
+            .unwrap();
+        let request_lease = repository
+            .begin_physical_write(child_intent(&intent))
+            .await
+            .unwrap();
+        record_put_evidence(&repository, &intent, 3).await;
+        {
+            let mut state = repository.state.lock().await;
+            state
+                .logical_operations
+                .get_mut(&intent.operation_id)
+                .unwrap()
+                .updated_at_ms = 0;
+            state
+                .physical_write_leases
+                .insert(request_lease.intent_id, 0);
+        }
+        let expiry = crate::transaction::unix_time_ms() + 60_000;
+        let mut first = repository
+            .claim_stale_logical_operations("recovery-a", 1, expiry, 10)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(
+            repository
+                .claim_stale_logical_operations("recovery-b", 1, expiry, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let initial_claim = first.pop().unwrap();
+        repository
+            .mark_logical_recovery_blocked(&initial_claim, "temporarily_unprovable")
+            .await
+            .unwrap();
+        {
+            repository
+                .state
+                .lock()
+                .await
+                .logical_operations
+                .get_mut(&intent.operation_id)
+                .unwrap()
+                .updated_at_ms = 0;
+        }
+        let claim = repository
+            .claim_stale_logical_operations("recovery-c", 1, expiry, 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            claim.operation.state,
+            ManagedLogicalOperationState::RecoveryBlocked
+        );
+        assert!(matches!(
+            repository
+                .finalize_logical_put(
+                    intent.operation_id,
+                    &request_lease,
+                    ExactPhysicalCommit {
+                        selected_version_id: Some("version-2".to_string()),
+                        superseded_version_ids: vec!["version-1".to_string()],
+                        version_history_complete: true,
+                    },
+                    None,
+                )
+                .await,
+            Err(ManagedError::Conflict)
+        ));
+        let recovery_lease = repository
+            .claim_logical_physical_write_intent(&claim, expiry)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = ExactPhysicalCommit {
+            selected_version_id: Some("version-2".to_string()),
+            superseded_version_ids: vec!["version-1".to_string()],
+            version_history_complete: true,
+        };
+        let committed = repository
+            .finalize_logical_put(
+                intent.operation_id,
+                &recovery_lease,
+                result.clone(),
+                Some(&claim),
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed.authority.placement_version, 9);
+        assert_eq!(committed.operation.committed_physical_bytes, 6);
+        assert_eq!(committed.usage.reserved_bytes, 0);
+        assert_eq!(committed.usage.active_operation_id, None);
+        repository
+            .finalize_logical_put(intent.operation_id, &recovery_lease, result, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_version_mismatch_rolls_back_in_memory_finalization() {
+        let repository = InMemoryManagedRepository::new();
+        let tenant = "tenant-exact-mismatch";
+        let intent = logical_intent(
+            tenant,
+            "key",
+            ManagedMutationKind::Put,
+            repository.route_fence(tenant).await.unwrap(),
+        );
+        repository
+            .admit_logical_operation(intent.clone(), 6)
+            .await
+            .unwrap();
+        let lease = repository
+            .begin_physical_write(child_intent(&intent))
+            .await
+            .unwrap();
+        record_put_evidence(&repository, &intent, 3).await;
+        let mismatched = ExactPhysicalCommit {
+            selected_version_id: Some("same".to_string()),
+            superseded_version_ids: vec!["same".to_string()],
+            version_history_complete: true,
+        };
+        assert!(matches!(
+            repository
+                .finalize_logical_put(intent.operation_id, &lease, mismatched, None)
+                .await,
+            Err(ManagedError::RecoveryBlocked(_))
+        ));
+        assert!(repository.get(&intent.logical).await.unwrap().is_none());
+        assert!(
+            repository
+                .physical_versions(
+                    tenant,
+                    &intent.backend_id,
+                    &intent.provider_bucket,
+                    &intent.physical_key,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repository
+                .physical_write_intent(intent.primary_child_operation_id)
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 
@@ -8669,7 +10431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proven_physical_abort_stays_allocated_until_exact_child_cleanup() {
+    async fn logical_child_abort_is_atomic_and_releases_the_workspace_slot() {
         let repository = InMemoryManagedRepository::new();
         let tenant = "tenant-physical-abort";
         let intent = logical_intent(
@@ -8690,86 +10452,39 @@ mod tests {
             .begin_physical_write(child_intent(&intent))
             .await
             .unwrap();
-        repository
-            .commit_physical_write(
-                &lease,
-                &["ambiguous-version-1".to_string()],
-                Some("ambiguous-version-2"),
-            )
-            .await
-            .unwrap();
-        record_put_evidence(&repository, &intent, 3).await;
         assert!(matches!(
-            repository
-                .prove_logical_abort(
-                    intent.operation_id,
-                    "authority_not_published",
-                    Some(ManagedProvenPhysicalAllocation {
-                        authority: put_authority(&intent, 3),
-                        allocated_bytes: 3,
-                    }),
-                )
-                .await,
+            repository.abort_physical_write(&lease).await,
             Err(ManagedError::Conflict)
         ));
         let aborted = repository
-            .prove_logical_abort(
+            .abort_logical_put(
                 intent.operation_id,
-                "authority_not_published",
-                Some(ManagedProvenPhysicalAllocation {
-                    authority: put_authority(&intent, 3),
-                    allocated_bytes: 6,
-                }),
+                Some(&lease),
+                LogicalAbortProof::ChildProvenAborted,
+                "child_proven_aborted",
+                None,
             )
             .await
             .unwrap();
         assert_eq!(aborted.state, ManagedLogicalOperationState::ProvenAborted);
         assert_eq!(aborted.settlement_state, ManagedSettlementState::Released);
-        assert_eq!(
+        let usage = repository.workspace_usage(tenant).await.unwrap().unwrap();
+        assert_eq!(usage.reserved_bytes, 0);
+        assert_eq!(usage.active_operation_id, None);
+        assert!(
             repository
-                .workspace_usage(tenant)
+                .physical_write_intent(intent.primary_child_operation_id)
                 .await
                 .unwrap()
-                .unwrap()
-                .physical_allocated_bytes,
-            6
+                .is_none()
         );
-        let versions = repository
-            .physical_versions(
-                tenant,
-                &intent.backend_id,
-                &intent.provider_bucket,
-                &intent.physical_key,
-            )
-            .await
-            .unwrap();
-        assert_eq!(versions.len(), 2);
-        repository
-            .forget_physical_version(&versions[0])
-            .await
-            .unwrap();
-        assert_eq!(
-            repository
-                .workspace_usage(tenant)
-                .await
-                .unwrap()
-                .unwrap()
-                .physical_allocated_bytes,
-            6
+        let next = logical_intent(
+            tenant,
+            "next",
+            ManagedMutationKind::Put,
+            repository.route_fence(tenant).await.unwrap(),
         );
-        repository
-            .forget_physical_version(&versions[1])
-            .await
-            .unwrap();
-        assert_eq!(
-            repository
-                .workspace_usage(tenant)
-                .await
-                .unwrap()
-                .unwrap()
-                .physical_allocated_bytes,
-            0
-        );
+        repository.admit_logical_operation(next, 1).await.unwrap();
     }
 
     #[tokio::test]
@@ -8790,13 +10505,18 @@ mod tests {
             .begin_physical_write(child_intent(&put))
             .await
             .unwrap();
-        repository
-            .commit_physical_write(&lease, &[], Some("put-version"))
-            .await
-            .unwrap();
         record_put_evidence(&repository, &put, 3).await;
         let put_commit = repository
-            .commit_logical_put(put.operation_id, put_authority(&put, 3), 3)
+            .finalize_logical_put(
+                put.operation_id,
+                &lease,
+                ExactPhysicalCommit {
+                    selected_version_id: Some("put-version".to_string()),
+                    superseded_version_ids: Vec::new(),
+                    version_history_complete: true,
+                },
+                None,
+            )
             .await
             .unwrap();
 
@@ -9212,13 +10932,18 @@ mod tests {
             .begin_physical_write(child_intent(&intent))
             .await
             .unwrap();
-        repository
-            .commit_physical_write(&lease, &[], Some("purge-version"))
-            .await
-            .unwrap();
         record_put_evidence(&repository, &intent, 3).await;
         repository
-            .commit_logical_put(intent.operation_id, put_authority(&intent, 3), 3)
+            .finalize_logical_put(
+                intent.operation_id,
+                &lease,
+                ExactPhysicalCommit {
+                    selected_version_id: Some("purge-version".to_string()),
+                    superseded_version_ids: Vec::new(),
+                    version_history_complete: true,
+                },
+                None,
+            )
             .await
             .unwrap();
 
@@ -9314,9 +11039,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next_lease.namespace_epoch, next_fence.namespace_epoch);
-        repository.abort_physical_write(&next_lease).await.unwrap();
         repository
-            .prove_logical_abort(next.operation_id, "test_cleanup", None)
+            .abort_logical_put(
+                next.operation_id,
+                Some(&next_lease),
+                LogicalAbortProof::ChildProvenAborted,
+                "test_cleanup",
+                None,
+            )
             .await
             .unwrap();
     }

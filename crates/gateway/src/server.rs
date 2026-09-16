@@ -12503,6 +12503,15 @@ pub async fn build_state_with_pipeline_template(
             (operation_journal.clone(), managed_streaming_capabilities)
     {
         service_storage
+            .reconcile_managed_logical_operations(
+                journal.clone(),
+                capabilities,
+                Duration::from_millis(crate::managed::PHYSICAL_WRITE_LEASE_MS as u64),
+                256,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        service_storage
             .reconcile_managed_write_intents(
                 journal,
                 capabilities,
@@ -12598,6 +12607,17 @@ pub async fn build_state_with_pipeline_template(
         tokio::spawn(async move {
             let owner = format!("managed-repair-{}", uuid::Uuid::now_v7());
             loop {
+                if let Err(error) = storage
+                    .reconcile_managed_logical_operations(
+                        journal.clone(),
+                        capabilities,
+                        Duration::from_millis(crate::managed::PHYSICAL_WRITE_LEASE_MS as u64),
+                        64,
+                    )
+                    .await
+                {
+                    warn!("managed logical-operation reconciliation failed: {error}");
+                }
                 if let Err(error) = storage
                     .reconcile_managed_write_intents(
                         journal.clone(),
