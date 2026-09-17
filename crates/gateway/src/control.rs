@@ -367,6 +367,33 @@ impl UsageEvent {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_durable_settlement(
+        receipt_id: Uuid,
+        operation_id: Uuid,
+        occurred_at_micros: i64,
+        rate_version: i32,
+        bucket: String,
+        kind: RequestKind,
+        route: UsageRoute,
+        source_bytes: u64,
+        output_bytes: u64,
+    ) -> Option<Self> {
+        Some(Self {
+            receipt_id,
+            operation_id,
+            occurred_at: DateTime::from_timestamp_micros(occurred_at_micros)?,
+            rate_version,
+            bucket,
+            kind,
+            route,
+            source_bytes,
+            output_bytes,
+            processed_bytes: source_bytes.max(output_bytes),
+            pipeline_evidence: None,
+        })
+    }
+
     /// Attach the immutable pipeline COGS evidence for this operation.
     pub fn with_pipeline_evidence(mut self, evidence: PipelineEvidence) -> Self {
         self.pipeline_evidence = Some(evidence);
@@ -488,6 +515,24 @@ pub trait ControlPlane: Send + Sync + 'static {
         context: &AuthenticatedRequestContext,
         event: &UsageEvent,
     ) -> Result<(), MeteringError>;
+
+    /// Settle a previously authorized durable operation after request context
+    /// has been lost. Implementations must verify the event against the
+    /// reservation identified by its operation and receipt IDs.
+    async fn record_reconciled(
+        &self,
+        workspace_id: &WorkspaceId,
+        event: &UsageEvent,
+    ) -> Result<(), MeteringError> {
+        self.record(
+            &AuthenticatedRequestContext {
+                user_id: String::new(),
+                workspace_id: workspace_id.clone(),
+            },
+            event,
+        )
+        .await
+    }
 
     /// Record internal failed-attempt COGS. The default preserves compatibility
     /// for existing control planes; hosted implementations may persist it in a

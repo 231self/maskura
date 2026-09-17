@@ -8,13 +8,13 @@ use std::time::Duration;
 use tokio::sync::{RwLock, watch};
 use tracing::{info, warn};
 
-use crate::control::{RequestKind, UsageEvent, UsageRoute};
+use crate::control::{ControlPlane, RequestKind, UsageEvent, UsageRoute};
 use crate::managed::{
     AuthorityListPage, AuthorityListQuery, AuthorityPlacementCursor, AuthorityPlacementPage,
     AuthorityPlacementPageQuery, AuthorityPlacementStats, BackendVersioningCapability,
     BackendVersioningMode, CopyStatus, DurablePhysicalWriteIntent, ExactPhysicalCommit,
-    LogicalObjectKey, MANAGED_PUBLICATION_RECIPE_VERSION, ManagedError,
-    ManagedLogicalOperationIntent, ManagedLogicalOperationState, ManagedMutationKind,
+    LogicalObjectKey, MANAGED_PUBLICATION_RECIPE_VERSION, ManagedDeleteError, ManagedDeleteRequest,
+    ManagedError, ManagedLogicalOperationIntent, ManagedLogicalOperationState, ManagedMutationKind,
     ManagedPublicationRecipe, ManagedRepository, ManagedStreamingMode, ManagedUsageEvidence,
     NamespacePurgeRequest, NamespacePurgeStatus, ObjectAuthority, PLACEMENT_VERSION_V1,
     PhysicalVersionTarget, PhysicalWriteIntent, Placement, ProviderStorageIdentity, RepairKind,
@@ -30,10 +30,27 @@ use crate::transaction::{
     ObjectSinkTransaction, OperationJournal, OperationReconciler, OperationState, SinkCommitState,
     StoredObjectMeta, TransactionBackend, TransactionError, VersioningCapability,
 };
+use crate::workspace_storage::WorkspaceId;
 
 /// Reservation headroom for physical versions a managed generation may accrue
 /// across exact-version recovery before its logical commit settles.
 const MANAGED_STREAMING_PUT_HEADROOM: u64 = 4;
+
+async fn defer_delete_settlement(
+    repository: &Arc<dyn ManagedRepository>,
+    operation_id: uuid::Uuid,
+    receipt_id: uuid::Uuid,
+) {
+    if let Err(error) = repository
+        .defer_delete_settlement(operation_id, receipt_id)
+        .await
+    {
+        warn!(
+            operation_id = %operation_id,
+            "managed DELETE settlement retry could not be deferred: {error}"
+        );
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ServiceBackend {
@@ -1653,26 +1670,141 @@ impl ServiceStorage {
         Ok(None)
     }
 
-    pub async fn tombstone_authoritative(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn delete_authoritative(
         &self,
         logical: &LogicalObjectKey,
-    ) -> Result<(), ManagedError> {
+        operation_id: uuid::Uuid,
+        receipt_id: uuid::Uuid,
+        occurred_at_micros: i64,
+        rate_version: i32,
+        max_processed_bytes: u64,
+    ) -> Result<(), ManagedDeleteError> {
         if !self.managed_mode.allows_mutations() {
-            return Err(ManagedError::MutationDisabled(self.managed_mode));
+            return Err(ManagedError::MutationDisabled(self.managed_mode).into());
         }
         let repository = self.authority_repository_required()?;
-        let existing = repository.get(logical).await?;
         let placement = self.placement(logical).ok_or_else(|| {
             ManagedError::Persistence("managed storage has no backends".to_string())
         })?;
-        repository
-            .tombstone(
-                logical,
-                existing.as_ref().map(|authority| authority.cas_version),
-                &placement,
-            )
-            .await?;
+        let backend_index = self
+            .index_for_id(&placement.primary_backend_id)
+            .ok_or_else(|| {
+                ManagedError::Persistence(format!(
+                    "unknown managed backend {}",
+                    placement.primary_backend_id
+                ))
+            })?;
+        let request = ManagedDeleteRequest {
+            operation_id,
+            receipt_id,
+            logical: logical.clone(),
+            placement,
+            provider_bucket: self.backends[backend_index].bucket.clone(),
+            occurred_at_micros,
+            rate_version,
+            max_processed_bytes,
+        };
+        if let Err(error) = repository
+            .commit_atomic_logical_delete(request.clone())
+            .await
+        {
+            if !matches!(&error, ManagedDeleteError::CommitUnknown(_)) {
+                return Err(error);
+            }
+            // Re-enter with the same durable identity. This either observes the
+            // committed DELETE or executes it after a definitely failed commit;
+            // a second ambiguous result must retain the external reservation.
+            return repository
+                .commit_atomic_logical_delete(request)
+                .await
+                .map(|_| ())
+                .map_err(|_| error);
+        }
         Ok(())
+    }
+
+    pub async fn mark_authoritative_delete_settled(
+        &self,
+        operation_id: uuid::Uuid,
+        receipt_id: uuid::Uuid,
+    ) -> Result<(), ManagedError> {
+        self.authority_repository_required()?
+            .mark_logical_operation_settled(operation_id, receipt_id)
+            .await
+    }
+
+    pub async fn reconcile_managed_delete_settlements(
+        &self,
+        control: &dyn ControlPlane,
+        limit: u64,
+    ) -> Result<usize, ManagedError> {
+        let repository = self.authority_repository_required()?;
+        let operations = repository.pending_delete_settlements(limit).await?;
+        let mut settled = 0;
+        for operation in operations {
+            let intent = &operation.intent;
+            let Ok(workspace_id) = WorkspaceId::new(intent.logical.tenant_id.clone()) else {
+                warn!(
+                    operation_id = %intent.operation_id,
+                    "managed DELETE settlement has an invalid workspace identity"
+                );
+                defer_delete_settlement(&repository, intent.operation_id, intent.receipt_id).await;
+                continue;
+            };
+            let Some(occurred_at_micros) = operation
+                .evidence
+                .as_ref()
+                .and_then(|evidence| evidence.payload.get("occurred_at_micros"))
+                .and_then(serde_json::Value::as_i64)
+            else {
+                warn!(
+                    operation_id = %intent.operation_id,
+                    "managed DELETE settlement has no exact authorization timestamp"
+                );
+                defer_delete_settlement(&repository, intent.operation_id, intent.receipt_id).await;
+                continue;
+            };
+            let Some(event) = UsageEvent::from_durable_settlement(
+                intent.receipt_id,
+                intent.operation_id,
+                occurred_at_micros,
+                intent.rate_version,
+                intent.logical.bucket.clone(),
+                intent.request_kind,
+                intent.route,
+                0,
+                0,
+            ) else {
+                warn!(
+                    operation_id = %intent.operation_id,
+                    "managed DELETE settlement timestamp is out of range"
+                );
+                defer_delete_settlement(&repository, intent.operation_id, intent.receipt_id).await;
+                continue;
+            };
+            if let Err(error) = control.record_reconciled(&workspace_id, &event).await {
+                warn!(
+                    operation_id = %intent.operation_id,
+                    "managed DELETE settlement recording failed: {error}"
+                );
+                defer_delete_settlement(&repository, intent.operation_id, intent.receipt_id).await;
+                continue;
+            }
+            if let Err(error) = repository
+                .mark_logical_operation_settled(intent.operation_id, intent.receipt_id)
+                .await
+            {
+                warn!(
+                    operation_id = %intent.operation_id,
+                    "managed DELETE settlement acknowledgement failed: {error}"
+                );
+                defer_delete_settlement(&repository, intent.operation_id, intent.receipt_id).await;
+                continue;
+            }
+            settled += 1;
+        }
+        Ok(settled)
     }
 
     /// Start a managed generation with the exact physical child identity
@@ -3150,8 +3282,11 @@ pub fn parse_service_backends(env_value: &str) -> Result<Vec<ServiceBackend>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::NoopControlPlane;
     use crate::file_multipart_repository::FileMultipartRepository;
-    use crate::managed::{InMemoryManagedRepository, PostgresManagedRepository};
+    use crate::managed::{
+        InMemoryManagedRepository, ManagedSettlementState, PostgresManagedRepository,
+    };
     use crate::multipart_staging::{
         DestinationCommitPermit, MultipartIdentity, StagingQuotaLimits,
     };
@@ -3504,6 +3639,93 @@ mod tests {
             NamespacePurgeStatus::Complete {
                 deleted_versions: 0,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_delete_settlement_is_replayed_from_durable_operation() {
+        let repository = Arc::new(InMemoryManagedRepository::new());
+        let backend = parse_service_backends(
+            "b2|managed-primary|account-123|1|https://provider.example|test-region|provider-bucket|key|secret",
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let storage = ServiceStorage::with_management(
+            vec![backend],
+            repository.clone(),
+            ManagedStreamingMode::Enforce,
+            PLACEMENT_VERSION_V1,
+        );
+        let operation_id = uuid::Uuid::now_v7();
+        let receipt_id = uuid::Uuid::now_v7();
+        let occurred_at_micros = crate::transaction::unix_time_ms() * 1_000 + 123;
+        storage
+            .delete_authoritative(
+                &LogicalObjectKey::new("workspace", "bucket", "missing"),
+                operation_id,
+                receipt_id,
+                occurred_at_micros,
+                1,
+                0,
+            )
+            .await
+            .unwrap();
+
+        let pending = repository.pending_delete_settlements(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].evidence.as_ref().unwrap().payload["occurred_at_micros"],
+            occurred_at_micros
+        );
+        let second_operation_id = uuid::Uuid::now_v7();
+        let second_receipt_id = uuid::Uuid::now_v7();
+        storage
+            .delete_authoritative(
+                &LogicalObjectKey::new("workspace", "bucket", "other-missing"),
+                second_operation_id,
+                second_receipt_id,
+                occurred_at_micros + 1,
+                1,
+                0,
+            )
+            .await
+            .unwrap();
+        let oldest = repository.pending_delete_settlements(1).await.unwrap()[0]
+            .intent
+            .clone();
+        repository
+            .defer_delete_settlement(oldest.operation_id, oldest.receipt_id)
+            .await
+            .unwrap();
+        assert_ne!(
+            repository.pending_delete_settlements(1).await.unwrap()[0]
+                .intent
+                .operation_id,
+            oldest.operation_id
+        );
+        assert_eq!(
+            storage
+                .reconcile_managed_delete_settlements(&NoopControlPlane, 10)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            repository
+                .logical_operation(operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .settlement_state,
+            ManagedSettlementState::Settled
+        );
+        assert!(
+            repository
+                .pending_delete_settlements(10)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

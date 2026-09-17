@@ -25,13 +25,13 @@ use maskura_gateway::managed::{
     AuthorityListQuery, AuthorityPlacementPageQuery, BackendVersioningCapability,
     BackendVersioningMode, CopyStatus, ExactPhysicalCommit, InMemoryManagedRepository,
     LogicalAbortProof, LogicalObjectKey, MANAGED_LIST_CURSOR_RESPONSE_MAX_BYTES,
-    MANAGED_LIST_CURSOR_WORKSPACE_LIMIT, MANAGED_PUBLICATION_RECIPE_VERSION,
+    MANAGED_LIST_CURSOR_WORKSPACE_LIMIT, MANAGED_PUBLICATION_RECIPE_VERSION, ManagedDeleteRequest,
     ManagedListCursorBinding, ManagedListCursorPosition, ManagedListCursorRequest,
     ManagedListCursorState, ManagedListVersion, ManagedLogicalOperationIntent,
     ManagedLogicalOperationState, ManagedMutationKind, ManagedPublicationRecipe, ManagedRepository,
     ManagedRouteFence, ManagedUsageEvidence, NamespacePurgeRequest, NamespacePurgeStatus,
     ObjectAuthority, PhysicalWriteIntent, Placement, PostgresManagedRepository,
-    ProviderStorageIdentity, generation_physical_key,
+    ProviderStorageIdentity, RepairRecord, RepairTargetRole, generation_physical_key,
 };
 use maskura_gateway::multipart_staging::{
     ARTIFACT_PREFIX, CompletePart, CompletionAcquire, DestinationCommitPermit,
@@ -436,6 +436,7 @@ fn public_migrations_apply_fresh_after_private_shared_history() {
                 20260907000002,
                 20260909000001,
                 20260916000001,
+                20260917000001,
             ]
         );
         isolated.close().await;
@@ -1686,18 +1687,30 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             .enqueue(maskura_gateway::managed::RepairRecord::placement(
                 &partial,
                 Some(partial.primary_backend_id.clone()),
-                target_backend_id,
+                target_backend_id.clone(),
                 target_role,
                 &full_placement,
             ))
             .await
             .unwrap();
-        let retry = repository
-            .claim_repairs("process-placement-retry", unix_time_ms() + 30_000, 1)
+        let retry_claims = repository
+            .claim_repairs("process-placement-retry", unix_time_ms() + 30_000, 10)
             .await
-            .unwrap()
-            .pop()
             .unwrap();
+        let retry = retry_claims
+            .iter()
+            .find(|repair| {
+                repair.kind == maskura_gateway::managed::RepairKind::Placement
+                    && repair.target_backend_id == target_backend_id
+            })
+            .unwrap()
+            .clone();
+        for cleanup in retry_claims.iter().filter(|repair| repair.id != retry.id) {
+            repository
+                .fail_repair(cleanup.id, "defer cleanup during placement retry")
+                .await
+                .unwrap();
+        }
         assert!(repository.complete_repair(&retry).await.unwrap());
         let converged = repository.get(&logical).await.unwrap().unwrap();
         assert_eq!(converged.primary_backend_id, "primary-v3");
@@ -2099,23 +2112,132 @@ fn postgres_managed_logical_quota_listing_cursor_and_release_contract() {
             Err(maskura_gateway::managed::ManagedError::CursorExpired)
         ));
 
-        let advanced_authority = repository
-            .tombstone(
-                &intent.logical,
-                Some(committed.authority.cas_version),
+        repository
+            .enqueue(RepairRecord::placement(
+                &committed.authority,
+                Some(intent.backend_id.clone()),
+                "placement-target".to_string(),
+                RepairTargetRole::Primary,
                 &Placement {
-                    version: committed.authority.placement_version,
-                    primary_backend_id: committed.authority.primary_backend_id.clone(),
-                    replica_backend_id: committed.authority.replica_backend_id.clone(),
+                    version: committed.authority.placement_version + 1,
+                    primary_backend_id: "placement-target".to_string(),
+                    replica_backend_id: None,
                 },
-            )
+            ))
             .await
             .unwrap();
+        let placement_lease = repository
+            .begin_physical_write(PhysicalWriteIntent {
+                intent_id: uuid::Uuid::now_v7(),
+                tenant_id: tenant.clone(),
+                backend_id: "placement-target".to_string(),
+                storage_identity: test_storage_identity(),
+                credential_epoch: 1,
+                provider_bucket: intent.provider_bucket.clone(),
+                physical_key: intent.physical_key.clone(),
+                versioning_mode: BackendVersioningMode::Enabled,
+                versioning_capability: BackendVersioningCapability::Required,
+                lease_owner: "placement-delete-race".to_string(),
+            })
+            .await
+            .unwrap();
+        let stale_placement = repository
+            .claim_repairs("placement-delete-race", i64::MAX, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|repair| {
+                repair.kind == maskura_gateway::managed::RepairKind::Placement
+                    && repair.target_backend_id == "placement-target"
+            })
+            .unwrap();
+
+        let delete_request = ManagedDeleteRequest {
+            operation_id: uuid::Uuid::now_v7(),
+            receipt_id: uuid::Uuid::now_v7(),
+            logical: intent.logical.clone(),
+            placement: Placement {
+                version: committed.authority.placement_version,
+                primary_backend_id: committed.authority.primary_backend_id.clone(),
+                replica_backend_id: committed.authority.replica_backend_id.clone(),
+            },
+            provider_bucket: intent.provider_bucket.clone(),
+            occurred_at_micros: unix_time_ms() * 1_000,
+            rate_version: 7,
+            max_processed_bytes: 0,
+        };
+        let deleted = repository
+            .commit_atomic_logical_delete(delete_request.clone())
+            .await
+            .unwrap();
+        assert!(deleted.authority.tombstone);
+        assert_eq!(deleted.usage.visible_logical_bytes, 0);
+        assert_eq!(deleted.usage.physical_allocated_bytes, 6);
+        assert_eq!(deleted.usage.active_operation_id, None);
+        assert!(
+            repository
+                .pending_delete_settlements(10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|operation| operation.intent.operation_id == delete_request.operation_id)
+        );
+        repository
+            .mark_logical_operation_settled(delete_request.operation_id, delete_request.receipt_id)
+            .await
+            .unwrap();
+        repository
+            .mark_logical_operation_settled(delete_request.operation_id, delete_request.receipt_id)
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .pending_delete_settlements(10)
+                .await
+                .unwrap()
+                .iter()
+                .all(|operation| operation.intent.operation_id != delete_request.operation_id)
+        );
+        repository
+            .commit_physical_write(&placement_lease, &[], Some("late-placement-version"))
+            .await
+            .unwrap();
+        assert!(!repository.complete_repair(&stale_placement).await.unwrap());
+        let cleanup = repository
+            .claim_repairs("delete-cleanup", i64::MAX, 10)
+            .await
+            .unwrap();
+        assert!(cleanup.iter().any(|repair| {
+            repair.target_backend_id == "placement-target"
+                && repair.target_role == RepairTargetRole::Cleanup
+                && repair.generation == generation
+        }));
+        let advanced_authority = repository
+            .commit_atomic_logical_delete(delete_request.clone())
+            .await
+            .unwrap()
+            .authority;
+        assert_eq!(advanced_authority, deleted.authority);
         let replay_after_overwrite = repository
             .finalize_logical_put(intent.operation_id, &lease, exact_commit, None)
             .await
             .unwrap();
         assert_eq!(replay_after_overwrite.authority, advanced_authority);
+
+        let placement_versions = repository
+            .physical_versions(
+                &tenant,
+                "placement-target",
+                &intent.provider_bucket,
+                &intent.physical_key,
+            )
+            .await
+            .unwrap();
+        assert_eq!(placement_versions.len(), 1);
+        repository
+            .forget_physical_version(&placement_versions[0])
+            .await
+            .unwrap();
 
         let versions = repository
             .physical_versions(

@@ -459,6 +459,14 @@ pub enum ManagedError {
     CursorLimitExceeded,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ManagedDeleteError {
+    #[error(transparent)]
+    PreCommit(#[from] ManagedError),
+    #[error("managed delete commit outcome is unknown: {0}")]
+    CommitUnknown(ManagedError),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedMutationKind {
     Put,
@@ -640,6 +648,73 @@ pub struct ManagedLogicalOperationIntent {
     pub request_kind: RequestKind,
     pub max_processed_bytes: u64,
     pub publication_recipe: Option<ManagedPublicationRecipe>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedDeleteRequest {
+    pub operation_id: Uuid,
+    pub receipt_id: Uuid,
+    pub logical: LogicalObjectKey,
+    pub placement: Placement,
+    pub provider_bucket: String,
+    pub occurred_at_micros: i64,
+    pub rate_version: i32,
+    pub max_processed_bytes: u64,
+}
+
+fn delete_request_matches_operation(
+    request: &ManagedDeleteRequest,
+    operation: &ManagedLogicalOperation,
+) -> bool {
+    let intent = &operation.intent;
+    intent.operation_id == request.operation_id
+        && intent.receipt_id == request.receipt_id
+        && intent.logical == request.logical
+        && intent.kind == ManagedMutationKind::Delete
+        && intent.backend_id == request.placement.primary_backend_id
+        && intent.provider_bucket == request.provider_bucket
+        && intent.occurred_at_ms == request.occurred_at_micros.div_euclid(1_000)
+        && intent.rate_version == request.rate_version
+        && intent.route == UsageRoute::DeleteObject
+        && intent.request_kind == RequestKind::Write
+        && intent.max_processed_bytes == request.max_processed_bytes
+        && operation.evidence.as_ref().is_some_and(|evidence| {
+            evidence
+                .payload
+                .get("occurred_at_micros")
+                .and_then(serde_json::Value::as_i64)
+                == Some(request.occurred_at_micros)
+        })
+        && intent.publication_recipe.as_ref().is_some_and(|recipe| {
+            recipe.version == MANAGED_PUBLICATION_RECIPE_VERSION
+                && recipe.placement_version == request.placement.version
+                && recipe.primary_backend_id == request.placement.primary_backend_id
+                && recipe.replica_backend_id == request.placement.replica_backend_id
+                && recipe.metadata.is_empty()
+                && recipe.primary_status == CopyStatus::Absent
+                && recipe.replica_status == CopyStatus::Absent
+        })
+}
+
+fn committed_delete_replay_authority(
+    operation: &ManagedLogicalOperation,
+    authority: Option<ObjectAuthority>,
+) -> Result<ObjectAuthority, ManagedError> {
+    let authority = authority.ok_or(ManagedError::Conflict)?;
+    let committed_authority_version = operation
+        .committed_authority_version
+        .ok_or(ManagedError::Conflict)?;
+    let original_tombstone_matches = authority.tombstone
+        && authority.generation == operation.intent.generation
+        && authority.digest.is_empty()
+        && authority.size == 0;
+    if authority.logical != operation.intent.logical
+        || authority.cas_version < committed_authority_version
+        || (authority.cas_version == committed_authority_version && !original_tombstone_matches)
+    {
+        return Err(ManagedError::Conflict);
+    }
+    Ok(authority)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -984,6 +1059,20 @@ pub trait ManagedRepository: Send + Sync {
         &self,
         limit: u64,
     ) -> Result<Vec<ManagedLogicalOperation>, ManagedError>;
+    async fn pending_delete_settlements(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<ManagedLogicalOperation>, ManagedError>;
+    async fn mark_logical_operation_settled(
+        &self,
+        operation_id: Uuid,
+        receipt_id: Uuid,
+    ) -> Result<(), ManagedError>;
+    async fn defer_delete_settlement(
+        &self,
+        operation_id: Uuid,
+        receipt_id: Uuid,
+    ) -> Result<(), ManagedError>;
     async fn claim_stale_logical_operations(
         &self,
         owner: &str,
@@ -1048,6 +1137,12 @@ pub trait ManagedRepository: Send + Sync {
         operation_id: Uuid,
         placement: &Placement,
     ) -> Result<ManagedOperationCommit, ManagedError>;
+    /// Persist the DELETE intent, evidence, tombstone, cleanup work, and usage
+    /// accounting as one transaction after locking current authority.
+    async fn commit_atomic_logical_delete(
+        &self,
+        request: ManagedDeleteRequest,
+    ) -> Result<ManagedOperationCommit, ManagedDeleteError>;
     /// Mark an operation non-billable only after absence is proven. If a
     /// provider mutation occurred, transfer its reservation to allocated bytes
     /// and enqueue exact cleanup instead of releasing physical capacity early.
@@ -1371,6 +1466,37 @@ fn cleanup_repairs(authority: &ObjectAuthority) -> Vec<RepairRecord> {
     repairs
 }
 
+fn stale_repair_cleanup(repair: &RepairRecord) -> RepairRecord {
+    let now = crate::transaction::unix_time_ms();
+    let repair_id = Uuid::now_v7();
+    RepairRecord {
+        id: repair_id,
+        repair_id,
+        kind: RepairKind::DeleteGeneration,
+        logical: repair.logical.clone(),
+        namespace_epoch: repair.namespace_epoch,
+        authority_cas_version: repair.authority_cas_version,
+        generation: repair.generation,
+        digest: repair.digest.clone(),
+        size: repair.size,
+        metadata: repair.metadata.clone(),
+        physical_key: repair.physical_key.clone(),
+        source_backend_id: None,
+        target_backend_id: repair.target_backend_id.clone(),
+        target_role: RepairTargetRole::Cleanup,
+        placement_version: repair.placement_version,
+        placement_primary_backend_id: None,
+        placement_replica_backend_id: None,
+        attempts: 0,
+        lease_owner: None,
+        lease_token: None,
+        lease_expires_at_ms: None,
+        not_before_ms: 0,
+        created_at_ms: now,
+        updated_at_ms: now,
+    }
+}
+
 fn publication_repairs(authority: &ObjectAuthority) -> Vec<RepairRecord> {
     match (&authority.replica_backend_id, authority.replica_status) {
         (Some(replica), CopyStatus::RepairPending) => vec![RepairRecord::copy(
@@ -1478,6 +1604,13 @@ fn apply_repair_to_authority(
         RepairTargetRole::Cleanup => return Ok(false),
     }
     Ok(true)
+}
+
+fn repair_target_is_authoritative(authority: &ObjectAuthority, repair: &RepairRecord) -> bool {
+    !authority.tombstone
+        && authority.generation == repair.generation
+        && (authority.primary_backend_id == repair.target_backend_id
+            || authority.replica_backend_id.as_deref() == Some(repair.target_backend_id.as_str()))
 }
 
 fn authority_from_model(
@@ -2989,6 +3122,102 @@ impl ManagedRepository for PostgresManagedRepository {
             .collect()
     }
 
+    async fn pending_delete_settlements(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<ManagedLogicalOperation>, ManagedError> {
+        managed_logical_operation::Entity::find()
+            .filter(managed_logical_operation::Column::OperationKind.eq("DELETE"))
+            .filter(
+                managed_logical_operation::Column::State
+                    .eq(ManagedLogicalOperationState::Committed.as_str()),
+            )
+            .filter(
+                managed_logical_operation::Column::SettlementState
+                    .eq(ManagedSettlementState::Pending.as_str()),
+            )
+            .order_by_asc(managed_logical_operation::Column::UpdatedAtMs)
+            .limit(limit)
+            .all(&self.db)
+            .await
+            .map_err(persistence)?
+            .into_iter()
+            .map(logical_operation_from_model)
+            .collect()
+    }
+
+    async fn mark_logical_operation_settled(
+        &self,
+        operation_id: Uuid,
+        receipt_id: Uuid,
+    ) -> Result<(), ManagedError> {
+        let updated = managed_logical_operation::Entity::update_many()
+            .col_expr(
+                managed_logical_operation::Column::SettlementState,
+                Expr::value(ManagedSettlementState::Settled.as_str()),
+            )
+            .col_expr(
+                managed_logical_operation::Column::UpdatedAtMs,
+                Expr::value(crate::transaction::unix_time_ms()),
+            )
+            .filter(managed_logical_operation::Column::OperationId.eq(operation_id))
+            .filter(managed_logical_operation::Column::ReceiptId.eq(receipt_id))
+            .filter(managed_logical_operation::Column::OperationKind.eq("DELETE"))
+            .filter(
+                managed_logical_operation::Column::State
+                    .eq(ManagedLogicalOperationState::Committed.as_str()),
+            )
+            .filter(
+                managed_logical_operation::Column::SettlementState
+                    .eq(ManagedSettlementState::Pending.as_str()),
+            )
+            .exec(&self.db)
+            .await
+            .map_err(persistence)?;
+        if updated.rows_affected == 1 {
+            return Ok(());
+        }
+        self.logical_operation(operation_id)
+            .await?
+            .filter(|operation| {
+                operation.intent.receipt_id == receipt_id
+                    && operation.intent.kind == ManagedMutationKind::Delete
+                    && operation.state == ManagedLogicalOperationState::Committed
+                    && operation.settlement_state == ManagedSettlementState::Settled
+            })
+            .map(|_| ())
+            .ok_or(ManagedError::Conflict)
+    }
+
+    async fn defer_delete_settlement(
+        &self,
+        operation_id: Uuid,
+        receipt_id: Uuid,
+    ) -> Result<(), ManagedError> {
+        let updated = managed_logical_operation::Entity::update_many()
+            .col_expr(
+                managed_logical_operation::Column::UpdatedAtMs,
+                Expr::value(crate::transaction::unix_time_ms().saturating_add(60_000)),
+            )
+            .filter(managed_logical_operation::Column::OperationId.eq(operation_id))
+            .filter(managed_logical_operation::Column::ReceiptId.eq(receipt_id))
+            .filter(managed_logical_operation::Column::OperationKind.eq("DELETE"))
+            .filter(
+                managed_logical_operation::Column::State
+                    .eq(ManagedLogicalOperationState::Committed.as_str()),
+            )
+            .filter(
+                managed_logical_operation::Column::SettlementState
+                    .eq(ManagedSettlementState::Pending.as_str()),
+            )
+            .exec(&self.db)
+            .await
+            .map_err(persistence)?;
+        (updated.rows_affected == 1)
+            .then_some(())
+            .ok_or(ManagedError::Conflict)
+    }
+
     async fn claim_stale_logical_operations(
         &self,
         owner: &str,
@@ -4407,6 +4636,272 @@ impl ManagedRepository for PostgresManagedRepository {
         })
     }
 
+    async fn commit_atomic_logical_delete(
+        &self,
+        request: ManagedDeleteRequest,
+    ) -> Result<ManagedOperationCommit, ManagedDeleteError> {
+        if request.logical.tenant_id.is_empty()
+            || request.logical.bucket.is_empty()
+            || request.placement.version == 0
+            || request.placement.primary_backend_id.is_empty()
+            || request.provider_bucket.is_empty()
+            || request.rate_version <= 0
+            || request.occurred_at_micros < 0
+        {
+            return Err(ManagedError::Conflict.into());
+        }
+        let txn = self.db.begin().await.map_err(persistence)?;
+        let namespace = locked_namespace(&txn, &request.logical.tenant_id).await?;
+        if namespace.state != "ACTIVE" {
+            return Err(ManagedError::NamespaceFenced.into());
+        }
+        let fence = ManagedRouteFence {
+            namespace_epoch: u64_from_i64(namespace.epoch, "managed namespace epoch")?,
+            routing_epoch: u64_from_i64(namespace.routing_epoch, "managed routing epoch")?,
+        };
+        let existing_operation =
+            managed_logical_operation::Entity::find_by_id(request.operation_id)
+                .lock(LockType::Update)
+                .one(&txn)
+                .await
+                .map_err(persistence)?
+                .map(logical_operation_from_model)
+                .transpose()?;
+        let mut usage = locked_workspace_usage(&txn, &request.logical.tenant_id).await?;
+        let existing_model = managed_object_authority::Entity::find_by_id((
+            request.logical.tenant_id.clone(),
+            request.logical.bucket.clone(),
+            request.logical.key.clone(),
+        ))
+        .lock(LockType::Update)
+        .one(&txn)
+        .await
+        .map_err(persistence)?;
+        let existing = existing_model
+            .clone()
+            .map(authority_from_model)
+            .transpose()?;
+        let generation = existing
+            .as_ref()
+            .filter(|authority| authority.tombstone)
+            .map_or_else(
+                || Uuid::new_v5(&Uuid::NAMESPACE_URL, request.operation_id.as_bytes()),
+                |authority| authority.generation,
+            );
+        let prior_logical_size = existing
+            .as_ref()
+            .filter(|authority| !authority.tombstone)
+            .map_or(0, |authority| authority.size);
+        let recipe = ManagedPublicationRecipe {
+            version: MANAGED_PUBLICATION_RECIPE_VERSION,
+            placement_version: request.placement.version,
+            primary_backend_id: request.placement.primary_backend_id.clone(),
+            replica_backend_id: request.placement.replica_backend_id.clone(),
+            metadata: BTreeMap::new(),
+            primary_status: CopyStatus::Absent,
+            replica_status: CopyStatus::Absent,
+        };
+        let intent = ManagedLogicalOperationIntent {
+            operation_id: request.operation_id,
+            receipt_id: request.receipt_id,
+            logical: request.logical.clone(),
+            kind: ManagedMutationKind::Delete,
+            generation,
+            fence,
+            expected_authority_cas: existing.as_ref().map(|authority| authority.cas_version),
+            prior_logical_size,
+            primary_child_operation_id: Uuid::new_v5(
+                &Uuid::NAMESPACE_OID,
+                request.operation_id.as_bytes(),
+            ),
+            backend_id: request.placement.primary_backend_id.clone(),
+            provider_bucket: request.provider_bucket.clone(),
+            physical_key: generation_physical_key(&request.logical, generation),
+            occurred_at_ms: request.occurred_at_micros.div_euclid(1_000),
+            rate_version: request.rate_version,
+            route: UsageRoute::DeleteObject,
+            request_kind: RequestKind::Write,
+            max_processed_bytes: request.max_processed_bytes,
+            publication_recipe: Some(recipe),
+        };
+        if let Some(operation) = existing_operation {
+            if !delete_request_matches_operation(&request, &operation)
+                || operation.state != ManagedLogicalOperationState::Committed
+            {
+                return Err(ManagedError::Conflict.into());
+            }
+            let authority = committed_delete_replay_authority(&operation, existing)?;
+            txn.commit()
+                .await
+                .map_err(|error| ManagedDeleteError::CommitUnknown(persistence(error)))?;
+            return Ok(ManagedOperationCommit {
+                operation,
+                authority,
+                usage: workspace_usage_from_model(usage)?,
+            });
+        }
+        if usage.active_operation_id.is_some() {
+            return Err(ManagedError::MutationInProgress.into());
+        }
+        let now = crate::transaction::unix_time_ms();
+        let authority = if existing
+            .as_ref()
+            .is_some_and(|authority| authority.tombstone)
+        {
+            existing.clone().ok_or(ManagedError::Conflict)?
+        } else {
+            let authority = ObjectAuthority {
+                logical: request.logical.clone(),
+                generation,
+                digest: String::new(),
+                size: 0,
+                metadata: BTreeMap::new(),
+                placement_version: request.placement.version,
+                primary_backend_id: request.placement.primary_backend_id,
+                primary_version_id: None,
+                replica_backend_id: request.placement.replica_backend_id,
+                primary_status: CopyStatus::Absent,
+                replica_status: CopyStatus::Absent,
+                tombstone: true,
+                cas_version: existing
+                    .as_ref()
+                    .map_or(1, |authority| authority.cas_version.saturating_add(1)),
+                created_at_ms: existing
+                    .as_ref()
+                    .map_or(now, |authority| authority.created_at_ms),
+                updated_at_ms: now,
+            };
+            match existing_model {
+                None => {
+                    authority_active(&authority)?
+                        .insert(&txn)
+                        .await
+                        .map_err(persistence)?;
+                }
+                Some(model) => {
+                    let updated = managed_object_authority::Entity::update_many()
+                        .set(authority_active(&authority)?)
+                        .filter(
+                            managed_object_authority::Column::TenantId
+                                .eq(&request.logical.tenant_id),
+                        )
+                        .filter(
+                            managed_object_authority::Column::Bucket.eq(&request.logical.bucket),
+                        )
+                        .filter(
+                            managed_object_authority::Column::LogicalKey.eq(&request.logical.key),
+                        )
+                        .filter(managed_object_authority::Column::CasVersion.eq(model.cas_version))
+                        .exec(&txn)
+                        .await
+                        .map_err(persistence)?;
+                    if updated.rows_affected != 1 {
+                        return Err(ManagedError::Conflict.into());
+                    }
+                }
+            }
+            authority
+        };
+        if let Some(previous) = existing.filter(|authority| !authority.tombstone) {
+            for mut repair in cleanup_repairs(&previous) {
+                let targets = managed_physical_object_version::Entity::find()
+                    .filter(
+                        managed_physical_object_version::Column::TenantId
+                            .eq(&repair.logical.tenant_id),
+                    )
+                    .filter(
+                        managed_physical_object_version::Column::BackendId
+                            .eq(&repair.target_backend_id),
+                    )
+                    .filter(
+                        managed_physical_object_version::Column::PhysicalKey
+                            .eq(&repair.physical_key),
+                    )
+                    .count(&txn)
+                    .await
+                    .map_err(persistence)?;
+                if targets > 0 {
+                    repair.namespace_epoch = fence.namespace_epoch;
+                    insert_repair(&txn, repair).await?;
+                }
+            }
+        }
+        let prior = i64_from_u64(prior_logical_size, "managed prior size")?;
+        usage.visible_logical_bytes = usage
+            .visible_logical_bytes
+            .checked_sub(prior)
+            .ok_or(ManagedError::Conflict)?;
+        usage.version = usage.version.saturating_add(1);
+        usage.updated_at_ms = now;
+        managed_workspace_usage::Entity::update_many()
+            .col_expr(
+                managed_workspace_usage::Column::VisibleLogicalBytes,
+                Expr::value(usage.visible_logical_bytes),
+            )
+            .col_expr(
+                managed_workspace_usage::Column::Version,
+                Expr::value(usage.version),
+            )
+            .col_expr(
+                managed_workspace_usage::Column::UpdatedAtMs,
+                Expr::value(now),
+            )
+            .filter(managed_workspace_usage::Column::TenantId.eq(&request.logical.tenant_id))
+            .exec(&txn)
+            .await
+            .map_err(persistence)?;
+        let evidence = ManagedUsageEvidence {
+            expected_output_digest: None,
+            expected_output_size: 0,
+            source_bytes: 0,
+            processed_bytes: 0,
+            payload: serde_json::json!({
+                "occurred_at_micros": request.occurred_at_micros,
+            }),
+        };
+        let mut active = logical_operation_active(&intent, now)?;
+        active.expected_output_size = Set(Some(0));
+        active.source_bytes = Set(Some(0));
+        active.processed_bytes = Set(Some(0));
+        active.usage_evidence = Set(evidence.payload.clone());
+        active.state = Set(ManagedLogicalOperationState::Committed.as_str().to_string());
+        active.committed_authority_version = Set(Some(i64_from_u64(
+            authority.cas_version,
+            "managed authority CAS",
+        )?));
+        active.committed_at_ms = Set(Some(now));
+        managed_logical_operation::Entity::insert(active)
+            .exec_without_returning(&txn)
+            .await
+            .map_err(persistence)?;
+        let operation = ManagedLogicalOperation {
+            intent,
+            evidence: Some(evidence),
+            reserved_physical_bytes: 0,
+            committed_physical_bytes: 0,
+            released_physical_bytes: 0,
+            state: ManagedLogicalOperationState::Committed,
+            committed_authority_version: Some(authority.cas_version),
+            settlement_state: ManagedSettlementState::Pending,
+            last_error_class: None,
+            recovery_owner: None,
+            recovery_token: None,
+            recovery_expires_at_ms: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+            committed_at_ms: Some(now),
+            aborted_at_ms: None,
+        };
+        txn.commit()
+            .await
+            .map_err(|error| ManagedDeleteError::CommitUnknown(persistence(error)))?;
+        Ok(ManagedOperationCommit {
+            operation,
+            authority,
+            usage: workspace_usage_from_model(usage)?,
+        })
+    }
+
     async fn prove_logical_abort(
         &self,
         operation_id: Uuid,
@@ -5796,6 +6291,29 @@ impl ManagedRepository for PostgresManagedRepository {
                 Err(ManagedError::NamespaceFenced) => continue,
                 Err(error) => return Err(error),
             }
+            if candidate.kind == "DELETE_GENERATION" {
+                let current = managed_object_authority::Entity::find_by_id((
+                    candidate.tenant_id.clone(),
+                    candidate.bucket.clone(),
+                    candidate.logical_key.clone(),
+                ))
+                .lock(LockType::Update)
+                .one(&txn)
+                .await
+                .map_err(persistence)?
+                .map(authority_from_model)
+                .transpose()?;
+                if current.as_ref().is_some_and(|authority| {
+                    !authority.tombstone
+                        && authority.generation == candidate.generation
+                        && (authority.primary_backend_id == candidate.target_backend_id
+                            || authority.replica_backend_id.as_deref()
+                                == Some(candidate.target_backend_id.as_str()))
+                }) {
+                    txn.commit().await.map_err(persistence)?;
+                    continue;
+                }
+            }
             let lease_token = Uuid::now_v7();
             let result = managed_object_repair::Entity::update_many()
                 .col_expr(managed_object_repair::Column::State, Expr::value("LEASED"))
@@ -5897,6 +6415,33 @@ impl ManagedRepository for PostgresManagedRepository {
         if result.rows_affected != 1 {
             return Err(ManagedError::Conflict);
         }
+        if repair.kind == RepairKind::DeleteGeneration {
+            let remaining = managed_physical_object_version::Entity::find()
+                .filter(
+                    managed_physical_object_version::Column::TenantId.eq(&repair.logical.tenant_id),
+                )
+                .filter(
+                    managed_physical_object_version::Column::BackendId
+                        .eq(&repair.target_backend_id),
+                )
+                .filter(
+                    managed_physical_object_version::Column::PhysicalKey.eq(&repair.physical_key),
+                )
+                .count(&txn)
+                .await
+                .map_err(persistence)?;
+            if remaining != 0 {
+                managed_object_repair::Entity::update_many()
+                    .col_expr(managed_object_repair::Column::State, Expr::value("PENDING"))
+                    .filter(managed_object_repair::Column::Id.eq(repair.repair_id))
+                    .filter(managed_object_repair::Column::State.eq("DONE"))
+                    .exec(&txn)
+                    .await
+                    .map_err(persistence)?;
+                txn.commit().await.map_err(persistence)?;
+                return Ok(false);
+            }
+        }
         let mut authority_updated = false;
         if repair.kind != RepairKind::DeleteGeneration {
             let target_versions = managed_physical_object_version::Entity::find()
@@ -5927,41 +6472,65 @@ impl ManagedRepository for PostgresManagedRepository {
             .lock(LockType::Update)
             .one(&txn)
             .await
-            .map_err(persistence)?;
-            if let Some(current) = current {
-                let mut authority = authority_from_model(current.clone())?;
+            .map_err(persistence)?
+            .map(authority_from_model)
+            .transpose()?;
+            let cleanup_in_progress = managed_object_repair::Entity::find()
+                .filter(managed_object_repair::Column::Kind.eq("DELETE_GENERATION"))
+                .filter(managed_object_repair::Column::TenantId.eq(&repair.logical.tenant_id))
+                .filter(managed_object_repair::Column::Bucket.eq(&repair.logical.bucket))
+                .filter(managed_object_repair::Column::LogicalKey.eq(&repair.logical.key))
+                .filter(managed_object_repair::Column::Generation.eq(repair.generation))
+                .filter(
+                    managed_object_repair::Column::TargetBackendId.eq(&repair.target_backend_id),
+                )
+                .filter(managed_object_repair::Column::State.eq("LEASED"))
+                .count(&txn)
+                .await
+                .map_err(persistence)?
+                != 0;
+            if !cleanup_in_progress && let Some(mut authority) = current.clone() {
+                let previous = authority.clone();
                 if authority.generation == repair.generation
                     && authority.cas_version == repair.authority_cas_version
                     && !authority.tombstone
                     && apply_repair_to_authority(&mut authority, repair)?
                 {
-                    authority.cas_version = authority.cas_version.saturating_add(1);
-                    authority.updated_at_ms = crate::transaction::unix_time_ms();
-                    let result = managed_object_authority::Entity::update_many()
-                        .set(authority_active(&authority)?)
-                        .filter(
-                            managed_object_authority::Column::TenantId
-                                .eq(&repair.logical.tenant_id),
-                        )
-                        .filter(managed_object_authority::Column::Bucket.eq(&repair.logical.bucket))
-                        .filter(
-                            managed_object_authority::Column::LogicalKey.eq(&repair.logical.key),
-                        )
-                        .filter(managed_object_authority::Column::Generation.eq(repair.generation))
-                        .filter(
-                            managed_object_authority::Column::CasVersion.eq(current.cas_version),
-                        )
-                        .exec(&txn)
-                        .await
-                        .map_err(persistence)?;
-                    if result.rows_affected != 1 {
-                        return Err(ManagedError::Conflict);
+                    if authority != previous {
+                        authority.cas_version = authority.cas_version.saturating_add(1);
+                        authority.updated_at_ms = crate::transaction::unix_time_ms();
+                        let result = managed_object_authority::Entity::update_many()
+                            .set(authority_active(&authority)?)
+                            .filter(
+                                managed_object_authority::Column::TenantId
+                                    .eq(&repair.logical.tenant_id),
+                            )
+                            .filter(
+                                managed_object_authority::Column::Bucket.eq(&repair.logical.bucket),
+                            )
+                            .filter(
+                                managed_object_authority::Column::LogicalKey
+                                    .eq(&repair.logical.key),
+                            )
+                            .filter(
+                                managed_object_authority::Column::Generation.eq(repair.generation),
+                            )
+                            .filter(
+                                managed_object_authority::Column::CasVersion.eq(i64_from_u64(
+                                    previous.cas_version,
+                                    "managed authority CAS",
+                                )?),
+                            )
+                            .exec(&txn)
+                            .await
+                            .map_err(persistence)?;
+                        if result.rows_affected != 1 {
+                            return Err(ManagedError::Conflict);
+                        }
                     }
                     authority_updated = true;
                     if repair.kind == RepairKind::Placement {
-                        for mut cleanup in
-                            placement_cleanup_repairs(&authority_from_model(current)?, &authority)
-                        {
+                        for mut cleanup in placement_cleanup_repairs(&previous, &authority) {
                             cleanup.namespace_epoch = repair.namespace_epoch;
                             cleanup.placement_version = repair.placement_version;
                             insert_waiting_placement_cleanup(&txn, cleanup).await?;
@@ -6002,6 +6571,13 @@ impl ManagedRepository for PostgresManagedRepository {
                         }
                     }
                 }
+            }
+            if !authority_updated
+                && current
+                    .as_ref()
+                    .is_none_or(|authority| !repair_target_is_authoritative(authority, repair))
+            {
+                insert_repair(&txn, stale_repair_cleanup(repair)).await?;
             }
         }
         txn.commit().await.map_err(persistence)?;
@@ -7492,6 +8068,74 @@ impl ManagedRepository for InMemoryManagedRepository {
         Ok(operations)
     }
 
+    async fn pending_delete_settlements(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<ManagedLogicalOperation>, ManagedError> {
+        let mut operations: Vec<_> = self
+            .state
+            .lock()
+            .await
+            .logical_operations
+            .values()
+            .filter(|operation| {
+                operation.intent.kind == ManagedMutationKind::Delete
+                    && operation.state == ManagedLogicalOperationState::Committed
+                    && operation.settlement_state == ManagedSettlementState::Pending
+            })
+            .cloned()
+            .collect();
+        operations.sort_by_key(|operation| operation.updated_at_ms);
+        operations.truncate(limit as usize);
+        Ok(operations)
+    }
+
+    async fn mark_logical_operation_settled(
+        &self,
+        operation_id: Uuid,
+        receipt_id: Uuid,
+    ) -> Result<(), ManagedError> {
+        let mut state = self.state.lock().await;
+        let operation = state
+            .logical_operations
+            .get_mut(&operation_id)
+            .ok_or(ManagedError::Conflict)?;
+        if operation.intent.receipt_id != receipt_id
+            || operation.intent.kind != ManagedMutationKind::Delete
+            || operation.state != ManagedLogicalOperationState::Committed
+            || !matches!(
+                operation.settlement_state,
+                ManagedSettlementState::Pending | ManagedSettlementState::Settled
+            )
+        {
+            return Err(ManagedError::Conflict);
+        }
+        operation.settlement_state = ManagedSettlementState::Settled;
+        operation.updated_at_ms = crate::transaction::unix_time_ms();
+        Ok(())
+    }
+
+    async fn defer_delete_settlement(
+        &self,
+        operation_id: Uuid,
+        receipt_id: Uuid,
+    ) -> Result<(), ManagedError> {
+        let mut state = self.state.lock().await;
+        let operation = state
+            .logical_operations
+            .get_mut(&operation_id)
+            .ok_or(ManagedError::Conflict)?;
+        if operation.intent.receipt_id != receipt_id
+            || operation.intent.kind != ManagedMutationKind::Delete
+            || operation.state != ManagedLogicalOperationState::Committed
+            || operation.settlement_state != ManagedSettlementState::Pending
+        {
+            return Err(ManagedError::Conflict);
+        }
+        operation.updated_at_ms = crate::transaction::unix_time_ms().saturating_add(60_000);
+        Ok(())
+    }
+
     async fn claim_stale_logical_operations(
         &self,
         owner: &str,
@@ -8193,6 +8837,195 @@ impl ManagedRepository for InMemoryManagedRepository {
         operation.committed_at_ms = Some(now);
         Ok(ManagedOperationCommit {
             operation: operation.clone(),
+            authority,
+            usage: committed_usage,
+        })
+    }
+
+    async fn commit_atomic_logical_delete(
+        &self,
+        request: ManagedDeleteRequest,
+    ) -> Result<ManagedOperationCommit, ManagedDeleteError> {
+        if request.logical.tenant_id.is_empty()
+            || request.logical.bucket.is_empty()
+            || request.placement.version == 0
+            || request.placement.primary_backend_id.is_empty()
+            || request.provider_bucket.is_empty()
+            || request.rate_version <= 0
+            || request.occurred_at_micros < 0
+        {
+            return Err(ManagedError::Conflict.into());
+        }
+        let mut state = self.state.lock().await;
+        if state
+            .fenced_namespaces
+            .contains_key(&request.logical.tenant_id)
+        {
+            return Err(ManagedError::NamespaceFenced.into());
+        }
+        let fence = ManagedRouteFence {
+            namespace_epoch: state
+                .namespace_epochs
+                .get(&request.logical.tenant_id)
+                .copied()
+                .unwrap_or(1),
+            routing_epoch: state
+                .routing_epochs
+                .get(&request.logical.tenant_id)
+                .copied()
+                .unwrap_or(1),
+        };
+        let existing = state.authorities.get(&request.logical).cloned();
+        let generation = existing
+            .as_ref()
+            .filter(|authority| authority.tombstone)
+            .map_or_else(
+                || Uuid::new_v5(&Uuid::NAMESPACE_URL, request.operation_id.as_bytes()),
+                |authority| authority.generation,
+            );
+        let prior_logical_size = existing
+            .as_ref()
+            .filter(|authority| !authority.tombstone)
+            .map_or(0, |authority| authority.size);
+        let intent = ManagedLogicalOperationIntent {
+            operation_id: request.operation_id,
+            receipt_id: request.receipt_id,
+            logical: request.logical.clone(),
+            kind: ManagedMutationKind::Delete,
+            generation,
+            fence,
+            expected_authority_cas: existing.as_ref().map(|authority| authority.cas_version),
+            prior_logical_size,
+            primary_child_operation_id: Uuid::new_v5(
+                &Uuid::NAMESPACE_OID,
+                request.operation_id.as_bytes(),
+            ),
+            backend_id: request.placement.primary_backend_id.clone(),
+            provider_bucket: request.provider_bucket.clone(),
+            physical_key: generation_physical_key(&request.logical, generation),
+            occurred_at_ms: request.occurred_at_micros.div_euclid(1_000),
+            rate_version: request.rate_version,
+            route: UsageRoute::DeleteObject,
+            request_kind: RequestKind::Write,
+            max_processed_bytes: request.max_processed_bytes,
+            publication_recipe: Some(ManagedPublicationRecipe {
+                version: MANAGED_PUBLICATION_RECIPE_VERSION,
+                placement_version: request.placement.version,
+                primary_backend_id: request.placement.primary_backend_id.clone(),
+                replica_backend_id: request.placement.replica_backend_id.clone(),
+                metadata: BTreeMap::new(),
+                primary_status: CopyStatus::Absent,
+                replica_status: CopyStatus::Absent,
+            }),
+        };
+        if let Some(operation) = state.logical_operations.get(&request.operation_id).cloned() {
+            if !delete_request_matches_operation(&request, &operation)
+                || operation.state != ManagedLogicalOperationState::Committed
+            {
+                return Err(ManagedError::Conflict.into());
+            }
+            let authority = committed_delete_replay_authority(&operation, existing)?;
+            let usage = Self::workspace_usage(&mut state, &request.logical.tenant_id).clone();
+            return Ok(ManagedOperationCommit {
+                operation,
+                authority,
+                usage,
+            });
+        }
+        let usage = Self::workspace_usage(&mut state, &request.logical.tenant_id);
+        if usage.active_operation_id.is_some() {
+            return Err(ManagedError::MutationInProgress.into());
+        }
+        let visible = usage
+            .visible_logical_bytes
+            .checked_sub(prior_logical_size)
+            .ok_or(ManagedError::Conflict)?;
+        let now = crate::transaction::unix_time_ms();
+        let authority = existing
+            .as_ref()
+            .filter(|authority| authority.tombstone)
+            .cloned()
+            .unwrap_or_else(|| ObjectAuthority {
+                logical: request.logical.clone(),
+                generation,
+                digest: String::new(),
+                size: 0,
+                metadata: BTreeMap::new(),
+                placement_version: request.placement.version,
+                primary_backend_id: request.placement.primary_backend_id,
+                primary_version_id: None,
+                replica_backend_id: request.placement.replica_backend_id,
+                primary_status: CopyStatus::Absent,
+                replica_status: CopyStatus::Absent,
+                tombstone: true,
+                cas_version: existing
+                    .as_ref()
+                    .map_or(1, |authority| authority.cas_version.saturating_add(1)),
+                created_at_ms: existing
+                    .as_ref()
+                    .map_or(now, |authority| authority.created_at_ms),
+                updated_at_ms: now,
+            });
+        let repairs = existing
+            .as_ref()
+            .filter(|authority| !authority.tombstone)
+            .into_iter()
+            .flat_map(cleanup_repairs)
+            .filter(|repair| {
+                state.physical_versions.iter().any(|target| {
+                    target.tenant_id == repair.logical.tenant_id
+                        && target.backend_id == repair.target_backend_id
+                        && target.physical_key == repair.physical_key
+                })
+            })
+            .map(|mut repair| {
+                repair.namespace_epoch = fence.namespace_epoch;
+                repair
+            })
+            .collect::<Vec<_>>();
+        state
+            .authorities
+            .insert(request.logical.clone(), authority.clone());
+        for repair in repairs {
+            insert_memory_repair(&mut state, repair);
+        }
+        let usage = Self::workspace_usage(&mut state, &request.logical.tenant_id);
+        usage.visible_logical_bytes = visible;
+        usage.version = usage.version.saturating_add(1);
+        usage.updated_at_ms = now;
+        let committed_usage = usage.clone();
+        let evidence = ManagedUsageEvidence {
+            expected_output_digest: None,
+            expected_output_size: 0,
+            source_bytes: 0,
+            processed_bytes: 0,
+            payload: serde_json::json!({
+                "occurred_at_micros": request.occurred_at_micros,
+            }),
+        };
+        let operation = ManagedLogicalOperation {
+            intent,
+            evidence: Some(evidence),
+            reserved_physical_bytes: 0,
+            committed_physical_bytes: 0,
+            released_physical_bytes: 0,
+            state: ManagedLogicalOperationState::Committed,
+            committed_authority_version: Some(authority.cas_version),
+            settlement_state: ManagedSettlementState::Pending,
+            last_error_class: None,
+            recovery_owner: None,
+            recovery_token: None,
+            recovery_expires_at_ms: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+            committed_at_ms: Some(now),
+            aborted_at_ms: None,
+        };
+        state
+            .logical_operations
+            .insert(request.operation_id, operation.clone());
+        Ok(ManagedOperationCommit {
+            operation,
             authority,
             usage: committed_usage,
         })
@@ -9010,6 +9843,7 @@ impl ManagedRepository for InMemoryManagedRepository {
         let mut state = self.state.lock().await;
         let fenced_namespaces = state.fenced_namespaces.clone();
         let namespace_epochs = state.namespace_epochs.clone();
+        let authorities = state.authorities.clone();
         let mut candidates: Vec<_> = state
             .repairs
             .values_mut()
@@ -9026,6 +9860,10 @@ impl ManagedRepository for InMemoryManagedRepository {
                                 .lease_expires_at_ms
                                 .is_some_and(|expiry| expiry <= now)))
                     && repair.not_before_ms <= now
+                    && !(repair.kind == RepairKind::DeleteGeneration
+                        && authorities.get(&repair.logical).is_some_and(|authority| {
+                            repair_target_is_authoritative(authority, repair)
+                        }))
             })
             .collect();
         candidates.sort_by_key(|(repair, _)| repair.updated_at_ms);
@@ -9102,10 +9940,29 @@ impl ManagedRepository for InMemoryManagedRepository {
             stored.lease_expires_at_ms = None;
             stored.updated_at_ms = now;
         }
+        if repair.kind == RepairKind::DeleteGeneration
+            && state.physical_versions.iter().any(|target| {
+                target.tenant_id == repair.logical.tenant_id
+                    && target.backend_id == repair.target_backend_id
+                    && target.physical_key == repair.physical_key
+            })
+        {
+            let (_, status) = state.repairs.get_mut(&repair.repair_id).unwrap();
+            *status = "PENDING".to_string();
+            return Ok(false);
+        }
         let mut updated = false;
         let mut cleanups = Vec::new();
         let mut activate_cleanup = false;
+        let cleanup_in_progress = state.repairs.values().any(|(cleanup, status)| {
+            cleanup.kind == RepairKind::DeleteGeneration
+                && cleanup.logical == repair.logical
+                && cleanup.generation == repair.generation
+                && cleanup.target_backend_id == repair.target_backend_id
+                && status == "LEASED"
+        });
         if repair.kind != RepairKind::DeleteGeneration
+            && !cleanup_in_progress
             && let Some(authority) = state.authorities.get_mut(&repair.logical)
             && authority.generation == repair.generation
             && authority.cas_version == repair.authority_cas_version
@@ -9137,6 +9994,20 @@ impl ManagedRepository for InMemoryManagedRepository {
                     *status = "PENDING".to_string();
                 }
             }
+        }
+        if !updated
+            && repair.kind != RepairKind::DeleteGeneration
+            && state
+                .authorities
+                .get(&repair.logical)
+                .is_none_or(|authority| !repair_target_is_authoritative(authority, repair))
+            && state.physical_versions.iter().any(|target| {
+                target.tenant_id == repair.logical.tenant_id
+                    && target.backend_id == repair.target_backend_id
+                    && target.physical_key == repair.physical_key
+            })
+        {
+            insert_memory_repair(&mut state, stale_repair_cleanup(repair));
         }
         Ok(updated)
     }
@@ -10488,11 +11359,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logical_delete_tombstones_visibility_without_early_physical_release() {
+    async fn atomic_logical_delete_commits_exact_cleanup_and_is_idempotent() {
         let repository = InMemoryManagedRepository::new();
         let tenant = "tenant-logical-delete";
         let fence = repository.route_fence(tenant).await.unwrap();
-        let put = logical_intent(tenant, "key", ManagedMutationKind::Put, fence);
+        let mut put = logical_intent(tenant, "key", ManagedMutationKind::Put, fence);
+        let recipe = put.publication_recipe.as_mut().unwrap();
+        recipe.replica_backend_id = Some("b".to_string());
+        recipe.replica_status = CopyStatus::RepairPending;
         repository
             .insert_logical_operation(put.clone())
             .await
@@ -10519,54 +11393,336 @@ mod tests {
             )
             .await
             .unwrap();
-
-        let mut delete = logical_intent(tenant, "key", ManagedMutationKind::Delete, fence);
-        delete.expected_authority_cas = Some(put_commit.authority.cas_version);
-        delete.prior_logical_size = put_commit.authority.size;
-        repository
-            .insert_logical_operation(delete.clone())
+        let replica_lease = repository
+            .begin_physical_write(PhysicalWriteIntent {
+                intent_id: Uuid::now_v7(),
+                tenant_id: tenant.to_string(),
+                backend_id: "b".to_string(),
+                storage_identity: test_storage_identity(),
+                credential_epoch: 1,
+                provider_bucket: put.provider_bucket.clone(),
+                physical_key: put.physical_key.clone(),
+                versioning_mode: BackendVersioningMode::Enabled,
+                versioning_capability: BackendVersioningCapability::Required,
+                lease_owner: "replica-writer".to_string(),
+            })
+            .await
+            .unwrap();
+        let existing_replica_lease = repository
+            .begin_physical_write(PhysicalWriteIntent {
+                intent_id: Uuid::now_v7(),
+                tenant_id: tenant.to_string(),
+                backend_id: "b".to_string(),
+                storage_identity: test_storage_identity(),
+                credential_epoch: 1,
+                provider_bucket: put.provider_bucket.clone(),
+                physical_key: put.physical_key.clone(),
+                versioning_mode: BackendVersioningMode::Enabled,
+                versioning_capability: BackendVersioningCapability::Required,
+                lease_owner: "existing-replica-writer".to_string(),
+            })
             .await
             .unwrap();
         repository
-            .reserve_logical_operation(delete.operation_id, 0)
-            .await
-            .unwrap();
-        repository
-            .record_logical_usage(
-                delete.operation_id,
-                ManagedUsageEvidence {
-                    expected_output_digest: None,
-                    expected_output_size: 0,
-                    source_bytes: 0,
-                    processed_bytes: 0,
-                    payload: serde_json::json!({}),
-                },
+            .commit_physical_write(
+                &existing_replica_lease,
+                &[],
+                Some("existing-replica-version"),
             )
             .await
             .unwrap();
         repository
-            .transition_logical_operation(
-                delete.operation_id,
-                ManagedLogicalOperationState::Open,
-                ManagedLogicalOperationState::Completing,
+            .enqueue(RepairRecord::placement(
+                &put_commit.authority,
+                Some("a".to_string()),
+                "c".to_string(),
+                RepairTargetRole::Primary,
+                &Placement {
+                    version: 2,
+                    primary_backend_id: "c".to_string(),
+                    replica_backend_id: Some("b".to_string()),
+                },
+            ))
+            .await
+            .unwrap();
+        let placement_lease = repository
+            .begin_physical_write(PhysicalWriteIntent {
+                intent_id: Uuid::now_v7(),
+                tenant_id: tenant.to_string(),
+                backend_id: "c".to_string(),
+                storage_identity: test_storage_identity(),
+                credential_epoch: 1,
+                provider_bucket: put.provider_bucket.clone(),
+                physical_key: put.physical_key.clone(),
+                versioning_mode: BackendVersioningMode::Enabled,
+                versioning_capability: BackendVersioningCapability::Required,
+                lease_owner: "placement-writer".to_string(),
+            })
+            .await
+            .unwrap();
+        let stale_repairs = repository
+            .claim_repairs("replica", i64::MAX, 10)
+            .await
+            .unwrap();
+        let stale_replica = stale_repairs
+            .iter()
+            .find(|repair| repair.kind == RepairKind::Replica)
+            .unwrap();
+        let stale_placement = stale_repairs
+            .iter()
+            .find(|repair| repair.kind == RepairKind::Placement)
+            .unwrap();
+
+        let delete_id = Uuid::now_v7();
+        let delete = ManagedDeleteRequest {
+            operation_id: delete_id,
+            receipt_id: Uuid::now_v7(),
+            logical: put.logical.clone(),
+            placement: Placement {
+                version: 1,
+                primary_backend_id: "a".to_string(),
+                replica_backend_id: Some("b".to_string()),
+            },
+            provider_bucket: "provider-bucket".to_string(),
+            occurred_at_micros: crate::transaction::unix_time_ms() * 1_000,
+            rate_version: 1,
+            max_processed_bytes: 0,
+        };
+        let deleted = repository
+            .commit_atomic_logical_delete(delete.clone())
+            .await
+            .unwrap();
+        assert!(deleted.authority.tombstone);
+        assert_eq!(
+            deleted.authority.cas_version,
+            put_commit.authority.cas_version + 1
+        );
+        assert_eq!(deleted.usage.visible_logical_bytes, 0);
+        assert_eq!(deleted.usage.physical_allocated_bytes, 3);
+        assert_eq!(deleted.usage.active_operation_id, None);
+        assert_eq!(
+            deleted.operation.state,
+            ManagedLogicalOperationState::Committed
+        );
+        assert_eq!(
+            deleted.operation.evidence.as_ref().unwrap().processed_bytes,
+            0
+        );
+        assert!(deleted.operation.intent.publication_recipe.is_some());
+        assert_eq!(
+            repository
+                .logical_operation(delete_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ManagedLogicalOperationState::Committed
+        );
+        let tombstone_cas = deleted.authority.cas_version;
+        let leased_cleanup = repository
+            .claim_repairs("cleanup-snapshot", i64::MAX, 10)
+            .await
+            .unwrap();
+        let replica_cleanup = leased_cleanup
+            .iter()
+            .find(|repair| repair.target_backend_id == "b")
+            .unwrap();
+        let primary_cleanup = leased_cleanup
+            .iter()
+            .find(|repair| repair.target_backend_id == "a")
+            .unwrap();
+        let existing_replica = repository
+            .physical_versions(tenant, "b", &put.provider_bucket, &put.physical_key)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        // Simulate a provider repair that started before DELETE but ledgered its
+        // physical version only after the tombstone committed.
+        repository
+            .commit_physical_write(&replica_lease, &[], Some("replica-version"))
+            .await
+            .unwrap();
+        repository
+            .commit_physical_write(&placement_lease, &[], Some("placement-version"))
+            .await
+            .unwrap();
+        assert!(!repository.complete_repair(stale_replica).await.unwrap());
+        assert!(!repository.complete_repair(stale_placement).await.unwrap());
+        repository
+            .forget_physical_version(&existing_replica)
+            .await
+            .unwrap();
+        assert!(!repository.complete_repair(replica_cleanup).await.unwrap());
+        repository
+            .fail_repair(primary_cleanup.id, "defer cleanup")
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .get(&put.logical)
+                .await
+                .unwrap()
+                .unwrap()
+                .cas_version,
+            tombstone_cas
+        );
+
+        let cleanup = repository
+            .claim_repairs("cleanup", i64::MAX, 10)
+            .await
+            .unwrap();
+        assert!(cleanup.iter().all(|repair| {
+            repair.kind == RepairKind::DeleteGeneration && repair.generation == put.generation
+        }));
+        assert_eq!(
+            cleanup
+                .iter()
+                .map(|repair| repair.target_backend_id.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["b", "c"])
+        );
+
+        let again = repository
+            .commit_atomic_logical_delete(ManagedDeleteRequest {
+                operation_id: Uuid::now_v7(),
+                receipt_id: Uuid::now_v7(),
+                logical: put.logical,
+                placement: Placement {
+                    version: 1,
+                    primary_backend_id: "a".to_string(),
+                    replica_backend_id: Some("b".to_string()),
+                },
+                provider_bucket: "provider-bucket".to_string(),
+                occurred_at_micros: crate::transaction::unix_time_ms() * 1_000,
+                rate_version: 1,
+                max_processed_bytes: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(again.authority.cas_version, tombstone_cas);
+        assert_eq!(again.usage.physical_allocated_bytes, 3);
+
+        let mut replacement = logical_intent(
+            tenant,
+            "key",
+            ManagedMutationKind::Put,
+            repository.route_fence(tenant).await.unwrap(),
+        );
+        replacement.expected_authority_cas = Some(tombstone_cas);
+        repository
+            .insert_logical_operation(replacement.clone())
+            .await
+            .unwrap();
+        repository
+            .reserve_logical_operation(replacement.operation_id, 4)
+            .await
+            .unwrap();
+        let replacement_lease = repository
+            .begin_physical_write(child_intent(&replacement))
+            .await
+            .unwrap();
+        record_put_evidence(&repository, &replacement, 4).await;
+        let replacement_commit = repository
+            .finalize_logical_put(
+                replacement.operation_id,
+                &replacement_lease,
+                ExactPhysicalCommit {
+                    selected_version_id: Some("replacement-version".to_string()),
+                    superseded_version_ids: Vec::new(),
+                    version_history_complete: true,
+                },
                 None,
             )
             .await
             .unwrap();
+        let replay = repository
+            .commit_atomic_logical_delete(delete)
+            .await
+            .unwrap();
+        assert_eq!(replay.authority, replacement_commit.authority);
+        assert!(!replay.authority.tombstone);
+    }
+
+    #[tokio::test]
+    async fn atomic_logical_delete_missing_and_failure_have_no_partial_state() {
+        let repository = InMemoryManagedRepository::new();
+        let tenant = "tenant-atomic-delete-failure";
+        let missing = LogicalObjectKey::new(tenant, "bucket", "missing");
+        let request = ManagedDeleteRequest {
+            operation_id: Uuid::now_v7(),
+            receipt_id: Uuid::now_v7(),
+            logical: missing.clone(),
+            placement: Placement {
+                version: 1,
+                primary_backend_id: "a".to_string(),
+                replica_backend_id: None,
+            },
+            provider_bucket: "provider-bucket".to_string(),
+            occurred_at_micros: crate::transaction::unix_time_ms() * 1_000,
+            rate_version: 1,
+            max_processed_bytes: 0,
+        };
         let deleted = repository
-            .commit_logical_delete(
-                delete.operation_id,
-                &Placement {
-                    version: 1,
-                    primary_backend_id: "a".to_string(),
-                    replica_backend_id: None,
-                },
-            )
+            .commit_atomic_logical_delete(request)
             .await
             .unwrap();
         assert!(deleted.authority.tombstone);
         assert_eq!(deleted.usage.visible_logical_bytes, 0);
-        assert_eq!(deleted.usage.physical_allocated_bytes, 3);
+        assert_eq!(deleted.usage.physical_allocated_bytes, 0);
+
+        let fence = repository.route_fence(tenant).await.unwrap();
+        let blocker = logical_intent(tenant, "blocker", ManagedMutationKind::Put, fence);
+        repository
+            .admit_logical_operation(blocker.clone(), 1)
+            .await
+            .unwrap();
+        let failed_id = Uuid::now_v7();
+        let result = repository
+            .commit_atomic_logical_delete(ManagedDeleteRequest {
+                operation_id: failed_id,
+                receipt_id: Uuid::now_v7(),
+                logical: LogicalObjectKey::new(tenant, "bucket", "other"),
+                placement: Placement {
+                    version: 1,
+                    primary_backend_id: "a".to_string(),
+                    replica_backend_id: None,
+                },
+                provider_bucket: "provider-bucket".to_string(),
+                occurred_at_micros: crate::transaction::unix_time_ms() * 1_000,
+                rate_version: 1,
+                max_processed_bytes: 0,
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(ManagedDeleteError::PreCommit(
+                ManagedError::MutationInProgress
+            ))
+        ));
+        assert!(
+            repository
+                .logical_operation(failed_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .get(&LogicalObjectKey::new(tenant, "bucket", "other"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repository
+                .workspace_usage(tenant)
+                .await
+                .unwrap()
+                .unwrap()
+                .active_operation_id,
+            Some(blocker.operation_id)
+        );
     }
 
     #[tokio::test]
@@ -11690,6 +12846,78 @@ mod tests {
             repaired.placement_version,
             published.placement_version + 1,
             "a replica-only placement repair must advance the authority version"
+        );
+    }
+
+    #[tokio::test]
+    async fn leased_generation_cleanup_fences_repair_publication() {
+        let repository = InMemoryManagedRepository::new();
+        let logical = LogicalObjectKey::new("tenant-cleanup-fence", "bucket", "key");
+        let mut initial = authority(logical, Uuid::now_v7());
+        initial.replica_status = CopyStatus::Ready;
+        let published = repository.publish(initial, None).await.unwrap();
+        let placement = Placement {
+            version: published.placement_version + 1,
+            primary_backend_id: "c".to_string(),
+            replica_backend_id: Some("b".to_string()),
+        };
+        repository
+            .enqueue(RepairRecord::placement(
+                &published,
+                Some("a".to_string()),
+                "c".to_string(),
+                RepairTargetRole::Primary,
+                &placement,
+            ))
+            .await
+            .unwrap();
+        let repair = repository
+            .claim_repairs("repair", crate::transaction::unix_time_ms() + 30_000, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let target_lease = repository
+            .begin_physical_write(PhysicalWriteIntent {
+                intent_id: Uuid::now_v7(),
+                tenant_id: published.logical.tenant_id.clone(),
+                backend_id: "c".to_string(),
+                storage_identity: test_storage_identity(),
+                credential_epoch: 1,
+                provider_bucket: "provider-bucket".to_string(),
+                physical_key: generation_physical_key(&published.logical, published.generation),
+                versioning_mode: BackendVersioningMode::Enabled,
+                versioning_capability: BackendVersioningCapability::Required,
+                lease_owner: "repair-target".to_string(),
+            })
+            .await
+            .unwrap();
+        repository
+            .commit_physical_write(&target_lease, &[], Some("repair-target-version"))
+            .await
+            .unwrap();
+        repository
+            .enqueue(RepairRecord::copy(
+                RepairKind::DeleteGeneration,
+                &published,
+                None,
+                "c".to_string(),
+                RepairTargetRole::Cleanup,
+                published.placement_version,
+            ))
+            .await
+            .unwrap();
+        let cleanup = repository
+            .claim_repairs("cleanup", crate::transaction::unix_time_ms() + 30_000, 1)
+            .await
+            .unwrap();
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(cleanup[0].kind, RepairKind::DeleteGeneration);
+
+        assert!(!repository.complete_repair(&repair).await.unwrap());
+        assert_eq!(
+            repository.get(&published.logical).await.unwrap(),
+            Some(published)
         );
     }
 
