@@ -3631,6 +3631,38 @@ async fn begin_streaming_sink(
                 None => (None, 0),
             };
             let grant = operation.grant;
+            // The coordinator requires the deterministic destination operation
+            // in the durable journal before it can bind and commit a client
+            // multipart upload. Managed storage tracks that same parent
+            // operation in its authority ledger; insert the journal INTENT here
+            // so completion can resolve it.
+            if let Some((coordinator, identity, fingerprint)) = multipart_publication {
+                let operation = OperationRecord::direct_intent(
+                    direct_operation_scope(operation, destination_operation_id),
+                    ObjectDestination {
+                        backend_id: "Managed".to_string(),
+                        bucket: bucket.to_string(),
+                        logical_key: key.to_string(),
+                        physical_key: key.to_string(),
+                        workspace_binding: None,
+                    },
+                    ExpectedObject {
+                        metadata: std::collections::BTreeMap::from([(
+                            "content-type".to_string(),
+                            content_type.to_string(),
+                        )]),
+                        ..ExpectedObject::default()
+                    },
+                );
+                coordinator
+                    .open_operation(operation, identity, fingerprint)
+                    .await
+                    .map_err(|error| {
+                        StreamingPutError::Transaction(TransactionError::Publication(
+                            error.to_string(),
+                        ))
+                    })?;
+            }
             let sink = storage
                 .begin_managed_put_sink(
                     journal,
