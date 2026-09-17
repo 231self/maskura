@@ -11,6 +11,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use crc::{CRC_32_ISCSI, CRC_32_ISO_HDLC, CRC_64_NVME, Crc};
 use hmac::{Hmac, Mac};
+use md5::Md5;
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 
@@ -201,6 +202,42 @@ impl ChecksumVerifier {
             Ok(())
         } else {
             Err(IntegrityError::InvalidChecksum(self.algorithm.header()))
+        }
+    }
+}
+
+/// Incremental `Content-MD5` verification over decoded source bytes.
+pub struct ContentMd5Verifier {
+    state: Md5,
+    expected: [u8; 16],
+}
+
+impl ContentMd5Verifier {
+    pub fn from_headers(headers: &HeaderMap) -> Result<Option<Self>, IntegrityError> {
+        let Some(value) = one_header(headers, "content-md5")? else {
+            return Ok(None);
+        };
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .map_err(|_| IntegrityError::InvalidChecksum("Content-MD5"))?;
+        let expected = decoded
+            .try_into()
+            .map_err(|_| IntegrityError::InvalidChecksum("Content-MD5"))?;
+        Ok(Some(Self {
+            state: Md5::new(),
+            expected,
+        }))
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.state.update(bytes);
+    }
+
+    pub fn finish(self) -> Result<(), IntegrityError> {
+        if constant_time_eq(&self.state.finalize(), &self.expected) {
+            Ok(())
+        } else {
+            Err(IntegrityError::InvalidChecksum("Content-MD5"))
         }
     }
 }
@@ -915,6 +952,38 @@ mod tests {
                 false
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn content_md5_checks_source_bytes_incrementally_and_rejects_invalid_values() {
+        let mut verifier = ContentMd5Verifier::from_headers(&headers(&[(
+            "content-md5",
+            "XUFAKrxLKna5cZ2REBfFkg==",
+        )]))
+        .unwrap()
+        .unwrap();
+        verifier.update(b"he");
+        verifier.update(b"llo");
+        assert!(verifier.finish().is_ok());
+
+        for invalid in ["not-base64", "aGVsbG8="] {
+            assert!(matches!(
+                ContentMd5Verifier::from_headers(&headers(&[("content-md5", invalid)])),
+                Err(IntegrityError::InvalidChecksum("Content-MD5"))
+            ));
+        }
+
+        let mut mismatch = ContentMd5Verifier::from_headers(&headers(&[(
+            "content-md5",
+            "XUFAKrxLKna5cZ2REBfFkg==",
+        )]))
+        .unwrap()
+        .unwrap();
+        mismatch.update(b"world");
+        assert_eq!(
+            mismatch.finish(),
+            Err(IntegrityError::InvalidChecksum("Content-MD5"))
         );
     }
 

@@ -3,6 +3,7 @@
 - [Home](index.md)
 - [Open source and hosted boundaries](open-source.md)
 - [Demo](demo.md)
+- [MinIO-compatible Docker image](minio-docker.md)
 - [Run the claims](proofs.md)
 - [v0.6.0 release notes](releases/v0.6.0.md)
 - [Plugins](plugins.md)
@@ -13,6 +14,7 @@
 - [Binary adapters](binary-adapters.md)
 - [MCP](mcp.md)
 - [End-to-end suite](e2e.md)
+- [Configuration reference](reference/configuration.md)
 - [Security](security.md)
 
 # Architecture Decision Records
@@ -35,3 +37,4 @@
 - [ADR 0016: Maskura plugin contract and namespace](adr/0016-maskura-plugin-contract-and-namespace.md)
 - [ADR 0017: Atomic managed-write admission](adr/0017-atomic-managed-write-admission.md)
 - [ADR 0018: Atomic managed-write finalization and recovery](adr/0018-atomic-managed-write-finalization-and-recovery.md)
+- [ADR 0019: Zero-config local S3 appliance](adr/0019-zero-config-local-s3-appliance.md)

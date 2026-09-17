@@ -24,6 +24,7 @@
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use maskura_customer_config::Config;
 use maskura_gateway::control::NoopControlPlane;
 use maskura_gateway::key_cipher::default_wrapping;
 use maskura_gateway::server::{
@@ -161,12 +162,14 @@ async fn body_bytes(response: axum::response::Response) -> Vec<u8> {
 }
 
 async fn build_isolated_state() -> anyhow::Result<Arc<AppState>> {
-    let pipeline_template = StatePipelineTemplate::from_env()?;
+    let config = Config::resolve(None)?;
+    let pipeline_template = StatePipelineTemplate::from_config(&config)?;
     build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
         default_wrapping()?,
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         &pipeline_template,
+        &config,
     )
     .await
 }
@@ -251,6 +254,15 @@ fn sdk_client(endpoint: &str, access_key: &str, secret_key: &str) -> aws_sdk_s3:
         .force_path_style(true)
         .build();
     aws_sdk_s3::Client::from_conf(config)
+}
+
+async fn sdk_create_bucket(client: &aws_sdk_s3::Client, bucket: &str) {
+    client
+        .create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("SDK CreateBucket");
 }
 
 async fn sdk_get_text(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> (String, String) {
@@ -375,6 +387,19 @@ async fn initiate_upload_raw(
     upload_id
 }
 
+async fn create_bucket_raw(app: &Router, headers: &[(&'static str, String)], bucket: &str) {
+    let request = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/{bucket}"))
+            .body(Body::empty())
+            .unwrap(),
+        headers,
+    );
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "CreateBucket {bucket}");
+}
+
 async fn complete_upload_raw(
     app: &Router,
     headers: &[(&'static str, String)],
@@ -476,6 +501,7 @@ async fn run_sdk_multipart_lifecycle() {
     let key = "lifecycle.txt";
     let contact_one = "sdk-lifecycle@example.com";
     let contact_two = "sdk-lifecycle-2@example.org";
+    sdk_create_bucket(&client, bucket).await;
 
     let created = client
         .create_multipart_upload()
@@ -658,6 +684,7 @@ async fn run_sdk_multipart_replacement() {
     let original_raw = "ORIGINAL-SINGLE-PUT-VERSION\n";
     let contact_one = "replacement-v1@example.com";
     let contact_two = "replacement-final@example.com";
+    sdk_create_bucket(&client, bucket).await;
 
     client
         .put_object()
@@ -803,6 +830,7 @@ async fn run_sdk_multipart_abort_and_errors() {
     let abort_key = "beta.txt";
     let (server, endpoint) = spawn_listener(app).await;
     let client = sdk_client(&endpoint, &access_key, &secret_key);
+    sdk_create_bucket(&client, bucket).await;
 
     let keep_upload = client
         .create_multipart_upload()
@@ -979,6 +1007,7 @@ async fn run_completion_error_conformance() {
     let key = "errors.txt";
     let contact_two = "error-two@example.com";
     let contact_final = "error-final@example.org";
+    create_bucket_raw(&app, &headers, bucket).await;
 
     let upload_id = initiate_upload_raw(&app, &headers, bucket, key).await;
 
@@ -1125,6 +1154,7 @@ async fn run_difficult_keys_conformance() {
     let (state, app, access_key, secret_key) = build_local_state().await;
     let headers = auth_headers(&access_key, &secret_key);
     let bucket = "sdk-keys";
+    create_bucket_raw(&app, &headers, bucket).await;
 
     // Keys that stress path encoding, reserved characters, unicode, and nested
     // directories while staying within S3 path addressing.
@@ -1299,6 +1329,15 @@ async fn run_external_multipart_interop() {
         .expect("run AWS CLI")
     }
     let aws_base: Vec<&str> = vec!["--endpoint-url", endpoint.as_str(), "--region", "us-east-1"];
+
+    let mut create_bucket_args = vec!["s3api", "create-bucket", "--bucket", bucket];
+    create_bucket_args.extend(aws_base.iter().copied());
+    let create_bucket_output = aws_output(&create_bucket_args, &access_key, &secret_key).await;
+    assert!(
+        create_bucket_output.status.success(),
+        "aws create-bucket failed: {}",
+        String::from_utf8_lossy(&create_bucket_output.stderr)
+    );
 
     let mut create_args = vec![
         "s3api",

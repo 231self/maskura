@@ -124,25 +124,19 @@ fi
 
 echo "release image data-plane smoke passed"
 
-# The public Docker quickstart is intentionally independent from MinIO and
-# Postgres. Boot the exact documented local + staged configuration, persist an
-# object, restart the container, and prove the transformed object survives.
+# The public Docker quickstart is the zero-config local appliance: one volume,
+# no env vars, generated root credentials, byte-preserving storage, the
+# canonical `maskura` bucket, and the MinIO-convention port 9000.
 docker rm -f "$GATEWAY_NAME" >/dev/null
 docker volume create "$LOCAL_VOLUME" >/dev/null
 docker run -d --name "$GATEWAY_NAME" \
-  -p "127.0.0.1:${GATEWAY_PORT}:8080" \
+  -p "127.0.0.1:${GATEWAY_PORT}:9000" \
   -v "$LOCAL_VOLUME:/data" \
-  -e AUTH_DISABLED=true \
-  -e MASKURA_KEYS_FILE=/data/keys.json \
-  -e MASKURA_STORAGE_MODE=local \
-  -e MASKURA_LOCAL_STORAGE_DIR=/data \
-  -e MASKURA_MULTIPART_MODE=staged \
-  -e MASKURA_STREAMING_READ_MODE=passthrough \
   "$IMAGE_REF" >/dev/null
 
 ready=0
 for _ in $(seq 1 30); do
-  if curl --fail --silent "http://127.0.0.1:${GATEWAY_PORT}/health" >/dev/null; then
+  if curl --fail --silent "http://127.0.0.1:${GATEWAY_PORT}/ready" >/dev/null; then
     ready=1
     break
   fi
@@ -153,30 +147,47 @@ for _ in $(seq 1 30); do
 done
 if [ "$ready" -ne 1 ]; then
   docker logs "$GATEWAY_NAME" || true
-  echo "ERROR: packaged gateway rejected documented local staged configuration" >&2
+  echo "ERROR: zero-config gateway did not become ready" >&2
   exit 1
 fi
 
+# The generated root credential is disclosed once in the container logs.
+CRED_LINE="$(docker logs "$GATEWAY_NAME" 2>&1 | grep 'generated local root credentials' | head -1)"
+ACCESS_KEY="$(printf '%s\n' "$CRED_LINE" | grep -o 'access_key=[^ ]*' | cut -d= -f2-)"
+SECRET_KEY="$(printf '%s\n' "$CRED_LINE" | grep -o 'secret_key=[^ ]*' | cut -d= -f2-)"
+if [ -z "$ACCESS_KEY" ] || [ -z "$SECRET_KEY" ]; then
+  docker logs "$GATEWAY_NAME" || true
+  echo "ERROR: zero-config gateway did not disclose generated root credentials" >&2
+  exit 1
+fi
+
+# Byte-preserving round trip into the canonical bucket (no prior `mb`).
+AUTH_HEADERS=(-H "x-maskura-access-key: $ACCESS_KEY" -H "x-maskura-secret-key: $SECRET_KEY")
 curl --fail --silent --show-error \
   -X PUT \
+  "${AUTH_HEADERS[@]}" \
   -H 'Content-Type: text/plain' \
   --data-binary "$INPUT" \
-  "http://127.0.0.1:${GATEWAY_PORT}/maskura-local/restart.txt" >/dev/null
+  "http://127.0.0.1:${GATEWAY_PORT}/maskura/object.txt" >/dev/null
+
+READBACK="$(curl --fail --silent --show-error \
+  "${AUTH_HEADERS[@]}" \
+  "http://127.0.0.1:${GATEWAY_PORT}/maskura/object.txt")"
+if [ "$READBACK" != "$INPUT" ]; then
+  echo "ERROR: zero-config gateway did not preserve bytes on round trip" >&2
+  exit 1
+fi
+
+# Restart against the same volume; the persisted credential and object must
+# survive, and the credential must not be re-printed.
 docker rm -f "$GATEWAY_NAME" >/dev/null
 docker run -d --name "$GATEWAY_NAME" \
-  -p "127.0.0.1:${GATEWAY_PORT}:8080" \
+  -p "127.0.0.1:${GATEWAY_PORT}:9000" \
   -v "$LOCAL_VOLUME:/data" \
-  -e AUTH_DISABLED=true \
-  -e MASKURA_KEYS_FILE=/data/keys.json \
-  -e MASKURA_STORAGE_MODE=local \
-  -e MASKURA_LOCAL_STORAGE_DIR=/data \
-  -e MASKURA_MULTIPART_MODE=staged \
-  -e MASKURA_STREAMING_READ_MODE=passthrough \
   "$IMAGE_REF" >/dev/null
-
 ready=0
 for _ in $(seq 1 30); do
-  if curl --fail --silent "http://127.0.0.1:${GATEWAY_PORT}/health" >/dev/null; then
+  if curl --fail --silent "http://127.0.0.1:${GATEWAY_PORT}/ready" >/dev/null; then
     ready=1
     break
   fi
@@ -184,22 +195,50 @@ for _ in $(seq 1 30); do
 done
 if [ "$ready" -ne 1 ]; then
   docker logs "$GATEWAY_NAME" || true
-  echo "ERROR: packaged local gateway did not recover after restart" >&2
+  echo "ERROR: zero-config gateway did not recover after restart" >&2
   exit 1
 fi
-
+if docker logs "$GATEWAY_NAME" 2>&1 | grep -q 'generated local root credentials'; then
+  echo "ERROR: zero-config gateway re-disclosed the root secret on restart" >&2
+  exit 1
+fi
 READBACK="$(curl --fail --silent --show-error \
-  "http://127.0.0.1:${GATEWAY_PORT}/maskura-local/restart.txt")"
-case "$READBACK" in
-  *'[REDACTED_EMAIL]'*'[REDACTED_CARD]'*) ;;
-  *)
-    echo "ERROR: packaged local gateway did not recover transformed data" >&2
-    exit 1
-    ;;
-esac
-if [[ "$READBACK" == *"release-smoke@example.com"* || "$READBACK" == *"4111111111111111"* ]]; then
-  echo "ERROR: packaged local gateway recovered raw PII" >&2
+  "${AUTH_HEADERS[@]}" \
+  "http://127.0.0.1:${GATEWAY_PORT}/maskura/object.txt")"
+if [ "$READBACK" != "$INPUT" ]; then
+  echo "ERROR: zero-config gateway did not persist bytes across restart" >&2
   exit 1
 fi
 
-echo "release image local staged restart smoke passed"
+# Credential override: a fresh volume plus explicit MASKURA_ROOT_USER/PASSWORD.
+docker rm -f "$GATEWAY_NAME" >/dev/null
+docker volume rm "$LOCAL_VOLUME" >/dev/null
+docker volume create "$LOCAL_VOLUME" >/dev/null
+docker run -d --name "$GATEWAY_NAME" \
+  -p "127.0.0.1:${GATEWAY_PORT}:9000" \
+  -v "$LOCAL_VOLUME:/data" \
+  -e MASKURA_ROOT_USER=smoke-root \
+  -e MASKURA_ROOT_PASSWORD=smoke-secret \
+  "$IMAGE_REF" >/dev/null
+ready=0
+for _ in $(seq 1 30); do
+  if curl --fail --silent "http://127.0.0.1:${GATEWAY_PORT}/ready" >/dev/null; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+if [ "$ready" -ne 1 ]; then
+  docker logs "$GATEWAY_NAME" || true
+  echo "ERROR: zero-config gateway with credential override did not become ready" >&2
+  exit 1
+fi
+curl --fail --silent --show-error \
+  -X PUT \
+  -H "x-maskura-access-key: smoke-root" \
+  -H "x-maskura-secret-key: smoke-secret" \
+  -H 'Content-Type: text/plain' \
+  --data-binary "$INPUT" \
+  "http://127.0.0.1:${GATEWAY_PORT}/maskura/override.txt" >/dev/null
+
+echo "release image zero-config local appliance smoke passed"

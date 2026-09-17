@@ -82,6 +82,24 @@ pub fn no_such_key(key: &str) -> axum::response::Response {
     )
 }
 
+pub fn no_such_bucket(bucket: &str) -> axum::response::Response {
+    s3_error_xml(
+        "NoSuchBucket",
+        "The specified bucket does not exist.",
+        bucket,
+        StatusCode::NOT_FOUND,
+    )
+}
+
+pub fn bucket_already_exists(bucket: &str) -> axum::response::Response {
+    s3_error_xml(
+        "BucketAlreadyExists",
+        "The requested bucket name is not available.",
+        bucket,
+        StatusCode::CONFLICT,
+    )
+}
+
 pub fn internal_error(key: &str, _detail: &str) -> axum::response::Response {
     s3_error_xml(
         "InternalError",

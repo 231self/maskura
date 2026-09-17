@@ -19,6 +19,7 @@ use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{HeaderMap, HeaderName, Method, StatusCode, Uri, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse},
     routing::{any, delete, get, head, post, put},
 };
@@ -26,7 +27,11 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
-use maskura_customer_config::{aliases as customer_env, resolve as resolve_customer_env};
+use maskura_customer_config::config::{
+    ManagedStreamingMode as ConfigManagedStreamingMode, MultipartMode as ConfigMultipartMode,
+    StreamingReadMode as ConfigStreamingReadMode,
+};
+use maskura_customer_config::{Config, aliases as customer_env, resolve as resolve_customer_env};
 use md5::Md5;
 use rand::{RngCore, rngs::OsRng};
 use serde::de::DeserializeOwned;
@@ -50,7 +55,7 @@ use crate::control::{
 };
 use crate::customer_headers;
 use crate::file_store::{FileStore, LocalChecksumState};
-use crate::integrity::{BodyVerifier, IntegrityError};
+use crate::integrity::{BodyVerifier, ContentMd5Verifier, IntegrityError};
 use crate::key_cipher::{KeyWrapping, SecretCipher};
 use crate::local_storage::LocalStorageRuntime;
 use crate::managed::{
@@ -119,6 +124,7 @@ pub struct AppState {
     pub service_storage: Arc<ServiceStorage>,
     pub s3_client: Option<Client>,
     pub supabase_url: String,
+    pub supabase_anon_key: String,
     pub jwt_decoder: Option<Arc<jsonwebtoken::DecodingKey>>,
     pub auth_disabled: bool,
     pub explicit_single_tenant: bool,
@@ -695,24 +701,17 @@ pub struct StatePipelineTemplate {
 
 impl StatePipelineTemplate {
     #[doc(hidden)]
-    pub fn from_env() -> anyhow::Result<Self> {
-        let source_body_limits = source_body_limits_from_env()?;
-        let explicit_component_path = component_path()?;
+    pub fn from_config(config: &Config) -> anyhow::Result<Self> {
+        let source_body_limits = source_body_limits(config)?;
+        let explicit_component_path = component_path(config);
         let component_bytes = std::fs::read(&explicit_component_path)?;
-        let pipeline_fuel = resolve_customer_env(customer_env::WASM_FUEL)?
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(crate::plugin_registry::DEFAULT_PIPELINE_FUEL);
+        let pipeline_fuel = pipeline_fuel(config);
         let engine = Arc::new(maskura_wasm_runtime::FilterEngine::with_fuel(
             &component_bytes,
             pipeline_fuel,
         )?);
         let default_pipeline_limits = PipelineLimits::default();
-        let max_pipeline_output_bytes =
-            resolve_customer_env(customer_env::MAX_PIPELINE_OUTPUT_BYTES)?
-                .and_then(|value| value.parse::<u64>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(default_pipeline_limits.max_output_bytes)
-                .min(default_pipeline_limits.max_output_bytes);
+        let max_pipeline_output_bytes = max_pipeline_output_bytes(config);
         let pipeline_limits = PipelineLimits {
             max_input_bytes: default_pipeline_limits
                 .max_input_bytes
@@ -726,7 +725,7 @@ impl StatePipelineTemplate {
             pipeline_limits,
             maskura_wasm_runtime::ExecutorConfig::default(),
         )?;
-        let prefix_safe_hashes = prefix_safe_component_hashes()?;
+        let prefix_safe_hashes = prefix_safe_component_hashes(config);
 
         use sha2::Digest as _;
         let default_hash = hex::encode(sha2::Sha256::digest(&component_bytes));
@@ -738,7 +737,7 @@ impl StatePipelineTemplate {
             },
         )?;
 
-        if let Some(plugin_dir) = resolve_customer_env(customer_env::PLUGINS_DIR)? {
+        if let Some(plugin_dir) = &config.wasm.plugins_dir {
             let dir = std::path::Path::new(&plugin_dir);
             if dir.exists() {
                 plugins.load_from_dir_with_capabilities_excluding(
@@ -749,7 +748,7 @@ impl StatePipelineTemplate {
             }
         }
 
-        let stable_demo_component = bundled_stable_component()?;
+        let stable_demo_component = bundled_stable_component(config)?;
         let demo = build_demo_pipeline_template(
             &component_bytes,
             stable_demo_component.as_deref(),
@@ -767,6 +766,15 @@ impl StatePipelineTemplate {
         let plugins = Arc::new(self.plugins.isolated_clone()?);
         let gateway = Gateway::with_shared_registry(Arc::clone(&self.engine), plugins.clone());
         Ok((gateway, plugins, self.demo.instantiate()?))
+    }
+
+    /// Disable every catalog plugin so the resolved pipeline is an explicit
+    /// byte-preserving pass-through. The auto-local appliance starts this way;
+    /// the transform pipeline remains available but opt-in.
+    fn disable_all_plugins(&self) {
+        for plugin in self.plugins.list() {
+            self.plugins.set_enabled(&plugin.id, false);
+        }
     }
 }
 
@@ -885,18 +893,12 @@ pub enum StreamingReadMode {
 }
 
 impl StreamingReadMode {
-    fn from_env() -> anyhow::Result<Self> {
-        Ok(
-            match resolve_customer_env(customer_env::STREAMING_READ_MODE)?.as_deref() {
-                Some("passthrough") => Self::Passthrough,
-                Some("transformed") => Self::Transformed,
-                Some("off") | None => Self::Off,
-                Some(value) => {
-                    warn!("invalid MASKURA_STREAMING_READ_MODE={value:?}; using off");
-                    Self::Off
-                }
-            },
-        )
+    fn from_config(config: &Config) -> Self {
+        match config.features.streaming_read_mode {
+            ConfigStreamingReadMode::Off => Self::Off,
+            ConfigStreamingReadMode::Passthrough => Self::Passthrough,
+            ConfigStreamingReadMode::Transformed => Self::Transformed,
+        }
     }
 
     fn streams_passthrough(self) -> bool {
@@ -904,41 +906,32 @@ impl StreamingReadMode {
     }
 }
 
-fn transformed_read_spool_enabled() -> anyhow::Result<bool> {
-    Ok(resolve_customer_env(customer_env::TRANSFORMED_READ_SPOOL)?
-        .is_some_and(|value| value.eq_ignore_ascii_case("encrypted")))
-}
-
-fn binary_avro_enabled() -> anyhow::Result<bool> {
-    Ok(resolve_customer_env(customer_env::ENABLE_AVRO)?
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")))
-}
-
 /// Imported plugins are unsafe by default. Operators may opt known component
 /// digests into direct reads at process start; dashboard callers cannot raise
 /// this capability and a digest cannot be re-registered with different flags.
-fn prefix_safe_component_hashes() -> anyhow::Result<HashSet<String>> {
-    Ok(
-        resolve_customer_env(customer_env::PREFIX_SAFE_COMPONENT_HASHES)?
-            .into_iter()
-            .flat_map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .filter_map(|hash| {
-                let valid = hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit());
-                if !valid {
-                    warn!("ignoring invalid MASKURA_PREFIX_SAFE_COMPONENT_HASHES entry");
-                    None
-                } else {
-                    Some(hash.to_ascii_lowercase())
-                }
-            })
-            .collect(),
-    )
+fn prefix_safe_component_hashes(config: &Config) -> HashSet<String> {
+    config
+        .wasm
+        .prefix_safe_component_hashes
+        .iter()
+        .map(|hash| hash.to_ascii_lowercase())
+        .collect()
+}
+
+fn pipeline_fuel(config: &Config) -> u64 {
+    config
+        .wasm
+        .fuel
+        .unwrap_or(crate::plugin_registry::DEFAULT_PIPELINE_FUEL)
+}
+
+fn max_pipeline_output_bytes(config: &Config) -> u64 {
+    let immutable_max = PipelineLimits::default().max_output_bytes;
+    config
+        .limits
+        .max_pipeline_output_bytes
+        .unwrap_or(immutable_max)
+        .min(immutable_max)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -956,45 +949,16 @@ enum MultipartPersistenceMode {
     HostedStaged,
 }
 
-fn multipart_mode() -> anyhow::Result<MultipartMode> {
-    Ok(
-        match resolve_customer_env(customer_env::MULTIPART_MODE)?.as_deref() {
-            Some("staged") => MultipartMode::Staged,
-            Some("reject") | None => MultipartMode::Reject,
-            Some(value) => {
-                warn!("invalid MASKURA_MULTIPART_MODE={value:?}; using reject");
-                MultipartMode::Reject
-            }
-        },
-    )
-}
-
-fn configured_s3_streaming_capabilities() -> anyhow::Result<Option<BackendCapabilities>> {
-    let Some(provider) = resolve_customer_env(customer_env::STREAMING_S3_PROVIDER)? else {
-        return Ok(None);
-    };
-    if !matches!(provider.as_str(), "aws" | "minio" | "r2" | "b2") {
-        warn!("unknown MASKURA_STREAMING_S3_PROVIDER={provider:?}; direct streaming disabled");
-        return Ok(None);
+fn multipart_mode(config: &Config) -> MultipartMode {
+    match config.features.multipart_mode {
+        ConfigMultipartMode::Reject => MultipartMode::Reject,
+        ConfigMultipartMode::Staged => MultipartMode::Staged,
     }
-    Ok(Some(BackendCapabilities {
-        incomplete_upload_discovery: IncompleteUploadDiscovery::ExactKeyAndStartTime,
-        abort_incomplete_upload: true,
-        cleanup_sla: Some(Duration::from_secs(5 * 60)),
-        lifecycle_rule: true,
-        versioning: VersioningCapability::Optional,
-        conditional_reads: ConditionalReadCapability::VersionAndEtag,
-        response_checksums: ResponseChecksumCapability::Standard,
-        list_operations: ListCapability::V1AndV2,
-        multipart_responses: MultipartResponseCapability::Standard,
-        completion_reconciliation: CompletionReconciliation::HeadWithOperationIdentity,
-    }))
 }
 
-fn configured_managed_streaming_capabilities() -> Option<BackendCapabilities> {
-    let configured = std::env::var("MASKURA_MANAGED_STREAMING_TRANSACTIONAL")
-        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-    configured.then_some(BackendCapabilities {
+fn configured_s3_streaming_capabilities(config: &Config) -> Option<BackendCapabilities> {
+    config.features.streaming_s3_provider?;
+    Some(BackendCapabilities {
         incomplete_upload_discovery: IncompleteUploadDiscovery::ExactKeyAndStartTime,
         abort_incomplete_upload: true,
         cleanup_sla: Some(Duration::from_secs(5 * 60)),
@@ -1008,26 +972,90 @@ fn configured_managed_streaming_capabilities() -> Option<BackendCapabilities> {
     })
 }
 
-fn legacy_max_object_bytes() -> anyhow::Result<usize> {
-    let configured = match resolve_customer_env(customer_env::LEGACY_MAX_OBJECT_BYTES)? {
-        Some(raw) => match raw.parse::<usize>() {
-            Ok(value) if value > 0 => value,
-            _ => {
-                warn!(
-                    "invalid MASKURA_LEGACY_MAX_OBJECT_BYTES={raw:?}; using {LEGACY_MAX_OBJECT_BYTES}"
-                );
-                LEGACY_MAX_OBJECT_BYTES
-            }
-        },
-        None => LEGACY_MAX_OBJECT_BYTES,
-    };
-    let bounded = configured.min(LEGACY_MAX_OBJECT_BYTES);
-    if bounded != configured {
-        warn!(
-            "MASKURA_LEGACY_MAX_OBJECT_BYTES={configured} exceeds the immutable 16 MiB limit; using {bounded}"
-        );
+fn configured_managed_streaming_capabilities(config: &Config) -> Option<BackendCapabilities> {
+    config
+        .features
+        .managed_streaming_transactional
+        .then_some(BackendCapabilities {
+            incomplete_upload_discovery: IncompleteUploadDiscovery::ExactKeyAndStartTime,
+            abort_incomplete_upload: true,
+            cleanup_sla: Some(Duration::from_secs(5 * 60)),
+            lifecycle_rule: true,
+            versioning: VersioningCapability::Optional,
+            conditional_reads: ConditionalReadCapability::VersionAndEtag,
+            response_checksums: ResponseChecksumCapability::Standard,
+            list_operations: ListCapability::V1AndV2,
+            multipart_responses: MultipartResponseCapability::Standard,
+            completion_reconciliation: CompletionReconciliation::HeadWithOperationIdentity,
+        })
+}
+
+fn legacy_max_object_bytes(config: &Config) -> usize {
+    config
+        .limits
+        .legacy_max_object_bytes
+        .unwrap_or(LEGACY_MAX_OBJECT_BYTES as u64)
+        .min(LEGACY_MAX_OBJECT_BYTES as u64) as usize
+}
+
+fn dev_memory_max_object_bytes(config: &Config) -> usize {
+    config
+        .limits
+        .dev_memory_max_object_bytes
+        .unwrap_or(LEGACY_MAX_OBJECT_BYTES as u64)
+        .min(64 * 1024 * 1024) as usize
+}
+
+fn multipart_quota_bytes(config: &Config, source_max_bytes: u64) -> (u64, u64) {
+    let tenant = config
+        .multipart_staging
+        .tenant_quota_bytes
+        .unwrap_or_else(|| source_max_bytes.saturating_mul(MAX_ACTIVE_UPLOADS as u64));
+    let global = config
+        .multipart_staging
+        .global_quota_bytes
+        .unwrap_or_else(|| tenant.saturating_mul(4));
+    (tenant, global)
+}
+
+fn spool_limits(config: &Config, source_max_bytes: u64) -> (u64, u64) {
+    let max_object = config
+        .spool
+        .max_object_bytes
+        .unwrap_or(source_max_bytes)
+        .min(source_max_bytes);
+    let quota = config
+        .spool
+        .quota_bytes
+        .filter(|value| *value >= max_object)
+        .unwrap_or(max_object.saturating_mul(2));
+    (max_object, quota)
+}
+
+fn managed_placement_version(config: &Config) -> u32 {
+    config
+        .managed
+        .placement_version
+        .unwrap_or(PLACEMENT_VERSION_V1)
+}
+
+async fn ensure_configured_local_root(
+    keys: &dyn KeyRepository,
+    access_key: &str,
+    secret: &str,
+    workspace: &WorkspaceId,
+) -> anyhow::Result<()> {
+    if keys.get_key(access_key).await?.is_none() {
+        keys.bootstrap_root_credential(access_key, secret, "root", workspace, "local-root")
+            .await?;
+    } else if keys
+        .resolve_credentials(access_key, secret)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("configured local root credentials do not match the persisted credential");
     }
-    Ok(bounded)
+    Ok(())
 }
 
 /// Derive the deterministic-encryption key for an API key secret:
@@ -1299,6 +1327,12 @@ fn insert_number<T: ToString>(metadata: &mut ObjectMetadata, name: &'static str,
     if let Some(value) = value {
         metadata.insert(HeaderName::from_static(name), value.to_string());
     }
+}
+
+fn http_date(millis: i64) -> Option<String> {
+    aws_smithy_types::DateTime::from_millis(millis)
+        .fmt(DateTimeFormat::HttpDate)
+        .ok()
 }
 
 fn s3_response_body(
@@ -1804,6 +1838,9 @@ async fn open_backend_object(
                 metadata.insert(header::CONTENT_TYPE, &stored.content_type);
                 metadata.insert(header::ETAG, &stored.etag);
                 metadata.insert(header::ACCEPT_RANGES, "bytes");
+                if let Some(modified) = stored.last_modified_ms.and_then(http_date) {
+                    metadata.insert(header::LAST_MODIFIED, modified);
+                }
                 apply_file_stored_headers(
                     &mut metadata,
                     &stored.representation_headers,
@@ -1829,6 +1866,9 @@ async fn open_backend_object(
             metadata.insert(header::CONTENT_TYPE, &object.content_type);
             metadata.insert(header::ETAG, &object.etag);
             metadata.insert(header::ACCEPT_RANGES, "bytes");
+            if let Some(modified) = object.last_modified_ms.and_then(http_date) {
+                metadata.insert(header::LAST_MODIFIED, modified);
+            }
             apply_file_stored_headers(
                 &mut metadata,
                 &object.representation_headers,
@@ -3083,9 +3123,13 @@ async fn streaming_put_failure_response(
 fn streaming_format(headers: &HeaderMap) -> Result<(Format, String), StreamingPutError> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
-        .ok_or_else(|| StreamingPutError::InvalidRequest("Content-Type is required".to_string()))?
-        .to_str()
-        .map_err(|_| StreamingPutError::InvalidRequest("invalid Content-Type".to_string()))?;
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| StreamingPutError::InvalidRequest("invalid Content-Type".to_string()))
+        })
+        .transpose()?
+        .unwrap_or("application/octet-stream");
     streaming_format_content_type(content_type)
 }
 
@@ -3104,6 +3148,7 @@ fn streaming_format_content_type(
         "application/json" => Format::Json,
         "text/csv" => Format::Csv,
         "text/tab-separated-values" => Format::Tsv,
+        "application/octet-stream" | "binary/octet-stream" => Format::Binary,
         _ => {
             return Err(StreamingPutError::Unsupported(format!(
                 "unsupported streaming Content-Type {media_type:?}"
@@ -3311,7 +3356,7 @@ async fn begin_streaming_sink(
     key: &str,
     content_type: &str,
     multipart_publication: Option<(&MultipartCompletionCoordinator, &MultipartIdentity, &str)>,
-    multipart_metadata: Option<MultipartStoredMetadata>,
+    metadata: Option<MultipartStoredMetadata>,
 ) -> Result<Box<dyn ObjectSinkTransaction>, StreamingPutError> {
     validate_streaming_backend(state, &backend)?;
     match backend {
@@ -3552,18 +3597,19 @@ async fn begin_streaming_sink(
                         content_type,
                         state.max_pipeline_output_bytes,
                         destination_operation_id,
-                        multipart_metadata.unwrap_or_default(),
+                        metadata.clone().unwrap_or_default(),
                     )
                     .await?,
                 ))
             } else {
                 Ok(Box::new(
-                    FileSinkTransaction::new(
+                    FileSinkTransaction::new_with_metadata(
                         store,
                         bucket,
                         key,
                         content_type,
                         state.max_pipeline_output_bytes,
+                        metadata.clone().unwrap_or_default(),
                     )
                     .await?,
                 ))
@@ -3690,6 +3736,23 @@ fn direct_operation_scope(
     DirectOperationScope {
         operation_id,
         tenant_id: operation.auth.workspace_id().as_str().to_string(),
+    }
+}
+
+/// For File-backed storage, reject writes to a bucket that does not exist yet.
+/// S3 buckets are explicit: a PutObject must not silently create one. Non-File
+/// backends are unaffected.
+async fn require_file_bucket(
+    backend: &ResolvedBackend,
+    bucket: &str,
+) -> Option<axum::response::Response> {
+    let ResolvedBackend::File(store) = backend else {
+        return None;
+    };
+    match store.bucket_exists(bucket).await {
+        Ok(true) => None,
+        Ok(false) => Some(s3_error::no_such_bucket(bucket)),
+        Err(error) => Some(s3_error::invalid_request(bucket, &error.to_string())),
     }
 }
 
@@ -3855,6 +3918,8 @@ async fn streaming_single_put(
         .await;
     }
     let (format, content_type) = streaming_format(headers)?;
+    let mut content_md5 =
+        ContentMd5Verifier::from_headers(headers).map_err(StreamingPutError::Integrity)?;
     let sink = begin_streaming_sink(
         state,
         backend,
@@ -3867,11 +3932,12 @@ async fn streaming_single_put(
         key,
         &content_type,
         None,
-        None,
+        Some(single_put_stored_metadata(headers)),
     )
     .await?;
     let mut sink_guard = SinkAbortGuard::new(sink);
     let sink = Arc::clone(&sink_guard.sink);
+
     let stable_fields = customer_headers::validated(headers, customer_headers::STABLE_FIELDS)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
@@ -3933,6 +3999,9 @@ async fn streaming_single_put(
                 vec![data]
             };
             for chunk in decoded {
+                if let Some(verifier) = &mut content_md5 {
+                    verifier.update(&chunk);
+                }
                 input_bytes = input_bytes
                     .checked_add(chunk.len() as u64)
                     .ok_or(StreamingPutError::InputTooLarge)?;
@@ -3960,6 +4029,9 @@ async fn streaming_single_put(
                     IntegrityError::DecodedLengthMismatch,
                 ));
             }
+        }
+        if let Some(verifier) = content_md5.take() {
+            verifier.finish().map_err(StreamingPutError::Integrity)?;
         }
         decoder.finish()?;
         while let Some(record) = decoder.next_record()? {
@@ -4124,6 +4196,8 @@ async fn streaming_avro_single_put(
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
+    let mut content_md5 =
+        ContentMd5Verifier::from_headers(headers).map_err(StreamingPutError::Integrity)?;
     let sink = begin_streaming_sink(
         state,
         backend,
@@ -4161,6 +4235,9 @@ async fn streaming_avro_single_put(
                 vec![data]
             };
             for chunk in decoded {
+                if let Some(verifier) = &mut content_md5 {
+                    verifier.update(&chunk);
+                }
                 input_bytes = input_bytes
                     .checked_add(chunk.len() as u64)
                     .ok_or(StreamingPutError::InputTooLarge)?;
@@ -4177,6 +4254,9 @@ async fn streaming_avro_single_put(
                     IntegrityError::DecodedLengthMismatch,
                 ));
             }
+        }
+        if let Some(verifier) = content_md5.take() {
+            verifier.finish().map_err(StreamingPutError::Integrity)?;
         }
 
         let limits = crate::avro::AvroLimits {
@@ -4415,6 +4495,45 @@ fn multipart_stored_metadata(snapshot: &MultipartSnapshot) -> MultipartStoredMet
         user_metadata,
         tags: snapshot.tags.clone(),
         checksum_algorithm: snapshot.checksum_mode.clone(),
+    }
+}
+
+/// Capture single-PUT representation/user metadata and tags from headers so a
+/// plain PutObject persists the same metadata as a multipart completion.
+fn single_put_stored_metadata(headers: &HeaderMap) -> MultipartStoredMetadata {
+    let mut representation_headers = std::collections::BTreeMap::new();
+    let mut user_metadata = std::collections::BTreeMap::new();
+    for (name, value) in headers {
+        let Some(value) = value.to_str().ok() else {
+            continue;
+        };
+        if let Some(meta) = name.as_str().strip_prefix("x-amz-meta-") {
+            user_metadata.insert(meta.to_string(), value.to_string());
+        } else if name.as_str() == "content-encoding" {
+            representation_headers.insert("content-encoding".to_string(), value.to_string());
+        }
+    }
+    let tags = headers
+        .get("x-amz-tagging")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split('&')
+                .filter_map(|pair| {
+                    pair.split_once('=')
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    MultipartStoredMetadata {
+        representation_headers,
+        user_metadata,
+        tags,
+        checksum_algorithm: headers
+            .get("x-amz-checksum-algorithm")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned),
     }
 }
 
@@ -6437,6 +6556,16 @@ async fn s3_put(
             .await;
         }
     };
+    if let Some(response) = require_file_bucket(&backend, &bucket).await {
+        return release_failure(
+            state.control.as_ref(),
+            &auth_context,
+            &grant,
+            &key,
+            response,
+        )
+        .await;
+    }
     if let Err(error) = validate_streaming_backend(&state, &backend) {
         let response = streaming_put_error_response(&key, error);
         return release_failure(
@@ -8260,15 +8389,82 @@ mod tests {
 
     #[test]
     fn startup_storage_boundary_requires_explicit_single_tenant_or_managed_storage() {
-        assert!(explicit_single_tenant_mode(true, false));
-        assert!(explicit_single_tenant_mode(false, true));
-        assert!(!explicit_single_tenant_mode(false, false));
+        let mut config = Config::default();
+        assert!(!explicit_single_tenant_mode(&config, false));
+        assert!(explicit_single_tenant_mode(&config, true));
+
+        config.auth.disabled = true;
+        assert!(explicit_single_tenant_mode(&config, false));
+        config.auth.disabled = false;
+        config.storage.single_tenant = true;
+        assert!(explicit_single_tenant_mode(&config, false));
 
         assert!(validate_storage_boundary_startup(false, true, true).is_err());
         assert!(validate_storage_boundary_startup(false, false, false).is_err());
         assert!(validate_storage_boundary_startup(false, false, true).is_ok());
         assert!(validate_storage_boundary_startup(true, true, false).is_ok());
         assert!(validate_storage_boundary_startup(true, false, false).is_ok());
+    }
+
+    #[test]
+    fn auto_local_profile_uses_resolved_storage_config_and_operator_inputs() {
+        let mut config = Config::default();
+        assert!(auto_local_appliance_with_operator_state(
+            &config, false, false
+        ));
+        assert!(!auto_local_appliance_with_operator_state(
+            &config, true, false
+        ));
+        assert!(!auto_local_appliance_with_operator_state(
+            &config, false, true
+        ));
+
+        config.storage.s3_endpoint = Some("http://minio:9000".to_string());
+        assert!(!auto_local_appliance_with_operator_state(
+            &config, false, false
+        ));
+        config.storage.s3_endpoint = None;
+        config.storage.mode = Some("local".to_string());
+        assert!(!auto_local_appliance_with_operator_state(
+            &config, false, false
+        ));
+        config.storage.mode = None;
+        config.storage.local_dir = Some("./data".to_string());
+        assert!(!auto_local_appliance_with_operator_state(
+            &config, false, false
+        ));
+        config.storage.local_dir = None;
+        config.storage.single_tenant = true;
+        assert!(!auto_local_appliance_with_operator_state(
+            &config, false, false
+        ));
+    }
+
+    #[test]
+    fn auto_local_defaults_do_not_override_explicit_feature_modes() {
+        let defaults = Config::default();
+        assert_eq!(
+            effective_multipart_mode(&defaults, true),
+            MultipartMode::Staged
+        );
+        assert_eq!(
+            effective_streaming_read_mode(&defaults, true),
+            StreamingReadMode::Passthrough
+        );
+
+        let explicit = Config::from_toml_str(
+            "[features]\nmultipart_mode = \"reject\"\nstreaming_read_mode = \"off\"\n\n[wasm]\nfilter_component = \"/tmp/noop.wasm\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            effective_multipart_mode(&explicit, true),
+            MultipartMode::Reject
+        );
+        assert_eq!(
+            effective_streaming_read_mode(&explicit, true),
+            StreamingReadMode::Off
+        );
+        assert!(explicit.filter_component_is_explicit());
     }
 
     #[test]
@@ -10207,6 +10403,9 @@ async fn s3_post(
         if let Err(error) = validate_streaming_backend(&state, &backend) {
             return streaming_put_error_response(&key, error);
         }
+        if let Some(response) = require_file_bucket(&backend, &bucket).await {
+            return response;
+        }
         if let ResolvedBackend::Managed(storage) = &backend
             && let Err(error) = storage
                 .assert_namespace_active(auth.workspace_id().as_str())
@@ -10849,7 +11048,7 @@ fn list_from_memory(
         .filter_map(|full| full.strip_prefix(&bucket_prefix).map(|key| key.to_string()))
         .map(|key| {
             let (size, _, etag) = store.metadata(bucket, &key).unwrap_or_default();
-            (key, etag, size as u64)
+            (key, etag, size as u64, None)
         })
         .collect();
     list_from_local_objects(objects, bucket, params, continuation_key)
@@ -10869,7 +11068,7 @@ async fn list_from_file(
 }
 
 fn list_from_local_objects(
-    objects: Vec<(String, String, u64)>,
+    objects: Vec<(String, String, u64, Option<i64>)>,
     bucket: &str,
     params: &S3Query,
     continuation_key: &[u8; 32],
@@ -10904,18 +11103,18 @@ fn list_from_local_objects(
             .map(ToOwned::to_owned),
     };
 
-    let mut objects: Vec<(String, String, u64)> = objects
+    let mut objects: Vec<(String, String, u64, Option<i64>)> = objects
         .into_iter()
-        .filter(|(key, _, _)| key.starts_with(prefix))
+        .filter(|(key, _, _, _)| key.starts_with(prefix))
         .collect();
     objects.sort_by(|left, right| left.0.cmp(&right.0));
     enum Output {
-        Content((String, String, u64)),
+        Content((String, String, u64, Option<i64>)),
         Common(String),
     }
     let mut outputs: Vec<Output> = Vec::new();
     let mut prev_common: Option<String> = None;
-    for (k, etag, size) in objects {
+    for (k, etag, size, modified) in objects {
         if let Some(delim) = delimiter.filter(|d| !d.is_empty())
             && let Some(rel) = k.strip_prefix(prefix)
             && let Some(idx) = rel.find(delim)
@@ -10928,7 +11127,7 @@ fn list_from_local_objects(
             continue;
         }
         prev_common = None;
-        outputs.push(Output::Content((k, etag, size)));
+        outputs.push(Output::Content((k, etag, size, modified)));
     }
 
     // Continue from the previous *listed output*, not the raw object key. A
@@ -10936,12 +11135,12 @@ fn list_from_local_objects(
     // after it; filtering only raw keys would repeat that CommonPrefix forever.
     if let Some(resume_after) = &resume_after {
         outputs.retain(|output| match output {
-            Output::Content((key, _, _)) => key > resume_after,
+            Output::Content((key, _, _, _)) => key > resume_after,
             Output::Common(prefix) => prefix > resume_after,
         });
     }
 
-    let mut contents: Vec<(String, String, u64)> = Vec::new();
+    let mut contents: Vec<(String, String, u64, Option<i64>)> = Vec::new();
     let mut commons: Vec<String> = Vec::new();
     let mut seen = 0usize;
     for out in outputs.iter().take(max_keys) {
@@ -10956,7 +11155,7 @@ fn list_from_local_objects(
     let truncated = max_keys > 0 && outputs.len() > seen;
     let next_token = if truncated && seen > 0 {
         outputs.get(seen - 1).map(|out| match out {
-            Output::Content((k, _, _)) => k.clone(),
+            Output::Content((k, _, _, _)) => k.clone(),
             Output::Common(cp) => cp.clone(),
         })
     } else {
@@ -11012,10 +11211,14 @@ fn list_from_local_objects(
         };
         xml.push_str(&elem);
     }
-    for (k, etag, size) in &contents {
+    for (k, etag, size, modified) in &contents {
         let display = if encoding { url_encode(k) } else { k.clone() };
+        let last_modified = modified
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string());
         xml.push_str(&format!(
-            "<Contents><Key>{}</Key><LastModified>1970-01-01T00:00:00.000Z</LastModified><ETag>{}</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+            "<Contents><Key>{}</Key><LastModified>{last_modified}</LastModified><ETag>{}</ETag><Size>{size}</Size><StorageClass>STANDARD</StorageClass></Contents>",
             xml_escape(&display),
             xml_escape(etag)
         ));
@@ -11050,7 +11253,7 @@ async fn root(
                 .any(|pair| pair.starts_with("X-Amz-Algorithm="))
         });
     if !is_s3 {
-        return Html(dashboard_html()).into_response();
+        return Html(dashboard_html(&state)).into_response();
     }
     let auth = match authenticate(method.as_str(), &uri, &headers, &[], &state.keys, &state).await {
         Ok(auth) => auth,
@@ -11130,8 +11333,12 @@ async fn s3_bucket_put(
         Err(error) => return authentication_error_response(&bucket, error),
     };
     match resolve_backend(&state, &auth, &headers, StorageOperation::Put).await {
-        Ok(ResolvedBackend::File(store)) => match store.create_bucket(&bucket).await {
-            Ok(()) => StatusCode::OK.into_response(),
+        Ok(ResolvedBackend::File(store)) => match store.bucket_exists(&bucket).await {
+            Ok(true) => s3_error::bucket_already_exists(&bucket),
+            Ok(false) => match store.create_bucket(&bucket).await {
+                Ok(()) => StatusCode::OK.into_response(),
+                Err(error) => s3_error::invalid_request(&bucket, &error.to_string()),
+            },
             Err(error) => s3_error::invalid_request(&bucket, &error.to_string()),
         },
         Ok(_) => s3_error::bucket_not_allowed(&bucket),
@@ -11152,11 +11359,15 @@ async fn s3_bucket_delete(
         Err(error) => return authentication_error_response(&bucket, error),
     };
     match resolve_backend(&state, &auth, &headers, StorageOperation::Delete).await {
-        Ok(ResolvedBackend::File(store)) => match store.delete_bucket(&bucket).await {
-            Ok(_) => StatusCode::NO_CONTENT.into_response(),
-            Err(crate::file_store::FileStoreError::BucketNotEmpty) => {
-                s3_error::bucket_not_empty(&bucket)
-            }
+        Ok(ResolvedBackend::File(store)) => match store.bucket_exists(&bucket).await {
+            Ok(false) => s3_error::no_such_bucket(&bucket),
+            Ok(true) => match store.delete_bucket(&bucket).await {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(crate::file_store::FileStoreError::BucketNotEmpty) => {
+                    s3_error::bucket_not_empty(&bucket)
+                }
+                Err(error) => s3_error::invalid_request(&bucket, &error.to_string()),
+            },
             Err(error) => s3_error::invalid_request(&bucket, &error.to_string()),
         },
         Ok(_) => s3_error::bucket_not_allowed(&bucket),
@@ -11164,15 +11375,11 @@ async fn s3_bucket_delete(
     }
 }
 
-fn dashboard_html() -> String {
+fn dashboard_html(state: &AppState) -> String {
     let html = include_str!("../static/dashboard.html");
-    let auth_disabled = std::env::var("AUTH_DISABLED")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let supabase_url =
-        std::env::var("SUPABASE_URL").unwrap_or_else(|_| "http://127.0.0.1:54321".to_string());
-    let anon_key = std::env::var("SUPABASE_ANON_KEY")
-        .unwrap_or_else(|_| "sb_publishable_ACJWlzQHlZjBrEguHvfOxg_3BJgxAaH".to_string());
+    let auth_disabled = state.auth_disabled;
+    let supabase_url = &state.supabase_url;
+    let anon_key = &state.supabase_anon_key;
     let has_supabase = anon_key.starts_with("sb_");
 
     let supabase_script = if has_supabase {
@@ -11202,6 +11409,74 @@ fn dashboard_html() -> String {
 
 async fn health() -> impl IntoResponse {
     "ok"
+}
+
+/// Readiness: local storage is initialized and listable (liveness plus a
+/// filesystem sanity check). The OCI healthcheck and Compose gate on this.
+async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(file_store) = &state.file_store {
+        match file_store.list_buckets().await {
+            Ok(_) => StatusCode::OK,
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    } else {
+        StatusCode::OK
+    }
+}
+
+/// S3 subresources Maskura does not implement. Before dispatch, any request
+/// carrying one of these is rejected with `NotImplemented` so it can never be
+/// misrouted into a destructive operation (e.g. `PUT ?versioning` creating a
+/// bucket or `PUT ?tagging` overwriting an object).
+const UNSUPPORTED_S3_SUBRESOURCES: &[&str] = &[
+    "acl",
+    "tagging",
+    "policy",
+    "versioning",
+    "versions",
+    "location",
+    "lifecycle",
+    "retention",
+    "legal-hold",
+    "delete",
+    "cors",
+    "encryption",
+    "replication",
+    "requestPayment",
+    "website",
+    "notification",
+    "object-lock",
+    "accelerate",
+    "logging",
+    "metrics",
+    "ownershipControls",
+    "publicAccessBlock",
+    "intelligent-tiering",
+    "inventory",
+    "analytics",
+    "select",
+    "restore",
+];
+
+/// Reject unsupported S3 operations before method/path dispatch. CopyObject and
+/// UploadPartCopy (via `x-amz-copy-source`) and any unsupported subresource
+/// return `501 NotImplemented` without touching state.
+async fn reject_unsupported_s3_operations(
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    if request.headers().contains_key("x-amz-copy-source") {
+        return s3_error::not_implemented("");
+    }
+    if request.uri().query().is_some_and(|query| {
+        query.split('&').any(|pair| {
+            let key = pair.split('=').next().unwrap_or(pair);
+            UNSUPPORTED_S3_SUBRESOURCES.contains(&key)
+        })
+    }) {
+        return s3_error::not_implemented("");
+    }
+    next.run(request).await
 }
 
 fn invalid_credential_mutation_response() -> axum::response::Response {
@@ -11809,10 +12084,17 @@ async fn list_objects(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(objects)
 }
 
-fn component_path() -> anyhow::Result<PathBuf> {
-    Ok(resolve_customer_env(customer_env::DEFAULT_PLUGIN)?
+fn component_path(config: &Config) -> PathBuf {
+    config
+        .wasm
+        .filter_component
+        .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| {
+            let installed = PathBuf::from("/app/components/pii-default.component.wasm");
+            if installed.exists() {
+                return installed;
+            }
             let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             p.push("..");
             p.push("..");
@@ -11820,11 +12102,11 @@ fn component_path() -> anyhow::Result<PathBuf> {
             p.push("components");
             p.push("pii-default.component.wasm");
             p
-        }))
+        })
 }
 
-fn bundled_stable_component() -> anyhow::Result<Option<Vec<u8>>> {
-    let directory = match resolve_customer_env(customer_env::PLUGINS_DIR)? {
+fn bundled_stable_component(config: &Config) -> anyhow::Result<Option<Vec<u8>>> {
+    let directory = match &config.wasm.plugins_dir {
         Some(directory) => PathBuf::from(directory),
         None => {
             warn!("join demo disabled because MASKURA_PLUGINS_DIR is not configured");
@@ -11844,12 +12126,62 @@ fn bundled_stable_component() -> anyhow::Result<Option<Vec<u8>>> {
     }
 }
 
-fn enabled_env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+/// Whether the gateway should boot as a zero-configuration local S3 appliance
+/// (the MinIO replacement). True only when no hosted or external storage
+/// configuration is present, so an explicit cloud/hosted deployment never
+/// silently degrades into a local single-node store. Operator-only and secret
+/// inputs (`MASKURA_SERVICE_BUCKETS`, `DATABASE_URL`) stay environment-sourced;
+/// the customer settings come from the resolved config.
+pub fn auto_local_appliance(config: &Config) -> bool {
+    auto_local_appliance_with_operator_state(
+        config,
+        nonempty_env("MASKURA_SERVICE_BUCKETS"),
+        nonempty_env("DATABASE_URL"),
+    )
 }
 
-fn explicit_single_tenant_mode(auth_disabled: bool, configured_single_tenant: bool) -> bool {
-    auth_disabled || configured_single_tenant
+fn auto_local_appliance_with_operator_state(
+    config: &Config,
+    has_service_backends: bool,
+    has_database: bool,
+) -> bool {
+    !has_service_backends
+        && config.storage.s3_endpoint.is_none()
+        && !has_database
+        && config.storage.mode.is_none()
+        && config.storage.local_dir.is_none()
+        && !config.storage.single_tenant
+}
+
+/// The effective default listen address for the current profile: the MinIO
+/// convention (9000) in auto-local mode, the historical gateway port (8080)
+/// otherwise.
+pub fn default_listen_addr(config: &Config) -> &'static str {
+    if auto_local_appliance(config) {
+        "0.0.0.0:9000"
+    } else {
+        "0.0.0.0:8080"
+    }
+}
+
+fn effective_multipart_mode(config: &Config, auto_local: bool) -> MultipartMode {
+    if auto_local && !config.multipart_mode_is_explicit() {
+        MultipartMode::Staged
+    } else {
+        multipart_mode(config)
+    }
+}
+
+fn effective_streaming_read_mode(config: &Config, auto_local: bool) -> StreamingReadMode {
+    if auto_local && !config.streaming_read_mode_is_explicit() {
+        StreamingReadMode::Passthrough
+    } else {
+        StreamingReadMode::from_config(config)
+    }
+}
+
+fn explicit_single_tenant_mode(config: &Config, auto_local: bool) -> bool {
+    config.auth.disabled || auto_local || config.storage.single_tenant
 }
 
 fn validate_storage_boundary_startup(
@@ -12108,15 +12440,19 @@ fn nonempty_env(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
 }
 
-fn source_body_limits_from_env() -> anyhow::Result<BodyLimits> {
+fn source_body_limits(config: &Config) -> anyhow::Result<BodyLimits> {
+    let max_frame_bytes = config
+        .limits
+        .source_max_frame_bytes
+        .map(usize::try_from)
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("limits.source_max_frame_bytes exceeds platform usize"))?
+        .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_FRAME_BYTES);
     Ok(BodyLimits {
-        max_frame_bytes: resolve_customer_env(customer_env::SOURCE_MAX_FRAME_BYTES)?
-            .and_then(|value| value.parse().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_FRAME_BYTES),
-        max_bytes: resolve_customer_env(customer_env::MAX_OBJECT_BYTES)?
-            .and_then(|value| value.parse().ok())
-            .filter(|value| *value > 0)
+        max_frame_bytes,
+        max_bytes: config
+            .limits
+            .max_object_bytes
             .unwrap_or(crate::object::DEFAULT_MAX_SOURCE_BYTES)
             .min(crate::object::DEFAULT_MAX_SOURCE_BYTES),
     })
@@ -12152,8 +12488,9 @@ fn managed_storage_launch_validation_rejects_unsupported_provider_before_serving
     );
 }
 
-/// Build the engine state from environment variables, injecting the given
-/// control plane and key-wrapping backend. This is the shared construction
+/// Build the engine state from resolved configuration, injecting the given
+/// control plane and key-wrapping backend. Secrets remain environment-sourced.
+/// This is the shared construction
 /// path for both the OSS self-host binary (`NoopControlPlane` +
 /// [`crate::key_cipher::default_wrapping`]) and the private SaaS control
 /// plane (KMS/Vault-backed wrapping).
@@ -12161,10 +12498,20 @@ pub async fn build_state(
     control: Arc<dyn ControlPlane>,
     wrapping: Arc<dyn KeyWrapping>,
     workspace_storage: Arc<dyn WorkspaceStorageRepository>,
+    config: &Config,
 ) -> anyhow::Result<Arc<AppState>> {
-    let pipeline_template = StatePipelineTemplate::from_env()?;
-    build_state_with_pipeline_template(control, wrapping, workspace_storage, &pipeline_template)
-        .await
+    let pipeline_template = StatePipelineTemplate::from_config(config)?;
+    if auto_local_appliance(config) && !config.filter_component_is_explicit() {
+        pipeline_template.disable_all_plugins();
+    }
+    build_state_with_pipeline_template(
+        control,
+        wrapping,
+        workspace_storage,
+        &pipeline_template,
+        config,
+    )
+    .await
 }
 
 /// Build isolated state from startup artifacts that have already compiled the
@@ -12175,50 +12522,54 @@ pub async fn build_state_with_pipeline_template(
     wrapping: Arc<dyn KeyWrapping>,
     workspace_storage: Arc<dyn WorkspaceStorageRepository>,
     pipeline_template: &StatePipelineTemplate,
+    config: &Config,
 ) -> anyhow::Result<Arc<AppState>> {
-    maskura_customer_config::validate(customer_env::GATEWAY_CUSTOMER_SETTINGS)?;
-    let s3_endpoint = std::env::var("S3_ENDPOINT").ok();
-    let auth_disabled = enabled_env_flag("AUTH_DISABLED");
-    let explicit_single_tenant = explicit_single_tenant_mode(
-        auth_disabled,
-        resolve_customer_env(customer_env::SINGLE_TENANT)?
-            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
-    );
+    let s3_endpoint = config.storage.s3_endpoint.clone();
+    let auto_local = auto_local_appliance(config);
+    let auth_disabled = config.auth.disabled;
+    let explicit_single_tenant = explicit_single_tenant_mode(config, auto_local);
     let service_backends = std::env::var("MASKURA_SERVICE_BUCKETS")
         .ok()
         .map(|value| parse_service_backends(&value))
         .transpose()
         .map_err(anyhow::Error::msg)?
         .unwrap_or_default();
-    let local_storage_mode = resolve_customer_env(customer_env::STORAGE_MODE)?;
-    let local_storage_dir = resolve_customer_env(customer_env::LOCAL_STORAGE_DIR)?;
-    let local_storage_root = match (local_storage_mode.as_deref(), local_storage_dir) {
-        (Some("local"), directory) => {
-            let directory = PathBuf::from(directory.unwrap_or_else(|| "./data".to_string()));
-            if !explicit_single_tenant {
-                anyhow::bail!("MASKURA_LOCAL_STORAGE_DIR requires single-tenant mode");
+    let local_storage_mode = config.storage.mode.clone();
+    let local_storage_dir = config.storage.local_dir.clone();
+    let local_storage_root = if auto_local {
+        // The zero-config appliance defaults to the container's `/data` volume.
+        // `MASKURA_LOCAL_STORAGE_DIR` still overrides it.
+        let directory = PathBuf::from(local_storage_dir.unwrap_or_else(|| "/data".to_string()));
+        Some(directory)
+    } else {
+        match (local_storage_mode.as_deref(), local_storage_dir) {
+            (Some("local"), directory) => {
+                let directory = PathBuf::from(directory.unwrap_or_else(|| "./data".to_string()));
+                if !explicit_single_tenant {
+                    anyhow::bail!("MASKURA_LOCAL_STORAGE_DIR requires single-tenant mode");
+                }
+                if s3_endpoint.is_some() || !service_backends.is_empty() {
+                    anyhow::bail!(
+                        "MASKURA_LOCAL_STORAGE_DIR is mutually exclusive with S3_ENDPOINT and MASKURA_SERVICE_BUCKETS"
+                    );
+                }
+                Some(directory)
             }
-            if s3_endpoint.is_some() || !service_backends.is_empty() {
-                anyhow::bail!(
-                    "MASKURA_LOCAL_STORAGE_DIR is mutually exclusive with S3_ENDPOINT and MASKURA_SERVICE_BUCKETS"
-                );
+            (None, Some(directory)) => {
+                let directory = PathBuf::from(directory);
+                if !explicit_single_tenant {
+                    anyhow::bail!("MASKURA_LOCAL_STORAGE_DIR requires single-tenant mode");
+                }
+                if s3_endpoint.is_some() || !service_backends.is_empty() {
+                    anyhow::bail!(
+                        "MASKURA_LOCAL_STORAGE_DIR is mutually exclusive with S3_ENDPOINT and MASKURA_SERVICE_BUCKETS"
+                    );
+                }
+                Some(directory)
             }
-            Some(directory)
+            (Some(_), _) => anyhow::bail!("MASKURA_STORAGE_MODE must be local when configured"),
+            (None, None) => None,
         }
-        (None, Some(directory)) => {
-            let directory = PathBuf::from(directory);
-            if !explicit_single_tenant {
-                anyhow::bail!("MASKURA_LOCAL_STORAGE_DIR requires single-tenant mode");
-            }
-            if s3_endpoint.is_some() || !service_backends.is_empty() {
-                anyhow::bail!(
-                    "MASKURA_LOCAL_STORAGE_DIR is mutually exclusive with S3_ENDPOINT and MASKURA_SERVICE_BUCKETS"
-                );
-            }
-            Some(directory)
-        }
-        (Some(_), _) => anyhow::bail!("MASKURA_STORAGE_MODE must be local when configured"),
-        (None, None) => None,
     };
     validate_storage_boundary_startup(
         explicit_single_tenant,
@@ -12226,31 +12577,18 @@ pub async fn build_state_with_pipeline_template(
         !service_backends.is_empty(),
     )?;
     let workspace_endpoint_policy =
-        WorkspaceEndpointPolicy::from_env(explicit_single_tenant).map_err(anyhow::Error::msg)?;
+        WorkspaceEndpointPolicy::from_config(explicit_single_tenant, &config.allowlists)
+            .map_err(anyhow::Error::msg)?;
 
-    let source_body_limits = source_body_limits_from_env()?;
+    let source_body_limits = source_body_limits(config)?;
     let max_pipeline_output_bytes = pipeline_template.max_pipeline_output_bytes;
     let (gateway, plugins, demo_pipelines) = pipeline_template.instantiate()?;
 
-    let multipart_mode = multipart_mode()?;
+    let multipart_mode = effective_multipart_mode(config, auto_local);
     let multipart_persistence_mode =
         multipart_persistence_mode(multipart_mode, local_storage_root.is_some());
-    let multipart_tenant_quota_bytes =
-        std::env::var("MASKURA_MULTIPART_STAGING_TENANT_QUOTA_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or_else(|| {
-                source_body_limits
-                    .max_bytes
-                    .saturating_mul(MAX_ACTIVE_UPLOADS as u64)
-            });
-    let multipart_global_quota_bytes =
-        std::env::var("MASKURA_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or_else(|| multipart_tenant_quota_bytes.saturating_mul(4));
+    let (multipart_tenant_quota_bytes, multipart_global_quota_bytes) =
+        multipart_quota_bytes(config, source_body_limits.max_bytes);
     let multipart_quotas = (multipart_mode == MultipartMode::Staged)
         .then(|| {
             StagingQuotaLimits::new(multipart_tenant_quota_bytes, multipart_global_quota_bytes)
@@ -12264,14 +12602,14 @@ pub async fn build_state_with_pipeline_template(
         MultipartStartupDependencies {
             durable_wrapping: wrapping.is_durable(),
             database: nonempty_env("DATABASE_URL"),
-            endpoint: nonempty_env("MASKURA_MULTIPART_STAGING_ENDPOINT"),
-            bucket: nonempty_env("MASKURA_MULTIPART_STAGING_BUCKET"),
+            endpoint: config.multipart_staging.endpoint.is_some(),
+            bucket: config.multipart_staging.bucket.is_some(),
             access_key: nonempty_env("MASKURA_MULTIPART_STAGING_ACCESS_KEY_ID"),
             secret_key: nonempty_env("MASKURA_MULTIPART_STAGING_SECRET_ACCESS_KEY"),
-            region: nonempty_env("MASKURA_MULTIPART_STAGING_REGION"),
-            directory: nonempty_env("MASKURA_MULTIPART_STAGING_DIR"),
-            tenant_quota: nonempty_env("MASKURA_MULTIPART_STAGING_TENANT_QUOTA_BYTES"),
-            global_quota: nonempty_env("MASKURA_MULTIPART_STAGING_GLOBAL_QUOTA_BYTES"),
+            region: config.multipart_staging.region.is_some(),
+            directory: config.multipart_staging.dir.is_some(),
+            tenant_quota: config.multipart_staging.tenant_quota_bytes.is_some(),
+            global_quota: config.multipart_staging.global_quota_bytes.is_some(),
         },
     )?;
     let local_storage = match local_storage_root {
@@ -12307,14 +12645,15 @@ pub async fn build_state_with_pipeline_template(
             let secret_key = std::env::var("S3_SECRET_ACCESS_KEY")
                 .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
                 .ok();
-            let region = std::env::var("S3_REGION")
-                .or_else(|_| std::env::var("AWS_REGION"))
-                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-                .unwrap_or_else(|_| "us-east-1".to_string());
+            let region = config
+                .storage
+                .s3_region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_string());
             match (access_key, secret_key) {
                 (Some(ak), Some(sk)) => {
                     let creds = Credentials::new(ak, sk, None, None, "env");
-                    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
                         .region(Region::new(region))
                         .endpoint_url(endpoint)
                         .credentials_provider(creds)
@@ -12322,7 +12661,7 @@ pub async fn build_state_with_pipeline_template(
                         .timeout_config(s3_timeout_config())
                         .load()
                         .await;
-                    let s3_config = aws_sdk_s3::config::Builder::from(&config)
+                    let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
                         .force_path_style(true)
                         .build();
                     Some(Client::from_conf(s3_config))
@@ -12335,14 +12674,14 @@ pub async fn build_state_with_pipeline_template(
                     info!(
                         "S3_ENDPOINT set without static keys; using the default AWS credential provider chain"
                     );
-                    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
                         .region(Region::new(region))
                         .endpoint_url(endpoint)
                         .retry_config(s3_retry_config())
                         .timeout_config(s3_timeout_config())
                         .load()
                         .await;
-                    let s3_config = aws_sdk_s3::config::Builder::from(&config)
+                    let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
                         .force_path_style(true)
                         .build();
                     Some(Client::from_conf(s3_config))
@@ -12352,33 +12691,33 @@ pub async fn build_state_with_pipeline_template(
         None => None,
     };
 
-    let supabase_url =
-        std::env::var("SUPABASE_URL").unwrap_or_else(|_| "http://127.0.0.1:54321".to_string());
+    let supabase_url = config
+        .supabase
+        .url
+        .clone()
+        .unwrap_or_else(|| "http://127.0.0.1:54321".to_string());
+    let supabase_anon_key = std::env::var("SUPABASE_ANON_KEY")
+        .unwrap_or_else(|_| "sb_publishable_ACJWlzQHlZjBrEguHvfOxg_3BJgxAaH".to_string());
     let supabase_jwt_secret = std::env::var("SUPABASE_JWT_SECRET").ok();
 
     let jwt_decoder = supabase_jwt_secret
         .map(|secret| Arc::new(jsonwebtoken::DecodingKey::from_secret(secret.as_bytes())));
 
-    let managed_mode_value = std::env::var("MASKURA_MANAGED_STREAMING_MODE").ok();
-    let managed_mode = ManagedStreamingMode::from_value(managed_mode_value.as_deref())?;
-    let managed_placement_version = std::env::var("MASKURA_MANAGED_PLACEMENT_VERSION")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(PLACEMENT_VERSION_V1);
-    let s3_streaming_capabilities = configured_s3_streaming_capabilities()?;
-    let managed_streaming_capabilities = configured_managed_streaming_capabilities();
-    let spool_max_object_bytes = resolve_customer_env(customer_env::SPOOL_MAX_OBJECT_BYTES)?
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(source_body_limits.max_bytes)
-        .min(source_body_limits.max_bytes);
-    let spool_quota_bytes = resolve_customer_env(customer_env::SPOOL_QUOTA_BYTES)?
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value >= spool_max_object_bytes)
-        .unwrap_or(spool_max_object_bytes.saturating_mul(2));
+    let managed_mode = match config.features.managed_streaming_mode {
+        ConfigManagedStreamingMode::Off => ManagedStreamingMode::Off,
+        ConfigManagedStreamingMode::Observe => ManagedStreamingMode::Observe,
+        ConfigManagedStreamingMode::Enforce => ManagedStreamingMode::Enforce,
+    };
+    let managed_placement_version = managed_placement_version(config);
+    let s3_streaming_capabilities = configured_s3_streaming_capabilities(config);
+    let managed_streaming_capabilities = configured_managed_streaming_capabilities(config);
+    let (spool_max_object_bytes, spool_quota_bytes) =
+        spool_limits(config, source_body_limits.max_bytes);
     let spool_config = CompatibilitySpoolConfig {
-        directory: resolve_customer_env(customer_env::SPOOL_DIR)?
+        directory: config
+            .spool
+            .dir
+            .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("maskura-spool")),
         max_object_bytes: spool_max_object_bytes,
@@ -12390,23 +12729,20 @@ pub async fn build_state_with_pipeline_template(
     }
     schedule_spool_cleanup(spool_config.clone());
     let spool_quota = Arc::new(SpoolQuota::new(spool_quota_bytes));
-    let dev_memory_max_object_bytes =
-        resolve_customer_env(customer_env::DEV_MEMORY_MAX_OBJECT_BYTES)?
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(LEGACY_MAX_OBJECT_BYTES)
-            .min(64 * 1024 * 1024);
-    let dev_memory_streaming_enabled = explicit_single_tenant
-        || resolve_customer_env(customer_env::DEV_MEMORY_STREAMING)?
-            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let dev_memory_max_object_bytes = dev_memory_max_object_bytes(config);
+    let dev_memory_streaming_enabled =
+        explicit_single_tenant || config.features.dev_memory_streaming;
 
     // API key persistence: Postgres (Supabase) when DATABASE_URL is set,
-    // a JSON file when MASKURA_KEYS_FILE (or its legacy alias) is set, a default JSON file in local
+    // a JSON file when MASKURA_KEYS_FILE is set, a default JSON file in local
     // mode (AUTH_DISABLED=true), and otherwise the in-memory KeyStore.
     let mut operation_journal: Option<Arc<dyn OperationJournal>> = None;
     let mut postgres_pool = None;
     let keys: Arc<dyn KeyRepository> = if let Some(runtime) = &local_storage {
-        let keys_file = resolve_customer_env(customer_env::KEYS_FILE)?
+        let keys_file = config
+            .keys
+            .keys_file
+            .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| runtime.internal_root().join("keys.json"));
         info!(path = %keys_file.display(), "Key store: local file");
@@ -12429,7 +12765,7 @@ pub async fn build_state_with_pipeline_template(
         )));
         postgres_pool = Some(pool.clone());
         Arc::new(PostgresKeyStore::with_cipher(pool, cipher.clone()))
-    } else if let Some(keys_file) = resolve_customer_env(customer_env::KEYS_FILE)? {
+    } else if let Some(keys_file) = &config.keys.keys_file {
         info!("Key store: file ({keys_file})");
         Arc::new(FileKeyStore::with_cipher(
             PathBuf::from(keys_file),
@@ -12516,15 +12852,18 @@ pub async fn build_state_with_pipeline_template(
             let pool = postgres_pool
                 .clone()
                 .expect("hosted staged dependencies were validated");
-            let endpoint = std::env::var("MASKURA_MULTIPART_STAGING_ENDPOINT").ok();
-            let bucket = std::env::var("MASKURA_MULTIPART_STAGING_BUCKET").ok();
+            let endpoint = config.multipart_staging.endpoint.clone();
+            let bucket = config.multipart_staging.bucket.clone();
             let access_key = std::env::var("MASKURA_MULTIPART_STAGING_ACCESS_KEY_ID").ok();
             let secret_key = std::env::var("MASKURA_MULTIPART_STAGING_SECRET_ACCESS_KEY").ok();
             match (endpoint, bucket, access_key, secret_key) {
                 (Some(endpoint), Some(bucket), Some(access_key), Some(secret_key)) => {
-                    let region = std::env::var("MASKURA_MULTIPART_STAGING_REGION")
-                        .unwrap_or_else(|_| "us-east-1".to_string());
-                    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    let region = config
+                        .multipart_staging
+                        .region
+                        .clone()
+                        .unwrap_or_else(|| "us-east-1".to_string());
+                    let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
                         .region(Region::new(region))
                         .endpoint_url(endpoint)
                         .credentials_provider(Credentials::new(
@@ -12544,12 +12883,15 @@ pub async fn build_state_with_pipeline_template(
                             multipart_quotas.expect("staged multipart has validated quotas"),
                         )),
                         artifacts: Arc::new(S3StagingArtifactStore::new(
-                            Client::new(&config),
+                            Client::new(&sdk_config),
                             bucket,
                         )),
-                        directory: std::env::var("MASKURA_MULTIPART_STAGING_DIR")
+                        directory: config
+                            .multipart_staging
+                            .dir
+                            .as_ref()
                             .map(PathBuf::from)
-                            .unwrap_or_else(|_| spool_config.directory.join("multipart")),
+                            .unwrap_or_else(|| spool_config.directory.join("multipart")),
                         wrapping: wrapping.clone(),
                     }))
                 }
@@ -12661,7 +13003,7 @@ pub async fn build_state_with_pipeline_template(
     // Operator bootstrap: seed a preconfigured key id/secret pair so headless
     // automation has a stable credential without the interactive mint step.
     // Idempotent: an existing key with the same id is left untouched.
-    let bootstrap_key = resolve_customer_env(customer_env::BOOTSTRAP_KEY)?;
+    let bootstrap_key = config.keys.bootstrap_key.clone();
     let bootstrap_secret = resolve_customer_env(customer_env::BOOTSTRAP_SECRET)?;
     match (bootstrap_key, bootstrap_secret) {
         (Some(key_id), Some(secret)) => {
@@ -12680,6 +13022,51 @@ pub async fn build_state_with_pipeline_template(
         (None, None) => {}
     }
 
+    // Local appliance: bootstrap a SigV4 root credential and the canonical
+    // bucket. Explicit MASKURA_ROOT_USER/MASKURA_ROOT_PASSWORD override the
+    // generated pair; otherwise a strong pair is generated and disclosed once.
+    if auto_local {
+        let workspace = workspace_storage.resolve_workspace("root").await?;
+        let root_user = resolve_customer_env(customer_env::ROOT_USER)?;
+        let root_password = resolve_customer_env(customer_env::ROOT_PASSWORD)?;
+        match (root_user, root_password) {
+            (Some(access_key), Some(secret)) => {
+                ensure_configured_local_root(keys.as_ref(), &access_key, &secret, &workspace)
+                    .await?;
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!("MASKURA_ROOT_USER and MASKURA_ROOT_PASSWORD must be set together");
+            }
+            (None, None) => {
+                if keys.list_for_user("root").await?.is_empty() {
+                    let (secret, created) = keys
+                        .create_key("root", &workspace, "local-root", 0, None)
+                        .await?;
+                    // First-run disclosure only: the operator needs the secret
+                    // once to configure an S3 client. Later starts reuse it.
+                    info!(
+                        access_key = %created.key_id,
+                        secret_key = %secret,
+                        "generated local root credentials (shown once)"
+                    );
+                }
+            }
+        }
+        if let Some(file_store) = &file_store {
+            let buckets = file_store
+                .list_buckets()
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if !buckets.iter().any(|bucket| bucket == "maskura") {
+                file_store
+                    .create_bucket("maskura")
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                info!("created canonical local bucket `maskura`");
+            }
+        }
+    }
+
     let mut continuation_token_key = [0; 32];
     OsRng.fill_bytes(&mut continuation_token_key);
     let state = Arc::new(AppState {
@@ -12693,25 +13080,27 @@ pub async fn build_state_with_pipeline_template(
         service_storage,
         s3_client,
         supabase_url,
+        supabase_anon_key,
         jwt_decoder,
         auth_disabled,
         explicit_single_tenant,
         workspace_endpoint_policy,
         control,
-        legacy_max_object_bytes: legacy_max_object_bytes()?,
-        streaming_read_mode: StreamingReadMode::from_env()?,
+        legacy_max_object_bytes: legacy_max_object_bytes(config),
+        streaming_read_mode: effective_streaming_read_mode(config, auto_local),
         source_body_limits,
         max_pipeline_output_bytes,
-        presigned_http_policy: PresignedHttpPolicy::from_env().map_err(anyhow::Error::msg)?,
+        presigned_http_policy: PresignedHttpPolicy::from_config(&config.allowlists)
+            .map_err(anyhow::Error::msg)?,
         sigv4_cache: Arc::new(SigningKeyCache::standard()),
-        sigv4_policy: SigV4Policy::from_env(),
+        sigv4_policy: SigV4Policy::from_config(&config.sigv4),
         operation_journal,
         s3_streaming_capabilities,
         managed_streaming_capabilities,
         spool_config,
         spool_quota,
-        transformed_read_spool_enabled: transformed_read_spool_enabled()?,
-        binary_avro_enabled: binary_avro_enabled()?,
+        transformed_read_spool_enabled: config.features.transformed_read_spool,
+        binary_avro_enabled: config.features.enable_avro,
         dev_memory_max_object_bytes,
         dev_memory_streaming_enabled,
         demo_pipelines,
@@ -13124,8 +13513,22 @@ pub async fn invoke_mcp(
 /// Build the axum router for the engine. The SaaS crate merges its own
 /// control-plane routes (workspaces, billing, dashboard) onto this.
 pub fn build_router(state: Arc<AppState>) -> Router {
+    let s3_routes = Router::new()
+        .route("/{bucket}", get(s3_list_objects))
+        .route("/{bucket}", put(s3_bucket_put))
+        .route("/{bucket}", delete(s3_bucket_delete))
+        .route("/{bucket}/", get(s3_list_objects))
+        .route("/{bucket}/", put(s3_bucket_put))
+        .route("/{bucket}/", delete(s3_bucket_delete))
+        .route("/{bucket}/{*key}", put(s3_put))
+        .route("/{bucket}/{*key}", get(s3_get))
+        .route("/{bucket}/{*key}", head(s3_head))
+        .route("/{bucket}/{*key}", delete(s3_delete))
+        .route("/{bucket}/{*key}", post(s3_post))
+        .route_layer(middleware::from_fn(reject_unsupported_s3_operations));
     let mut router = Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/", get(root))
         .route("/dashboard/api/keys", get(get_keys))
         .route(
@@ -13156,14 +13559,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/dashboard/api/demo/process", post(demo_process))
         .route("/dashboard/api/backend", get(get_backend))
         .route("/dashboard/api/backend", put(put_backend))
-        .route("/{bucket}", get(s3_list_objects))
-        .route("/{bucket}", put(s3_bucket_put))
-        .route("/{bucket}", delete(s3_bucket_delete))
-        .route("/{bucket}/{*key}", put(s3_put))
-        .route("/{bucket}/{*key}", get(s3_get))
-        .route("/{bucket}/{*key}", head(s3_head))
-        .route("/{bucket}/{*key}", delete(s3_delete))
-        .route("/{bucket}/{*key}", post(s3_post));
+        .merge(s3_routes);
     if state.auth_disabled {
         router = router
             .route("/dashboard/api/plugins", get(get_plugins))
@@ -13359,25 +13755,148 @@ mod multipart_completion_tests {
 
 #[cfg(test)]
 mod s3_provider_capability_tests {
-    use super::configured_s3_streaming_capabilities;
+    use maskura_customer_config::config::{
+        MultipartMode as ConfigMultipartMode, StreamingReadMode as ConfigStreamingReadMode,
+        StreamingS3Provider,
+    };
+
+    use super::*;
 
     #[test]
-    fn provider_selection_is_exact_and_fail_closed() {
-        for provider in ["aws", "minio", "r2", "b2"] {
-            unsafe { std::env::set_var("MASKURA_STREAMING_S3_PROVIDER", provider) }
-            let capabilities = configured_s3_streaming_capabilities().unwrap();
+    fn resolved_feature_config_drives_gateway_modes_and_capabilities() {
+        for provider in [
+            StreamingS3Provider::Aws,
+            StreamingS3Provider::Minio,
+            StreamingS3Provider::R2,
+            StreamingS3Provider::B2,
+        ] {
+            let mut config = Config::default();
+            config.features.streaming_s3_provider = Some(provider);
+            let capabilities = configured_s3_streaming_capabilities(&config);
             assert!(
                 capabilities.is_some(),
-                "provider {provider} must enable direct S3 streaming"
+                "configured provider must enable direct S3 streaming"
             );
             let capabilities = capabilities.expect("capabilities present");
             assert!(capabilities.supports_conditional_reads());
             assert!(capabilities.supports_response_checksums());
         }
-        unsafe { std::env::set_var("MASKURA_STREAMING_S3_PROVIDER", "wasabi") }
-        assert!(configured_s3_streaming_capabilities().unwrap().is_none());
-        unsafe { std::env::remove_var("MASKURA_STREAMING_S3_PROVIDER") }
-        assert!(configured_s3_streaming_capabilities().unwrap().is_none());
+
+        let mut config = Config::default();
+        assert!(configured_s3_streaming_capabilities(&config).is_none());
+        assert!(configured_managed_streaming_capabilities(&config).is_none());
+        assert_eq!(multipart_mode(&config), MultipartMode::Reject);
+        assert_eq!(
+            StreamingReadMode::from_config(&config),
+            StreamingReadMode::Off
+        );
+
+        config.features.managed_streaming_transactional = true;
+        config.features.multipart_mode = ConfigMultipartMode::Staged;
+        config.features.streaming_read_mode = ConfigStreamingReadMode::Transformed;
+        assert!(configured_managed_streaming_capabilities(&config).is_some());
+        assert_eq!(multipart_mode(&config), MultipartMode::Staged);
+        assert_eq!(
+            StreamingReadMode::from_config(&config),
+            StreamingReadMode::Transformed
+        );
+    }
+
+    #[test]
+    fn resolved_limits_preserve_immutable_safety_caps() {
+        let mut config = Config::default();
+        let defaults = source_body_limits(&config).unwrap();
+        assert_eq!(
+            defaults.max_frame_bytes,
+            crate::object::DEFAULT_MAX_SOURCE_FRAME_BYTES
+        );
+        assert_eq!(defaults.max_bytes, crate::object::DEFAULT_MAX_SOURCE_BYTES);
+        assert_eq!(legacy_max_object_bytes(&config), LEGACY_MAX_OBJECT_BYTES);
+        assert_eq!(
+            dev_memory_max_object_bytes(&config),
+            LEGACY_MAX_OBJECT_BYTES
+        );
+
+        config.limits.source_max_frame_bytes = Some(4096);
+        config.limits.max_object_bytes = Some(u64::MAX);
+        config.limits.max_pipeline_output_bytes = Some(u64::MAX);
+        config.limits.legacy_max_object_bytes = Some(u64::MAX);
+        config.limits.dev_memory_max_object_bytes = Some(u64::MAX);
+        let limits = source_body_limits(&config).unwrap();
+        assert_eq!(limits.max_frame_bytes, 4096);
+        assert_eq!(limits.max_bytes, crate::object::DEFAULT_MAX_SOURCE_BYTES);
+        assert_eq!(
+            max_pipeline_output_bytes(&config),
+            PipelineLimits::default().max_output_bytes
+        );
+        assert_eq!(legacy_max_object_bytes(&config), LEGACY_MAX_OBJECT_BYTES);
+        assert_eq!(dev_memory_max_object_bytes(&config), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn resolved_wasm_config_drives_paths_fuel_and_prefix_capabilities() {
+        let mut config = Config::default();
+        config.wasm.filter_component = Some("/tmp/filter.component.wasm".to_string());
+        config.wasm.fuel = Some(123_456);
+        config.wasm.prefix_safe_component_hashes = vec!["AB".repeat(32)];
+
+        assert_eq!(
+            component_path(&config),
+            PathBuf::from("/tmp/filter.component.wasm")
+        );
+        assert_eq!(pipeline_fuel(&config), 123_456);
+        assert!(prefix_safe_component_hashes(&config).contains(&"ab".repeat(32)));
+    }
+
+    #[test]
+    fn resolved_spool_managed_and_multipart_config_drives_runtime_values() {
+        let mut config = Config::default();
+        assert_eq!(spool_limits(&config, 1024), (1024, 2048));
+        assert_eq!(
+            multipart_quota_bytes(&config, 1024),
+            (
+                1024 * MAX_ACTIVE_UPLOADS as u64,
+                4096 * MAX_ACTIVE_UPLOADS as u64
+            )
+        );
+        assert_eq!(managed_placement_version(&config), PLACEMENT_VERSION_V1);
+
+        config.spool.max_object_bytes = Some(512);
+        config.spool.quota_bytes = Some(1536);
+        config.multipart_staging.tenant_quota_bytes = Some(2048);
+        config.multipart_staging.global_quota_bytes = Some(4096);
+        config.managed.placement_version = Some(7);
+        assert_eq!(spool_limits(&config, 1024), (512, 1536));
+        assert_eq!(multipart_quota_bytes(&config, 1024), (2048, 4096));
+        assert_eq!(managed_placement_version(&config), 7);
+
+        config.spool.max_object_bytes = Some(4096);
+        config.spool.quota_bytes = Some(4096);
+        assert_eq!(spool_limits(&config, 1024), (1024, 4096));
+    }
+
+    #[tokio::test]
+    async fn configured_local_root_fails_closed_on_persisted_secret_mismatch() {
+        let keys = KeyStore::new();
+        let workspace = WorkspaceId::new("workspace").unwrap();
+        ensure_configured_local_root(&keys, "root-user", "first-secret", &workspace)
+            .await
+            .unwrap();
+        ensure_configured_local_root(&keys, "root-user", "first-secret", &workspace)
+            .await
+            .unwrap();
+
+        let error =
+            ensure_configured_local_root(&keys, "root-user", "different-secret", &workspace)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("do not match"));
+        assert!(
+            keys.resolve_credentials("root-user", "first-secret")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }
 
@@ -13606,6 +14125,76 @@ mod multipart_listing_validation_tests {
         assert_eq!(
             validate_multipart_checksum_mode(&snapshot),
             Err("unsupported checksum algorithm; supported values are SHA256")
+        );
+    }
+
+    #[test]
+    fn single_put_metadata_partitions_headers_like_multipart() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            axum::http::HeaderValue::from_static("text/plain"),
+        );
+        headers.insert(
+            "content-encoding",
+            axum::http::HeaderValue::from_static("gzip"),
+        );
+        headers.insert(
+            "x-amz-meta-project",
+            axum::http::HeaderValue::from_static("maskura"),
+        );
+        headers.insert(
+            "x-amz-tagging",
+            axum::http::HeaderValue::from_static("team=data"),
+        );
+        headers.insert(
+            "x-amz-checksum-algorithm",
+            axum::http::HeaderValue::from_static("SHA256"),
+        );
+        let stored = single_put_stored_metadata(&headers);
+        assert_eq!(
+            stored
+                .representation_headers
+                .get("content-encoding")
+                .map(String::as_str),
+            Some("gzip")
+        );
+        assert!(!stored.representation_headers.contains_key("content-type"));
+        assert_eq!(
+            stored.user_metadata.get("project").map(String::as_str),
+            Some("maskura")
+        );
+        assert_eq!(stored.user_metadata.len(), 1);
+        assert_eq!(stored.tags.get("team").map(String::as_str), Some("data"));
+        assert_eq!(stored.checksum_algorithm.as_deref(), Some("SHA256"));
+    }
+
+    #[test]
+    fn streaming_put_defaults_missing_content_type_to_octet_stream() {
+        let empty = HeaderMap::new();
+        assert_eq!(
+            streaming_format(&empty).unwrap(),
+            (Format::Binary, "application/octet-stream".to_string())
+        );
+
+        let mut octet = HeaderMap::new();
+        octet.insert(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/octet-stream"),
+        );
+        assert_eq!(
+            streaming_format(&octet).unwrap(),
+            (Format::Binary, "application/octet-stream".to_string())
+        );
+
+        let mut binary = HeaderMap::new();
+        binary.insert(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("binary/octet-stream"),
+        );
+        assert_eq!(
+            streaming_format(&binary).unwrap(),
+            (Format::Binary, "binary/octet-stream".to_string())
         );
     }
 }

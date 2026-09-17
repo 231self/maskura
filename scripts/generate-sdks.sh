@@ -43,7 +43,7 @@ echo "→ Building gateway..."
 (cd "$PROJECT_DIR" && cargo build --locked -p maskura-gateway)
 
 echo "→ Starting gateway on port $GATEWAY_PORT..."
-(cd "$PROJECT_DIR" && AUTH_DISABLED=true MASKURA_KEYS_FILE="$KEYS_FILE" LISTEN_ADDR="127.0.0.1:$GATEWAY_PORT" cargo run --locked -p maskura-gateway) >"$GATEWAY_LOG" 2>&1 &
+(cd "$PROJECT_DIR" && AUTH_DISABLED=true MASKURA_SINGLE_TENANT=true MASKURA_KEYS_FILE="$KEYS_FILE" LISTEN_ADDR="127.0.0.1:$GATEWAY_PORT" cargo run --locked -p maskura-gateway) >"$GATEWAY_LOG" 2>&1 &
 GATEWAY_PID=$!
 
 # Wait for gateway to be ready

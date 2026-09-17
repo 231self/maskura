@@ -55,34 +55,34 @@ and TypeScript clients, and the local MCP server.
 
 ## Quickstart
 
-No cloud account, database, or repository clone is required:
+No cloud account, database, or repository clone is required. One command starts
+a single-node S3-compatible server backed by a Docker volume:
 
 ```bash
-docker run --rm -p 127.0.0.1:8791:8080 -v maskura-data:/data \
-  -e AUTH_DISABLED=true \
-  -e MASKURA_STORAGE_MODE=local \
-  -e MASKURA_LOCAL_STORAGE_DIR=/data \
-  -e MASKURA_MULTIPART_MODE=staged \
+docker run -p 127.0.0.1:9000:9000 -v maskura-data:/data \
   ghcr.io/231self/maskura/maskura:v0.7.5
 ```
 
-Maskura is now an S3-compatible endpoint at `http://localhost:8791`. Use any
-non-empty credentials when auth is disabled:
+The first time it starts, the gateway prints a root access key and secret. Use
+them with any S3 client; the `maskura` bucket is already available:
 
 ```bash
-export AWS_ACCESS_KEY_ID=demo AWS_SECRET_ACCESS_KEY=demo
+export AWS_ACCESS_KEY_ID=maskura_... AWS_SECRET_ACCESS_KEY=maskura_secret_...
 printf '{"email":"jane@example.com","card":"4111111111111111"}\n' > data.jsonl
 
-aws s3 --endpoint-url http://localhost:8791 \
-  cp data.jsonl s3://maskura-local/ingest/data.jsonl \
-  --content-type application/x-ndjson
+aws s3 --endpoint-url http://localhost:9000 \
+  cp data.jsonl s3://maskura/ingest/data.jsonl --content-type application/x-ndjson
 
-aws s3 --endpoint-url http://localhost:8791 \
-  cp s3://maskura-local/ingest/data.jsonl -
-# {"email":"[REDACTED_EMAIL]","card":"[REDACTED_CARD]"}
+aws s3 --endpoint-url http://localhost:9000 \
+  cp s3://maskura/ingest/data.jsonl -
 ```
 
-Open <http://localhost:8791> for the local dashboard.
+Bytes are stored unchanged by default. To run the pipeline on the way in,
+enable plugins explicitly (see [Bring your own Wasm pipeline](#bring-your-own-wasm-pipeline));
+PII redaction and encryption are opt-in, not automatic. Override the generated
+credentials with `MASKURA_ROOT_USER`/`MASKURA_ROOT_PASSWORD` (both required).
+
+Open <http://localhost:9000> for the local dashboard.
 
 ## CLI
 
@@ -99,7 +99,9 @@ maskura local down
 
 `maskura local init` uses the gateway image matching the CLI version, stores data
 in a Docker volume, and binds only to localhost. Run `maskura --help` for keys,
-external storage, plugins, and MCP commands.
+external storage, plugins, and MCP commands. Self-hosted gateway settings and
+`maskura config --check` are covered in the
+[configuration reference](docs/reference/configuration.md).
 
 ## Bring your own Wasm pipeline
 

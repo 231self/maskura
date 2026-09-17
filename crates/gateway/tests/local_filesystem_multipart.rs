@@ -14,6 +14,7 @@
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use maskura_customer_config::Config;
 use maskura_gateway::control::NoopControlPlane;
 use maskura_gateway::key_cipher::default_wrapping;
 use maskura_gateway::server::{
@@ -161,12 +162,14 @@ async fn body_bytes(response: axum::response::Response) -> Vec<u8> {
 }
 
 async fn build_isolated_state() -> anyhow::Result<Arc<AppState>> {
-    let pipeline_template = StatePipelineTemplate::from_env()?;
+    let config = Config::resolve(None)?;
+    let pipeline_template = StatePipelineTemplate::from_config(&config)?;
     build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
         default_wrapping()?,
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         &pipeline_template,
+        &config,
     )
     .await
 }
@@ -355,6 +358,15 @@ async fn get_status_and_text(
     (status, body)
 }
 
+async fn create_bucket(app: &Router, headers: &[(&'static str, String)], bucket: &str) {
+    let response = app
+        .clone()
+        .oneshot(get_request(headers, "PUT", &format!("/{bucket}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "CreateBucket {bucket}");
+}
+
 fn assert_plaintext_never_leaks(text: &str) {
     for marker in RAW_MARKERS {
         assert!(
@@ -494,6 +506,24 @@ async fn run_lifecycle(root: &Path) {
     let object_key = "final.txt";
     let aborted_key = "aborted.txt";
     let list_bucket = "bucket-list";
+
+    let missing_bucket = "bucket-missing";
+    let missing = add_headers(
+        Request::builder()
+            .method("POST")
+            .uri(format!("/{missing_bucket}/object.txt?uploads"))
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(missing).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = String::from_utf8(body_bytes(response).await).expect("missing bucket XML");
+    assert!(body.contains("<Code>NoSuchBucket</Code>"), "{body}");
+
+    create_bucket(&app, &headers, bucket).await;
+    create_bucket(&app, &headers, list_bucket).await;
 
     // ---- Phase 1: initiate -------------------------------------------------
     let upload_id = initiate_upload_with_metadata(
@@ -1081,6 +1111,7 @@ async fn run_restart_matrix() {
     let replacement = format!("PART-NEW-VERSION\ncontact {PLAINTEXT_EMAIL_A} now\n").into_bytes();
     let (state, app, access_key, secret_key) = build_local_state().await;
     let headers = auth_headers(&access_key, &secret_key);
+    create_bucket(&app, &headers, bucket).await;
 
     // A completed single PUT installs the object that multipart completion must
     // atomically replace without ever exposing a partial assembly.

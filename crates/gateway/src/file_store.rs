@@ -47,6 +47,8 @@ struct FileObjectMetadata {
     etag: String,
     size: u64,
     data_file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_modified_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     representation_headers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -80,6 +82,7 @@ pub struct FileStoredMeta {
     pub size: u64,
     pub content_type: String,
     pub etag: String,
+    pub last_modified_ms: Option<i64>,
     pub representation_headers: BTreeMap<String, String>,
     pub user_metadata: BTreeMap<String, String>,
     pub tags: BTreeMap<String, String>,
@@ -151,6 +154,7 @@ pub struct FileObjectReader<R> {
     pub object_length: u64,
     pub content_type: String,
     pub etag: String,
+    pub last_modified_ms: Option<i64>,
     pub representation_headers: BTreeMap<String, String>,
     pub user_metadata: BTreeMap<String, String>,
     pub tags: BTreeMap<String, String>,
@@ -169,6 +173,7 @@ impl FileObjectReader<File> {
             object_length: self.object_length,
             content_type: self.content_type,
             etag: self.etag,
+            last_modified_ms: self.last_modified_ms,
             representation_headers: self.representation_headers,
             user_metadata: self.user_metadata,
             tags: self.tags,
@@ -337,6 +342,7 @@ impl FileStore {
                 size: metadata.size,
                 content_type: metadata.content_type,
                 etag: metadata.etag,
+                last_modified_ms: metadata.last_modified_ms,
                 representation_headers: metadata.representation_headers,
                 user_metadata: metadata.user_metadata,
                 tags: metadata.tags,
@@ -378,7 +384,7 @@ impl FileStore {
             if validate_bucket(&bucket).is_err() {
                 continue;
             }
-            for (key, _, _) in self.list_objects(&bucket).await? {
+            for (key, _, _, _) in self.list_objects(&bucket).await? {
                 keys.push(format!("{bucket}/{key}"));
             }
         }
@@ -408,7 +414,7 @@ impl FileStore {
     pub async fn list_objects(
         &self,
         bucket: &str,
-    ) -> Result<Vec<(String, String, u64)>, FileStoreError> {
+    ) -> Result<Vec<(String, String, u64, Option<i64>)>, FileStoreError> {
         validate_bucket(bucket)?;
         let mut metadata = match fs::read_dir(self.metadata_dir(bucket)?).await {
             Ok(entries) => entries,
@@ -427,7 +433,12 @@ impl FileStore {
             }
             let metadata = read_metadata_file(&entry.path()).await?;
             validate_key(&metadata.key)?;
-            objects.push((metadata.key, metadata.etag, metadata.size));
+            objects.push((
+                metadata.key,
+                metadata.etag,
+                metadata.size,
+                metadata.last_modified_ms,
+            ));
         }
         objects.sort_by(|left, right| left.0.cmp(&right.0));
         Ok(objects)
@@ -436,6 +447,15 @@ impl FileStore {
     pub async fn create_bucket(&self, bucket: &str) -> Result<(), FileStoreError> {
         let _guard = self.mutation_lock.lock().await;
         self.ensure_bucket_layout(bucket).await
+    }
+
+    pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, FileStoreError> {
+        validate_bucket(bucket)?;
+        match fs::metadata(self.bucket_dir(bucket)?).await {
+            Ok(metadata) => Ok(metadata.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub async fn delete_bucket(&self, bucket: &str) -> Result<bool, FileStoreError> {
@@ -521,6 +541,7 @@ impl FileStore {
             etag: etag.to_string(),
             size,
             data_file,
+            last_modified_ms: Some(crate::transaction::unix_time_ms()),
             representation_headers: BTreeMap::new(),
             user_metadata: BTreeMap::new(),
             tags: BTreeMap::new(),
@@ -604,6 +625,7 @@ impl FileStore {
             etag: etag.to_string(),
             size: context.expected_size,
             data_file: data_file.clone(),
+            last_modified_ms: Some(crate::transaction::unix_time_ms()),
             representation_headers: context.representation_headers.clone(),
             user_metadata: context.user_metadata.clone(),
             tags: context.tags.clone(),
@@ -732,7 +754,7 @@ impl FileStore {
     pub(crate) async fn backfill_current_commit_proofs(&self) -> Result<usize, FileStoreError> {
         let mut repaired = 0;
         for bucket in self.list_buckets().await? {
-            for (key, _, _) in self.list_objects(&bucket).await? {
+            for (key, _, _, _) in self.list_objects(&bucket).await? {
                 if self.backfill_commit_proof(&bucket, &key).await?.is_some() {
                     repaired += 1;
                 }
@@ -870,6 +892,7 @@ impl FileStore {
                 object_length: metadata.size,
                 content_type: metadata.content_type,
                 etag: metadata.etag,
+                last_modified_ms: metadata.last_modified_ms,
                 representation_headers: metadata.representation_headers,
                 user_metadata: metadata.user_metadata,
                 tags: metadata.tags,
@@ -1238,6 +1261,18 @@ mod tests {
 
     fn test_root() -> PathBuf {
         std::env::temp_dir().join(format!("maskura-file-store-{}", Uuid::now_v7()))
+    }
+
+    #[tokio::test]
+    async fn bucket_exists_distinguishes_missing_and_present_buckets() {
+        let root = test_root();
+        let store = FileStore::new(root.clone()).await.unwrap();
+        assert!(!store.bucket_exists("missing").await.unwrap());
+        store.create_bucket("bucket").await.unwrap();
+        assert!(store.bucket_exists("bucket").await.unwrap());
+        store.delete_bucket("bucket").await.unwrap();
+        assert!(!store.bucket_exists("bucket").await.unwrap());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn commit_context(operation_id: Uuid, generation_id: Uuid) -> LocalCommitContext {
@@ -1665,6 +1700,46 @@ mod tests {
         assert_eq!(
             store.list_keys().await.unwrap(),
             vec!["bucket/nested/object.txt"]
+        );
+
+        fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stores_and_surfaces_last_modified() {
+        let root = test_root();
+        let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+        store
+            .put(
+                "bucket",
+                "object",
+                Bytes::from_static(b"hello"),
+                "text/plain",
+            )
+            .await
+            .unwrap();
+
+        let opened = store.open("bucket", "object").await.unwrap().unwrap();
+        let modified_ms = opened
+            .last_modified_ms
+            .expect("committed object must carry a last-modified timestamp");
+        assert!(modified_ms > 0);
+
+        let head = store
+            .stored_meta("bucket", "object")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.last_modified_ms, Some(modified_ms));
+
+        assert_eq!(
+            store.list_objects("bucket").await.unwrap(),
+            vec![(
+                "object".to_string(),
+                "\"5d41402abc4b2a76b9719d911017c592\"".to_string(),
+                5,
+                Some(modified_ms),
+            )]
         );
 
         fs::remove_dir_all(root).await.unwrap();

@@ -11,6 +11,10 @@ use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use http_body_util::BodyExt as _;
+use maskura_customer_config::Config;
+use maskura_customer_config::config::{
+    StreamingReadMode as ConfigStreamingReadMode, StreamingS3Provider,
+};
 use maskura_gateway::Gateway;
 use maskura_gateway::backend::{
     AddressResolver, PresignedHttpPolicy, TokioAddressResolver, WorkspaceEndpointPolicy,
@@ -611,19 +615,123 @@ fn test_pipeline_template() -> &'static StatePipelineTemplate {
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/components");
             std::env::set_var("MASKURA_PLUGINS_DIR", components);
         }
-        StatePipelineTemplate::from_env().expect("compile test pipeline components")
+        let config = Config::resolve(None).expect("resolve pipeline config");
+        StatePipelineTemplate::from_config(&config).expect("compile test pipeline components")
     })
 }
 
+fn test_config() -> Config {
+    let _ = test_pipeline_template();
+    Config::resolve(None).expect("resolve test config")
+}
+
 async fn test_state() -> Arc<AppState> {
+    let config = test_config();
     build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
         default_wrapping().expect("wrapping"),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         test_pipeline_template(),
+        &config,
     )
     .await
     .expect("build_state")
+}
+
+#[tokio::test]
+async fn resolved_feature_limit_and_wasm_config_populates_state_without_late_env_reads() {
+    let root =
+        std::env::temp_dir().join(format!("maskura-resolved-config-{}", uuid::Uuid::new_v4()));
+    let mut config = test_config();
+    config.supabase.url = Some("https://config-snapshot.supabase.co".to_string());
+    config.features.streaming_read_mode = ConfigStreamingReadMode::Transformed;
+    config.features.transformed_read_spool = true;
+    config.features.enable_avro = true;
+    config.features.streaming_s3_provider = Some(StreamingS3Provider::Aws);
+    config.limits.source_max_frame_bytes = Some(4096);
+    config.limits.max_object_bytes = Some(2 * 1024 * 1024);
+    config.limits.max_pipeline_output_bytes = Some(1024 * 1024);
+    config.limits.legacy_max_object_bytes = Some(8192);
+    config.limits.dev_memory_max_object_bytes = Some(16_384);
+    config.wasm.fuel = Some(123_456);
+    config.spool.dir = Some(root.join("spool").display().to_string());
+    config.spool.max_object_bytes = Some(512 * 1024);
+    config.spool.quota_bytes = Some(1024 * 1024);
+    let keys_file = root.join("keys/keys.json");
+    config.keys.keys_file = Some(keys_file.display().to_string());
+    config.managed.placement_version = Some(7);
+    config.multipart_staging.endpoint = Some("https://staging.example.com".to_string());
+    config.multipart_staging.bucket = Some("staging-bucket".to_string());
+    config.multipart_staging.region = Some("config-region-1".to_string());
+    config.multipart_staging.dir = Some(root.join("multipart").display().to_string());
+    config.multipart_staging.tenant_quota_bytes = Some(2 * 1024 * 1024);
+    config.multipart_staging.global_quota_bytes = Some(4 * 1024 * 1024);
+    config.sigv4.region = Some("config-region-1".to_string());
+    config.sigv4.trusted_tls = true;
+    config.allowlists.workspace_endpoint = vec!["storage.example.com".to_string()];
+    config.allowlists.workspace_endpoint_private = vec!["127.0.0.1".to_string()];
+    config.allowlists.presigned_http = vec!["download.example.com".to_string()];
+    config.allowlists.presigned_http_private = vec!["127.0.0.1".to_string()];
+    config.allowlists.presigned_http_allow_http = true;
+    config.allowlists.presigned_http_min_validity_secs = Some(45);
+    config.validate().expect("valid resolved config snapshot");
+
+    let pipeline_template =
+        StatePipelineTemplate::from_config(&config).expect("compile configured pipeline");
+    let state = build_state_with_pipeline_template(
+        Arc::new(NoopControlPlane),
+        default_wrapping().expect("wrapping"),
+        Arc::new(InMemoryWorkspaceStorageRepository::new()),
+        &pipeline_template,
+        &config,
+    )
+    .await
+    .expect("build configured state");
+
+    assert_eq!(state.streaming_read_mode, StreamingReadMode::Transformed);
+    assert!(state.transformed_read_spool_enabled);
+    assert!(state.binary_avro_enabled);
+    assert!(state.s3_streaming_capabilities.is_some());
+    assert_eq!(state.source_body_limits.max_frame_bytes, 4096);
+    assert_eq!(state.source_body_limits.max_bytes, 2 * 1024 * 1024);
+    assert_eq!(state.max_pipeline_output_bytes, 1024 * 1024);
+    assert_eq!(state.legacy_max_object_bytes, 8192);
+    assert_eq!(state.dev_memory_max_object_bytes, 16_384);
+    assert_eq!(state.supabase_url, "https://config-snapshot.supabase.co");
+    assert_eq!(state.spool_config.directory, root.join("spool"));
+    assert_eq!(state.spool_config.max_object_bytes, 512 * 1024);
+
+    state
+        .keys
+        .create_key(
+            "config-snapshot",
+            &WorkspaceId::new("config-snapshot").unwrap(),
+            "config-snapshot",
+            0,
+            None,
+        )
+        .await
+        .expect("configured key store persists");
+    assert!(keys_file.is_file());
+
+    let app = build_router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("https://config-snapshot.supabase.co"));
+
+    drop(app);
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 async fn trusted_context(state: &Arc<AppState>, workspace_id: &str) -> TrustedInvocationContext {
@@ -1984,6 +2092,34 @@ async fn streaming_put_is_frame_invariant_and_preserves_separators() {
 }
 
 #[tokio::test]
+async fn empty_pipeline_preserves_binary_bytes() {
+    let mut state = test_state().await;
+    for plugin in state.plugins.list() {
+        state.plugins.set_enabled(&plugin.id, false);
+    }
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.auth_disabled = true;
+    state_mut.dev_memory_streaming_enabled = true;
+    let app = build_router(state.clone());
+
+    let binary = Bytes::from_static(b"\x89PNG\r\n\x1a\n\x00\xff\xfe\xfd non-utf8 \x80\x81");
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/stream/blob.bin")
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, binary.len().to_string())
+        .body(Body::from(binary.clone()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored = state
+        .store
+        .get("stream", "blob.bin")
+        .expect("binary stored verbatim");
+    assert_eq!(stored.data, binary);
+}
+
+#[tokio::test]
 async fn streaming_put_limit_failure_has_no_partial_visibility() {
     let mut state = test_state().await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
@@ -2071,11 +2207,13 @@ async fn unsupported_streaming_backend_is_rejected_without_polling_body() {
 
 #[tokio::test]
 async fn avro_acquires_workspace_lease_before_first_body_poll() {
+    let config = test_config();
     let mut state = build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
         default_wrapping().expect("wrapping"),
         Arc::new(RejectingAttestedRepository),
         test_pipeline_template(),
+        &config,
     )
     .await
     .expect("build attested test state");
@@ -5397,6 +5535,58 @@ async fn streaming_sigv4_hash_is_checked_before_atomic_commit() {
 }
 
 #[tokio::test]
+async fn content_md5_covers_source_bytes_before_transformation() {
+    use base64::Engine as _;
+    use md5::{Digest as _, Md5};
+
+    let mut state = test_state().await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .dev_memory_streaming_enabled = true;
+    let (access_key, secret_key) = make_key(&state).await;
+    let app = build_router(state.clone());
+    let input = b"contact a@b.com now\n";
+    let output = b"contact [REDACTED_EMAIL] now\n";
+    let source_md5 = base64::engine::general_purpose::STANDARD.encode(Md5::digest(input));
+    let output_md5 = base64::engine::general_purpose::STANDARD.encode(Md5::digest(output));
+
+    let accepted = signed_request(
+        &access_key,
+        &secret_key,
+        "PUT",
+        "http://maskura.local/md5/source.txt",
+        input,
+        &[("content-type", "text/plain"), ("content-md5", &source_md5)],
+    );
+    assert_eq!(
+        app.clone().oneshot(accepted).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        state.store.get("md5", "source.txt").unwrap().data,
+        Bytes::from_static(output)
+    );
+
+    for (key, digest) in [
+        ("transformed.txt", output_md5.as_str()),
+        ("malformed.txt", "not-base64"),
+        ("wrong-length.txt", "aGVsbG8="),
+    ] {
+        let request = signed_request(
+            &access_key,
+            &secret_key,
+            "PUT",
+            &format!("http://maskura.local/md5/{key}"),
+            input,
+            &[("content-type", "text/plain"), ("content-md5", digest)],
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{key}");
+        assert!(state.store.get("md5", key).is_none(), "{key}");
+    }
+}
+
+#[tokio::test]
 async fn sigv4_get_object_roundtrip() {
     let (app, state) = router().await;
     let (ak, sk) = make_key(&state).await;
@@ -6206,11 +6396,13 @@ fn trusted_mcp_limits_have_non_configurable_hard_ceilings() {
 #[tokio::test]
 async fn active_trusted_mcp_cancellation_releases_precommit_reservation() {
     let control = Arc::new(RecordingMeteringControl::default());
+    let config = test_config();
     let state = build_state_with_pipeline_template(
         control.clone(),
         default_wrapping().expect("wrapping"),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         test_pipeline_template(),
+        &config,
     )
     .await
     .unwrap();
@@ -6246,11 +6438,13 @@ async fn active_trusted_mcp_cancellation_releases_precommit_reservation() {
 #[tokio::test]
 async fn cancellation_during_committed_settlement_returns_success_without_release() {
     let control = Arc::new(BlockingSettlementControl::default());
+    let config = test_config();
     let state = build_state_with_pipeline_template(
         control.clone(),
         default_wrapping().expect("wrapping"),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         test_pipeline_template(),
+        &config,
     )
     .await
     .unwrap();

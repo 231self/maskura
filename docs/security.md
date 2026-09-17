@@ -535,16 +535,27 @@ The gateway must never log:
 Operational logs may reference keys, buckets, user IDs, and error messages
 that do not embed the above.
 
+**Local appliance credentials.** When no hosted or external storage is
+configured, the gateway generates a root access key and secret and logs them on
+the first start. Later starts reuse the saved credential without logging it.
+This is the only case in which Maskura logs a credential, and it applies only to
+the single-node local appliance, not hosted or multi-tenant deployments. See ADR
+0019.
+
 ## 14. Deployment responsibilities
 
-These are **operator responsibilities**; Maskura will not and cannot enforce them
-from inside a container:
+You must handle the following outside the Maskura container:
 
-Customer-configurable gateway settings use `MASKURA_*` environment variables.
-Internal/operator controls such as `MASKURA_SECRET_KEK`,
-`MASKURA_SERVICE_BUCKETS`, `MASKURA_WORKSPACE_ENDPOINT_*`, `MASKURA_PRESIGNED_HTTP_*`,
-`MASKURA_SIGV4_*`, `MASKURA_MANAGED_*`, and `MASKURA_MULTIPART_STAGING_*` keep their existing
-names and are not exposed through customer aliases.
+Non-secret gateway settings may be set by strict TOML keys or their documented
+environment overrides; environment values take precedence. See the
+[configuration reference](reference/configuration.md) for the complete schema.
+Secrets and other environment-only settings, including `MASKURA_SECRET_KEK`,
+`MASKURA_SERVICE_BUCKETS`, backend credentials, `DATABASE_URL`, and bootstrap
+secrets, are not TOML keys. Settings that support both TOML and environment
+variables, including `MASKURA_WORKSPACE_ENDPOINT_*`,
+`MASKURA_PRESIGNED_HTTP_*`, `MASKURA_SIGV4_*`, `MASKURA_MANAGED_*`, and non-secret
+`MASKURA_MULTIPART_STAGING_*` values, use those names for their environment
+overrides.
 
 - **TLS termination** — place the gateway behind a TLS-terminating proxy
   (platform load balancer, ingress, or reverse proxy). SigV4 is signed
@@ -557,7 +568,8 @@ names and are not exposed through customer aliases.
 - **KMS/Vault readiness** — configure a durable `KeyWrapping` (KMS or Vault)
   for any non-local deployment. `MASKURA_SECRET_KEK` is durable but operator-managed
   plaintext; the ephemeral wrapper loses all wrapped secrets on restart.
-  Durable multipart staging fails closed without a durable wrapping.
+  The gateway will not start durable multipart staging without durable key
+  wrapping.
 - **Durable journal / staging dependencies** — standalone local mode uses one
   mounted `MASKURA_LOCAL_STORAGE_DIR` and automatically places its file-backed
   repository, journal, proofs, artifacts, and wrapping key beneath that root;
@@ -567,18 +579,18 @@ names and are not exposed through customer aliases.
 - **Backend lifecycle permissions** — the backend credentials Maskura uses for
   direct/managed streaming must be able to create, abort, and discover
   multipart uploads, complete uploads, and (for reconciliation) perform
-  conditional reads/HEAD. The capability gate refuses streaming eligibility
-  without incomplete-upload discovery, abort, completion reconciliation, and a
-  cleanup SLA within five minutes.
-- **Feature-gate defaults** — transformed reads and managed streaming are
+  conditional reads/HEAD. Maskura enables streaming only when the backend can
+  discover and abort incomplete uploads, reconcile completed uploads, and clean
+  up within five minutes.
+- **Feature defaults** — transformed reads and managed streaming are
   **off/reject by default** and must be explicitly enabled:
   `MASKURA_STREAMING_READ_MODE=off`, `MASKURA_MULTIPART_MODE=reject`,
   `MASKURA_MANAGED_STREAMING_MODE=off`. Single-part streaming writes are always
   enabled; staged multipart additionally requires `MASKURA_MULTIPART_MODE=staged`.
   Local mode supplies its durable file-backed dependencies from the mounted root;
   hosted mode requires its Postgres, wrapping, and staging-backend dependencies.
-  Enabling a gated feature without the corresponding durable dependencies causes
-  startup to refuse configuration rather than silently degrade.
+  If you enable one of these features without its required durable services,
+  Maskura will not start.
 - **Outbound credentials** — the global `S3_ENDPOINT` client accepts static
   `S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY` and, when those are absent, falls
   back to the AWS default credential provider chain (EC2 instance profile,

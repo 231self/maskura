@@ -118,6 +118,24 @@ impl FileSinkTransaction {
         sink.checksum_algorithm = metadata.checksum_algorithm;
         Ok(sink)
     }
+
+    /// A single-part PUT that carries the captured representation/user metadata
+    /// into the durable commit (mirrors the multipart metadata contract).
+    pub async fn new_with_metadata(
+        store: Arc<FileStore>,
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+        content_type: impl Into<String>,
+        max_bytes: u64,
+        metadata: MultipartStoredMetadata,
+    ) -> Result<Self, TransactionError> {
+        let mut sink = Self::new(store, bucket, key, content_type, max_bytes).await?;
+        sink.representation_headers = metadata.representation_headers;
+        sink.user_metadata = metadata.user_metadata;
+        sink.tags = metadata.tags;
+        sink.checksum_algorithm = metadata.checksum_algorithm;
+        Ok(sink)
+    }
 }
 
 #[async_trait]

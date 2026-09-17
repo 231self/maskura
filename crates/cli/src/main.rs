@@ -1,6 +1,8 @@
 use anyhow::{Context, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
-use maskura_customer_config::{EnvAlias, aliases as customer_env, resolve as resolve_customer_env};
+use maskura_customer_config::{
+    Config as GatewayConfig, EnvAlias, aliases as customer_env, resolve as resolve_customer_env,
+};
 use reqwest::Url;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -143,6 +145,16 @@ enum Command {
 
     /// Check gateway health
     Health,
+
+    /// Validate gateway configuration without starting the gateway
+    Config {
+        /// Check the resolved configuration and exit
+        #[arg(long)]
+        check: bool,
+        /// Explicit TOML path; otherwise uses MASKURA_CONFIG or ./maskura.toml
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+    },
 
     /// Local development environment
     Local {
@@ -508,6 +520,18 @@ fn config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("maskura")
+}
+
+/// Generate a root access key + secret in the `maskura_`/`maskura_secret_`
+/// namespace for a `local init` appliance.
+fn random_root_credential() -> (String, String) {
+    use rand::RngCore as _;
+    let mut access = [0u8; 16];
+    let mut secret = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut access);
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    (format!("maskura_{}", hex(&access)), format!("maskura_secret_{}", hex(&secret)))
 }
 
 struct Client {
@@ -1175,6 +1199,29 @@ fn parse_draft_step(raw: &str) -> anyhow::Result<serde_json::Value> {
         "enabled": true,
         "config_json": config_json,
     }))
+}
+
+fn check_gateway_config(path: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let selected = path.map(PathBuf::from).or_else(|| {
+        std::env::var("MASKURA_CONFIG")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    match selected {
+        Some(path) => {
+            GatewayConfig::resolve(Some(&path))?;
+        }
+        None => {
+            let default = PathBuf::from("maskura.toml");
+            if default.exists() {
+                GatewayConfig::resolve(Some(&default))?;
+            } else {
+                GatewayConfig::resolve(None)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -1900,7 +1947,12 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Health => {
-            let gateway = cli.requested_gateway();
+            let gateway = cli
+                .gateway
+                .clone()
+                .or_else(|| cli.customer_env.gateway.clone())
+                .or_else(|| Config::load().gateway)
+                .unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
             let resp = reqwest::get(format!("{gateway}/health")).await?;
             if resp.status().is_success() {
                 println!("Maskura Gateway is healthy at {gateway}");
@@ -1911,6 +1963,14 @@ async fn main() -> anyhow::Result<()> {
                     resp.text().await?
                 );
             }
+        }
+
+        Command::Config { check, config } => {
+            if !check {
+                bail!("`maskura config` requires `--check`");
+            }
+            check_gateway_config(config.as_deref())?;
+            println!("Configuration is valid.");
         }
 
         Command::Local { cmd } => {
@@ -1937,11 +1997,27 @@ async fn main() -> anyhow::Result<()> {
                         bail!("docker is not running — start Docker/colima first");
                     }
 
-                    // Pick a free host port (8080 is commonly taken) and
-                    // publish on the loopback interface only.
-                    let port = (8080u16..=8180u16)
+                    // Pick a free host port and publish on the loopback
+                    // interface only. The appliance listens on the container's
+                    // MinIO-convention port 9000.
+                    let port = (9000u16..=9020u16)
                         .find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
-                        .expect("no free port in 8080..8180");
+                        .expect("no free port in 9000..9020");
+
+                    // Generate (or reuse) a stable root credential so the CLI
+                    // can always authenticate the local appliance. The gateway
+                    // bootstraps it into its persisted key store.
+                    let mut cfg = Config::load();
+                    let (access_key, secret_key) = match (cfg.access_key.clone(), cfg.secret_key.clone())
+                    {
+                        (Some(access), Some(secret)) => (access, secret),
+                        _ => {
+                            let (access, secret) = random_root_credential();
+                            cfg.access_key = Some(access.clone());
+                            cfg.secret_key = Some(secret.clone());
+                            (access, secret)
+                        }
+                    };
 
                     let _ = std::process::Command::new("docker")
                         .args(["rm", "-f", LOCAL_GATEWAY_NAME])
@@ -1955,21 +2031,13 @@ async fn main() -> anyhow::Result<()> {
                             "--name",
                             LOCAL_GATEWAY_NAME,
                             "-p",
-                            &format!("127.0.0.1:{port}:8080"),
+                            &format!("127.0.0.1:{port}:9000"),
                             "-v",
                             "maskura-local-keys:/data",
                             "-e",
-                            "AUTH_DISABLED=true",
+                            &format!("MASKURA_ROOT_USER={access_key}"),
                             "-e",
-                            "MASKURA_KEYS_FILE=/data/keys.json",
-                            "-e",
-                            "MASKURA_STORAGE_MODE=local",
-                            "-e",
-                            "MASKURA_LOCAL_STORAGE_DIR=/data",
-                            "-e",
-                            "MASKURA_MULTIPART_MODE=staged",
-                            "-e",
-                            "MASKURA_STREAMING_READ_MODE=passthrough",
+                            &format!("MASKURA_ROOT_PASSWORD={secret_key}"),
                             &local_gateway_image,
                         ])
                         .status()?;
@@ -2008,28 +2076,25 @@ async fn main() -> anyhow::Result<()> {
                         bail!("gateway did not become healthy at {url}/health");
                     }
 
-                    // Point the CLI at the local gateway in demo mode so the
-                    // quickstart works without any credentials.
-                    let mut cfg = Config::load();
-                    cfg.access_key = None;
-                    cfg.secret_key = None;
+                    // Point the CLI at the local appliance with its root
+                    // credential and the canonical bucket.
                     cfg.gateway = Some(url.clone());
-                    cfg.bucket = None;
+                    cfg.bucket = Some("maskura".to_string());
                     cfg.save()?;
 
                     println!("Maskura Gateway is running locally (published image).");
                     println!("  Gateway: {url}");
+                    println!("  Bucket:  maskura");
                     println!("  Storage: durable local filesystem (/data)");
-                    println!("  Multipart: durable staged uploads enabled");
                     println!("  Volume:  maskura-local-keys (keys and object state)");
                     println!();
                     println!("Quickstart:");
                     println!(
-                        "  {} put ./data.csv ingest/data.csv --bucket maskura-local",
+                        "  {} put ./data.csv ingest/data.csv --bucket maskura",
                         cli.program.name()
                     );
                     println!(
-                        "  {} get ingest/data.csv --bucket maskura-local",
+                        "  {} get ingest/data.csv --bucket maskura",
                         cli.program.name()
                     );
                     println!();
@@ -2374,6 +2439,25 @@ mod tests {
                 decrypt: Some(path),
                 ..
             } if path == std::path::Path::new("private.pem")
+        ));
+    }
+
+    #[test]
+    fn cli_parses_config_check_with_an_explicit_path() {
+        let cli = Cli::try_parse_from([
+            "maskura",
+            "config",
+            "--check",
+            "--config",
+            "/tmp/maskura.toml",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Config {
+                check: true,
+                config: Some(path),
+            } if path == std::path::Path::new("/tmp/maskura.toml")
         ));
     }
 
