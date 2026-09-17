@@ -371,6 +371,22 @@ async fn release_failure(
     }
 }
 
+async fn managed_delete_failure_response(
+    control: &dyn ControlPlane,
+    context: &AuthenticatedRequestContext,
+    grant: &AuthorizationGrant,
+    key: &str,
+    error: crate::managed::ManagedDeleteError,
+) -> axum::response::Response {
+    let response = s3_error::internal_error(key, "The managed delete could not be completed.");
+    match error {
+        crate::managed::ManagedDeleteError::PreCommit(_) => {
+            release_failure(control, context, grant, key, response).await
+        }
+        crate::managed::ManagedDeleteError::CommitUnknown(_) => response,
+    }
+}
+
 async fn record_usage(
     control: Arc<dyn ControlPlane>,
     context: &AuthenticatedRequestContext,
@@ -8114,6 +8130,47 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn managed_delete_releases_only_definite_precommit_failures() {
+        let context = AuthenticatedRequestContext {
+            user_id: "user-a".to_string(),
+            workspace_id: crate::workspace_storage::WorkspaceId::new("workspace-a").unwrap(),
+        };
+        let operation = request_operation_identity();
+        let authorization =
+            operation.authorization("bucket-a", UsageRoute::DeleteObject, RequestKind::Write, 0);
+        let grant = test_grant(&authorization);
+
+        let definite = RecordingControlPlane::default();
+        let response = managed_delete_failure_response(
+            &definite,
+            &context,
+            &grant,
+            "key-a",
+            crate::managed::ManagedDeleteError::PreCommit(crate::managed::ManagedError::Conflict),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            definite.releases.lock().unwrap().as_slice(),
+            &[grant.operation_id()]
+        );
+
+        let uncertain = RecordingControlPlane::default();
+        let response = managed_delete_failure_response(
+            &uncertain,
+            &context,
+            &grant,
+            "key-a",
+            crate::managed::ManagedDeleteError::CommitUnknown(
+                crate::managed::ManagedError::Conflict,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(uncertain.releases.lock().unwrap().is_empty());
+    }
+
     struct PrivateAddressResolver;
 
     #[async_trait::async_trait]
@@ -9588,15 +9645,34 @@ async fn s3_delete(
                 ManagedStreamingMode::Off => storage
                     .delete(&format!("{}/{bucket}/{key}", auth.workspace_id().as_str()))
                     .await
-                    .map_err(|error| error.to_string()),
+                    .map_err(|error| {
+                        crate::managed::ManagedDeleteError::PreCommit(
+                            crate::managed::ManagedError::Persistence(error.to_string()),
+                        )
+                    }),
                 ManagedStreamingMode::Observe => unreachable!("handled above"),
-                ManagedStreamingMode::Enforce => storage
-                    .tombstone_authoritative(&managed_logical_key(&auth, &bucket, &key))
-                    .await
-                    .map_err(|error| error.to_string()),
+                ManagedStreamingMode::Enforce => {
+                    storage
+                        .delete_authoritative(
+                            &managed_logical_key(&auth, &bucket, &key),
+                            grant.operation_id(),
+                            grant.receipt_id(),
+                            grant.occurred_at().timestamp_micros(),
+                            grant.rate_version(),
+                            grant.max_processed_bytes(),
+                        )
+                        .await
+                }
             };
             if let Err(error) = result {
-                return s3_error::internal_error(&key, &error.to_string());
+                return managed_delete_failure_response(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &grant,
+                    &key,
+                    error,
+                )
+                .await;
             }
             if let Err(response) = record_operation(
                 state.control.clone(),
@@ -9611,6 +9687,16 @@ async fn s3_delete(
             .await
             {
                 return response;
+            }
+            if storage.managed_mode() == ManagedStreamingMode::Enforce
+                && let Err(error) = storage
+                    .mark_authoritative_delete_settled(grant.operation_id(), grant.receipt_id())
+                    .await
+            {
+                warn!(
+                    operation_id = %grant.operation_id(),
+                    "durable managed DELETE settlement remains pending: {error}"
+                );
             }
             StatusCode::NO_CONTENT.into_response()
         }
@@ -12512,6 +12598,10 @@ pub async fn build_state_with_pipeline_template(
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         service_storage
+            .reconcile_managed_delete_settlements(control.as_ref(), 256)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        service_storage
             .reconcile_managed_write_intents(
                 journal,
                 capabilities,
@@ -12604,6 +12694,7 @@ pub async fn build_state_with_pipeline_template(
         )
     {
         let storage = state.service_storage.clone();
+        let control = state.control.clone();
         tokio::spawn(async move {
             let owner = format!("managed-repair-{}", uuid::Uuid::now_v7());
             loop {
@@ -12628,6 +12719,12 @@ pub async fn build_state_with_pipeline_template(
                     .await
                 {
                     warn!("managed write-intent reconciliation failed: {error}");
+                }
+                if let Err(error) = storage
+                    .reconcile_managed_delete_settlements(control.as_ref(), 64)
+                    .await
+                {
+                    warn!("managed DELETE settlement reconciliation failed: {error}");
                 }
                 if let Err(error) = storage
                     .repair_due(journal.clone(), capabilities, &owner, 16)
