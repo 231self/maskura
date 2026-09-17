@@ -23,14 +23,15 @@ use maskura_gateway::entity::object_operation;
 use maskura_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher};
 use maskura_gateway::managed::{
     AuthorityListQuery, AuthorityPlacementPageQuery, BackendVersioningCapability,
-    BackendVersioningMode, CopyStatus, InMemoryManagedRepository, LogicalObjectKey,
-    MANAGED_LIST_CURSOR_RESPONSE_MAX_BYTES, MANAGED_LIST_CURSOR_WORKSPACE_LIMIT,
+    BackendVersioningMode, CopyStatus, ExactPhysicalCommit, InMemoryManagedRepository,
+    LogicalAbortProof, LogicalObjectKey, MANAGED_LIST_CURSOR_RESPONSE_MAX_BYTES,
+    MANAGED_LIST_CURSOR_WORKSPACE_LIMIT, MANAGED_PUBLICATION_RECIPE_VERSION,
     ManagedListCursorBinding, ManagedListCursorPosition, ManagedListCursorRequest,
     ManagedListCursorState, ManagedListVersion, ManagedLogicalOperationIntent,
-    ManagedLogicalOperationState, ManagedMutationKind, ManagedProvenPhysicalAllocation,
-    ManagedRepository, ManagedRouteFence, ManagedUsageEvidence, NamespacePurgeRequest,
-    NamespacePurgeStatus, ObjectAuthority, PhysicalWriteIntent, Placement,
-    PostgresManagedRepository, ProviderStorageIdentity, generation_physical_key,
+    ManagedLogicalOperationState, ManagedMutationKind, ManagedPublicationRecipe, ManagedRepository,
+    ManagedRouteFence, ManagedUsageEvidence, NamespacePurgeRequest, NamespacePurgeStatus,
+    ObjectAuthority, PhysicalWriteIntent, Placement, PostgresManagedRepository,
+    ProviderStorageIdentity, generation_physical_key,
 };
 use maskura_gateway::multipart_staging::{
     ARTIFACT_PREFIX, CompletePart, CompletionAcquire, DestinationCommitPermit,
@@ -51,7 +52,7 @@ use sea_orm::{
 };
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -74,6 +75,18 @@ const TEST_PUBLIC_KEY_PEM: &str =
 const TEST_PUBLIC_KEY_2_PEM: &str =
     include_str!("../../../tests/fixtures/pii/crypto/hybrid-public-2.pem");
 static DB_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn publication_recipe(primary_backend_id: &str) -> ManagedPublicationRecipe {
+    ManagedPublicationRecipe {
+        version: MANAGED_PUBLICATION_RECIPE_VERSION,
+        placement_version: 1,
+        primary_backend_id: primary_backend_id.to_string(),
+        replica_backend_id: None,
+        metadata: BTreeMap::new(),
+        primary_status: CopyStatus::Ready,
+        replica_status: CopyStatus::Absent,
+    }
+}
 
 #[derive(Default)]
 struct MultipartBillingControl {
@@ -168,6 +181,64 @@ fn test_physical_intent(
     }
 }
 
+async fn insert_committed_child(
+    pool: &PgPool,
+    intent: &ManagedLogicalOperationIntent,
+    digest: &str,
+    size: u64,
+    result: &ExactPhysicalCommit,
+) {
+    let journal = PostgresOperationJournal::new(pool.clone());
+    let expected = ExpectedObject {
+        digest: Some(digest.to_string()),
+        size: Some(size),
+        metadata: BTreeMap::new(),
+    };
+    journal
+        .insert_intent(OperationRecord::scoped_intent(
+            intent.primary_child_operation_id,
+            ObjectDestination {
+                backend_id: intent.backend_id.clone(),
+                bucket: intent.provider_bucket.clone(),
+                logical_key: intent.logical.object_key(),
+                physical_key: intent.physical_key.clone(),
+                workspace_binding: None,
+            },
+            expected,
+            intent.logical.tenant_id.clone(),
+            intent.fence.namespace_epoch,
+        ))
+        .await
+        .unwrap();
+    journal
+        .set_open(intent.primary_child_operation_id, None)
+        .await
+        .unwrap();
+    journal
+        .transition(
+            intent.primary_child_operation_id,
+            OperationState::Open,
+            OperationState::Completing,
+            None,
+        )
+        .await
+        .unwrap();
+    journal
+        .transition(
+            intent.primary_child_operation_id,
+            OperationState::Completing,
+            OperationState::Committed,
+            Some(&StoredObjectMeta {
+                etag: Some("test-etag".to_string()),
+                version_id: result.selected_version_id.clone(),
+                superseded_version_ids: result.superseded_version_ids.clone(),
+                version_history_complete: result.version_history_complete,
+            }),
+        )
+        .await
+        .unwrap();
+}
+
 async fn assert_physical_intent_duplicate_contract(
     repository: &dyn ManagedRepository,
     tenant_id: &str,
@@ -216,7 +287,7 @@ async fn assert_physical_intent_duplicate_contract(
     for conflicting in conflicts {
         assert!(matches!(
             repository.begin_physical_write(conflicting).await,
-            Err(maskura_gateway::managed::ManagedError::Conflict)
+            Err(maskura_gateway::managed::ManagedError::RecoveryBlocked(_))
         ));
     }
     let pending = repository.pending_physical_write_intents(10).await.unwrap();
@@ -276,10 +347,11 @@ fn engine_migration_helper_ignores_unknown_private_versions_but_rejects_checksum
             .await
             .unwrap();
 
-        let (version, checksum): (i64, Vec<u8>) = sqlx::query_as(
-            "SELECT version, checksum FROM _sqlx_migrations \
-             WHERE success = TRUE ORDER BY version LIMIT 1",
+        let version = 20260809000001_i64;
+        let checksum: Vec<u8> = sqlx::query_scalar(
+            "SELECT checksum FROM _sqlx_migrations WHERE version = $1 AND success = TRUE",
         )
+        .bind(version)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -357,7 +429,15 @@ fn public_migrations_apply_fresh_after_private_shared_history() {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(versions, [20260907000001, 20260907000002, 20260909000001]);
+        assert_eq!(
+            versions,
+            [
+                20260907000001,
+                20260907000002,
+                20260909000001,
+                20260916000001,
+            ]
+        );
         isolated.close().await;
         sqlx::raw_sql(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
             .execute(&pool)
@@ -485,7 +565,7 @@ fn postgres_namespace_purge_fences_late_writes_and_completes_idempotently() {
     with_pool(|pool| async move {
         let db = sea_db(pool.clone());
         let journal = PostgresOperationJournal::new(pool.clone());
-        let repository = PostgresManagedRepository::new(pool);
+        let repository = PostgresManagedRepository::new(pool.clone());
         let tenant = format!("purge-unit-{}", uuid::Uuid::new_v4());
         let intent_id = uuid::Uuid::now_v7();
         let physical_intent = test_physical_intent(
@@ -512,7 +592,9 @@ fn postgres_namespace_purge_fences_late_writes_and_completes_idempotently() {
                     ..physical_intent
                 })
                 .await,
-            Err(maskura_gateway::managed::ManagedError::Conflict)
+            Err(maskura_gateway::managed::ManagedError::RecoveryBlocked(
+                "physical_intent_mismatch"
+            ))
         ));
         journal
             .insert_intent(OperationRecord::scoped_intent(
@@ -1680,7 +1762,7 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
 fn postgres_managed_logical_quota_listing_cursor_and_release_contract() {
     with_pool(|pool| async move {
         let db = sea_db(pool.clone());
-        let repository = PostgresManagedRepository::new(pool);
+        let repository = PostgresManagedRepository::new(pool.clone());
         let tenant = format!("managed-logical-unit-{}", uuid::Uuid::new_v4());
         let logical = LogicalObjectKey::new(&tenant, "bucket", "prefix%/key");
         let generation = uuid::Uuid::now_v7();
@@ -1710,6 +1792,7 @@ fn postgres_managed_logical_quota_listing_cursor_and_release_contract() {
             route: UsageRoute::PutObject,
             request_kind: RequestKind::Write,
             max_processed_bytes: 64,
+            publication_recipe: Some(publication_recipe("primary")),
         };
         let mut concurrent = intent.clone();
         concurrent.operation_id = uuid::Uuid::now_v7();
@@ -1788,17 +1871,6 @@ fn postgres_managed_logical_quota_listing_cursor_and_release_contract() {
             Err(maskura_gateway::managed::ManagedError::MutationInProgress)
         ));
         let lease = repository.begin_physical_write(child).await.unwrap();
-        repository
-            .commit_physical_write(
-                &lease,
-                &[
-                    "ambiguous-retry-version".to_string(),
-                    "ambiguous-retry-version".to_string(),
-                ],
-                Some("committed-version"),
-            )
-            .await
-            .unwrap();
         assert_eq!(
             repository
                 .insert_logical_operation(intent.clone())
@@ -1830,31 +1902,56 @@ fn postgres_managed_logical_quota_listing_cursor_and_release_contract() {
             )
             .await
             .unwrap();
-        let authority = ObjectAuthority {
-            logical: logical.clone(),
-            generation,
-            digest: "digest".to_string(),
-            size: 3,
-            metadata: std::collections::BTreeMap::new(),
-            placement_version: 1,
-            primary_backend_id: intent.backend_id.clone(),
-            primary_version_id: Some("committed-version".to_string()),
-            replica_backend_id: None,
-            primary_status: CopyStatus::Ready,
-            replica_status: CopyStatus::Absent,
-            tombstone: false,
-            cas_version: 0,
-            created_at_ms: 0,
-            updated_at_ms: 0,
+        assert!(matches!(
+            repository
+                .finalize_logical_put(
+                    intent.operation_id,
+                    &lease,
+                    ExactPhysicalCommit {
+                        selected_version_id: Some("committed-version".to_string()),
+                        superseded_version_ids: vec!["ambiguous-retry-version".to_string()],
+                        version_history_complete: false,
+                    },
+                    None,
+                )
+                .await,
+            Err(maskura_gateway::managed::ManagedError::RecoveryBlocked(
+                "invalid_exact_version_history"
+            ))
+        ));
+        let exact_commit = ExactPhysicalCommit {
+            selected_version_id: Some("committed-version".to_string()),
+            superseded_version_ids: vec!["ambiguous-retry-version".to_string()],
+            version_history_complete: true,
         };
         assert!(matches!(
             repository
-                .commit_logical_put(intent.operation_id, authority.clone(), 3)
+                .finalize_logical_put(
+                    intent.operation_id,
+                    &lease,
+                    ExactPhysicalCommit {
+                        selected_version_id: None,
+                        superseded_version_ids: Vec::new(),
+                        version_history_complete: true,
+                    },
+                    None,
+                )
                 .await,
-            Err(maskura_gateway::managed::ManagedError::Conflict)
+            Err(maskura_gateway::managed::ManagedError::RecoveryBlocked(
+                "physical_versioning_contract_mismatch"
+            ))
         ));
+        assert!(matches!(
+            repository
+                .finalize_logical_put(intent.operation_id, &lease, exact_commit.clone(), None,)
+                .await,
+            Err(maskura_gateway::managed::ManagedError::RecoveryBlocked(
+                "missing_child_journal"
+            ))
+        ));
+        insert_committed_child(&pool, &intent, "digest", 3, &exact_commit).await;
         let committed = repository
-            .commit_logical_put(intent.operation_id, authority.clone(), 6)
+            .finalize_logical_put(intent.operation_id, &lease, exact_commit.clone(), None)
             .await
             .unwrap();
         assert_eq!(committed.operation.intent.receipt_id, intent.receipt_id);
@@ -1864,10 +1961,9 @@ fn postgres_managed_logical_quota_listing_cursor_and_release_contract() {
         assert_eq!(committed.usage.reserved_bytes, 0);
         assert_eq!(committed.usage.active_operation_id, None);
         repository
-            .commit_logical_put(intent.operation_id, authority, 6)
+            .finalize_logical_put(intent.operation_id, &lease, exact_commit.clone(), None)
             .await
             .unwrap();
-
         managed_object_authority::Entity::insert(managed_object_authority::ActiveModel {
             tenant_id: Set(tenant.clone()),
             bucket: Set("bucket".to_string()),
@@ -2003,6 +2099,24 @@ fn postgres_managed_logical_quota_listing_cursor_and_release_contract() {
             Err(maskura_gateway::managed::ManagedError::CursorExpired)
         ));
 
+        let advanced_authority = repository
+            .tombstone(
+                &intent.logical,
+                Some(committed.authority.cas_version),
+                &Placement {
+                    version: committed.authority.placement_version,
+                    primary_backend_id: committed.authority.primary_backend_id.clone(),
+                    replica_backend_id: committed.authority.replica_backend_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let replay_after_overwrite = repository
+            .finalize_logical_put(intent.operation_id, &lease, exact_commit, None)
+            .await
+            .unwrap();
+        assert_eq!(replay_after_overwrite.authority, advanced_authority);
+
         let versions = repository
             .physical_versions(
                 &tenant,
@@ -2073,7 +2187,7 @@ fn postgres_managed_logical_quota_listing_cursor_and_release_contract() {
 fn postgres_managed_zero_byte_put_is_ledgered_and_committed() {
     with_pool(|pool| async move {
         let db = sea_db(pool.clone());
-        let repository = PostgresManagedRepository::new(pool);
+        let repository = PostgresManagedRepository::new(pool.clone());
         let tenant = format!("managed-zero-unit-{}", uuid::Uuid::new_v4());
         let logical = LogicalObjectKey::new(&tenant, "bucket", "empty");
         let generation = uuid::Uuid::now_v7();
@@ -2096,6 +2210,7 @@ fn postgres_managed_zero_byte_put_is_ledgered_and_committed() {
             route: UsageRoute::PutObject,
             request_kind: RequestKind::Write,
             max_processed_bytes: 0,
+            publication_recipe: Some(publication_recipe("primary")),
         };
         repository
             .insert_logical_operation(intent.clone())
@@ -2116,10 +2231,6 @@ fn postgres_managed_zero_byte_put_is_ledgered_and_committed() {
         );
         child.versioning_capability = BackendVersioningCapability::Required;
         let lease = repository.begin_physical_write(child).await.unwrap();
-        repository
-            .commit_physical_write(&lease, &[], Some("empty-version"))
-            .await
-            .unwrap();
         repository
             .record_logical_usage(
                 intent.operation_id,
@@ -2142,28 +2253,14 @@ fn postgres_managed_zero_byte_put_is_ledgered_and_committed() {
             )
             .await
             .unwrap();
+        let exact_commit = ExactPhysicalCommit {
+            selected_version_id: Some("empty-version".to_string()),
+            superseded_version_ids: Vec::new(),
+            version_history_complete: true,
+        };
+        insert_committed_child(&pool, &intent, "empty-digest", 0, &exact_commit).await;
         let committed = repository
-            .commit_logical_put(
-                intent.operation_id,
-                ObjectAuthority {
-                    logical,
-                    generation,
-                    digest: "empty-digest".to_string(),
-                    size: 0,
-                    metadata: std::collections::BTreeMap::new(),
-                    placement_version: 1,
-                    primary_backend_id: intent.backend_id.clone(),
-                    primary_version_id: Some("empty-version".to_string()),
-                    replica_backend_id: None,
-                    primary_status: CopyStatus::Ready,
-                    replica_status: CopyStatus::Absent,
-                    tombstone: false,
-                    cas_version: 0,
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                },
-                0,
-            )
+            .finalize_logical_put(intent.operation_id, &lease, exact_commit, None)
             .await
             .unwrap();
         assert_eq!(committed.operation.committed_physical_bytes, 0);
@@ -2232,6 +2329,7 @@ fn postgres_managed_admission_is_atomic() {
                 route: UsageRoute::PutObject,
                 request_kind: RequestKind::Write,
                 max_processed_bytes: 0,
+                publication_recipe: Some(publication_recipe("primary")),
             }
         };
         let first = intent("first");
@@ -2284,10 +2382,10 @@ fn postgres_managed_admission_is_atomic() {
 }
 
 #[test]
-fn postgres_proven_abort_rejects_under_counted_physical_allocation() {
+fn postgres_logical_child_abort_is_atomic() {
     with_pool(|pool| async move {
         let db = sea_db(pool.clone());
-        let repository = PostgresManagedRepository::new(pool);
+        let repository = PostgresManagedRepository::new(pool.clone());
         let tenant = format!("managed-abort-unit-{}", uuid::Uuid::new_v4());
         let logical = LogicalObjectKey::new(&tenant, "bucket", "aborted");
         let generation = uuid::Uuid::now_v7();
@@ -2309,6 +2407,7 @@ fn postgres_proven_abort_rejects_under_counted_physical_allocation() {
             route: UsageRoute::PutObject,
             request_kind: RequestKind::Write,
             max_processed_bytes: 3,
+            publication_recipe: Some(publication_recipe("primary")),
         };
         repository
             .insert_logical_operation(intent.clone())
@@ -2329,78 +2428,80 @@ fn postgres_proven_abort_rejects_under_counted_physical_allocation() {
             ))
             .await
             .unwrap();
-        repository
-            .commit_physical_write(
-                &lease,
-                &["retry-version".to_string(), "retry-version".to_string()],
-                Some("final-version"),
-            )
-            .await
-            .unwrap();
-        repository
-            .record_logical_usage(
-                intent.operation_id,
-                ManagedUsageEvidence {
-                    expected_output_digest: Some("digest".to_string()),
-                    expected_output_size: 3,
-                    source_bytes: 3,
-                    processed_bytes: 3,
-                    payload: serde_json::json!({}),
-                },
-            )
-            .await
-            .unwrap();
-        repository
-            .transition_logical_operation(
-                intent.operation_id,
-                ManagedLogicalOperationState::Open,
-                ManagedLogicalOperationState::Completing,
-                None,
-            )
-            .await
-            .unwrap();
-        let authority = ObjectAuthority {
-            logical,
-            generation,
-            digest: "digest".to_string(),
-            size: 3,
-            metadata: std::collections::BTreeMap::new(),
-            placement_version: 1,
-            primary_backend_id: intent.backend_id.clone(),
-            primary_version_id: Some("final-version".to_string()),
-            replica_backend_id: None,
-            primary_status: CopyStatus::Ready,
-            replica_status: CopyStatus::Absent,
-            tombstone: false,
-            cas_version: 0,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
+        assert!(matches!(
+            repository.abort_physical_write(&lease).await,
+            Err(maskura_gateway::managed::ManagedError::Conflict)
+        ));
         assert!(matches!(
             repository
-                .prove_logical_abort(
+                .abort_logical_put(
                     intent.operation_id,
-                    "publication_failed",
-                    Some(ManagedProvenPhysicalAllocation {
-                        authority: authority.clone(),
-                        allocated_bytes: 3,
-                    }),
+                    Some(&lease),
+                    LogicalAbortProof::ChildProvenAborted,
+                    "unverified_child_abort",
+                    None,
                 )
                 .await,
             Err(maskura_gateway::managed::ManagedError::Conflict)
         ));
-        let aborted = repository
-            .prove_logical_abort(
-                intent.operation_id,
-                "publication_failed",
-                Some(ManagedProvenPhysicalAllocation {
-                    authority,
-                    allocated_bytes: 6,
-                }),
+        let journal = PostgresOperationJournal::new(pool.clone());
+        let destination = ObjectDestination {
+            backend_id: intent.backend_id.clone(),
+            bucket: intent.provider_bucket.clone(),
+            logical_key: logical.object_key(),
+            physical_key: intent.physical_key.clone(),
+            workspace_binding: None,
+        };
+        journal
+            .insert_intent(OperationRecord::scoped_intent(
+                intent.primary_child_operation_id,
+                destination,
+                ExpectedObject::default(),
+                tenant.clone(),
+                intent.fence.namespace_epoch,
+            ))
+            .await
+            .unwrap();
+        journal
+            .set_open(intent.primary_child_operation_id, None)
+            .await
+            .unwrap();
+        journal
+            .transition(
+                intent.primary_child_operation_id,
+                OperationState::Open,
+                OperationState::Aborting,
+                None,
             )
             .await
             .unwrap();
-        assert_eq!(aborted.committed_physical_bytes, 6);
+        let observed_at = unix_time_ms();
+        assert!(
+            !journal
+                .confirm_exact_absence(intent.primary_child_operation_id, observed_at, 0)
+                .await
+                .unwrap()
+        );
+        journal
+            .transition(
+                intent.primary_child_operation_id,
+                OperationState::Aborting,
+                OperationState::ProvenAborted,
+                None,
+            )
+            .await
+            .unwrap();
+        let aborted = repository
+            .abort_logical_put(
+                intent.operation_id,
+                Some(&lease),
+                LogicalAbortProof::ChildProvenAborted,
+                "child_proven_aborted",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(aborted.state, ManagedLogicalOperationState::ProvenAborted);
         assert_eq!(
             repository
                 .workspace_usage(&tenant)
@@ -2408,7 +2509,7 @@ fn postgres_proven_abort_rejects_under_counted_physical_allocation() {
                 .unwrap()
                 .unwrap()
                 .physical_allocated_bytes,
-            6
+            0
         );
         let versions = repository
             .physical_versions(
@@ -2419,10 +2520,7 @@ fn postgres_proven_abort_rejects_under_counted_physical_allocation() {
             )
             .await
             .unwrap();
-        assert_eq!(versions.len(), 2);
-        for version in versions {
-            repository.forget_physical_version(&version).await.unwrap();
-        }
+        assert!(versions.is_empty());
         assert_eq!(
             repository
                 .workspace_usage(&tenant)
@@ -2435,6 +2533,10 @@ fn postgres_proven_abort_rejects_under_counted_physical_allocation() {
 
         managed_object_repair::Entity::delete_many()
             .filter(managed_object_repair::Column::TenantId.eq(&tenant))
+            .exec(&db)
+            .await
+            .unwrap();
+        object_operation::Entity::delete_by_id(intent.primary_child_operation_id)
             .exec(&db)
             .await
             .unwrap();
@@ -2482,6 +2584,7 @@ fn postgres_managed_quota_and_cursor_limits_hold_under_concurrency() {
                 route: UsageRoute::PutObject,
                 request_kind: RequestKind::Write,
                 max_processed_bytes: 1,
+                publication_recipe: Some(publication_recipe("primary")),
             }
         };
         let first_intent = make_intent("first");

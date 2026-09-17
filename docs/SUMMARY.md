@@ -32,3 +32,6 @@
 - [ADR 0013: Durable local multipart storage](adr/0013-durable-local-multipart-storage.md)
 - [ADR 0014: Supply-chain security and release provenance](adr/0014-supply-chain-security.md)
 - [ADR 0015: LLM-authored release notes and Discord announcements](adr/0015-release-notes-and-discord-notifications.md)
+- [ADR 0016: Maskura plugin contract and namespace](adr/0016-maskura-plugin-contract-and-namespace.md)
+- [ADR 0017: Atomic managed-write admission](adr/0017-atomic-managed-write-admission.md)
+- [ADR 0018: Atomic managed-write finalization and recovery](adr/0018-atomic-managed-write-finalization-and-recovery.md)

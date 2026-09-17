@@ -12,12 +12,14 @@ use crate::control::{RequestKind, UsageEvent, UsageRoute};
 use crate::managed::{
     AuthorityListPage, AuthorityListQuery, AuthorityPlacementCursor, AuthorityPlacementPage,
     AuthorityPlacementPageQuery, AuthorityPlacementStats, BackendVersioningCapability,
-    BackendVersioningMode, CopyStatus, DurablePhysicalWriteIntent, LogicalObjectKey, ManagedError,
+    BackendVersioningMode, CopyStatus, DurablePhysicalWriteIntent, ExactPhysicalCommit,
+    LogicalObjectKey, MANAGED_PUBLICATION_RECIPE_VERSION, ManagedError,
     ManagedLogicalOperationIntent, ManagedLogicalOperationState, ManagedMutationKind,
-    ManagedRepository, ManagedStreamingMode, ManagedUsageEvidence, NamespacePurgeRequest,
-    NamespacePurgeStatus, ObjectAuthority, PLACEMENT_VERSION_V1, PhysicalVersionTarget,
-    PhysicalWriteIntent, Placement, ProviderStorageIdentity, RepairKind, RepairRecord,
-    RepairStateCounts, RepairTargetRole, generation_physical_key, weighted_rendezvous_placement,
+    ManagedPublicationRecipe, ManagedRepository, ManagedStreamingMode, ManagedUsageEvidence,
+    NamespacePurgeRequest, NamespacePurgeStatus, ObjectAuthority, PLACEMENT_VERSION_V1,
+    PhysicalVersionTarget, PhysicalWriteIntent, Placement, ProviderStorageIdentity, RepairKind,
+    RepairRecord, RepairStateCounts, RepairTargetRole, generation_physical_key,
+    weighted_rendezvous_placement,
 };
 use crate::s3_safety::{
     record_s3_body_failure, record_s3_failure, s3_retry_config, s3_timeout_config,
@@ -149,6 +151,11 @@ pub struct ServiceStorage {
     managed_mode: ManagedStreamingMode,
     placement_version: u32,
     managed_versioning_capability: Option<BackendVersioningCapability>,
+}
+
+enum DurableBackendValidationError {
+    Transient,
+    Blocked(String),
 }
 
 const LEGACY_VIRTUAL_NODES: usize = 150;
@@ -723,40 +730,49 @@ impl ServiceStorage {
     async fn validate_durable_intent_backend(
         &self,
         durable: &DurablePhysicalWriteIntent,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, DurableBackendValidationError> {
         let intent = &durable.intent;
-        let index = self
-            .index_for_id(&intent.backend_id)
-            .ok_or_else(|| format!("unknown managed backend {}", intent.backend_id))?;
+        let index = self.index_for_id(&intent.backend_id).ok_or_else(|| {
+            DurableBackendValidationError::Blocked(format!(
+                "unknown managed backend {}",
+                intent.backend_id
+            ))
+        })?;
         if !self.backends[index]
             .matches_persisted_identity(&intent.storage_identity, intent.credential_epoch)
         {
-            return Err(format!(
+            return Err(DurableBackendValidationError::Blocked(format!(
                 "managed backend {} storage identity changed or its credential epoch moved backwards while a write intent was unresolved",
                 intent.backend_id
-            ));
+            )));
         }
         if self.backends[index].bucket != intent.provider_bucket {
-            return Err(format!(
+            return Err(DurableBackendValidationError::Blocked(format!(
                 "managed backend {} bucket changed while a write intent was unresolved",
                 intent.backend_id
-            ));
+            )));
         }
         let current_versioning = self.versioning_mode(index).await;
-        if current_versioning == BackendVersioningMode::Unknown
-            || intent.versioning_mode == BackendVersioningMode::Unknown
-            || current_versioning != intent.versioning_mode
-        {
-            return Err(format!(
+        if intent.versioning_mode == BackendVersioningMode::Unknown {
+            return Err(DurableBackendValidationError::Blocked(format!(
+                "managed backend {} persisted an unknown versioning mode while a write intent was unresolved",
+                intent.backend_id
+            )));
+        }
+        if current_versioning == BackendVersioningMode::Unknown {
+            return Err(DurableBackendValidationError::Transient);
+        }
+        if current_versioning != intent.versioning_mode {
+            return Err(DurableBackendValidationError::Blocked(format!(
                 "managed backend {} versioning mode is unknown or changed while a write intent was unresolved",
                 intent.backend_id
-            ));
+            )));
         }
         if self.managed_versioning_capability != Some(intent.versioning_capability) {
-            return Err(format!(
+            return Err(DurableBackendValidationError::Blocked(format!(
                 "managed backend {} versioning capability changed while a write intent was unresolved",
                 intent.backend_id
-            ));
+            )));
         }
         Ok(index)
     }
@@ -790,7 +806,8 @@ impl ServiceStorage {
             };
             let index = match self.validate_durable_intent_backend(&durable).await {
                 Ok(index) => index,
-                Err(reason) => {
+                Err(DurableBackendValidationError::Transient) => continue,
+                Err(DurableBackendValidationError::Blocked(reason)) => {
                     repository.block_physical_write(&lease, &reason).await?;
                     continue;
                 }
@@ -866,8 +883,18 @@ impl ServiceStorage {
                     })?;
             }
             match (operation.state, operation.committed) {
-                (OperationState::ProvenAborted, _) => {
+                (OperationState::ProvenAborted, _)
+                    if operation.exact_absence_observed_at_ms.is_some() =>
+                {
                     repository.abort_physical_write(&lease).await?;
+                }
+                (OperationState::ProvenAborted, _) => {
+                    repository
+                        .block_physical_write(
+                            &lease,
+                            "managed operation is aborted without exact absence evidence",
+                        )
+                        .await?;
                 }
                 (OperationState::Committed, Some(stored)) if stored.version_history_complete => {
                     repository
@@ -904,6 +931,309 @@ impl ServiceStorage {
                             .await?;
                     }
                 }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Recover stale logical managed writes from their immutable publication
+    /// recipe and terminal child journal. Ambiguous evidence is retained for
+    /// operator action instead of releasing quota or deriving current routing.
+    pub async fn reconcile_managed_logical_operations(
+        &self,
+        journal: Arc<dyn OperationJournal>,
+        capabilities: BackendCapabilities,
+        stale_after: Duration,
+        limit: u64,
+    ) -> Result<usize, ManagedError> {
+        let repository = self.authority_repository_required()?;
+        let now = crate::transaction::unix_time_ms();
+        let owner = format!("managed-logical-reconciler-{}", uuid::Uuid::now_v7());
+        let claims = repository
+            .claim_stale_logical_operations(
+                &owner,
+                now.saturating_sub(stale_after.as_millis() as i64),
+                now.saturating_add(crate::managed::PHYSICAL_WRITE_LEASE_MS),
+                limit,
+            )
+            .await?;
+        let count = claims.len();
+        for mut claim in claims {
+            let operation = claim.operation.clone();
+            let durable = repository
+                .physical_write_intent(operation.intent.primary_child_operation_id)
+                .await?;
+            let child = match journal
+                .get(operation.intent.primary_child_operation_id)
+                .await
+            {
+                Ok(child) => child,
+                Err(_) => continue,
+            };
+            if matches!(
+                operation.state,
+                ManagedLogicalOperationState::Intent | ManagedLogicalOperationState::Open
+            ) && durable.is_none()
+                && child.is_none()
+            {
+                match repository
+                    .abort_logical_put(
+                        operation.intent.operation_id,
+                        None,
+                        crate::managed::LogicalAbortProof::NoChildStarted,
+                        "proven_no_child",
+                        Some(&claim),
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(ManagedError::RecoveryBlocked(reason)) => {
+                        warn!(
+                            operation_id = %operation.intent.operation_id,
+                            reason,
+                            "managed logical recovery blocked"
+                        );
+                        repository
+                            .mark_logical_recovery_blocked(&claim, reason)
+                            .await?;
+                    }
+                    Err(_) => {}
+                }
+                continue;
+            }
+            if operation.intent.publication_recipe.is_none() {
+                if operation.state != ManagedLogicalOperationState::RecoveryBlocked {
+                    warn!(
+                        operation_id = %operation.intent.operation_id,
+                        reason = "missing_publication_recipe",
+                        "managed logical recovery blocked"
+                    );
+                }
+                repository
+                    .mark_logical_recovery_blocked(&claim, "missing_publication_recipe")
+                    .await?;
+                continue;
+            }
+            let Some(durable) = durable else {
+                if operation.state != ManagedLogicalOperationState::RecoveryBlocked {
+                    warn!(
+                        operation_id = %operation.intent.operation_id,
+                        reason = "missing_physical_intent",
+                        "managed logical recovery blocked"
+                    );
+                }
+                repository
+                    .mark_logical_recovery_blocked(&claim, "missing_physical_intent")
+                    .await?;
+                continue;
+            };
+            let Some(mut child) = child else {
+                if operation.state != ManagedLogicalOperationState::RecoveryBlocked {
+                    warn!(
+                        operation_id = %operation.intent.operation_id,
+                        reason = "missing_child_journal",
+                        "managed logical recovery blocked"
+                    );
+                }
+                repository
+                    .mark_logical_recovery_blocked(&claim, "missing_child_journal")
+                    .await?;
+                continue;
+            };
+            if child.tenant_id.as_deref() != Some(operation.intent.logical.tenant_id.as_str())
+                || child.namespace_epoch != Some(operation.intent.fence.namespace_epoch)
+                || child.destination.backend_id != operation.intent.backend_id
+                || child.destination.bucket != operation.intent.provider_bucket
+                || child.destination.physical_key != operation.intent.physical_key
+                || child.expected.digest
+                    != operation
+                        .evidence
+                        .as_ref()
+                        .and_then(|evidence| evidence.expected_output_digest.clone())
+                || child.expected.size
+                    != operation
+                        .evidence
+                        .as_ref()
+                        .map(|evidence| evidence.expected_output_size)
+            {
+                if operation.state != ManagedLogicalOperationState::RecoveryBlocked {
+                    warn!(
+                        operation_id = %operation.intent.operation_id,
+                        reason = "child_evidence_mismatch",
+                        "managed logical recovery blocked"
+                    );
+                }
+                repository
+                    .mark_logical_recovery_blocked(&claim, "child_evidence_mismatch")
+                    .await?;
+                continue;
+            }
+            let index = match self.validate_durable_intent_backend(&durable).await {
+                Ok(index) => index,
+                Err(DurableBackendValidationError::Transient) => continue,
+                Err(DurableBackendValidationError::Blocked(_)) => {
+                    if operation.state != ManagedLogicalOperationState::RecoveryBlocked {
+                        warn!(
+                            operation_id = %operation.intent.operation_id,
+                            reason = "provider_binding_mismatch",
+                            "managed logical recovery blocked"
+                        );
+                    }
+                    repository
+                        .mark_logical_recovery_blocked(&claim, "provider_binding_mismatch")
+                        .await?;
+                    continue;
+                }
+            };
+            claim = match repository
+                .renew_logical_recovery_claim(
+                    &claim,
+                    crate::transaction::unix_time_ms()
+                        .saturating_add(crate::managed::PHYSICAL_WRITE_LEASE_MS),
+                )
+                .await
+            {
+                Ok(claim) => claim,
+                Err(_) => continue,
+            };
+            let Some(lease) = repository
+                .claim_logical_physical_write_intent(
+                    &claim,
+                    crate::transaction::unix_time_ms()
+                        .saturating_add(crate::managed::PHYSICAL_WRITE_LEASE_MS),
+                )
+                .await?
+            else {
+                continue;
+            };
+            if !child.state.is_terminal() {
+                let Some(client) = self.client_for(index).await else {
+                    continue;
+                };
+                let backend: Arc<dyn TransactionBackend> = if self.backends[index].is_b2() {
+                    Arc::new(AwsS3TransactionBackend::new_managed_b2(
+                        client,
+                        capabilities,
+                    ))
+                } else {
+                    Arc::new(AwsS3TransactionBackend::new(client, capabilities))
+                };
+                let reconciler = OperationReconciler::new(journal.clone(), backend, owner.clone())
+                    .map_err(|error| ManagedError::Persistence(error.to_string()))?;
+                if reconciler
+                    .reconcile_operation(child.id, stale_after)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                claim = match repository
+                    .renew_logical_recovery_claim(
+                        &claim,
+                        crate::transaction::unix_time_ms()
+                            .saturating_add(crate::managed::PHYSICAL_WRITE_LEASE_MS),
+                    )
+                    .await
+                {
+                    Ok(claim) => claim,
+                    Err(_) => continue,
+                };
+                child = journal
+                    .get(child.id)
+                    .await
+                    .map_err(|error| ManagedError::Persistence(error.to_string()))?
+                    .ok_or_else(|| {
+                        ManagedError::Persistence("child journal disappeared".to_string())
+                    })?;
+            }
+            match (child.state, child.committed) {
+                (OperationState::Committed, Some(stored)) if stored.version_history_complete => {
+                    match repository
+                        .finalize_logical_put(
+                            operation.intent.operation_id,
+                            &lease,
+                            ExactPhysicalCommit {
+                                selected_version_id: stored.version_id,
+                                superseded_version_ids: stored.superseded_version_ids,
+                                version_history_complete: true,
+                            },
+                            Some(&claim),
+                        )
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(
+                            ManagedError::Persistence(_)
+                            | ManagedError::MutationInProgress
+                            | ManagedError::Conflict,
+                        ) => continue,
+                        Err(ManagedError::RecoveryBlocked(reason)) => {
+                            if operation.state != ManagedLogicalOperationState::RecoveryBlocked {
+                                warn!(
+                                    operation_id = %operation.intent.operation_id,
+                                    reason,
+                                    "managed logical recovery blocked"
+                                );
+                            }
+                            repository
+                                .mark_logical_recovery_blocked(&claim, reason)
+                                .await?;
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                (OperationState::ProvenAborted, _)
+                    if child.exact_absence_observed_at_ms.is_some() =>
+                {
+                    match repository
+                        .abort_logical_put(
+                            operation.intent.operation_id,
+                            Some(&lease),
+                            crate::managed::LogicalAbortProof::ChildProvenAborted,
+                            "child_proven_aborted",
+                            Some(&claim),
+                        )
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(ManagedError::RecoveryBlocked(reason)) => {
+                            warn!(
+                                operation_id = %operation.intent.operation_id,
+                                reason,
+                                "managed logical recovery blocked"
+                            );
+                            repository
+                                .mark_logical_recovery_blocked(&claim, reason)
+                                .await?;
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                (OperationState::Committed, _) => {
+                    if operation.state != ManagedLogicalOperationState::RecoveryBlocked {
+                        warn!(
+                            operation_id = %operation.intent.operation_id,
+                            reason = "incomplete_version_history",
+                            "managed logical recovery blocked"
+                        );
+                    }
+                    repository
+                        .mark_logical_recovery_blocked(&claim, "incomplete_version_history")
+                        .await?;
+                }
+                (OperationState::ProvenAborted, _) => {
+                    if operation.state != ManagedLogicalOperationState::RecoveryBlocked {
+                        warn!(
+                            operation_id = %operation.intent.operation_id,
+                            reason = "absence_not_proven",
+                            "managed logical recovery blocked"
+                        );
+                    }
+                    repository
+                        .mark_logical_recovery_blocked(&claim, "absence_not_proven")
+                        .await?;
+                }
+                _ => {}
             }
         }
         Ok(count)
@@ -1423,7 +1753,10 @@ impl ServiceStorage {
                 &logical,
                 &physical_key,
                 metadata.clone(),
-                ManagedChildIdentity::Supplied(child_scope),
+                ManagedChildIdentity::Supplied {
+                    scope: child_scope,
+                    parent_operation_id: logical_operation_id,
+                },
             )
             .await?;
         metadata.remove("maskura-generation");
@@ -1529,6 +1862,19 @@ impl ServiceStorage {
             route: UsageRoute::PutObject,
             request_kind: RequestKind::Write,
             max_processed_bytes,
+            publication_recipe: Some(ManagedPublicationRecipe {
+                version: MANAGED_PUBLICATION_RECIPE_VERSION,
+                placement_version: placement.version,
+                primary_backend_id: placement.primary_backend_id.clone(),
+                replica_backend_id: placement.replica_backend_id.clone(),
+                metadata: BTreeMap::from([("content-type".to_string(), content_type.to_string())]),
+                primary_status: CopyStatus::Ready,
+                replica_status: if placement.replica_backend_id.is_some() {
+                    CopyStatus::RepairPending
+                } else {
+                    CopyStatus::Absent
+                },
+            }),
         };
         // Admit the logical operation and reserve the maximum exposure this
         // request could publish in one transaction. The reservation is bounded
@@ -1562,7 +1908,13 @@ impl ServiceStorage {
             Ok(sink) => sink,
             Err(error) => {
                 let _ = repository
-                    .prove_logical_abort(operation_id, "sink_begin_failed", None)
+                    .abort_logical_put(
+                        operation_id,
+                        None,
+                        crate::managed::LogicalAbortProof::NoChildStarted,
+                        "sink_begin_failed",
+                        None,
+                    )
                     .await;
                 return Err(error);
             }
@@ -1628,8 +1980,15 @@ impl ServiceStorage {
             physical_key: physical_key.to_string(),
             workspace_binding: None,
         };
+        let logical_parent_operation_id = match &child_identity {
+            ManagedChildIdentity::Supplied {
+                parent_operation_id,
+                ..
+            } => Some(*parent_operation_id),
+            ManagedChildIdentity::Deterministic { .. } => None,
+        };
         let (operation_id, expected_namespace_epoch) = match child_identity {
-            ManagedChildIdentity::Supplied(scope) => {
+            ManagedChildIdentity::Supplied { scope, .. } => {
                 (scope.operation_id, Some(scope.namespace_epoch))
             }
             ManagedChildIdentity::Deterministic { parent, role } => (
@@ -1679,10 +2038,23 @@ impl ServiceStorage {
             .await
             .map_err(|error| TransactionError::Publication(error.to_string()))?;
         if expected_namespace_epoch.is_some_and(|expected| expected != lease.namespace_epoch) {
-            repository
-                .abort_physical_write(&lease)
-                .await
-                .map_err(|error| TransactionError::Publication(error.to_string()))?;
+            if let Some(parent) = logical_parent_operation_id {
+                repository
+                    .abort_logical_put(
+                        parent,
+                        Some(&lease),
+                        crate::managed::LogicalAbortProof::NoChildStarted,
+                        "stale_child_scope",
+                        None,
+                    )
+                    .await
+                    .map_err(|error| TransactionError::Publication(error.to_string()))?;
+            } else {
+                repository
+                    .abort_physical_write(&lease)
+                    .await
+                    .map_err(|error| TransactionError::Publication(error.to_string()))?;
+            }
             return Err(TransactionError::Publication(
                 "managed child scope namespace epoch is stale".to_string(),
             ));
@@ -1724,10 +2096,21 @@ impl ServiceStorage {
         {
             Ok(sink) => sink,
             Err(error) => {
-                repository
-                    .abort_physical_write(&lease)
-                    .await
-                    .map_err(|ledger_error| {
+                let cleanup = if let Some(parent) = logical_parent_operation_id {
+                    repository
+                        .abort_logical_put(
+                            parent,
+                            Some(&lease),
+                            crate::managed::LogicalAbortProof::NoChildStarted,
+                            "child_journal_init_failed",
+                            None,
+                        )
+                        .await
+                        .map(|_| ())
+                } else {
+                    repository.abort_physical_write(&lease).await
+                };
+                cleanup.map_err(|ledger_error| {
                         TransactionError::Publication(format!(
                             "managed journal initialization failed: {error}; intent cleanup failed: {ledger_error}"
                         ))
@@ -1766,6 +2149,7 @@ impl ServiceStorage {
             operation_id,
             repository,
             lease,
+            logical_parent_operation_id,
             lease_stop: Some(lease_stop),
         }))
     }
@@ -1962,7 +2346,10 @@ impl ServiceStorage {
 
 #[derive(Clone, Debug)]
 enum ManagedChildIdentity {
-    Supplied(ManagedOperationScope),
+    Supplied {
+        scope: ManagedOperationScope,
+        parent_operation_id: uuid::Uuid,
+    },
     Deterministic {
         parent: uuid::Uuid,
         role: ManagedChildRole,
@@ -1975,6 +2362,7 @@ struct ManagedDirectSink {
     operation_id: uuid::Uuid,
     repository: Arc<dyn ManagedRepository>,
     lease: crate::managed::PhysicalWriteLease,
+    logical_parent_operation_id: Option<uuid::Uuid>,
     lease_stop: Option<watch::Sender<()>>,
 }
 
@@ -2049,10 +2437,15 @@ trait ManagedDestination: Send {
         authority: &DestinationCommitAuthority,
     ) -> Result<StoredObjectMeta, TransactionError>;
     async fn abort(&mut self) -> Result<(), TransactionError>;
+    fn physical_lease(&self) -> crate::managed::PhysicalWriteLease;
 }
 
 #[async_trait::async_trait]
 impl ManagedDestination for ManagedDirectSink {
+    fn physical_lease(&self) -> crate::managed::PhysicalWriteLease {
+        self.lease.clone()
+    }
+
     async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError> {
         self.repository
             .renew_physical_write_intent(
@@ -2120,6 +2513,9 @@ impl ManagedDestination for ManagedDirectSink {
                 .map_err(|error| TransactionError::Publication(error.to_string()))?;
             return Err(TransactionError::Publication(reason.to_string()));
         }
+        if self.logical_parent_operation_id.is_some() {
+            return Ok(stored);
+        }
         if let Err(error) = self
             .repository
             .commit_physical_write(
@@ -2156,14 +2552,27 @@ impl ManagedDestination for ManagedDirectSink {
                     | OperationState::Completing
             )
         {
-            settle_managed_intent_from_journal(&self.repository, &self.lease, &operation).await?;
+            if self.logical_parent_operation_id.is_none() {
+                settle_managed_intent_from_journal(&self.repository, &self.lease, &operation)
+                    .await?;
+            }
             return Err(TransactionError::CompletionAmbiguous);
         }
         self.sink.abort().await?;
         let operation = self.journal.get(self.operation_id).await?.ok_or_else(|| {
             TransactionError::Publication("managed operation journal row disappeared".to_string())
         })?;
-        settle_managed_intent_from_journal(&self.repository, &self.lease, &operation).await
+        if self.logical_parent_operation_id.is_some() {
+            if operation.state == OperationState::ProvenAborted
+                && operation.exact_absence_observed_at_ms.is_some()
+            {
+                Ok(())
+            } else {
+                Err(TransactionError::CompletionAmbiguous)
+            }
+        } else {
+            settle_managed_intent_from_journal(&self.repository, &self.lease, &operation).await
+        }
     }
 }
 
@@ -2284,6 +2693,7 @@ impl ObjectSinkTransaction for ManagedReplicatedSink {
             )
             .await?;
         let primary = self.primary.complete(&authority).await?;
+        let primary_lease = self.primary.physical_lease();
         let replica_status = if let Some(replica) = &mut self.replica {
             authority
                 .validate(
@@ -2321,15 +2731,17 @@ impl ObjectSinkTransaction for ManagedReplicatedSink {
             updated_at_ms: now,
         };
         if let Some(logical_operation_id) = self.logical_operation_id {
-            let physical_version_count = u64::try_from(primary.superseded_version_ids.len())
-                .ok()
-                .and_then(|count| count.checked_add(1))
-                .ok_or(TransactionError::CapacityExceeded)?;
-            let physical_allocated_bytes = size
-                .checked_mul(physical_version_count)
-                .ok_or(TransactionError::CapacityExceeded)?;
             self.repository
-                .commit_logical_put(logical_operation_id, authority, physical_allocated_bytes)
+                .finalize_logical_put(
+                    logical_operation_id,
+                    &primary_lease,
+                    ExactPhysicalCommit {
+                        selected_version_id: primary.version_id.clone(),
+                        superseded_version_ids: primary.superseded_version_ids.clone(),
+                        version_history_complete: primary.version_history_complete,
+                    },
+                    None,
+                )
                 .await
                 .map_err(|error| TransactionError::Publication(error.to_string()))?;
         } else if let Err(error) = self
@@ -2362,10 +2774,24 @@ impl ObjectSinkTransaction for ManagedReplicatedSink {
         if self.finished {
             return Ok(());
         }
+        let primary_lease = self.primary.physical_lease();
         let primary = self.primary.abort().await;
         self.abandon_replica().await;
-        self.finished = primary.is_ok();
-        primary
+        primary?;
+        if let Some(operation_id) = self.logical_operation_id {
+            self.repository
+                .abort_logical_put(
+                    operation_id,
+                    Some(&primary_lease),
+                    crate::managed::LogicalAbortProof::ChildProvenAborted,
+                    "client_abort",
+                    None,
+                )
+                .await
+                .map_err(|error| TransactionError::Publication(error.to_string()))?;
+        }
+        self.finished = true;
+        Ok(())
     }
 }
 
@@ -2504,13 +2930,6 @@ impl ObjectSinkTransaction for ManagedLogicalSink {
             return Ok(());
         }
         self.inner.abort().await?;
-        if self.usage_recorded {
-            return Ok(());
-        }
-        self.repository
-            .prove_logical_abort(self.operation_id, "client_abort", None)
-            .await
-            .map_err(|error| TransactionError::Publication(error.to_string()))?;
         Ok(())
     }
 }
@@ -3624,6 +4043,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ManagedDestination for FakeDestination {
+        fn physical_lease(&self) -> crate::managed::PhysicalWriteLease {
+            crate::managed::PhysicalWriteLease {
+                intent_id: uuid::Uuid::nil(),
+                namespace_epoch: 1,
+                owner: self.label.to_string(),
+                token: uuid::Uuid::nil(),
+            }
+        }
+
         async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError> {
             self.events
                 .lock()
