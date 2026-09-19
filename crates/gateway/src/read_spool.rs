@@ -135,7 +135,10 @@ impl EncryptedReadSpool {
                 stream_decrypted_file(&path, key, task_cancellation.clone(), sender.clone()).await;
             if let Err(error) = result {
                 task_cancellation.cancel();
-                tracing::warn!("encrypted transformed-read spool failed: {error}");
+                tracing::warn!(
+                    error_kind = ?error.kind(),
+                    "encrypted transformed-read spool failed"
+                );
                 // Headers have already been emitted. Surface a body error so the
                 // HTTP server terminates the representation instead of claiming a
                 // successful, complete transformed response.

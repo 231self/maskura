@@ -400,9 +400,7 @@ fn generate_api_key(
                 .context("API key secret encryption failed")?,
         ),
         None => {
-            tracing::warn!(
-                "secret encryption is not configured; key {key_id} supports header authentication only"
-            );
+            tracing::warn!("secret encryption is not configured; header authentication only");
             None
         }
     };
@@ -513,9 +511,7 @@ fn bootstrap_api_key_validated(
                 .context("API key secret encryption failed")?,
         ),
         None => {
-            tracing::warn!(
-                "secret encryption is not configured; key {key_id} supports header authentication only"
-            );
+            tracing::warn!("secret encryption is not configured; header authentication only");
             None
         }
     };
@@ -587,6 +583,17 @@ fn authenticated_mcp_principal(
     })
 }
 
+fn listable_mcp_token(token: &McpToken) -> bool {
+    token
+        .credential_id
+        .as_deref()
+        .is_some_and(|credential_id| credential_id.parse::<Uuid>().is_ok())
+        && token
+            .workspace_id
+            .as_deref()
+            .is_some_and(|workspace_id| WorkspaceId::new(workspace_id.to_string()).is_ok())
+}
+
 fn decrypt_verified_secret(
     cipher: &SecretCipher,
     key_id: &str,
@@ -597,10 +604,7 @@ fn decrypt_verified_secret(
         return Ok(None);
     };
     if sha256_hash(&secret) != secret_hash {
-        tracing::warn!(
-            key_id = key_id,
-            "decrypted API key secret failed hash verification"
-        );
+        tracing::warn!("decrypted API key secret failed hash verification");
         return Ok(None);
     }
     let rewrapped = if SecretCipher::is_legacy_envelope(blob) {
@@ -986,7 +990,7 @@ impl KeyRepository for KeyStore {
             .read()
             .map_err(|_| anyhow::anyhow!("KeyStore MCP token lock poisoned"))?
             .values()
-            .filter(|t| t.user_id == user_id)
+            .filter(|t| t.user_id == user_id && listable_mcp_token(t))
             .cloned()
             .collect())
     }
@@ -1527,7 +1531,7 @@ impl KeyRepository for FileKeyStore {
             .read()
             .map_err(|_| anyhow::anyhow!("FileKeyStore MCP token lock poisoned"))?
             .values()
-            .filter(|t| t.user_id == user_id)
+            .filter(|t| t.user_id == user_id && listable_mcp_token(t))
             .cloned()
             .collect())
     }
@@ -1957,6 +1961,7 @@ impl KeyRepository for PostgresKeyStore {
                 created_at: m.created_at.to_string(),
                 expires_at: m.expires_at.map(|e| e.to_string()),
             })
+            .filter(listable_mcp_token)
             .collect())
     }
 
@@ -2890,9 +2895,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_file_mcp_token_without_workspace_fails_closed() {
+    async fn mixed_legacy_file_mcp_snapshot_lists_only_usable_tokens() {
         let path = temp_keys_file();
         let token = "maskura_mcp_legacy";
+        let malformed_credential_token = "maskura_mcp_malformed_credential";
+        let malformed_workspace_token = "maskura_mcp_malformed_workspace";
+        let valid_token = "maskura_mcp_valid";
         let persisted = serde_json::json!({
             "keys": {},
             "mcp_tokens": {
@@ -2902,13 +2910,42 @@ mod tests {
                     "label": "legacy",
                     "created_at": "0",
                     "expires_at": null
+                },
+                sha256_hash(malformed_credential_token): {
+                    "credential_id": "not-a-uuid",
+                    "token_hash": sha256_hash(malformed_credential_token),
+                    "user_id": "legacy-user",
+                    "workspace_id": "legacy-workspace",
+                    "label": "malformed credential",
+                    "created_at": "1",
+                    "expires_at": null
+                },
+                sha256_hash(malformed_workspace_token): {
+                    "credential_id": "01995f4d-42ff-7000-8000-000000000002",
+                    "token_hash": sha256_hash(malformed_workspace_token),
+                    "user_id": "legacy-user",
+                    "workspace_id": "invalid workspace",
+                    "label": "malformed workspace",
+                    "created_at": "2",
+                    "expires_at": null
+                },
+                sha256_hash(valid_token): {
+                    "credential_id": "01995f4d-42ff-7000-8000-000000000001",
+                    "token_hash": sha256_hash(valid_token),
+                    "user_id": "legacy-user",
+                    "workspace_id": "legacy-workspace",
+                    "label": "valid",
+                    "created_at": "3",
+                    "expires_at": null
                 }
             }
         });
         std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
         let store = FileKeyStore::new(path.clone()).unwrap();
         assert!(store.resolve_mcp_token(token).await.unwrap().is_none());
-        assert_eq!(store.list_mcp_tokens("legacy-user").await.unwrap().len(), 1);
+        let listed = store.list_mcp_tokens("legacy-user").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].token_hash, sha256_hash(valid_token));
         std::fs::remove_file(path).unwrap();
     }
 
