@@ -60,7 +60,7 @@ a single-node S3-compatible server backed by a Docker volume:
 
 ```bash
 docker run -p 127.0.0.1:9000:9000 -v maskura-data:/data \
-  ghcr.io/231self/maskura/maskura:v0.7.7
+  ghcr.io/231self/maskura/maskura:v0.7.8
 ```
 
 The first time it starts, the gateway prints a root access key and secret. Use
@@ -92,8 +92,8 @@ Silicon binary from [GitHub Releases](https://github.com/231self/maskura/release
 ```bash
 cargo install --git https://github.com/231self/maskura --bin maskura
 maskura local init
-maskura put ./data.jsonl ingest/data.jsonl --bucket maskura-local
-maskura get ingest/data.jsonl --bucket maskura-local
+maskura put ./data.jsonl ingest/data.jsonl --bucket maskura
+maskura get ingest/data.jsonl --bucket maskura
 maskura local down
 ```
 

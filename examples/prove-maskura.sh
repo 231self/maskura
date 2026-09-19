@@ -67,14 +67,14 @@ put_with_aws() {
   local key="$2"
   AWS_ACCESS_KEY_ID=proof AWS_SECRET_ACCESS_KEY=proof AWS_DEFAULT_REGION=us-east-1 \
     AWS_EC2_METADATA_DISABLED=true aws s3 --endpoint-url "$ENDPOINT" \
-    cp "$source" "s3://maskura-local/$key" --content-type text/plain >/dev/null
+    cp "$source" "s3://maskura/$key" --content-type text/plain >/dev/null
 }
 
 get_with_aws() {
   local key="$1"
   AWS_ACCESS_KEY_ID=proof AWS_SECRET_ACCESS_KEY=proof AWS_DEFAULT_REGION=us-east-1 \
     AWS_EC2_METADATA_DISABLED=true aws s3 --endpoint-url "$ENDPOINT" \
-    cp "s3://maskura-local/$key" -
+    cp "s3://maskura/$key" -
 }
 
 prove_redaction() {
@@ -139,14 +139,17 @@ require python3
 
 printf 'Pulling %s\n' "$IMAGE"
 docker pull "$IMAGE" >/dev/null
+# Run the zero-config local appliance exactly as the public quickstart does:
+# one volume, the MinIO-convention container port 9000, and the canonical
+# `maskura` bucket. MASKURA_ROOT_USER/PASSWORD pin the SigV4 root credential so
+# the harness does not have to scrape the once-only generated secret, and
+# AUTH_DISABLED lets it manage the plugin pipeline without a dashboard session.
 docker run --rm -d --name "$CONTAINER" \
-  -p "127.0.0.1:${PORT}:8080" \
+  -p "127.0.0.1:${PORT}:9000" \
   --volume "$VOLUME:/data" \
   -e AUTH_DISABLED=true \
-  -e MASKURA_KEYS_FILE=/data/keys.json \
-  -e MASKURA_STORAGE_MODE=local \
-  -e MASKURA_LOCAL_STORAGE_DIR=/data \
-  -e MASKURA_STREAMING_READ_MODE=passthrough \
+  -e MASKURA_ROOT_USER=proof \
+  -e MASKURA_ROOT_PASSWORD=proof \
   "$IMAGE" >/dev/null
 
 healthy=0
