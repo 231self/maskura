@@ -152,9 +152,11 @@ if [ "$ready" -ne 1 ]; then
 fi
 
 # The generated root credential is disclosed once in the container logs.
-CRED_LINE="$(docker logs "$GATEWAY_NAME" 2>&1 | grep 'generated local root credentials' | head -1)"
-ACCESS_KEY="$(printf '%s\n' "$CRED_LINE" | grep -o 'access_key=[^ ]*' | cut -d= -f2-)"
-SECRET_KEY="$(printf '%s\n' "$CRED_LINE" | grep -o 'secret_key=[^ ]*' | cut -d= -f2-)"
+CRED_LINE="$(docker logs "$GATEWAY_NAME" 2>&1 \
+  | sed $'s/\033\\[[0-9;]*m//g' \
+  | grep -m1 'generated local root credentials' || true)"
+ACCESS_KEY="$(printf '%s\n' "$CRED_LINE" | sed -n 's/.*access_key=\([^ ]*\).*/\1/p')"
+SECRET_KEY="$(printf '%s\n' "$CRED_LINE" | sed -n 's/.*secret_key=\([^ ]*\).*/\1/p')"
 if [ -z "$ACCESS_KEY" ] || [ -z "$SECRET_KEY" ]; then
   docker logs "$GATEWAY_NAME" || true
   echo "ERROR: zero-config gateway did not disclose generated root credentials" >&2

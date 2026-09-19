@@ -114,6 +114,7 @@ async fn run_healthcheck(config: &Config) -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
         .init();
 
     let (mut config_path, healthcheck) = parse_args(std::env::args().skip(1))?;
