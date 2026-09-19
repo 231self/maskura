@@ -31,8 +31,8 @@ def main() -> None:
     assert "MASKURA HYBRID PRIVATE KEY" not in serialized_keys
 
     plaintext = b"customer jane@example.com card 4111111111111111\n"
-    client.put_object("maskura-local", "proof/python-hybrid.txt", plaintext)
-    stored = client.get_object("maskura-local", "proof/python-hybrid.txt")
+    client.put_object("maskura", "proof/python-hybrid.txt", plaintext)
+    stored = client.get_object("maskura", "proof/python-hybrid.txt")
 
     assert b"jane@example.com" not in stored, "plaintext email reached raw read-back"
     assert b"4111111111111111" not in stored, "plaintext card reached raw read-back"
