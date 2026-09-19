@@ -527,13 +527,22 @@ The gateway must never log:
   object content),
 - **Staging keys or DEKs** (wrapped or unwrapped),
 - **Credentials** — API key secrets, backend access keys, KEKs, or tokens,
+- **Customer identifiers** — bucket names, object keys, user IDs, credential
+  identifiers, or tenant-controlled labels,
 - **Backend endpoint URLs containing query data** (these are rejected before
   persistence or client construction),
 - **Signed URLs** (presigned URLs are bearer credentials),
-- **Staging artifact ciphertext or key material**.
+- **Staging artifact ciphertext or key material**,
+- **Raw database, provider, filesystem, plugin, or transport errors** on request
+  and reconciliation paths; these can contain customer identifiers, local paths,
+  schema details, or upstream response bodies.
 
-Operational logs may reference keys, buckets, user IDs, and error messages
-that do not embed the above.
+Operational logs use server-generated operation or receipt IDs, bounded counts,
+and reviewed low-cardinality categories. Client-facing internal and
+service-unavailable responses use fixed protocol-appropriate messages rather
+than raw error text. Local startup diagnostics may name operator-configured
+filesystem and plugin paths, but request handling never logs customer object
+identity or raw failure detail.
 
 **Local appliance credentials.** When no hosted or external storage is
 configured, the gateway generates a root access key and secret and logs them on

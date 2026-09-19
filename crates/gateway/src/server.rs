@@ -89,8 +89,9 @@ use crate::s3_safety::{S3Failure, record_s3_failure, s3_retry_config, s3_timeout
 use crate::service_storage::{ServiceStorage, parse_service_backends};
 use crate::sigv4::{RequestAuthorization, SigV4Error, SigV4Policy, SigningKeyCache};
 use crate::store::{
-    FileKeyStore, KeyRepository, KeyStore, MAX_PUBLIC_KEY_PEM_BYTES, MemoryStore, PostgresKeyStore,
-    canonicalize_credential_label, canonicalize_public_key_pem, validate_credential_ttl,
+    FileKeyStore, KeyRepository, KeyStore, MAX_PUBLIC_KEY_PEM_BYTES, McpToken, MemoryStore,
+    PostgresKeyStore, canonicalize_credential_label, canonicalize_public_key_pem,
+    validate_credential_ttl,
 };
 use crate::transaction::{
     AbortSignal, AwsS3TransactionBackend, BackendCapabilities, BackendError, BackendErrorKind,
@@ -186,10 +187,6 @@ tokio::task_local! {
 }
 
 impl Auth {
-    fn user_id(&self) -> &str {
-        &self.context.user_id
-    }
-
     fn workspace_id(&self) -> &crate::workspace_storage::WorkspaceId {
         &self.context.workspace_id
     }
@@ -435,11 +432,7 @@ async fn record_failed_pipeline_attempt(
     );
     warn!(
         operation_id = %attempt.operation_id(),
-        bucket = attempt.bucket(),
         direction = ?attempt.direction(),
-        revision = attempt.revision(),
-        fingerprint = attempt.fingerprint(),
-        components = attempt.components(),
         error_code = attempt.error_code(),
         fuel_consumed = attempt.fuel_consumed(),
         duration_ms = attempt.duration_ms(),
@@ -480,16 +473,13 @@ async fn record_durable_operation_with_event(
     event: UsageEvent,
     key: &str,
 ) -> Result<(), axum::response::Response> {
-    persist_usage_evidence(journal, &event)
-        .await
-        .map_err(|error| {
-            warn!(
-                operation_id = %event.operation_id(),
-                error = %error,
-                "failed to persist usage evidence"
-            );
-            s3_error::service_unavailable(key, "Usage evidence could not be persisted.")
-        })?;
+    persist_usage_evidence(journal, &event).await.map_err(|_| {
+        warn!(
+            operation_id = %event.operation_id(),
+            "failed to persist usage evidence"
+        );
+        s3_error::service_unavailable(key, "Usage evidence could not be persisted.")
+    })?;
     record_operation_with_event(control, context, event, key).await
 }
 
@@ -854,8 +844,11 @@ fn build_demo_pipeline_template(
     let stable_id = if let Some(component) = stable_component {
         let stable = match registry.import("stable-encrypt", component) {
             Ok(stable) => stable,
-            Err(error) => {
-                warn!("stable-encrypt unavailable for the stateless demo: {error}");
+            Err(_) => {
+                warn!(
+                    error_category = "plugin",
+                    "stable-encrypt unavailable for the stateless demo"
+                );
                 return Ok(DemoPipelineTemplate {
                     registry,
                     pii_id: pii.id,
@@ -1250,7 +1243,7 @@ async fn resolve_backend(
 }
 
 fn backend_resolution_error_response(key: &str) -> axum::response::Response {
-    warn!(key, "workspace backend resolution failed");
+    warn!("workspace backend resolution failed");
     s3_error::service_unavailable(key, "workspace storage is unavailable")
 }
 
@@ -1298,17 +1291,18 @@ fn open_error_response(key: &str, error: OpenObjectError) -> axum::response::Res
             s3_error::invalid_range(key, object_length)
         }
         OpenObjectError::Rejected(detail) => {
-            warn!("presigned source rejected for {key}: {detail}");
+            drop(detail);
+            warn!(error_category = "policy", "presigned source rejected");
             s3_error::access_denied(key)
         }
         OpenObjectError::Backend(detail) => {
-            warn!("backend read failed for {key}: {detail}");
-            s3_error::internal_error(key, &detail)
+            drop(detail);
+            warn!(error_category = "backend", "backend read failed");
+            s3_error::internal_error(key, "backend read failed")
         }
         OpenObjectError::S3(failure) => s3_error::internal_error(key, failure.client_message()),
         OpenObjectError::PresignedTransport(failure) => {
             warn!(
-                key,
                 category = failure.as_str(),
                 "presigned source transport failed"
             );
@@ -2040,12 +2034,20 @@ fn authentication_error_response(key: &str, error: HeaderAuthError) -> axum::res
         HeaderAuthError::InvalidPayload(error) => {
             s3_error::invalid_request(key, &error.to_string())
         }
-        HeaderAuthError::CredentialStoreUnavailable(error) => {
-            warn!("credential storage unavailable during authentication: {error}");
+        HeaderAuthError::CredentialStoreUnavailable(detail) => {
+            drop(detail);
+            warn!(
+                error_category = "persistence",
+                "credential storage unavailable during authentication"
+            );
             s3_error::service_unavailable(key, "credential storage is temporarily unavailable")
         }
-        HeaderAuthError::Unavailable(error) => {
-            warn!("workspace resolution failed: {error}");
+        HeaderAuthError::Unavailable(detail) => {
+            drop(detail);
+            warn!(
+                error_category = "persistence",
+                "workspace resolution failed"
+            );
             s3_error::service_unavailable(key, "workspace storage is temporarily unavailable")
         }
     }
@@ -2425,8 +2427,8 @@ fn get_user_claims(headers: &HeaderMap, state: &AppState) -> Option<serde_json::
     let validation = supabase_jwt_validation(jsonwebtoken::Algorithm::HS256, &issuer);
     match jsonwebtoken::decode::<serde_json::Value>(token, key, &validation) {
         Ok(data) => Some(data.claims),
-        Err(e) => {
-            warn!("JWT validation failed: {e}");
+        Err(_) => {
+            warn!(error_category = "invalid_token", "JWT validation failed");
             None
         }
     }
@@ -2452,8 +2454,11 @@ async fn get_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
         .to_string();
     let keys = match state.keys.list_for_user(user_id).await {
         Ok(keys) => keys,
-        Err(error) => {
-            tracing::error!(user_id, error = %error, "credential storage unavailable");
+        Err(_) => {
+            tracing::error!(
+                error_category = "persistence",
+                "credential storage unavailable"
+            );
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
@@ -3071,7 +3076,8 @@ fn streaming_put_error_response(key: &str, error: StreamingPutError) -> axum::re
         }
         StreamingPutError::InvalidRequest(detail) => s3_error::invalid_request(key, &detail),
         StreamingPutError::Unsupported(detail) => {
-            warn!("streaming PUT rejected for {key}: {detail}");
+            drop(detail);
+            warn!(error_category = "unsupported", "streaming PUT rejected");
             s3_error::not_implemented(key)
         }
     }
@@ -3510,11 +3516,16 @@ async fn begin_streaming_sink(
             tokio::spawn(async move {
                 while let Some(operation_id) = abort_receiver.recv().await {
                     tokio::time::sleep(Duration::from_secs(1)).await;
-                    if let Err(error) = reconciler
+                    if reconciler
                         .reconcile_operation(operation_id, Duration::from_secs(1))
                         .await
+                        .is_err()
                     {
-                        warn!("streaming transaction cleanup failed: {error}");
+                        warn!(
+                            operation_id = %operation_id,
+                            error_category = "reconciliation",
+                            "streaming transaction cleanup failed"
+                        );
                     }
                 }
             });
@@ -4093,10 +4104,11 @@ async fn streaming_single_put(
                 let _ = pipeline.cancel_and_wait().await;
             }
             let preserve_reservation = sink.lock().await.commit_state().preserves_reservation();
-            if !preserve_reservation && let Err(abort_error) = sink.lock().await.abort().await {
+            if !preserve_reservation && sink.lock().await.abort().await.is_err() {
                 warn!(
-                    "streaming sink abort failed for /{}/{key}: {abort_error}",
-                    grant.bucket()
+                    operation_id = %grant.operation_id(),
+                    error_category = "abort",
+                    "streaming sink abort failed"
                 );
             }
             sink_guard.disarm();
@@ -5024,7 +5036,7 @@ async fn cleanup_staged_parts(
                 serde_json::json!({"part_number":part.part_number,"attempt":part.attempt,"error":error.to_string()})
             }
         };
-        if let Err(error) = staging
+        if staging
             .repository
             .audit(CleanupAudit {
                 id: Uuid::now_v7(),
@@ -5034,8 +5046,12 @@ async fn cleanup_staged_parts(
                 created_at_ms: now_ms(),
             })
             .await
+            .is_err()
         {
-            warn!("multipart cleanup audit failed: {error}");
+            warn!(
+                error_category = "persistence",
+                "multipart cleanup audit failed"
+            );
         }
     }
     complete
@@ -6191,8 +6207,8 @@ impl MultipartPersistenceBundle {
                 tokio::select! {
                     () = worker_cancellation.cancelled() => break,
                     () = tokio::time::sleep(Duration::from_secs(60)) => {
-                        if let Err(error) = recovery.run_once(now_ms(), 64).await {
-                            warn!("multipart recovery worker failed: {error}");
+                        if recovery.run_once(now_ms(), 64).await.is_err() {
+                            warn!(error_category = "recovery", "multipart recovery worker failed");
                         }
                     }
                 }
@@ -6260,7 +6276,7 @@ async fn s3_upload_part(
         let Some(epoch) = upload.namespace_epoch else {
             return s3_error::service_unavailable(&key, "managed multipart upload has no epoch");
         };
-        if let Err(error) = storage
+        if storage
             .assert_managed_multipart(
                 &upload_id,
                 authentication.auth.workspace_id().as_str(),
@@ -6268,8 +6284,12 @@ async fn s3_upload_part(
                 false,
             )
             .await
+            .is_err()
         {
-            return s3_error::service_unavailable(&key, &error.to_string());
+            return s3_error::service_unavailable(
+                &key,
+                "managed multipart storage is temporarily unavailable",
+            );
         }
     }
     if upload.lifecycle != MultipartLifecycle::Open || upload.expires_at_ms <= now_ms() {
@@ -6624,8 +6644,10 @@ async fn s3_put(
                 return response;
             }
             info!(
-                "streaming PUT /{bucket}/{key} committed ({output_bytes} stored bytes, user={})",
-                auth.user_id()
+                operation_id = %grant.operation_id(),
+                receipt_id = %grant.receipt_id(),
+                output_bytes,
+                "streaming PUT committed"
             );
             let mut response = axum::response::Response::builder().status(StatusCode::OK);
             if let Some(etag) = stored.etag {
@@ -6695,7 +6717,13 @@ fn transformed_read_error_response(
 ) -> axum::response::Response {
     match error {
         TransformedReadError::InvalidRequest(detail) => s3_error::invalid_request(key, &detail),
-        TransformedReadError::Capacity(detail) => s3_error::service_unavailable(key, &detail),
+        TransformedReadError::Capacity(detail) => {
+            drop(detail);
+            s3_error::service_unavailable(
+                key,
+                "transformed-read capacity is temporarily unavailable",
+            )
+        }
         TransformedReadError::Source(detail) => s3_error::internal_error(key, &detail),
         TransformedReadError::Spool(TransactionError::CapacityExceeded) => {
             s3_error::service_unavailable(
@@ -6898,7 +6926,10 @@ fn schedule_spool_cleanup(config: CompatibilitySpoolConfig) {
                     info!(removed, "removed stale spool files");
                 }
                 Ok(_) => {}
-                Err(error) => warn!("failed to remove stale spool files: {error}"),
+                Err(_) => warn!(
+                    error_category = "spool",
+                    "failed to remove stale spool files"
+                ),
             }
         }
     });
@@ -7613,7 +7644,7 @@ async fn s3_get(
                     "managed multipart upload has no namespace epoch",
                 );
             };
-            if let Err(error) = storage
+            if storage
                 .assert_managed_multipart(
                     &identity.upload_id,
                     auth.workspace_id().as_str(),
@@ -7621,8 +7652,12 @@ async fn s3_get(
                     false,
                 )
                 .await
+                .is_err()
             {
-                return s3_error::service_unavailable(&key, &error.to_string());
+                return s3_error::service_unavailable(
+                    &key,
+                    "managed multipart storage is temporarily unavailable",
+                );
             }
         }
         let max_parts = match params.max_parts {
@@ -8890,7 +8925,7 @@ mod tests {
         let multipart = multipart_identity(&auth, "bucket", "key", "upload");
         assert_eq!(logical.tenant_id, "workspace-b");
         assert_eq!(multipart.tenant_id, "workspace-b");
-        assert_ne!(logical.tenant_id, auth.user_id());
+        assert_ne!(logical.tenant_id, auth.context.user_id);
     }
 
     #[test]
@@ -9618,7 +9653,11 @@ async fn s3_delete(
         Ok(grant) => grant,
         Err(response) => return response,
     };
-    info!("DELETE /{bucket}/{key} user={}", auth.user_id());
+    info!(
+        operation_id = %grant.operation_id(),
+        receipt_id = %grant.receipt_id(),
+        "DELETE authorized"
+    );
 
     if params.upload_id.is_some() {
         let backend =
@@ -9685,16 +9724,20 @@ async fn s3_delete(
                 )
                 .await;
             };
-            if let Err(error) = storage
+            if storage
                 .assert_managed_multipart(upload_id, auth.workspace_id().as_str(), epoch, true)
                 .await
+                .is_err()
             {
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
                     &grant,
                     &key,
-                    s3_error::service_unavailable(&key, &error.to_string()),
+                    s3_error::service_unavailable(
+                        &key,
+                        "managed multipart storage is temporarily unavailable",
+                    ),
                 )
                 .await;
             }
@@ -9818,7 +9861,6 @@ async fn s3_delete(
                 Err(error) => {
                     let failure = PresignedTransportFailure::from_reqwest(&error);
                     warn!(
-                        key,
                         category = failure.as_str(),
                         "presigned DELETE transport failed"
                     );
@@ -9917,13 +9959,14 @@ async fn s3_delete(
                 return response;
             }
             if storage.managed_mode() == ManagedStreamingMode::Enforce
-                && let Err(error) = storage
+                && let Err(_) = storage
                     .mark_authoritative_delete_settled(grant.operation_id(), grant.receipt_id())
                     .await
             {
                 warn!(
                     operation_id = %grant.operation_id(),
-                    "durable managed DELETE settlement remains pending: {error}"
+                    error_category = "persistence",
+                    "durable managed DELETE settlement remains pending"
                 );
             }
             StatusCode::NO_CONTENT.into_response()
@@ -10089,11 +10132,15 @@ async fn s3_post(
                 );
                 return response;
             };
-            if let Err(error) = storage
+            if storage
                 .assert_managed_multipart(upload_id, auth.workspace_id().as_str(), epoch, false)
                 .await
+                .is_err()
             {
-                return s3_error::service_unavailable(&key, &error.to_string());
+                return s3_error::service_unavailable(
+                    &key,
+                    "managed multipart storage is temporarily unavailable",
+                );
             }
         }
         let fingerprint = match completion_fingerprint(&upload, &selected) {
@@ -10364,8 +10411,6 @@ async fn s3_post(
     if let Some(response) = client_metering_id_rejection(&parts.headers, &key) {
         return response;
     }
-    info!("POST /{bucket}/{key} user={}", auth.user_id());
-
     if params.uploads.is_some() {
         let resolution_started = Instant::now();
         let resolution = match state
@@ -10407,11 +10452,15 @@ async fn s3_post(
             return response;
         }
         if let ResolvedBackend::Managed(storage) = &backend
-            && let Err(error) = storage
+            && storage
                 .assert_namespace_active(auth.workspace_id().as_str())
                 .await
+                .is_err()
         {
-            return s3_error::service_unavailable(&key, &error.to_string());
+            return s3_error::service_unavailable(
+                &key,
+                "managed namespace is temporarily unavailable",
+            );
         }
         let Some(staging) = staged_multipart(&state).cloned() else {
             return s3_error::multipart_not_supported(&key);
@@ -10430,7 +10479,12 @@ async fn s3_post(
                 .await
             {
                 Ok(epoch) => Some((storage.clone(), epoch)),
-                Err(error) => return s3_error::service_unavailable(&key, &error.to_string()),
+                Err(_) => {
+                    return s3_error::service_unavailable(
+                        &key,
+                        "managed multipart storage is temporarily unavailable",
+                    );
+                }
             }
         } else {
             None
@@ -10467,7 +10521,7 @@ async fn s3_post(
         return match staging.repository.create(upload).await {
             Ok(()) => {
                 if let Some((storage, epoch)) = &managed_registration
-                    && let Err(error) = storage
+                    && let Err(_) = storage
                         .confirm_managed_multipart(&upload_id, auth.workspace_id().as_str(), *epoch)
                         .await
                 {
@@ -10477,7 +10531,10 @@ async fn s3_post(
                     let _ = storage
                         .finish_managed_multipart(&upload_id, auth.workspace_id().as_str(), *epoch)
                         .await;
-                    return s3_error::service_unavailable(&key, &error.to_string());
+                    return s3_error::service_unavailable(
+                        &key,
+                        "managed multipart storage is temporarily unavailable",
+                    );
                 }
                 s3_xml_ok(create_multipart_xml(&bucket, &key, &upload_id))
             }
@@ -11499,8 +11556,8 @@ async fn get_keys(
     };
     let keys = match state.keys.list_for_user(&uid).await {
         Ok(keys) => keys,
-        Err(error) => {
-            tracing::error!(user_id = uid, error = %error, "API key listing failed");
+        Err(_) => {
+            tracing::error!(error_category = "persistence", "API key listing failed");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
@@ -11560,10 +11617,9 @@ async fn create_key(
         .await;
     let (secret, created) = match result {
         Ok(created) => created,
-        Err(error) => {
+        Err(_) => {
             tracing::error!(
-                user_id = uid,
-                error = %error,
+                error_category = "persistence",
                 "API key creation persistence failed"
             );
             return (
@@ -11608,8 +11664,8 @@ async fn delete_key(
     match state.keys.delete_key(&body.key_id, &uid).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "key not found").into_response(),
-        Err(error) => {
-            tracing::error!(user_id = uid, error = %error, "API key deletion failed");
+        Err(_) => {
+            tracing::error!(error_category = "persistence", "API key deletion failed");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
@@ -11631,25 +11687,43 @@ async fn get_mcp_tokens(
     };
     let tokens = match state.keys.list_mcp_tokens(&uid).await {
         Ok(tokens) => tokens,
-        Err(error) => {
-            tracing::error!(user_id = uid, error = %error, "MCP token listing failed");
+        Err(_) => {
+            tracing::error!(error_category = "persistence", "MCP token listing failed");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    let resp: Vec<McpTokenResponse> = tokens
+    let resp = mcp_token_responses(tokens);
+    Json(resp).into_response()
+}
+
+fn mcp_token_responses(tokens: Vec<McpToken>) -> Vec<McpTokenResponse> {
+    let mut omitted = 0usize;
+    let responses = tokens
         .into_iter()
-        .map(|t| McpTokenResponse {
-            credential_id: t
-                .credential_id
-                .expect("persisted MCP tokens have credential IDs"),
-            token_hash: t.token_hash,
-            workspace_id: t.workspace_id,
-            label: t.label,
-            created_at: t.created_at,
-            expires_at: t.expires_at,
+        .filter_map(|token| {
+            let (Some(credential_id), Some(workspace_id)) =
+                (token.credential_id, token.workspace_id)
+            else {
+                omitted += 1;
+                return None;
+            };
+            Some(McpTokenResponse {
+                credential_id,
+                token_hash: token.token_hash,
+                workspace_id: Some(workspace_id),
+                label: token.label,
+                created_at: token.created_at,
+                expires_at: token.expires_at,
+            })
         })
         .collect();
-    Json(resp).into_response()
+    if omitted > 0 {
+        warn!(
+            omitted,
+            "omitted unusable legacy MCP tokens from dashboard response"
+        );
+    }
+    responses
 }
 
 /// Create an MCP bearer token (`maskura_mcp_...`). The plaintext token is returned
@@ -11686,8 +11760,11 @@ async fn create_mcp_token(
         .await
     {
         Ok(created) => created,
-        Err(error) => {
-            tracing::error!(user_id = uid, error = %error, "MCP token creation persistence failed");
+        Err(_) => {
+            tracing::error!(
+                error_category = "persistence",
+                "MCP token creation persistence failed"
+            );
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
@@ -11725,8 +11802,8 @@ async fn delete_mcp_token(
     match state.keys.delete_mcp_token(&body.token_hash, &uid).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "token not found").into_response(),
-        Err(error) => {
-            tracing::error!(user_id = uid, error = %error, "MCP token deletion failed");
+        Err(_) => {
+            tracing::error!(error_category = "persistence", "MCP token deletion failed");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
@@ -11900,8 +11977,11 @@ async fn authenticate_public_key_mutation(
             .keys
             .resolve_credentials(access_key, secret_key)
             .await
-            .map_err(|error| {
-                tracing::error!(error = %error, "credential storage unavailable");
+            .map_err(|_| {
+                tracing::error!(
+                    error_category = "persistence",
+                    "credential storage unavailable"
+                );
                 StatusCode::SERVICE_UNAVAILABLE
             })?;
         let (context, _) = resolved.ok_or(StatusCode::UNAUTHORIZED)?;
@@ -11923,8 +12003,11 @@ async fn authenticate_public_key_mutation(
             .keys
             .resolve_credentials(access_key, secret_key)
             .await
-            .map_err(|error| {
-                tracing::error!(error = %error, "credential storage unavailable");
+            .map_err(|_| {
+                tracing::error!(
+                    error_category = "persistence",
+                    "credential storage unavailable"
+                );
                 StatusCode::SERVICE_UNAVAILABLE
             })?;
         let (context, _) = resolved.ok_or(StatusCode::UNAUTHORIZED)?;
@@ -11975,8 +12058,11 @@ async fn set_public_key(
     {
         Ok(true) => StatusCode::OK.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "key not found").into_response(),
-        Err(error) => {
-            tracing::error!(user_id = uid, error = %error, "public key persistence failed");
+        Err(_) => {
+            tracing::error!(
+                error_category = "persistence",
+                "public key persistence failed"
+            );
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
@@ -12993,10 +13079,10 @@ pub async fn build_state_with_pipeline_template(
         let demo_workspace = workspace_storage.resolve_workspace("demo-user").await?;
         let existing = keys.list_for_user("demo-user").await?;
         if existing.is_empty() {
-            let (_secret, created) = keys
+            let (_secret, _created) = keys
                 .create_key("demo-user", &demo_workspace, "local-default", 0, None)
                 .await?;
-            info!(key_id = %created.key_id, "created local demo API key");
+            info!("created local demo API key");
         }
     }
 
@@ -13011,7 +13097,7 @@ pub async fn build_state_with_pipeline_template(
                 let workspace = workspace_storage.resolve_workspace("demo-user").await?;
                 keys.bootstrap_key(&key_id, &secret, "demo-user", &workspace, "bootstrapped")
                     .await?;
-                info!("Bootstrapped API key {key_id}");
+                info!("bootstrapped API key");
             }
         }
         (Some(_), None) | (None, Some(_)) => {
@@ -13119,7 +13205,7 @@ pub async fn build_state_with_pipeline_template(
         tokio::spawn(async move {
             let owner = format!("managed-repair-{}", uuid::Uuid::now_v7());
             loop {
-                if let Err(error) = storage
+                if storage
                     .reconcile_managed_logical_operations(
                         journal.clone(),
                         capabilities,
@@ -13127,10 +13213,14 @@ pub async fn build_state_with_pipeline_template(
                         64,
                     )
                     .await
+                    .is_err()
                 {
-                    warn!("managed logical-operation reconciliation failed: {error}");
+                    warn!(
+                        error_category = "persistence",
+                        "managed logical-operation reconciliation failed"
+                    );
                 }
-                if let Err(error) = storage
+                if storage
                     .reconcile_managed_write_intents(
                         journal.clone(),
                         capabilities,
@@ -13138,20 +13228,32 @@ pub async fn build_state_with_pipeline_template(
                         64,
                     )
                     .await
+                    .is_err()
                 {
-                    warn!("managed write-intent reconciliation failed: {error}");
+                    warn!(
+                        error_category = "persistence",
+                        "managed write-intent reconciliation failed"
+                    );
                 }
-                if let Err(error) = storage
+                if storage
                     .reconcile_managed_delete_settlements(control.as_ref(), 64)
                     .await
+                    .is_err()
                 {
-                    warn!("managed DELETE settlement reconciliation failed: {error}");
+                    warn!(
+                        error_category = "persistence",
+                        "managed DELETE settlement reconciliation failed"
+                    );
                 }
-                if let Err(error) = storage
+                if storage
                     .repair_due(journal.clone(), capabilities, &owner, 16)
                     .await
+                    .is_err()
                 {
-                    warn!("managed repair worker failed: {error}");
+                    warn!(
+                        error_category = "persistence",
+                        "managed repair worker failed"
+                    );
                 }
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
@@ -13576,6 +13678,47 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/dashboard/api/demo/read", any(legacy_demo_gone))
         .with_state(state)
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+}
+
+#[cfg(test)]
+mod mcp_token_response_tests {
+    use super::{McpToken, mcp_token_responses};
+
+    fn token(credential_id: Option<&str>, workspace_id: Option<&str>, hash: &str) -> McpToken {
+        McpToken {
+            credential_id: credential_id.map(str::to_string),
+            token_hash: hash.to_string(),
+            user_id: "user-a".to_string(),
+            workspace_id: workspace_id.map(str::to_string),
+            label: "test".to_string(),
+            created_at: "0".to_string(),
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn omits_unusable_legacy_rows_without_hiding_valid_tokens() {
+        let responses = mcp_token_responses(vec![
+            token(None, Some("workspace-a"), "legacy-hash"),
+            token(
+                Some("01995f4d-42ff-7000-8000-000000000000"),
+                None,
+                "unbound-hash",
+            ),
+            token(
+                Some("01995f4d-42ff-7000-8000-000000000001"),
+                Some("workspace-a"),
+                "valid-hash",
+            ),
+        ]);
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0].credential_id,
+            "01995f4d-42ff-7000-8000-000000000001"
+        );
+        assert_eq!(responses[0].token_hash, "valid-hash");
+    }
 }
 
 #[cfg(test)]

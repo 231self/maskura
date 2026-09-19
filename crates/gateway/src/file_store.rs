@@ -362,8 +362,8 @@ impl FileStore {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             warn!(
-                bucket,
-                key, "local storage left an unreferenced object file: {error}"
+                error_kind = ?error.kind(),
+                "local storage left an unreferenced object file"
             );
         }
         Ok(true)
@@ -558,8 +558,8 @@ impl FileStore {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             warn!(
-                bucket,
-                key, "local storage left an unreferenced object file: {error}"
+                error_kind = ?error.kind(),
+                "local storage left an unreferenced object file"
             );
         }
         Ok(())
@@ -660,9 +660,9 @@ impl FileStore {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             warn!(
-                bucket = context.bucket,
-                key = context.key,
-                "local storage left an unreferenced object file: {error}"
+                operation_id = %context.operation_id,
+                error_kind = ?error.kind(),
+                "local storage left an unreferenced object file"
             );
         }
         Ok(committed)
@@ -1218,7 +1218,10 @@ async fn write_metadata_atomically(
         if require_directory_sync {
             return Err(FileStoreError::MutationUnknown(error.to_string()));
         }
-        warn!(path = %parent.display(), "local storage directory sync failed after committed metadata rename: {error}");
+        warn!(
+            error_category = "persistence",
+            "local storage directory sync failed after committed metadata rename"
+        );
     }
     Ok(())
 }
