@@ -41,13 +41,14 @@ async fn defer_delete_settlement(
     operation_id: uuid::Uuid,
     receipt_id: uuid::Uuid,
 ) {
-    if let Err(error) = repository
+    if repository
         .defer_delete_settlement(operation_id, receipt_id)
         .await
+        .is_err()
     {
         warn!(
             operation_id = %operation_id,
-            "managed DELETE settlement retry could not be deferred: {error}"
+            "managed DELETE settlement retry could not be deferred"
         );
     }
 }
@@ -1289,7 +1290,7 @@ impl ServiceStorage {
         if let Some(output) = try_get(primary).await {
             return Some(output);
         }
-        info!("primary miss for {key}, trying replica");
+        info!("managed primary miss; trying replica");
         if let Some(replica) = replica_opt {
             return try_get(replica).await;
         }
@@ -1783,21 +1784,26 @@ impl ServiceStorage {
                 defer_delete_settlement(&repository, intent.operation_id, intent.receipt_id).await;
                 continue;
             };
-            if let Err(error) = control.record_reconciled(&workspace_id, &event).await {
+            if control
+                .record_reconciled(&workspace_id, &event)
+                .await
+                .is_err()
+            {
                 warn!(
                     operation_id = %intent.operation_id,
-                    "managed DELETE settlement recording failed: {error}"
+                    "managed DELETE settlement recording failed"
                 );
                 defer_delete_settlement(&repository, intent.operation_id, intent.receipt_id).await;
                 continue;
             }
-            if let Err(error) = repository
+            if repository
                 .mark_logical_operation_settled(intent.operation_id, intent.receipt_id)
                 .await
+                .is_err()
             {
                 warn!(
                     operation_id = %intent.operation_id,
-                    "managed DELETE settlement acknowledgement failed: {error}"
+                    "managed DELETE settlement acknowledgement failed"
                 );
                 defer_delete_settlement(&repository, intent.operation_id, intent.receipt_id).await;
                 continue;
@@ -2200,11 +2206,16 @@ impl ServiceStorage {
         tokio::spawn(async move {
             while let Some(operation_id) = abort_receiver.recv().await {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                if let Err(error) = reconciler
+                if reconciler
                     .reconcile_operation(operation_id, Duration::from_secs(1))
                     .await
+                    .is_err()
                 {
-                    warn!("managed transaction cleanup failed: {error}");
+                    warn!(
+                        operation_id = %operation_id,
+                        error_category = "reconciliation",
+                        "managed transaction cleanup failed"
+                    );
                 }
             }
         });
@@ -2312,7 +2323,11 @@ impl ServiceStorage {
                             match heartbeat_repository.renew_repair(lease_token, lease_until).await {
                                 Ok(()) => {}
                                 Err(ManagedError::Conflict) => break,
-                                Err(error) => warn!("managed repair lease heartbeat failed: {error}"),
+                                Err(_) => warn!(
+                                    repair_id = %lease_token,
+                                    error_category = "persistence",
+                                    "managed repair lease heartbeat failed"
+                                ),
                             }
                         }
                     }
@@ -2322,8 +2337,12 @@ impl ServiceStorage {
                 .execute_repair(journal.clone(), capabilities, &repair)
                 .await;
             let _ = stop_heartbeat.send(());
-            if let Err(error) = heartbeat.await {
-                warn!("managed repair lease heartbeat task failed: {error}");
+            if heartbeat.await.is_err() {
+                warn!(
+                    repair_id = %lease_token,
+                    error_category = "task",
+                    "managed repair lease heartbeat task failed"
+                );
             }
             match result {
                 Ok(()) => match repository.complete_repair(&repair).await {

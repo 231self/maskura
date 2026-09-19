@@ -226,10 +226,10 @@ pub fn slow_down(key: &str) -> axum::response::Response {
     )
 }
 
-pub fn service_unavailable(key: &str, detail: &str) -> axum::response::Response {
+pub fn service_unavailable(key: &str, _detail: &str) -> axum::response::Response {
     s3_error_xml(
         "ServiceUnavailable",
-        detail,
+        "The service is temporarily unavailable.",
         key,
         StatusCode::SERVICE_UNAVAILABLE,
     )
@@ -255,7 +255,7 @@ pub fn bucket_not_empty(bucket: &str) -> axum::response::Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_S3_ERROR_FIELD_BYTES, internal_error, s3_error_body};
+    use super::{MAX_S3_ERROR_FIELD_BYTES, internal_error, s3_error_body, service_unavailable};
     use http_body_util::BodyExt as _;
 
     #[test]
@@ -293,5 +293,17 @@ mod tests {
         assert!(!body.contains(secret));
         assert!(body.contains("We encountered an internal error."));
         assert!(body.len() < MAX_S3_ERROR_FIELD_BYTES + 512);
+    }
+
+    #[tokio::test]
+    async fn service_unavailable_discards_internal_detail() {
+        let secret = "database constraint customer_provider_secret";
+        let response = service_unavailable("key", secret);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("<Code>ServiceUnavailable</Code>"));
+        assert!(body.contains("The service is temporarily unavailable."));
+        assert!(!body.contains(secret));
     }
 }
