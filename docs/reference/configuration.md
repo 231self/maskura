@@ -149,6 +149,44 @@ Allowlist entries are hostnames, IP literals, or `*.suffix` patterns as
 applicable, never URLs. More restrictive runtime DNS and public/private address
 checks still apply; see [Security](../security.md#10-outbound-requests--ssrf-dns-redirect-expiry-address-pinning).
 
+## Observability
+
+Telemetry is environment-only and disabled unless an OTLP endpoint is
+configured. Collector vendor, production endpoint, and credentials are an
+operations decision; see [ADR 0020](../adr/0020-safe-opentelemetry-observability.md).
+
+### Local logging
+
+| Environment variable | Default and behavior |
+|---|---|
+| `MASKURA_LOG_FORMAT` | `text` or `json`; default `text`. |
+| `MASKURA_LOG_LEVEL` | `error`, `warn`, `info`, or `debug`; default `info`. Applies only to Maskura-owned targets. Dependency targets stay capped at WARN; OpenTelemetry and HTTP-client targets are never written locally. |
+
+### OTLP export
+
+| Environment variable | Default and behavior |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Base endpoint; enables traces, logs, and metrics when set. Signal-specific endpoints override it. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Per-signal endpoints; enable only that signal. |
+| `OTEL_TRACES_EXPORTER`, `OTEL_LOGS_EXPORTER`, `OTEL_METRICS_EXPORTER` | `otlp` or `none` only; `none` disables one signal. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` (and per-signal variants) | `http/protobuf` only; any other value fails startup. |
+| `OTEL_EXPORTER_OTLP_INSECURE` (and per-signal variants) | `false` by default. A plaintext `http://` endpoint requires the matching `true`; an `https://` endpoint rejects `true`. |
+| `OTEL_EXPORTER_OTLP_HEADERS` (and per-signal variants) | Comma-separated `name=value` pairs, at most 32, no CR/LF. Values are never echoed in diagnostics. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` (and per-signal variants) | Export timeout in milliseconds, 1–300000; default 10000. |
+| `OTEL_SERVICE_NAME` | Non-empty bounded printable-ASCII service name; defaults to `maskura-gateway`. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Comma-separated `key=value` pairs restricted to `service.namespace`, `service.instance.id`, `deployment.environment.name`, `cloud.provider`, `cloud.region`, and `cloud.availability_zone`. Reserved or unknown keys, duplicates, and unbounded or non-printable values fail startup. |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | `always_on`, `always_off`, `traceidratio`, `parentbased_always_on`, `parentbased_always_off`, or `parentbased_traceidratio`; ratio in `(0, 1]`. Default `parentbased_traceidratio` with ratio `0.1`. |
+| `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_EXPORT_TIMEOUT` | Bounded span batch queue, delay, batch size, and export timeout. Batch size cannot exceed the queue. |
+| `OTEL_BLRP_MAX_QUEUE_SIZE`, `OTEL_BLRP_SCHEDULE_DELAY`, `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BLRP_EXPORT_TIMEOUT` | The same bounds for the log batch processor. |
+| `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_METRIC_EXPORT_TIMEOUT` | Metric export interval (1000–3600000 ms, default 60000) and timeout (1–300000 ms, default 10000). |
+
+Malformed explicit configuration fails startup with a fixed message that never
+echoes the offending endpoint, header, or resource value. Exported attributes,
+logs, and metrics are limited to the allowlist in
+[Security §13.1](../security.md#131-exported-telemetry). On SIGTERM or Ctrl-C
+the gateway stops accepting requests, drains in-flight connections for at most
+30 seconds, then flushes providers for at most 10 seconds.
+
 ## Environment-only values
 
 These values are deliberately absent from the TOML schema. Do not put them in

@@ -551,6 +551,44 @@ This is the only case in which Maskura logs a credential, and it applies only to
 the single-node local appliance, not hosted or multi-tenant deployments. See ADR
 0019.
 
+### 13.1 Exported telemetry
+
+The logging prohibitions above apply equally to records exported over OTLP. The
+agent-builder telemetry increment (`HTTP request` server span, the
+`http.server.request.completed` log, and the `maskura.http.server.*` metrics) is
+restricted to a fixed allowlist and can never carry customer identifiers.
+
+- The only span attributes are `maskura.request.id`, `http.request.method`,
+  `http.route`, `http.response.status_code`, `maskura.http.status_class`, and
+  `maskura.http.outcome`. `http.route` is the router's matched template (for
+  example `/v1/objects/{*key}` or `unmatched`), never a concrete path or query.
+- The completion log carries exactly `request_id`, `method`, `route`,
+  `status_class`, `outcome`, and `duration_ms`, plus trace/span IDs from the
+  server-owned span. It has one fixed event name and no message or error text.
+- Metrics use only normalized method, matched route template, status class, and
+  outcome. Request IDs and tenant, object, operation, receipt, or exception
+  identity are forbidden.
+- The resource carries `service.name`, `service.version`,
+  `maskura.process.role`, and only the allowlisted optional attributes
+  (`service.namespace`, `service.instance.id`,
+  `deployment.environment.name`, `cloud.provider`, `cloud.region`,
+  `cloud.availability_zone`). Other resource keys fail startup.
+- The trace layer rejects every event and every span other than the exact
+  request-span callsite, and it contributes no target, thread, source-location,
+  level, exception, or error-record attributes.
+- A sanitizing HTTP client maps collector transport failures to an opaque error
+  and strips collector response bodies, so no endpoint, header, URL, or
+  collector body can be reflected into a local or exported record. OTEL and
+  HTTP-client dependency targets are suppressed from local output entirely,
+  including WARN and ERROR.
+- Export is disabled unless an OTLP endpoint is configured. Collector DNS,
+  connection, timeout, HTTP, or decoding failures occur in background batch
+  workers and never affect request handling, health, readiness, billing, or
+  reconciliation. Enabling a production collector is a separate operations
+  decision and is not implied by this code.
+
+See ADR 0020 for the trust boundary and signal schemas.
+
 ## 14. Deployment responsibilities
 
 You must handle the following outside the Maskura container:

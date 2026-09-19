@@ -39,3 +39,4 @@
 - [ADR 0017: Atomic managed-write admission](adr/0017-atomic-managed-write-admission.md)
 - [ADR 0018: Atomic managed-write finalization and recovery](adr/0018-atomic-managed-write-finalization-and-recovery.md)
 - [ADR 0019: Zero-config local S3 appliance](adr/0019-zero-config-local-s3-appliance.md)
+- [ADR 0020: Safe OpenTelemetry observability](adr/0020-safe-opentelemetry-observability.md)

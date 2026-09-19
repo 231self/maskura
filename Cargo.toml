@@ -73,7 +73,20 @@ md-5 = "0.10"
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 serde_json = "1"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
+    "rt-tokio",
+    "trace",
+    "metrics",
+    "logs",
+    "experimental_trace_batch_span_processor_with_async_runtime",
+    "experimental_logs_batch_log_processor_with_async_runtime",
+    "experimental_metrics_periodicreader_with_async_runtime",
+] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "trace", "metrics", "logs"] }
+opentelemetry-http = { version = "0.32", default-features = false }
+tracing-opentelemetry = { version = "0.33", default-features = false }
 
 jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }

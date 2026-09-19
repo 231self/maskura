@@ -32,6 +32,7 @@ pub mod server;
 pub mod service_storage;
 pub mod sigv4;
 pub mod store;
+pub mod telemetry;
 pub mod transaction;
 pub mod workspace_storage;
 
