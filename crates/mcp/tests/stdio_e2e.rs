@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, ffi::OsString, process::Stdio, sync::Arc};
 
+use maskura_customer_config::Config;
 use maskura_gateway::{
     control::NoopControlPlane,
     key_cipher::default_wrapping,
@@ -97,10 +98,12 @@ async fn stdio_client_round_trips_through_the_real_gateway() -> anyhow::Result<(
     ]);
 
     let workspaces = Arc::new(InMemoryWorkspaceStorageRepository::new());
+    let config = Config::resolve(None)?;
     let state = build_state(
         Arc::new(NoopControlPlane),
         default_wrapping()?,
         workspaces.clone(),
+        &config,
     )
     .await?;
     let workspace = workspaces.resolve_workspace("mcp-e2e-user").await?;
@@ -219,10 +222,12 @@ async fn stdio_client_round_trips_through_the_real_gateway() -> anyhow::Result<(
         std::env::set_var("AUTH_DISABLED", "true");
     }
     let local_workspaces = Arc::new(InMemoryWorkspaceStorageRepository::new());
+    let local_config = Config::resolve(None)?;
     let local_state = build_state(
         Arc::new(NoopControlPlane),
         default_wrapping()?,
         local_workspaces,
+        &local_config,
     )
     .await?;
     let local_app = build_router(local_state);

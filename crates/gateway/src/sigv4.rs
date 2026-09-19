@@ -96,13 +96,11 @@ impl SigV4Policy {
         }
     }
 
-    pub fn from_env() -> Self {
-        let expected_region =
-            std::env::var("MASKURA_SIGV4_REGION").unwrap_or_else(|_| DEFAULT_REGION.to_string());
-        let trusted_tls_termination = std::env::var("MASKURA_SIGV4_TRUSTED_TLS")
-            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        Self::new(expected_region, trusted_tls_termination)
+    pub fn from_config(config: &maskura_customer_config::config::SigV4Config) -> Self {
+        Self::new(
+            config.region.as_deref().unwrap_or(DEFAULT_REGION),
+            config.trusted_tls,
+        )
     }
 
     fn trusted_tls(&self, uri: &Uri) -> bool {
@@ -808,6 +806,26 @@ mod tests {
     const ACCESS: &str = "AKIAIOSFODNN7EXAMPLE";
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
     const DATE: &str = "20260819T120000Z";
+
+    #[test]
+    fn policy_from_config_uses_defaults() {
+        let policy =
+            SigV4Policy::from_config(&maskura_customer_config::config::SigV4Config::default());
+
+        assert_eq!(policy.expected_region, "us-east-1");
+        assert!(!policy.trusted_tls_termination);
+    }
+
+    #[test]
+    fn policy_from_config_preserves_configured_values() {
+        let policy = SigV4Policy::from_config(&maskura_customer_config::config::SigV4Config {
+            region: Some("eu-west-1".to_string()),
+            trusted_tls: true,
+        });
+
+        assert_eq!(policy.expected_region, "eu-west-1");
+        assert!(policy.trusted_tls_termination);
+    }
 
     fn signed_request(
         uri: &str,

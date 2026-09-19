@@ -22,6 +22,7 @@ use crate::workspace_storage::WorkspaceId;
 pub const MAX_CREDENTIAL_LABEL_BYTES: usize = 128;
 pub const MAX_CREDENTIAL_TTL_SECONDS: u64 = 365 * 24 * 60 * 60;
 pub const MAX_PUBLIC_KEY_PEM_BYTES: usize = 16 * 1024;
+pub const MAX_ROOT_CREDENTIAL_BYTES: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct StoredObject {
@@ -246,6 +247,20 @@ pub trait KeyRepository: Send + Sync {
         label: &str,
     ) -> anyhow::Result<ApiKey>;
 
+    /// Seed the local-appliance root credential from an operator- or
+    /// user-supplied access key + secret. Unlike [`Self::bootstrap_key`], the
+    /// pair is not required to match the `maskura_`/`maskura_secret_` format:
+    /// it is only bounded and control-character-free, mirroring the MinIO
+    /// `ROOT_USER`/`ROOT_PASSWORD` contract.
+    async fn bootstrap_root_credential(
+        &self,
+        access_key: &str,
+        secret: &str,
+        user_id: &str,
+        workspace_id: &WorkspaceId,
+        label: &str,
+    ) -> anyhow::Result<ApiKey>;
+
     async fn set_public_key(
         &self,
         key_id: &str,
@@ -443,8 +458,52 @@ fn bootstrap_api_key(
     label: &str,
     cipher: Option<&SecretCipher>,
 ) -> anyhow::Result<(ApiKey, String)> {
-    validate_bootstrap_key_id(key_id)?;
-    validate_bootstrap_secret(secret)?;
+    bootstrap_api_key_validated(key_id, secret, user_id, workspace_id, label, cipher, false)
+}
+
+/// Seed a local-appliance root credential whose access key/secret need not
+/// match the `maskura_`/`maskura_secret_` format. Bounded and control-
+/// character-free only.
+fn bootstrap_root_api_key(
+    key_id: &str,
+    secret: &str,
+    user_id: &str,
+    workspace_id: &WorkspaceId,
+    label: &str,
+    cipher: Option<&SecretCipher>,
+) -> anyhow::Result<(ApiKey, String)> {
+    bootstrap_api_key_validated(key_id, secret, user_id, workspace_id, label, cipher, true)
+}
+
+fn validate_root_credential_part(value: &str, name: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{name} must not be empty");
+    }
+    if value.chars().any(char::is_control) {
+        anyhow::bail!("{name} must not contain control characters");
+    }
+    if value.len() > MAX_ROOT_CREDENTIAL_BYTES {
+        anyhow::bail!("{name} must not exceed {MAX_ROOT_CREDENTIAL_BYTES} UTF-8 bytes");
+    }
+    Ok(())
+}
+
+fn bootstrap_api_key_validated(
+    key_id: &str,
+    secret: &str,
+    user_id: &str,
+    workspace_id: &WorkspaceId,
+    label: &str,
+    cipher: Option<&SecretCipher>,
+    relaxed: bool,
+) -> anyhow::Result<(ApiKey, String)> {
+    if relaxed {
+        validate_root_credential_part(key_id, "root access key")?;
+        validate_root_credential_part(secret, "root secret key")?;
+    } else {
+        validate_bootstrap_key_id(key_id)?;
+        validate_bootstrap_secret(secret)?;
+    }
     let label = canonicalize_credential_label(label)?;
     let secret_hash = sha256_hash(secret);
     let secret_encrypted = match cipher {
@@ -781,6 +840,34 @@ impl KeyRepository for KeyStore {
             anyhow::bail!("bootstrap key id already exists");
         }
         keys.insert(key_id.to_string(), api_key);
+        Ok(committed)
+    }
+
+    async fn bootstrap_root_credential(
+        &self,
+        access_key: &str,
+        secret: &str,
+        user_id: &str,
+        workspace_id: &WorkspaceId,
+        label: &str,
+    ) -> anyhow::Result<ApiKey> {
+        let (api_key, _) = bootstrap_root_api_key(
+            access_key,
+            secret,
+            user_id,
+            workspace_id,
+            label,
+            self.cipher.as_deref(),
+        )?;
+        let committed = api_key.clone();
+        let mut keys = self
+            .keys
+            .write()
+            .map_err(|_| anyhow::anyhow!("KeyStore API key lock poisoned"))?;
+        if keys.contains_key(access_key) {
+            anyhow::bail!("root access key already exists");
+        }
+        keys.insert(access_key.to_string(), api_key);
         Ok(committed)
     }
 
@@ -1178,6 +1265,47 @@ impl KeyRepository for FileKeyStore {
         Ok(inserted)
     }
 
+    async fn bootstrap_root_credential(
+        &self,
+        access_key: &str,
+        secret: &str,
+        user_id: &str,
+        workspace_id: &WorkspaceId,
+        label: &str,
+    ) -> anyhow::Result<ApiKey> {
+        let (api_key, _) = bootstrap_root_api_key(
+            access_key,
+            secret,
+            user_id,
+            workspace_id,
+            label,
+            self.cipher.as_deref(),
+        )?;
+        let _mutation_guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("FileKeyStore mutation lock poisoned"))?;
+        let inserted = api_key.clone();
+        let mut keys = self
+            .keys
+            .write()
+            .map_err(|_| anyhow::anyhow!("FileKeyStore API key lock poisoned"))?;
+        if keys.contains_key(access_key) {
+            anyhow::bail!("root access key already exists");
+        }
+        let mcp_tokens = self
+            .mcp_tokens
+            .read()
+            .map_err(|_| anyhow::anyhow!("FileKeyStore MCP token lock poisoned"))?
+            .clone();
+        keys.insert(access_key.to_string(), api_key);
+        if let Err(error) = self.persist_snapshot(&keys, &mcp_tokens) {
+            keys.remove(access_key);
+            return Err(error.context("FileKeyStore persist failed"));
+        }
+        Ok(inserted)
+    }
+
     async fn set_public_key(
         &self,
         key_id: &str,
@@ -1533,6 +1661,43 @@ impl KeyRepository for PostgresKeyStore {
             secret_encrypted: Set(api_key.secret_encrypted.clone()),
             label: Set(api_key.label.clone()),
             expires_at: Set(expires_at),
+            public_key_pem: Set(api_key.public_key_pem.clone()),
+            ..Default::default()
+        };
+        let inserted = model
+            .insert(&self.db)
+            .await
+            .context("Postgres API key insert failed")?;
+        Ok(inserted.into())
+    }
+
+    async fn bootstrap_root_credential(
+        &self,
+        access_key: &str,
+        secret: &str,
+        user_id: &str,
+        workspace_id: &WorkspaceId,
+        label: &str,
+    ) -> anyhow::Result<ApiKey> {
+        let (api_key, _) = bootstrap_root_api_key(
+            access_key,
+            secret,
+            user_id,
+            workspace_id,
+            label,
+            self.cipher.as_deref(),
+        )?;
+        if fetch_key(&self.db, access_key).await?.is_some() {
+            anyhow::bail!("root access key already exists");
+        }
+        let model = api_key::ActiveModel {
+            user_id: Set(api_key.user_id.clone()),
+            workspace_id: Set(api_key.workspace_id.clone()),
+            key_id: Set(api_key.key_id.clone()),
+            secret_hash: Set(api_key.secret_hash.clone()),
+            secret_encrypted: Set(api_key.secret_encrypted.clone()),
+            label: Set(api_key.label.clone()),
+            expires_at: Set(None),
             public_key_pem: Set(api_key.public_key_pem.clone()),
             ..Default::default()
         };
@@ -2218,6 +2383,81 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(store.keys.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_root_credential_accepts_arbitrary_access_key_and_secret() {
+        let store = KeyStore::with_cipher(test_cipher());
+
+        let created = store
+            .bootstrap_root_credential(
+                "minioadmin",
+                "minioadmin",
+                "root",
+                &workspace("root"),
+                "local-root",
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.key_id, "minioadmin");
+        assert_eq!(created.label, "local-root");
+
+        let resolved = store
+            .resolve_credentials("minioadmin", "minioadmin")
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved,
+            Some((
+                crate::control::AuthenticatedRequestContext {
+                    user_id: "root".to_string(),
+                    workspace_id: workspace("root"),
+                },
+                None,
+            ))
+        );
+        assert_eq!(
+            store.decrypt_secret("minioadmin").await.unwrap().as_deref(),
+            Some("minioadmin")
+        );
+
+        assert!(
+            store
+                .bootstrap_root_credential(
+                    "minioadmin",
+                    "another",
+                    "root",
+                    &workspace("root"),
+                    "local-root"
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_root_credential_rejects_empty_or_control_characters() {
+        let store = KeyStore::with_cipher(test_cipher());
+        for (access_key, secret) in [
+            ("", "secret"),
+            ("user", ""),
+            ("user\0", "secret"),
+            ("user", "sec\tret"),
+        ] {
+            assert!(
+                store
+                    .bootstrap_root_credential(
+                        access_key,
+                        secret,
+                        "root",
+                        &workspace("root"),
+                        "local-root"
+                    )
+                    .await
+                    .is_err()
+            );
+        }
         assert!(store.keys.read().unwrap().is_empty());
     }
 

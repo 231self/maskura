@@ -13,6 +13,8 @@ S3-compatible API. No MinIO service is involved in this path. This site is the
 deeper documentation:
 
 - **[Plugins](plugins.md)** — write, load, and compose your own Wasm filters.
+- **[MinIO-compatible Docker image](minio-docker.md)** — run Maskura as a
+  zero-config drop-in replacement for `docker run minio/minio`.
 - **[Run the claims](proofs.md)** — black-box S3, plugin, and Python encryption
   proofs with explicit assertions and limits.
 - **[Avro gate](avro.md)** — the typed Avro OCF processing path.

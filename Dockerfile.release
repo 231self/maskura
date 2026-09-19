@@ -9,10 +9,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY dist/maskura-gateway /usr/local/bin/maskura-gateway
 COPY dist/components /app/components
-ENV MASKURA_DEFAULT_PLUGIN=/app/components/pii-default.component.wasm
 ENV MASKURA_PLUGINS_DIR=/app/components
 ENV MASKURA_KEYS_FILE=/data/keys.json
-ENV LISTEN_ADDR=0.0.0.0:8080
 VOLUME ["/data"]
-EXPOSE 8080
+EXPOSE 9000
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=5 \
+  CMD ["maskura-gateway", "--healthcheck"]
 ENTRYPOINT ["maskura-gateway"]

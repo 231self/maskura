@@ -672,14 +672,14 @@ impl WorkspaceEndpointPolicy {
         })
     }
 
-    pub fn from_env(explicit_single_tenant: bool) -> Result<Self, String> {
-        let trusted_hosts = parse_allowlist_env("MASKURA_WORKSPACE_ENDPOINT_ALLOWLIST")?;
-        let private_allowed_hosts =
-            parse_allowlist_env("MASKURA_WORKSPACE_ENDPOINT_PRIVATE_ALLOWLIST")?;
+    pub fn from_config(
+        explicit_single_tenant: bool,
+        config: &maskura_customer_config::config::AllowlistsConfig,
+    ) -> Result<Self, String> {
         Self::new(
             explicit_single_tenant,
-            trusted_hosts,
-            private_allowed_hosts,
+            config.workspace_endpoint.clone(),
+            config.workspace_endpoint_private.clone(),
             Arc::new(TokioAddressResolver),
         )
     }
@@ -767,26 +767,6 @@ impl WorkspaceEndpointPolicy {
         }
         Ok(url)
     }
-}
-
-fn parse_allowlist_env(name: &str) -> Result<Vec<String>, String> {
-    let Ok(value) = std::env::var(name) else {
-        return Ok(Vec::new());
-    };
-    if value.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    value
-        .split(',')
-        .map(|entry| {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                Err(format!("{name} contains an empty entry"))
-            } else {
-                Ok(entry.to_string())
-            }
-        })
-        .collect()
 }
 
 fn normalize_endpoint_host(host: &str) -> Result<String, String> {
@@ -898,27 +878,19 @@ impl PresignedHttpPolicy {
         })
     }
 
-    pub fn from_env() -> Result<Self, String> {
-        let allowed_hosts = parse_allowlist_env("MASKURA_PRESIGNED_HTTP_ALLOWLIST")?;
-        let allow_http = std::env::var("MASKURA_PRESIGNED_HTTP_ALLOW_HTTP")
-            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-        let minimum_validity = std::env::var("MASKURA_PRESIGNED_HTTP_MIN_VALIDITY_SECS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(30));
-        let private_allowed_hosts = std::env::var("MASKURA_PRESIGNED_HTTP_PRIVATE_ALLOWLIST")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|host| !host.is_empty())
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
+    pub fn from_config(
+        config: &maskura_customer_config::config::AllowlistsConfig,
+    ) -> Result<Self, String> {
         Self::new(
-            allowed_hosts,
-            private_allowed_hosts,
-            allow_http,
-            minimum_validity,
+            config.presigned_http.clone(),
+            config
+                .presigned_http_private
+                .iter()
+                .map(|host| host.trim())
+                .filter(|host| !host.is_empty())
+                .map(ToOwned::to_owned),
+            config.presigned_http_allow_http,
+            Duration::from_secs(config.presigned_http_min_validity_secs.unwrap_or(30)),
             Arc::new(TokioAddressResolver),
         )
     }
@@ -1211,6 +1183,7 @@ mod tests {
     use axum::extract::State;
     use axum::http::{StatusCode, Uri};
     use axum::routing::any;
+    use maskura_customer_config::config::AllowlistsConfig;
 
     async fn capture_request_path(
         State(paths): State<Arc<std::sync::Mutex<Vec<String>>>>,
@@ -1385,6 +1358,80 @@ mod tests {
             }),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn workspace_policy_from_config_preserves_normalization_and_validation() {
+        let config = AllowlistsConfig {
+            workspace_endpoint: vec![
+                " Objects.Example ".to_string(),
+                "*.Storage.Example".to_string(),
+            ],
+            workspace_endpoint_private: vec![" MINIO.Internal ".to_string()],
+            ..Default::default()
+        };
+        let policy = WorkspaceEndpointPolicy::from_config(true, &config).unwrap();
+
+        assert!(policy.explicit_single_tenant);
+        assert_eq!(
+            policy.trusted_hosts,
+            vec![
+                TrustedHostPattern::Exact("objects.example".to_string()),
+                TrustedHostPattern::Suffix("storage.example".to_string()),
+            ]
+        );
+        assert_eq!(
+            policy.private_allowed_hosts,
+            HashSet::from(["minio.internal".to_string()])
+        );
+
+        assert!(WorkspaceEndpointPolicy::from_config(false, &config).is_err());
+        let invalid = AllowlistsConfig {
+            workspace_endpoint: vec!["*.com".to_string()],
+            ..Default::default()
+        };
+        assert!(WorkspaceEndpointPolicy::from_config(false, &invalid).is_err());
+    }
+
+    #[test]
+    fn presigned_http_policy_from_config_preserves_values_and_defaults() {
+        let defaults = PresignedHttpPolicy::from_config(&AllowlistsConfig::default()).unwrap();
+        assert!(defaults.allowed_hosts.is_empty());
+        assert!(defaults.private_allowed_hosts.is_empty());
+        assert!(!defaults.allow_http);
+        assert_eq!(defaults.minimum_validity, Duration::from_secs(30));
+
+        let config = AllowlistsConfig {
+            presigned_http: vec![
+                " Objects.Example ".to_string(),
+                "*.Storage.Example".to_string(),
+            ],
+            presigned_http_private: vec![" PRIVATE.Internal ".to_string(), "  ".to_string()],
+            presigned_http_allow_http: true,
+            presigned_http_min_validity_secs: Some(45),
+            ..Default::default()
+        };
+        let policy = PresignedHttpPolicy::from_config(&config).unwrap();
+
+        assert_eq!(
+            policy.allowed_hosts,
+            vec![
+                TrustedHostPattern::Exact("objects.example".to_string()),
+                TrustedHostPattern::Suffix("storage.example".to_string()),
+            ]
+        );
+        assert_eq!(
+            policy.private_allowed_hosts,
+            HashSet::from(["private.internal".to_string()])
+        );
+        assert!(policy.allow_http);
+        assert_eq!(policy.minimum_validity, Duration::from_secs(45));
+
+        let invalid = AllowlistsConfig {
+            presigned_http: vec!["*".to_string()],
+            ..Default::default()
+        };
+        assert!(PresignedHttpPolicy::from_config(&invalid).is_err());
     }
 
     #[test]

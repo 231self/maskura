@@ -285,6 +285,13 @@ jobs:
             -t ${{ env.IMAGE }}:latest \
             ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}
 
+      - name: Verify anonymous pullability before release
+        run: |
+          docker logout ghcr.io || true
+          for tag in "${{ env.RELEASE_TAG }}" latest; do
+            docker buildx imagetools inspect "${{ env.IMAGE }}:${tag}" >/dev/null
+          done
+
       - name: Generate release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

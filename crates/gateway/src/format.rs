@@ -7,6 +7,7 @@ pub enum Format {
     Csv,
     Tsv,
     Text,
+    Binary,
 }
 
 impl Format {
@@ -17,6 +18,7 @@ impl Format {
             Format::Csv => "csv",
             Format::Tsv => "tsv",
             Format::Text => "text",
+            Format::Binary => "binary",
         }
     }
 
@@ -27,6 +29,7 @@ impl Format {
             "csv" => Some(Self::Csv),
             "tsv" => Some(Self::Tsv),
             "text" => Some(Self::Text),
+            "binary" => Some(Self::Binary),
             _ => None,
         }
     }
@@ -241,6 +244,18 @@ pub static TEXT_SPEC: FormatSpec = FormatSpec {
     record_format: Some(Format::Text),
 };
 
+pub static BINARY_SPEC: FormatSpec = FormatSpec {
+    name: "binary",
+    codec_kind: CodecKind::SequentialBinary,
+    canonical_media_type: "application/octet-stream",
+    media_type_aliases: &["binary/octet-stream"],
+    extensions: &[],
+    magic: MagicRequirements::NONE,
+    processed_read_safety: ProcessedReadSafety::PrefixSafe,
+    feature_gate: None,
+    record_format: Some(Format::Binary),
+};
+
 pub static AVRO_SPEC: FormatSpec = FormatSpec {
     name: "avro",
     codec_kind: CodecKind::SequentialBinary,
@@ -277,12 +292,13 @@ pub static PARQUET_SPEC: FormatSpec = FormatSpec {
     record_format: None,
 };
 
-pub static FORMAT_SPECS: [&FormatSpec; 7] = [
+pub static FORMAT_SPECS: [&FormatSpec; 8] = [
     &JSONL_SPEC,
     &JSON_SPEC,
     &CSV_SPEC,
     &TSV_SPEC,
     &TEXT_SPEC,
+    &BINARY_SPEC,
     &AVRO_SPEC,
     &PARQUET_SPEC,
 ];

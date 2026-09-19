@@ -9,6 +9,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use maskura_customer_config::Config;
 use maskura_gateway::entity::api_key;
 use maskura_gateway::entity::managed_list_cursor;
 use maskura_gateway::entity::managed_logical_operation;
@@ -3617,10 +3618,12 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         }
 
         let control = Arc::new(MultipartBillingControl::default());
+        let config = Config::resolve(None).expect("resolve multipart test config");
         let state = build_state(
             control.clone(),
             Arc::new(LocalKeyWrapping::with_kek(TEST_KEK)),
             Arc::new(maskura_gateway::workspace_storage::InMemoryWorkspaceStorageRepository::new()),
+            &config,
         )
         .await
         .expect("build_state with durable staged multipart");
@@ -3700,6 +3703,7 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
             control.clone(),
             Arc::new(LocalKeyWrapping::with_kek(TEST_KEK)),
             Arc::new(maskura_gateway::workspace_storage::InMemoryWorkspaceStorageRepository::new()),
+            &config,
         )
         .await
         .expect("restart gateway with durable staged multipart");

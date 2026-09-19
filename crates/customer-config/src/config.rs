@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,7 +56,6 @@ pub struct StorageConfig {
     pub mode: Option<String>,
     pub s3_endpoint: Option<String>,
     pub s3_region: Option<String>,
-    pub service_buckets: Vec<String>,
     pub single_tenant: bool,
     pub local_dir: Option<String>,
 }
@@ -149,8 +148,7 @@ pub struct AllowlistsConfig {
     pub presigned_http_min_validity_secs: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     pub server: ServerConfig,
     pub auth: AuthConfig,
@@ -165,6 +163,84 @@ pub struct Config {
     pub multipart_staging: MultipartStagingConfig,
     pub sigv4: SigV4Config,
     pub allowlists: AllowlistsConfig,
+    explicit: ExplicitSettings,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExplicitSettings {
+    multipart_mode: bool,
+    streaming_read_mode: bool,
+    filter_component: bool,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ConfigWire {
+    server: ServerConfig,
+    auth: AuthConfig,
+    storage: StorageConfig,
+    supabase: SupabaseConfig,
+    features: FeaturesWire,
+    wasm: WasmConfig,
+    limits: LimitsConfig,
+    spool: SpoolConfig,
+    keys: KeysConfig,
+    managed: ManagedConfig,
+    multipart_staging: MultipartStagingConfig,
+    sigv4: SigV4Config,
+    allowlists: AllowlistsConfig,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FeaturesWire {
+    multipart_mode: Option<MultipartMode>,
+    streaming_read_mode: Option<StreamingReadMode>,
+    transformed_read_spool: bool,
+    enable_avro: bool,
+    streaming_s3_provider: Option<StreamingS3Provider>,
+    dev_memory_streaming: bool,
+    managed_streaming_mode: ManagedStreamingMode,
+    managed_streaming_transactional: bool,
+}
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ConfigWire::deserialize(deserializer)?;
+        let explicit = ExplicitSettings {
+            multipart_mode: wire.features.multipart_mode.is_some(),
+            streaming_read_mode: wire.features.streaming_read_mode.is_some(),
+            filter_component: wire.wasm.filter_component.is_some(),
+        };
+        Ok(Self {
+            server: wire.server,
+            auth: wire.auth,
+            storage: wire.storage,
+            supabase: wire.supabase,
+            features: FeaturesConfig {
+                multipart_mode: wire.features.multipart_mode.unwrap_or_default(),
+                streaming_read_mode: wire.features.streaming_read_mode.unwrap_or_default(),
+                transformed_read_spool: wire.features.transformed_read_spool,
+                enable_avro: wire.features.enable_avro,
+                streaming_s3_provider: wire.features.streaming_s3_provider,
+                dev_memory_streaming: wire.features.dev_memory_streaming,
+                managed_streaming_mode: wire.features.managed_streaming_mode,
+                managed_streaming_transactional: wire.features.managed_streaming_transactional,
+            },
+            wasm: wire.wasm,
+            limits: wire.limits,
+            spool: wire.spool,
+            keys: wire.keys,
+            managed: wire.managed,
+            multipart_staging: wire.multipart_staging,
+            sigv4: wire.sigv4,
+            allowlists: wire.allowlists,
+            explicit,
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -191,25 +267,44 @@ impl From<crate::EnvError> for ConfigError {
 
 impl Config {
     pub fn from_toml_str(input: &str) -> Result<Self, ConfigError> {
-        let config: Config = toml::from_str(input)
-            .map_err(|error| invalid("<input>", format!("malformed TOML: {error}")))?;
+        let config = Self::from_toml_str_unvalidated(input, "<input>")?;
         config.validate()?;
         Ok(config)
     }
 
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
+        let config = Self::from_file_unvalidated(path)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn from_file_unvalidated(path: &Path) -> Result<Self, ConfigError> {
         let input = std::fs::read_to_string(path).map_err(|error| {
             invalid(
                 &path.display().to_string(),
                 format!("failed to read config file: {error}"),
             )
         })?;
-        let config: Config = toml::from_str(&input).map_err(|error| {
-            invalid(
-                &path.display().to_string(),
-                format!("malformed TOML: {error}"),
-            )
-        })?;
+        Self::from_toml_str_unvalidated(&input, &path.display().to_string())
+    }
+
+    fn from_toml_str_unvalidated(input: &str, source: &str) -> Result<Self, ConfigError> {
+        toml::from_str(input).map_err(|error| invalid(source, format!("malformed TOML: {error}")))
+    }
+
+    /// Resolve the effective configuration with the documented precedence:
+    /// compiled defaults, then the file at `path` (when present), then the
+    /// environment-variable override layer, then validation.
+    ///
+    /// With `path` absent the result is identical to the historical
+    /// env-plus-defaults behaviour, so a gateway booted without a config file
+    /// behaves exactly as before.
+    pub fn resolve(path: Option<&Path>) -> Result<Self, ConfigError> {
+        let mut config = match path {
+            Some(path) => Self::from_file_unvalidated(path)?,
+            None => Self::default(),
+        };
+        config.apply_env_overrides()?;
         config.validate()?;
         Ok(config)
     }
@@ -229,12 +324,7 @@ impl Config {
         if let Some(value) = std::env::var("S3_ENDPOINT").ok().filter(|v| !v.is_empty()) {
             self.storage.s3_endpoint = Some(value);
         }
-        if let Some(value) = std::env::var("S3_REGION").ok().filter(|v| !v.is_empty()) {
-            self.storage.s3_region = Some(value);
-        }
-        if let Ok(value) = std::env::var("MASKURA_SERVICE_BUCKETS") {
-            self.storage.service_buckets = split_commas(&value);
-        }
+        self.apply_s3_region_override(|name| std::env::var(name).ok());
         if let Some(value) = resolve(aliases::SINGLE_TENANT)? {
             self.storage.single_tenant = parse_bool("storage.single_tenant", &value)?;
         }
@@ -249,9 +339,11 @@ impl Config {
         }
         if let Some(value) = resolve(aliases::MULTIPART_MODE)? {
             self.features.multipart_mode = parse_multipart_mode(&value)?;
+            self.explicit.multipart_mode = true;
         }
         if let Some(value) = resolve(aliases::STREAMING_READ_MODE)? {
             self.features.streaming_read_mode = parse_streaming_read_mode(&value)?;
+            self.explicit.streaming_read_mode = true;
         }
         if let Some(value) = resolve(aliases::TRANSFORMED_READ_SPOOL)? {
             self.features.transformed_read_spool = value.eq_ignore_ascii_case("encrypted");
@@ -275,6 +367,7 @@ impl Config {
         }
         if let Some(value) = resolve(aliases::DEFAULT_PLUGIN)? {
             self.wasm.filter_component = Some(value);
+            self.explicit.filter_component = true;
         }
         if let Some(value) = resolve(aliases::PLUGINS_DIR)? {
             self.wasm.plugins_dir = Some(value);
@@ -377,6 +470,15 @@ impl Config {
         self.validate()
     }
 
+    fn apply_s3_region_override(&mut self, mut read: impl FnMut(&str) -> Option<String>) {
+        if let Some(value) = ["S3_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"]
+            .into_iter()
+            .find_map(|name| read(name).filter(|value| !value.is_empty()))
+        {
+            self.storage.s3_region = Some(value);
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if let Some(addr) = self.server.listen_addr.as_deref() {
             addr.parse::<SocketAddr>().map_err(|error| {
@@ -403,15 +505,6 @@ impl Config {
         {
             return Err(invalid("storage.mode", "must be local when configured"));
         }
-        for (index, bucket) in self.storage.service_buckets.iter().enumerate() {
-            if bucket.trim().is_empty() {
-                return Err(invalid(
-                    &format!("storage.service_buckets[{index}]"),
-                    "must not be empty",
-                ));
-            }
-        }
-
         validate_url("supabase.url", self.supabase.url.as_deref())?;
 
         for (index, hash) in self.wasm.prefix_safe_component_hashes.iter().enumerate() {
@@ -525,6 +618,16 @@ impl Config {
                 return Err(invalid(path, "must be greater than zero"));
             }
         }
+        if let (Some(tenant), Some(global)) = (
+            self.multipart_staging.tenant_quota_bytes,
+            self.multipart_staging.global_quota_bytes,
+        ) && tenant > global
+        {
+            return Err(invalid(
+                "multipart_staging.tenant_quota_bytes",
+                "must be less than or equal to multipart_staging.global_quota_bytes",
+            ));
+        }
 
         if let Some(region) = self.sigv4.region.as_deref()
             && region.is_empty()
@@ -559,28 +662,21 @@ impl Config {
 
     fn validate_combinations(&self) -> Result<(), ConfigError> {
         let configured = usize::from(self.storage.s3_endpoint.is_some())
-            + usize::from(!self.storage.service_buckets.is_empty())
             + usize::from(self.storage.local_dir.is_some() || self.storage.mode.is_some());
         if configured > 1 {
             return Err(invalid(
                 "storage",
-                "s3_endpoint, service_buckets, and local_dir are mutually exclusive: set one",
+                "s3_endpoint and local storage are mutually exclusive: set one",
             ));
         }
 
-        if self.features.managed_streaming_mode != ManagedStreamingMode::Off {
-            if !self.features.managed_streaming_transactional {
-                return Err(invalid(
-                    "features.managed_streaming_mode",
-                    "observe/enforce requires managed_streaming_transactional = true",
-                ));
-            }
-            if self.storage.service_buckets.is_empty() {
-                return Err(invalid(
-                    "features.managed_streaming_mode",
-                    "observe/enforce requires storage.service_buckets to be configured",
-                ));
-            }
+        if self.features.managed_streaming_mode != ManagedStreamingMode::Off
+            && !self.features.managed_streaming_transactional
+        {
+            return Err(invalid(
+                "features.managed_streaming_mode",
+                "observe/enforce requires managed_streaming_transactional = true",
+            ));
         }
 
         if self.features.streaming_read_mode == StreamingReadMode::Transformed
@@ -592,41 +688,19 @@ impl Config {
             ));
         }
 
-        if self.features.multipart_mode == MultipartMode::Staged {
-            let missing: Vec<&str> = [
-                (
-                    "multipart_staging.endpoint",
-                    self.multipart_staging.endpoint.as_deref(),
-                ),
-                (
-                    "multipart_staging.bucket",
-                    self.multipart_staging.bucket.as_deref(),
-                ),
-                (
-                    "multipart_staging.region",
-                    self.multipart_staging.region.as_deref(),
-                ),
-                (
-                    "multipart_staging.dir",
-                    self.multipart_staging.dir.as_deref(),
-                ),
-            ]
-            .into_iter()
-            .filter(|(_, value)| value.is_none_or(|v| v.is_empty()))
-            .map(|(path, _)| path)
-            .collect();
-            if !missing.is_empty() {
-                return Err(invalid(
-                    "features.multipart_mode",
-                    format!(
-                        "staged multipart requires {} to be configured",
-                        missing.join(", ")
-                    ),
-                ));
-            }
-        }
-
         Ok(())
+    }
+
+    pub fn multipart_mode_is_explicit(&self) -> bool {
+        self.explicit.multipart_mode
+    }
+
+    pub fn streaming_read_mode_is_explicit(&self) -> bool {
+        self.explicit.streaming_read_mode
+    }
+
+    pub fn filter_component_is_explicit(&self) -> bool {
+        self.explicit.filter_component
     }
 }
 
@@ -809,15 +883,65 @@ disabled = true
 [storage]
 s3_endpoint = "http://minio:9000"
 s3_region = "us-east-1"
+single_tenant = true
+
+[supabase]
+url = "https://example.supabase.co"
 
 [features]
-streaming_read_mode = "passthrough"
-
-[limits]
-max_object_bytes = 1048576
+multipart_mode = "reject"
+streaming_read_mode = "transformed"
+transformed_read_spool = true
+enable_avro = true
+streaming_s3_provider = "minio"
+dev_memory_streaming = true
+managed_streaming_mode = "observe"
+managed_streaming_transactional = true
 
 [wasm]
+filter_component = "/plugins/filter.wasm"
+plugins_dir = "/plugins"
 fuel = 1000000
+prefix_safe_component_hashes = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+
+[limits]
+source_max_frame_bytes = 524288
+max_object_bytes = 1048576
+max_pipeline_output_bytes = 2097152
+legacy_max_object_bytes = 4194304
+dev_memory_max_object_bytes = 8388608
+
+[spool]
+dir = "/var/lib/maskura/spool"
+max_object_bytes = 1048576
+quota_bytes = 2097152
+
+[keys]
+keys_file = "/etc/maskura/keys.json"
+bootstrap_key = "bootstrap"
+
+[managed]
+placement_version = 1
+
+[multipart_staging]
+endpoint = "https://staging.example.com"
+bucket = "staging"
+region = "us-west-2"
+dir = "/var/lib/maskura/staging"
+tenant_quota_bytes = 1048576
+global_quota_bytes = 2097152
+
+[sigv4]
+region = "us-east-2"
+trusted_tls = true
+
+[allowlists]
+workspace_endpoint = ["*.amazonaws.com"]
+workspace_endpoint_private = ["minio.internal"]
+presigned_http = ["objects.example.com"]
+presigned_http_private = ["storage.internal"]
+presigned_http_allow_http = true
+presigned_http_min_validity_secs = 30
 "#,
         )
         .unwrap();
@@ -829,9 +953,23 @@ fuel = 1000000
         );
         assert_eq!(
             config.features.streaming_read_mode,
-            StreamingReadMode::Passthrough
+            StreamingReadMode::Transformed
         );
+        assert_eq!(
+            config.supabase.url.as_deref(),
+            Some("https://example.supabase.co")
+        );
+        assert_eq!(config.wasm.fuel, Some(1_000_000));
         assert_eq!(config.limits.max_object_bytes, Some(1_048_576));
+        assert_eq!(config.spool.quota_bytes, Some(2_097_152));
+        assert_eq!(config.keys.bootstrap_key.as_deref(), Some("bootstrap"));
+        assert_eq!(config.managed.placement_version, Some(1));
+        assert_eq!(config.multipart_staging.global_quota_bytes, Some(2_097_152));
+        assert!(config.sigv4.trusted_tls);
+        assert_eq!(
+            config.allowlists.presigned_http_private,
+            vec!["storage.internal"]
+        );
     }
 
     #[test]
@@ -897,29 +1035,24 @@ fuel = 1000000
 
     #[test]
     fn rejects_mutually_exclusive_storage_modes() {
-        let error = parse(
-            "[storage]\ns3_endpoint = \"http://minio:9000\"\nservice_buckets = [\"primary\"]\n",
-        )
-        .unwrap_err();
+        let error =
+            parse("[storage]\ns3_endpoint = \"http://minio:9000\"\nlocal_dir = \"/data\"\n")
+                .unwrap_err();
         assert_eq!(error.path, "storage");
         assert!(error.message.contains("mutually exclusive"));
     }
 
     #[test]
-    fn rejects_managed_observe_without_buckets() {
-        let error = parse(
+    fn accepts_managed_observe_without_config_secrets() {
+        assert!(parse(
             "[features]\nmanaged_streaming_mode = \"observe\"\nmanaged_streaming_transactional = true\n",
         )
-        .unwrap_err();
-        assert_eq!(error.path, "features.managed_streaming_mode");
+        .is_ok());
     }
 
     #[test]
     fn rejects_managed_observe_without_transactional() {
-        let error = parse(
-            "[features]\nmanaged_streaming_mode = \"enforce\"\n\n[storage]\nservice_buckets = [\"primary\"]\n",
-        )
-        .unwrap_err();
+        let error = parse("[features]\nmanaged_streaming_mode = \"enforce\"\n").unwrap_err();
         assert!(error.message.contains("managed_streaming_transactional"));
     }
 
@@ -940,10 +1073,24 @@ fuel = 1000000
     }
 
     #[test]
-    fn rejects_staged_multipart_missing_dependencies() {
-        let error = parse("[features]\nmultipart_mode = \"staged\"\n").unwrap_err();
-        assert_eq!(error.path, "features.multipart_mode");
-        assert!(error.message.contains("multipart_staging.endpoint"));
+    fn accepts_auto_local_staged_multipart_without_hosted_dependencies() {
+        assert!(parse("[features]\nmultipart_mode = \"staged\"\n").is_ok());
+    }
+
+    #[test]
+    fn accepts_local_staged_multipart_without_hosted_dependencies() {
+        assert!(
+            parse(
+                r#"
+[storage]
+mode = "local"
+
+[features]
+multipart_mode = "staged"
+"#
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -986,5 +1133,196 @@ dir = "/var/lib/maskura/staging"
     fn rejects_spool_quota_below_object_max() {
         let error = parse("[spool]\nmax_object_bytes = 100\nquota_bytes = 50\n").unwrap_err();
         assert_eq!(error.path, "spool.quota_bytes");
+    }
+
+    #[test]
+    fn rejects_multipart_tenant_quota_above_global_quota() {
+        let error =
+            parse("[multipart_staging]\ntenant_quota_bytes = 101\nglobal_quota_bytes = 100\n")
+                .unwrap_err();
+        assert_eq!(error.path, "multipart_staging.tenant_quota_bytes");
+    }
+
+    #[test]
+    fn accepts_multipart_tenant_quota_equal_to_global_quota() {
+        assert!(
+            parse("[multipart_staging]\ntenant_quota_bytes = 100\nglobal_quota_bytes = 100\n")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn applies_s3_region_fallback_precedence_without_erasing_file_value() {
+        let cases = [
+            (
+                [
+                    ("S3_REGION", "explicit"),
+                    ("AWS_REGION", "aws"),
+                    ("AWS_DEFAULT_REGION", "default"),
+                ]
+                .as_slice(),
+                "explicit",
+            ),
+            (
+                [("AWS_REGION", "aws"), ("AWS_DEFAULT_REGION", "default")].as_slice(),
+                "aws",
+            ),
+            ([("AWS_DEFAULT_REGION", "default")].as_slice(), "default"),
+        ];
+
+        for (values, expected) in cases {
+            let mut config = parse("[storage]\ns3_region = \"from-file\"\n").unwrap();
+            config.apply_s3_region_override(|name| {
+                values
+                    .iter()
+                    .find_map(|(key, value)| (*key == name).then(|| (*value).to_string()))
+            });
+            assert_eq!(config.storage.s3_region.as_deref(), Some(expected));
+        }
+
+        let mut config = parse("[storage]\ns3_region = \"from-file\"\n").unwrap();
+        config.apply_s3_region_override(|_| None);
+        assert_eq!(config.storage.s3_region.as_deref(), Some("from-file"));
+    }
+
+    fn write_temp_file(name: &str, contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "maskura-config-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn resolve_without_file_yields_compiled_defaults() {
+        let config = Config::resolve(None).unwrap();
+        assert_eq!(config.server.listen_addr, None);
+        assert!(!config.auth.disabled);
+    }
+
+    #[test]
+    fn resolve_loads_file_values() {
+        let path = write_temp_file(
+            "valid",
+            "[server]\nlisten_addr = \"127.0.0.1:9000\"\n\n[auth]\ndisabled = true\n",
+        );
+        let config = Config::resolve(Some(&path)).unwrap();
+        assert_eq!(config.server.listen_addr.as_deref(), Some("127.0.0.1:9000"));
+        assert!(config.auth.disabled);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_applies_environment_before_cross_field_validation() {
+        let path = write_temp_file(
+            "env-repairs-combination",
+            "[features]\nstreaming_read_mode = \"transformed\"\n",
+        );
+        // SAFETY: this test owns this uncommon process variable for its brief
+        // lifetime, and setting it to `encrypted` cannot invalidate other
+        // configurations resolved concurrently.
+        unsafe { std::env::set_var("MASKURA_TRANSFORMED_READ_SPOOL", "encrypted") };
+        let config = Config::resolve(Some(&path)).unwrap();
+        unsafe { std::env::remove_var("MASKURA_TRANSFORMED_READ_SPOOL") };
+        assert!(config.features.transformed_read_spool);
+        assert_eq!(
+            config.features.streaming_read_mode,
+            StreamingReadMode::Transformed
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn records_explicit_auto_local_feature_and_filter_settings() {
+        const INPUT: &str = "[features]\nmultipart_mode = \"reject\"\nstreaming_read_mode = \"off\"\n\n[wasm]\nfilter_component = \"/tmp/noop.wasm\"\n";
+        let config = parse(INPUT).unwrap();
+        assert!(config.multipart_mode_is_explicit());
+        assert!(config.streaming_read_mode_is_explicit());
+        assert!(config.filter_component_is_explicit());
+
+        #[derive(Deserialize)]
+        struct EmbeddedConfig {
+            #[serde(flatten)]
+            base: Config,
+        }
+        let embedded: EmbeddedConfig = toml::from_str(INPUT).unwrap();
+        assert!(embedded.base.multipart_mode_is_explicit());
+        assert!(embedded.base.streaming_read_mode_is_explicit());
+        assert!(embedded.base.filter_component_is_explicit());
+
+        let defaults = Config::default();
+        assert!(!defaults.multipart_mode_is_explicit());
+        assert!(!defaults.streaming_read_mode_is_explicit());
+        assert!(!defaults.filter_component_is_explicit());
+    }
+
+    #[test]
+    fn resolve_rejects_missing_explicit_file() {
+        let path = std::env::temp_dir().join(format!(
+            "maskura-config-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let error = Config::resolve(Some(&path)).unwrap_err();
+        assert!(
+            error.message.contains("failed to read config file"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_malformed_file() {
+        let path = write_temp_file("malformed", "not [ valid toml");
+        let error = Config::resolve(Some(&path)).unwrap_err();
+        assert!(error.message.contains("malformed TOML"), "{error}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_rejects_unknown_key() {
+        let path = write_temp_file(
+            "unknown",
+            "[server]\nlisten_addr = \"0.0.0.0:9000\"\nport = 1\n",
+        );
+        let error = Config::resolve(Some(&path)).unwrap_err();
+        assert!(error.message.contains("unknown field"), "{error}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_rejects_invalid_value() {
+        let path = write_temp_file("invalid", "[features]\nmultipart_mode = \"bogus\"\n");
+        let error = Config::resolve(Some(&path)).unwrap_err();
+        assert!(error.message.contains("unknown variant"), "{error}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rejects_secrets_in_file() {
+        for (name, contents) in [
+            (
+                "service-buckets",
+                "[storage]\nservice_buckets = [\"endpoint|region|bucket|access|secret|aws\"]\n",
+            ),
+            ("supabase-secret", "[supabase]\njwt_secret = \"hunter2\"\n"),
+            (
+                "multipart-secret",
+                "[multipart_staging]\nsecret_access_key = \"hunter2\"\n",
+            ),
+        ] {
+            let path = write_temp_file(name, contents);
+            let error = Config::resolve(Some(&path)).unwrap_err();
+            assert!(error.message.contains("unknown field"), "{error}");
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }

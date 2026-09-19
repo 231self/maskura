@@ -59,6 +59,8 @@ pub mod aliases {
     pub const KEYS_FILE: EnvAlias = EnvAlias::new("MASKURA_KEYS_FILE");
     pub const BOOTSTRAP_KEY: EnvAlias = EnvAlias::new("MASKURA_BOOTSTRAP_KEY");
     pub const BOOTSTRAP_SECRET: EnvAlias = EnvAlias::new("MASKURA_BOOTSTRAP_SECRET");
+    pub const ROOT_USER: EnvAlias = EnvAlias::new("MASKURA_ROOT_USER");
+    pub const ROOT_PASSWORD: EnvAlias = EnvAlias::new("MASKURA_ROOT_PASSWORD");
 
     pub const GATEWAY_CUSTOMER_SETTINGS: &[EnvAlias] = &[
         DEFAULT_PLUGIN,
@@ -85,6 +87,8 @@ pub mod aliases {
         KEYS_FILE,
         BOOTSTRAP_KEY,
         BOOTSTRAP_SECRET,
+        ROOT_USER,
+        ROOT_PASSWORD,
         PORT,
     ];
 

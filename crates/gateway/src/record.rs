@@ -191,7 +191,35 @@ impl RecordDecoder {
             Format::Text | Format::Jsonl | Format::Tsv => self.prepare_line(at_eof),
             Format::Csv => self.prepare_csv(at_eof),
             Format::Json => self.prepare_json(at_eof),
+            Format::Binary => self.prepare_binary(at_eof),
         }
+    }
+
+    fn prepare_binary(&mut self, at_eof: bool) -> Result<(), MaskuraError> {
+        // Binary has no record boundaries or text encoding: emit accumulated
+        // bytes verbatim as a single record with no UTF-8 validation and no
+        // separator, so the byte-preserving pipeline passes them through unchanged.
+        if self.pending.is_empty() {
+            if at_eof {
+                self.complete = true;
+            }
+            return Ok(());
+        }
+        let payload_end = self.pending.len();
+        if payload_end > self.limits.max_record_bytes {
+            return Err(limit_error(
+                codes::RECORD_TOO_LARGE,
+                "record",
+                payload_end,
+                self.limits.max_record_bytes,
+            ));
+        }
+        let payload = Bytes::copy_from_slice(&self.pending[..payload_end]);
+        self.pending.drain(..payload_end);
+        self.ready = Some(Record::new(payload, Bytes::new()));
+        self.input_seen = true;
+        self.scan_offset = 0;
+        Ok(())
     }
 
     fn prepare_line(&mut self, at_eof: bool) -> Result<(), MaskuraError> {
