@@ -13,7 +13,7 @@ use maskura_mcp_protocol::{
 };
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::tool;
 use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool_handler, tool_router};
@@ -311,8 +311,8 @@ impl MaskuraServer {
 
 #[tool_handler]
 impl ServerHandler for MaskuraServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "maskura-mcp",
                 env!("CARGO_PKG_VERSION"),
