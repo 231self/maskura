@@ -70,6 +70,7 @@ chrono = "0.4"
 num-bigint = "0.4"
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 proptest.workspace = true
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace", "logs", "metrics"] }
 prost = "0.14"

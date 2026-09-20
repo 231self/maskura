@@ -326,9 +326,36 @@ mod tests {
                     "/stream",
                     get(|| async { Response::new(Body::new(StreamingBody { sent: false })) }),
                 )
+                .route("/error-body", get(error_body))
+                .route("/auth-denied", get(|| async { StatusCode::UNAUTHORIZED }))
+                .route(
+                    "/unsupported",
+                    get(|| async { StatusCode::NOT_IMPLEMENTED }),
+                )
+                .route("/cors", any(|| async { StatusCode::NO_CONTENT }))
+                .route("/readyz", get(|| async { StatusCode::SERVICE_UNAVAILABLE }))
                 .route("/pending", get(pending_handler)),
             handle,
         )
+    }
+
+    async fn error_body() -> Response {
+        Response::new(Body::new(FailingBody))
+    }
+
+    /// A response body whose first poll is an error.
+    struct FailingBody;
+
+    impl HttpBody for FailingBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            Poll::Ready(Some(Err(std::io::Error::other("SENTINEL-body-error-text"))))
+        }
     }
 
     async fn pending_handler() -> StatusCode {
@@ -409,6 +436,21 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Every export body for a signal path, in arrival order.
+    ///
+    /// A signal may arrive in more than one export batch, so assertions that
+    /// span multiple requests must not assume a single capture.
+    fn captured_all(collector: &Collector, path: &str) -> Vec<Vec<u8>> {
+        collector
+            .captures
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|capture| capture.path == path)
+            .map(|capture| capture.body.clone())
+            .collect()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn request_id_is_replaced_with_a_generated_uuid_v7() {
         let app = test_app(local_handle());
@@ -453,22 +495,28 @@ mod tests {
 
         assert!(handle.flush(Duration::from_secs(10)));
 
-        let traces = captured(&collector, "/v1/traces");
-        let logs = captured(&collector, "/v1/logs");
-        let metrics = captured(&collector, "/v1/metrics");
-        for body in [&traces, &logs, &metrics] {
-            assert!(
-                !String::from_utf8_lossy(body).contains(sentinel),
-                "sentinel leaked into exported records"
-            );
+        for path in ["/v1/traces", "/v1/logs", "/v1/metrics"] {
+            for body in captured_all(&collector, path) {
+                assert!(
+                    !String::from_utf8_lossy(&body).contains(sentinel),
+                    "sentinel leaked into exported records"
+                );
+            }
         }
 
-        let trace_request = ExportTraceServiceRequest::decode(traces.as_slice()).unwrap();
-        let spans = &trace_request.resource_spans[0].scope_spans[0].spans;
-        let routes: BTreeSet<String> = spans
-            .iter()
-            .filter_map(|span| string_attribute(&span.attributes, "http.route"))
-            .collect();
+        let mut routes = BTreeSet::new();
+        for body in captured_all(&collector, "/v1/traces") {
+            let trace_request = ExportTraceServiceRequest::decode(body.as_slice()).unwrap();
+            for resource in &trace_request.resource_spans {
+                for scope in &resource.scope_spans {
+                    for span in &scope.spans {
+                        if let Some(route) = string_attribute(&span.attributes, "http.route") {
+                            routes.insert(route);
+                        }
+                    }
+                }
+            }
+        }
         assert!(routes.contains("/v1/objects/{*key}"));
         assert!(routes.contains(UNMATCHED_ROUTE));
     }
@@ -678,5 +726,331 @@ mod tests {
         pending.finalize(Outcome::Completed);
         pending.finalize(Outcome::BodyError);
         assert!(pending.finalized);
+    }
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn instrumented_app(
+        handle: Arc<TelemetryHandle>,
+        route: &str,
+        method_router: axum::routing::MethodRouter,
+    ) -> Router {
+        instrument_router(Router::new().route(route, method_router), handle)
+    }
+
+    fn sdk_log_attr(record: &opentelemetry_sdk::logs::SdkLogRecord, key: &str) -> Option<String> {
+        record
+            .attributes_iter()
+            .find(|(name, _)| name.as_str() == key)
+            .map(|(_, value)| match value {
+                opentelemetry::logs::AnyValue::String(text) => text.to_string(),
+                opentelemetry::logs::AnyValue::Int(number) => number.to_string(),
+                other => format!("{other:?}"),
+            })
+    }
+
+    fn in_memory_active(exporter: &opentelemetry_sdk::metrics::InMemoryMetricExporter) -> i64 {
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        for resource_metrics in exporter.get_finished_metrics().expect("metrics") {
+            for scope in resource_metrics.scope_metrics() {
+                for metric in scope.metrics() {
+                    if metric.name() == "maskura.http.server.active_requests"
+                        && let AggregatedMetrics::I64(MetricData::Sum(sum)) = metric.data()
+                    {
+                        return sum.data_points().next().expect("data point").value();
+                    }
+                }
+            }
+        }
+        panic!("active requests metric missing");
+    }
+
+    fn local_in_memory_subscriber(
+        handle: &Arc<TelemetryHandle>,
+    ) -> Arc<dyn tracing::Subscriber + Send + Sync> {
+        logging_subscriber(handle.clone())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn body_error_finalizes_once_as_body_error() {
+        use crate::telemetry::provider::in_memory_handle;
+
+        let (handle, exporters) = in_memory_handle();
+        let _guard = tracing::subscriber::set_default(local_in_memory_subscriber(&handle));
+        let app = instrumented_app(handle.clone(), "/error-body", get(error_body));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/error-body")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert!(body.is_err(), "the body error must surface to the caller");
+        assert!(handle.flush(Duration::from_secs(10)));
+
+        let logs = exporters.log.get_emitted_logs().expect("emitted logs");
+        assert_eq!(logs.len(), 1, "exactly one completion log");
+        assert_eq!(
+            sdk_log_attr(&logs[0].record, "outcome").as_deref(),
+            Some("body_error")
+        );
+        assert_eq!(in_memory_active(&exporters.metric), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_completion_event_has_only_its_fixed_fields() {
+        use crate::telemetry::logging::{self, LogFormat};
+
+        let capture = LogCapture::default();
+        let subscriber =
+            logging::subscriber_with_writer(tracing::Level::INFO, LogFormat::Json, capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let app = test_app(local_handle());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        drain(response).await;
+
+        let output = capture.contents();
+        let line = output
+            .lines()
+            .find(|line| line.contains("http.server.request.completed"))
+            .expect("one local completion event");
+        let value: serde_json::Value = serde_json::from_str(line).expect("valid json record");
+        assert_eq!(value["target"], schema::TELEMETRY_TARGET);
+        assert_eq!(value["fields"]["message"], "http.server.request.completed");
+        let fields: BTreeSet<String> = value["fields"]
+            .as_object()
+            .expect("fields object")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            fields,
+            BTreeSet::from([
+                "message".to_string(),
+                "request_id".to_string(),
+                "method".to_string(),
+                "route".to_string(),
+                "status_class".to_string(),
+                "outcome".to_string(),
+                "duration_ms".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_response_status_carries_a_generated_request_id() {
+        let app = test_app(local_handle());
+        for (uri, status) in [
+            ("/health", StatusCode::OK),
+            ("/auth-denied", StatusCode::UNAUTHORIZED),
+            ("/unsupported", StatusCode::NOT_IMPLEMENTED),
+            ("/readyz", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{uri}");
+            let parsed = Uuid::parse_str(&request_id(&response)).expect("generated uuid");
+            assert_eq!(parsed.get_version_num(), 7, "{uri}");
+            drain(response).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cors_preflight_and_retries_get_distinct_request_ids() {
+        let app = test_app(local_handle());
+
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/cors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            Uuid::parse_str(&request_id(&preflight))
+                .expect("generated uuid")
+                .get_version_num(),
+            7
+        );
+        drain(preflight).await;
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            request_id(&first),
+            request_id(&second),
+            "retries must get distinct request ids"
+        );
+        drain(first).await;
+        drain(second).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credential_presigned_and_body_error_sentinels_are_never_exported() {
+        use crate::telemetry::provider::in_memory_handle;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+
+        let (handle, exporters) = in_memory_handle();
+        let _guard = tracing::subscriber::set_default(local_in_memory_subscriber(&handle));
+        let app = test_app(handle.clone());
+
+        let sentinel = "SENTINEL-adversarial-7c31";
+        let request = Request::builder()
+            .uri(format!(
+                "/v1/objects/{sentinel}/key?X-Amz-Signature={sentinel}&X-Amz-Credential={sentinel}"
+            ))
+            .header("authorization", format!("Bearer maskura_mcp_{sentinel}"))
+            .header("x-api-key", sentinel)
+            .header("x-maskura-api-key", sentinel)
+            .header("user-agent", format!("agent/{sentinel}"))
+            .header("x-maskura-request-id", sentinel)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drain(response).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/error-body")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert!(handle.flush(Duration::from_secs(10)));
+
+        let mut dump = String::new();
+        for span in exporters.span.get_finished_spans().expect("spans") {
+            dump.push_str(&format!("{span:?}"));
+        }
+        for log in exporters.log.get_emitted_logs().expect("logs") {
+            dump.push_str(log.record.event_name().unwrap_or_default());
+            for (name, value) in log.record.attributes_iter() {
+                dump.push_str(name.as_str());
+                dump.push_str(&format!("{value:?}"));
+            }
+        }
+        for resource_metrics in exporters.metric.get_finished_metrics().expect("metrics") {
+            for scope in resource_metrics.scope_metrics() {
+                for metric in scope.metrics() {
+                    dump.push_str(metric.name());
+                    match metric.data() {
+                        AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                            for point in sum.data_points() {
+                                for kv in point.attributes() {
+                                    dump.push_str(&format!("{kv:?}"));
+                                }
+                            }
+                        }
+                        AggregatedMetrics::I64(MetricData::Sum(sum)) => {
+                            for point in sum.data_points() {
+                                for kv in point.attributes() {
+                                    dump.push_str(&format!("{kv:?}"));
+                                }
+                            }
+                        }
+                        AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
+                            for point in histogram.data_points() {
+                                for kv in point.attributes() {
+                                    dump.push_str(&format!("{kv:?}"));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(!dump.contains(sentinel), "sentinel leaked: {dump}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreachable_collector_never_changes_the_response() {
+        let handle = exported_handle("http://127.0.0.1:1");
+        let app = instrumented_app(handle.clone(), "/health", get(|| async { StatusCode::OK }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(Uuid::parse_str(&request_id(&response)).is_ok());
+        drain(response).await;
+
+        // A collector outage must never block or panic shutdown.
+        let _ = handle.flush(Duration::from_millis(300));
     }
 }

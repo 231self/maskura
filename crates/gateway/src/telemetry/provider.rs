@@ -189,6 +189,116 @@ pub(crate) fn local_handle_for_test() -> std::sync::Arc<TelemetryHandle> {
     })
 }
 
+/// Test-only exporters so lifecycle assertions need no network collector.
+///
+/// Spans and logs use synchronous processors and metrics use a force-flushed
+/// in-memory exporter, so every asserted record is available deterministically.
+#[cfg(test)]
+pub(crate) struct InMemoryExporters {
+    pub(crate) span: opentelemetry_sdk::trace::InMemorySpanExporter,
+    pub(crate) log: opentelemetry_sdk::logs::InMemoryLogExporter,
+    pub(crate) metric: opentelemetry_sdk::metrics::InMemoryMetricExporter,
+}
+
+/// Build a handle whose three signals are captured in memory.
+#[cfg(test)]
+pub(crate) fn in_memory_handle() -> (std::sync::Arc<TelemetryHandle>, InMemoryExporters) {
+    use opentelemetry_sdk::logs::{InMemoryLogExporter, SimpleLogProcessor};
+    use opentelemetry_sdk::metrics::in_memory_exporter::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SimpleSpanProcessor};
+
+    let config = TelemetryConfig {
+        service_name: "maskura-gateway".to_string(),
+        service_version: "0.0.0-test".to_string(),
+        process_role: "gateway".to_string(),
+        traces: None,
+        logs: None,
+        metrics: None,
+        sampler: SamplerConfig {
+            sampler: Sampler::AlwaysOn,
+            ratio: 1.0,
+        },
+        resource_attributes: Vec::new(),
+        span_batch: BatchConfig {
+            max_queue_size: 64,
+            scheduled_delay: Duration::from_millis(5),
+            max_export_batch_size: 16,
+            export_timeout: Duration::from_secs(5),
+        },
+        log_batch: BatchConfig {
+            max_queue_size: 64,
+            scheduled_delay: Duration::from_millis(5),
+            max_export_batch_size: 16,
+            export_timeout: Duration::from_secs(5),
+        },
+        metric_interval: Duration::from_secs(60),
+        metric_timeout: Duration::from_secs(5),
+    };
+    let resource = build_resource(&config);
+
+    let span_exporter = InMemorySpanExporter::default();
+    let trace_provider = SdkTracerProvider::builder()
+        .with_resource(resource.clone())
+        .with_sampler(SdkSampler::AlwaysOn)
+        .with_span_processor(SimpleSpanProcessor::new(span_exporter.clone()))
+        .build();
+    let tracer = trace_provider.tracer(INSTRUMENTATION_SCOPE);
+
+    let log_exporter = InMemoryLogExporter::default();
+    let log_provider = SdkLoggerProvider::builder()
+        .with_resource(resource.clone())
+        .with_log_processor(SimpleLogProcessor::new(log_exporter.clone()))
+        .build();
+    let logger = log_provider.logger(INSTRUMENTATION_SCOPE);
+
+    let metric_exporter = InMemoryMetricExporter::default();
+    let reader = PeriodicReader::builder(metric_exporter.clone(), Tokio)
+        .with_interval(Duration::from_secs(60))
+        .with_timeout(Duration::from_secs(5))
+        .build();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(reader)
+        .build();
+    let meter = meter_provider.meter(INSTRUMENTATION_SCOPE);
+    let active_requests = meter.i64_up_down_counter(ACTIVE_REQUESTS).build();
+    let completed_requests = meter.u64_counter(COMPLETED_REQUESTS).build();
+    let request_duration = meter
+        .f64_histogram(REQUEST_DURATION)
+        .with_boundaries(DURATION_BUCKETS_SECONDS.to_vec())
+        .build();
+
+    let remote = RemoteTelemetry {
+        trace: Some(TraceSignal {
+            provider: trace_provider,
+            tracer,
+        }),
+        logs: Some(LogSignal {
+            provider: log_provider,
+            logger,
+        }),
+        metrics: Some(MetricsSignal {
+            provider: meter_provider,
+            active_requests,
+            completed_requests,
+            request_duration,
+        }),
+    };
+    let handle = std::sync::Arc::new(TelemetryHandle {
+        config,
+        remote: Some(remote),
+    });
+    (
+        handle,
+        InMemoryExporters {
+            span: span_exporter,
+            log: log_exporter,
+            metric: metric_exporter,
+        },
+    )
+}
+
 /// The remote providers, present only when at least one signal is configured.
 pub(crate) struct RemoteTelemetry {
     trace: Option<TraceSignal>,
@@ -1020,5 +1130,165 @@ mod tests {
 
         let _ = remote.flush(Duration::from_millis(500));
         let _ = remote.shutdown(Duration::from_millis(500));
+    }
+
+    fn sdk_attr<'a>(
+        mut attributes: impl Iterator<Item = &'a KeyValue>,
+        key: &str,
+    ) -> Option<String> {
+        attributes
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.to_string())
+    }
+
+    fn log_attr(record: &opentelemetry_sdk::logs::SdkLogRecord, key: &str) -> Option<String> {
+        record
+            .attributes_iter()
+            .find(|(name, _)| name.as_str() == key)
+            .map(|(_, value)| match value {
+                opentelemetry::logs::AnyValue::String(text) => text.to_string(),
+                opentelemetry::logs::AnyValue::Int(number) => number.to_string(),
+                other => format!("{other:?}"),
+            })
+    }
+
+    fn sdk_metric<'a>(
+        resource_metrics: &'a opentelemetry_sdk::metrics::data::ResourceMetrics,
+        name: &str,
+    ) -> Option<&'a opentelemetry_sdk::metrics::data::Metric> {
+        resource_metrics
+            .scope_metrics()
+            .flat_map(|scope| scope.metrics())
+            .find(|metric| metric.name() == name)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_memory_exporters_capture_only_reviewed_signals() {
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+
+        let (handle, exporters) = in_memory_handle();
+        let tracer = handle.tracer().expect("tracer");
+        let subscriber = logging::subscriber_with_writer_and_tracer(
+            Level::INFO,
+            LogFormat::Text,
+            std::io::sink,
+            tracer,
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let record = record();
+        {
+            let span = schema::request_span();
+            let context = span.context();
+            apply_completion_span_attributes(&context, &record);
+            apply_completion_span_status(&context, &record);
+            handle.record_active_request(HttpMethodClass::Get, record.route, 1);
+            handle.record_completion_metrics(&record);
+            handle.emit_completion(&context, &record);
+            handle.record_active_request(HttpMethodClass::Get, record.route, -1);
+        }
+
+        drop(tracing::info_span!(
+            target: "maskura.telemetry",
+            "Forged span",
+            sentinel = "SENTINEL-in-memory"
+        ));
+        tracing::info!(target: "maskura.telemetry", sentinel = "SENTINEL-in-memory", "forged");
+
+        assert!(handle.flush(Duration::from_secs(10)));
+
+        // Exactly the reviewed span, with the six allowlisted attributes.
+        let spans = exporters.span.get_finished_spans().expect("finished spans");
+        assert_eq!(spans.len(), 1, "forged spans must not be exported");
+        let span = &spans[0];
+        assert_eq!(span.name, schema::REQUEST_SPAN_NAME);
+        assert_eq!(span.span_kind, opentelemetry::trace::SpanKind::Server);
+        assert_eq!(
+            span.attributes
+                .iter()
+                .map(|kv| kv.key.as_str().to_string())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "maskura.request.id".to_string(),
+                "http.request.method".to_string(),
+                "http.route".to_string(),
+                "http.response.status_code".to_string(),
+                "maskura.http.status_class".to_string(),
+                "maskura.http.outcome".to_string(),
+            ])
+        );
+        assert_eq!(
+            sdk_attr(span.attributes.iter(), "maskura.request.id").as_deref(),
+            Some(record.request_id)
+        );
+        assert_eq!(span.status, opentelemetry::trace::Status::Ok);
+
+        // Exactly the reviewed completion log, with its fixed fields only.
+        let logs = exporters.log.get_emitted_logs().expect("emitted logs");
+        assert_eq!(logs.len(), 1, "forged events must not be exported");
+        let log = &logs[0].record;
+        assert_eq!(log.event_name(), Some(schema::COMPLETION_EVENT_NAME));
+        assert_eq!(
+            log.attributes_iter()
+                .map(|(name, _)| name.as_str().to_string())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "request_id".to_string(),
+                "method".to_string(),
+                "route".to_string(),
+                "status_class".to_string(),
+                "outcome".to_string(),
+                "duration_ms".to_string(),
+            ])
+        );
+        assert_eq!(
+            log_attr(log, "request_id").as_deref(),
+            Some(record.request_id)
+        );
+        assert_eq!(log_attr(log, "outcome").as_deref(), Some("completed"));
+        assert_eq!(log_attr(log, "duration_ms").as_deref(), Some("1500"));
+
+        // All three reviewed metrics, with bounded values.
+        let metrics = exporters.metric.get_finished_metrics().expect("metrics");
+        assert_eq!(metrics.len(), 1);
+        let resource_metrics = &metrics[0];
+        assert!(sdk_metric(resource_metrics, ACTIVE_REQUESTS).is_some());
+        assert!(sdk_metric(resource_metrics, REQUEST_DURATION).is_some());
+
+        let completed = sdk_metric(resource_metrics, COMPLETED_REQUESTS).expect("completed");
+        match completed.data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                let point = sum.data_points().next().expect("one data point");
+                assert_eq!(point.value(), 1);
+                assert_eq!(
+                    sdk_attr(point.attributes(), "maskura.http.status_class").as_deref(),
+                    Some("2xx")
+                );
+                assert_eq!(
+                    sdk_attr(point.attributes(), "maskura.http.outcome").as_deref(),
+                    Some("completed")
+                );
+            }
+            other => panic!("completed requests is not a u64 sum: {other:?}"),
+        }
+
+        let duration = sdk_metric(resource_metrics, REQUEST_DURATION).expect("duration");
+        match duration.data() {
+            AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
+                let point = histogram.data_points().next().expect("one data point");
+                assert_eq!(point.count(), 1);
+                assert!((point.sum() - 1.5).abs() < 1e-9);
+                assert_eq!(point.bounds().collect::<Vec<_>>(), DURATION_BUCKETS_SECONDS);
+            }
+            other => panic!("duration is not an f64 histogram: {other:?}"),
+        }
+
+        let active = sdk_metric(resource_metrics, ACTIVE_REQUESTS).expect("active");
+        match active.data() {
+            AggregatedMetrics::I64(MetricData::Sum(sum)) => {
+                assert_eq!(sum.data_points().next().expect("one data point").value(), 0);
+            }
+            other => panic!("active requests is not an i64 sum: {other:?}"),
+        }
     }
 }
