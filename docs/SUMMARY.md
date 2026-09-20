@@ -4,6 +4,7 @@
 - [Open source and hosted boundaries](open-source.md)
 - [Demo](demo.md)
 - [MinIO-compatible Docker image](minio-docker.md)
+- [S3 data-plane compatibility](minio-compatibility.md)
 - [Run the claims](proofs.md)
 - [v0.6.0 release notes](releases/v0.6.0.md)
 - [Plugins](plugins.md)
