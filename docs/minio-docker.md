@@ -59,18 +59,20 @@ The endpoint also accepts the header form (`x-maskura-access-key` /
 
 ## Supported operations
 
-- `ListBuckets`, `CreateBucket`, `DeleteBucket`
-- `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`
-- `ListObjects` and `ListObjectsV2`
-- Multipart upload (staged, durable)
+See the [S3 data-plane compatibility](minio-compatibility.md) table for the
+per-operation status and the test that covers each. In short, the appliance
+implements bucket create/delete (appliance only), object
+`PutObject`/`GetObject`/`HeadObject`/`DeleteObject`, `ListObjects` v1 and v2,
+`ListBuckets`, and durable staged multipart upload.
 
 ## Unsupported operations
 
-Recognized-but-unsupported S3 features return `501 NotImplemented` rather than
-being handled as a different operation: versioning, ACLs, bucket/object
+S3 features outside the data-plane verb list return `501 NotImplemented` rather
+than being handled as a different operation: versioning, ACLs, bucket/object
 tagging, policies, lifecycle, encryption config, website, CORS, replication,
 object-lock, legal-hold, notifications, logging, request-payment, and
-`CopyObject`/`UploadPartCopy` (`x-amz-copy-source`).
+`CopyObject`/`UploadPartCopy` (`x-amz-copy-source`). The full per-verb status is
+in the [compatibility table](minio-compatibility.md).
 
 ## Limits
 
