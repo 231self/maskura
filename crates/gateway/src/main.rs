@@ -7,6 +7,9 @@ use maskura_customer_config::Config;
 use maskura_gateway::control::NoopControlPlane;
 use maskura_gateway::key_cipher::default_wrapping;
 use maskura_gateway::server::{build_router, build_state, default_listen_addr};
+use maskura_gateway::telemetry::{
+    TelemetryConfig, init_local_logging, init_telemetry, instrument_router, serve_with_telemetry,
+};
 use maskura_gateway::workspace_storage::InMemoryWorkspaceStorageRepository;
 use tracing::info;
 
@@ -112,20 +115,25 @@ async fn run_healthcheck(config: &Config) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .init();
-
     let (mut config_path, healthcheck) = parse_args(std::env::args().skip(1))?;
     if healthcheck && config_path.is_none() {
         config_path = container_process_config_path();
     }
-    let config = resolve_config(config_path)?;
+
     if healthcheck {
+        init_local_logging()?;
+        let config = resolve_config(config_path)?;
         return run_healthcheck(&config).await;
     }
+
+    let config = resolve_config(config_path)?;
     let listen_addr = configured_listen_addr(&config)?;
+
+    let telemetry = Arc::new(init_telemetry(TelemetryConfig::from_env(
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        "gateway",
+    )?)?);
 
     // OSS self-host: no policy. Authorization/metering is a no-op.
     let state = build_state(
@@ -135,12 +143,12 @@ async fn main() -> anyhow::Result<()> {
         &config,
     )
     .await?;
-    let app = build_router(state);
+    let app = instrument_router(build_router(state), telemetry.clone());
 
     info!("Maskura Gateway listening on {listen_addr} (OSS, no control plane)");
 
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-    axum::serve(listener, app).await?;
+    serve_with_telemetry(listener, app, telemetry).await?;
 
     Ok(())
 }
