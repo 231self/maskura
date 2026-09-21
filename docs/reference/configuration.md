@@ -92,6 +92,23 @@ and filter components replace these defaults when provided.
 | `wasm.fuel` | `MASKURA_WASM_FUEL` | `1,000,000,000` instructions per pipeline session; must be greater than zero. |
 | `wasm.prefix_safe_component_hashes` | `MASKURA_PREFIX_SAFE_COMPONENT_HASHES` | Empty list. Each entry must be a 64-character hexadecimal SHA-256 digest. Maskura trusts the declaration only for that exact component and does not allow it to change while running. |
 
+#### Signed pipeline files
+
+A separate signed TOML file can define processing chains per workspace, bucket,
+and direction. When `MASKURA_PIPELINES_FILE` is set it replaces the catalog-order
+resolver; the file is verified against `MASKURA_PIPELINE_TRUST_ROOTS` before
+startup. See [ADR 0021](../adr/0021-signed-toml-pipeline-configuration.md) and
+[Plugins](../plugins.md).
+
+| Environment variable | Purpose and behavior |
+|---|---|
+| `MASKURA_PIPELINES_FILE` | Path to a signed TOML pipeline file. Unset selects the catalog-order resolver. |
+| `MASKURA_PIPELINE_TRUST_ROOTS` | Semicolon- or comma-separated `signer_id=hex-public-key` entries used to verify the file's Ed25519 signature. |
+| `MASKURA_PIPELINE_ALLOW_UNSIGNED` | `1`/`true` accepts an unsigned file and logs a prominent boot warning. Local development only; signing is required otherwise. |
+
+Author, sign, and inspect a file with `maskura pipelines init-key`,
+`maskura pipelines sign`, `maskura pipelines verify`, and `maskura pipelines check`.
+
 ### Limits and spool
 
 | TOML key | Environment override | Default and behavior |

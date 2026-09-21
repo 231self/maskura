@@ -126,5 +126,24 @@ only after an explicit capability grant. Empty pipelines require explicit
 pass-through, and failed read transforms never disclose unprocessed fallback
 data.
 
+## Declarative pipelines (self-hosted)
+
+Self-hosted gateways can define their processing chains in a signed TOML file
+instead of relying on catalog order. Point `MASKURA_PIPELINES_FILE` at the file
+and verify it against `MASKURA_PIPELINE_TRUST_ROOTS`; author and sign with:
+
+```bash
+maskura pipelines init-key --out maskura-pipeline.key
+maskura pipelines sign    --key maskura-pipeline.key pipelines.toml
+maskura pipelines verify  --trust-roots "acme=<hex-public-key>" pipelines.toml
+maskura pipelines check   pipelines.toml
+```
+
+A file carries **dedicated, ordered `write` and `read` chains** per scope —
+default, `buckets.<bucket>`, `workspaces.<id>`, and
+`workspaces.<id>.buckets.<bucket>` — and the most specific assignment wins. See
+[ADR 0021](adr/0021-signed-toml-pipeline-configuration.md) and the
+[configuration reference](reference/configuration.md#signed-pipeline-files).
+
 Typed binary formats can additionally use the `binary-reductor` world from the
 same WIT package. See [Binary adapters](binary-adapters.md).
