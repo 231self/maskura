@@ -2970,6 +2970,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "maskura-pipeline-config"
+version = "0.7.10"
+dependencies = [
+ "base64 0.23.1",
+ "ciborium",
+ "ed25519-dalek",
+ "hex",
+ "maskura-error",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "toml 0.8.23",
+ "url",
+]
+
+[[package]]
 name = "maskura-plugin-crypto-deterministic"
 version = "0.7.10"
 dependencies = [
