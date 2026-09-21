@@ -254,8 +254,7 @@ impl EncryptedPartWriter {
         tokio::fs::create_dir_all(directory)
             .await
             .map_err(|error| StagingError::Persistence(error.to_string()))?;
-        let mut dek = [0u8; 32];
-        OsRng.fill_bytes(&mut dek);
+        let dek: [u8; 32] = rand::random();
         let metadata_digest = hex::encode(Sha256::digest(
             serde_json::to_vec(metadata)
                 .map_err(|error| StagingError::Persistence(error.to_string()))?,
@@ -312,8 +311,7 @@ impl EncryptedPartWriter {
         {
             return Err(StagingError::QuotaExceeded);
         }
-        let mut nonce = [0u8; NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce);
+        let nonce: [u8; NONCE_LEN] = rand::random();
         let aad = artifact_aad(&self.header, self.chunk);
         let ciphertext = Aes256Gcm::new_from_slice(&self.dek)
             .map_err(|error| StagingError::Crypto(error.to_string()))?
