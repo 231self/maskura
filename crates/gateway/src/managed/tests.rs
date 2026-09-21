@@ -1,3 +1,4 @@
+use super::memory::insert_memory_repair;
 use super::*;
 
 fn authority(logical: LogicalObjectKey, generation: Uuid) -> ObjectAuthority {
