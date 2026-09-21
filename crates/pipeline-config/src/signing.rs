@@ -56,26 +56,33 @@ impl PipelineFile {
     /// Canonical signed body: the parsed model without the `signature` field,
     /// JSON-normalized (sorted keys) and encoded as canonical CBOR. TOML
     /// whitespace and comments are therefore not part of the signed body.
-    pub fn canonical_body(&self) -> Vec<u8> {
+    pub fn canonical_body(&self) -> Result<Vec<u8>, ConfigError> {
         let mut unsigned = self.clone();
         unsigned.signature = None;
-        let value =
-            serde_json::to_value(&unsigned).expect("pipeline file is always JSON-serializable");
+        let toml_value = toml::Value::try_from(&unsigned).map_err(|error| {
+            ConfigError::invalid(format!("cannot canonicalize pipeline config: {error}"))
+        })?;
+        ensure_finite_numbers(&toml_value)?;
+        let value = serde_json::to_value(&unsigned).map_err(|error| {
+            ConfigError::invalid(format!("cannot canonicalize pipeline config: {error}"))
+        })?;
         let mut encoded = Vec::new();
-        ciborium::ser::into_writer(&value, &mut encoded)
-            .expect("pipeline file is always CBOR-serializable");
-        encoded
+        ciborium::ser::into_writer(&value, &mut encoded).map_err(|error| {
+            ConfigError::invalid(format!("cannot encode canonical body: {error}"))
+        })?;
+        Ok(encoded)
     }
 
     /// Immutable revision identifier: the SHA-256 of the canonical body.
-    pub fn revision(&self) -> String {
-        hex::encode(Sha256::digest(self.canonical_body()))
+    pub fn revision(&self) -> Result<String, ConfigError> {
+        Ok(hex::encode(Sha256::digest(self.canonical_body()?)))
     }
 
     /// Sign the canonical body in place, replacing any existing signature.
-    pub fn sign(&mut self, signing_key: &SigningKey) {
-        let signature = signing_key.sign(&self.canonical_body());
+    pub fn sign(&mut self, signing_key: &SigningKey) -> Result<(), ConfigError> {
+        let signature = signing_key.sign(&self.canonical_body()?);
         self.signature = Some(BASE64.encode(signature.to_bytes()));
+        Ok(())
     }
 
     /// Verify the detached signature against the trust roots and enforce the
@@ -94,7 +101,7 @@ impl PipelineFile {
             .get(&self.signer_id)
             .ok_or_else(|| ConfigError::signature(format!("unknown signer: {}", self.signer_id)))?;
         verifying_key
-            .verify_strict(&self.canonical_body(), &signature)
+            .verify_strict(&self.canonical_body()?, &signature)
             .map_err(|error| {
                 ConfigError::signature(format!("signature verification failed: {error}"))
             })?;
@@ -103,6 +110,10 @@ impl PipelineFile {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or(0);
+        self.verify_validity_at(now)
+    }
+
+    fn verify_validity_at(&self, now: u64) -> Result<(), ConfigError> {
         if let Some(not_before) = self.not_before
             && now < not_before
         {
@@ -118,6 +129,17 @@ impl PipelineFile {
             )));
         }
         Ok(())
+    }
+}
+
+fn ensure_finite_numbers(value: &toml::Value) -> Result<(), ConfigError> {
+    match value {
+        toml::Value::Float(number) if !number.is_finite() => Err(ConfigError::invalid(
+            "pipeline config contains a non-finite float",
+        )),
+        toml::Value::Array(values) => values.iter().try_for_each(ensure_finite_numbers),
+        toml::Value::Table(values) => values.values().try_for_each(ensure_finite_numbers),
+        _ => Ok(()),
     }
 }
 
@@ -144,7 +166,7 @@ plugin = "envelope-decrypt"
 
     fn signed_file() -> PipelineFile {
         let mut file = PipelineFile::from_toml_str(BODY).unwrap();
-        file.sign(&signing_key());
+        file.sign(&signing_key()).unwrap();
         file
     }
 
@@ -197,23 +219,23 @@ plugin = "envelope-decrypt"
             "# exported by Maskura\n\n{BODY}\n# trailing comment\n"
         ))
         .unwrap();
-        assert_eq!(bare.revision(), commented.revision());
+        assert_eq!(bare.revision().unwrap(), commented.revision().unwrap());
     }
 
     #[test]
     fn semantic_change_changes_the_revision() {
         let mut file = PipelineFile::from_toml_str(BODY).unwrap();
-        let before = file.revision();
+        let before = file.revision().unwrap();
         file.read.as_mut().unwrap().steps[0].plugin.name = "other".to_string();
-        assert_ne!(before, file.revision());
+        assert_ne!(before, file.revision().unwrap());
     }
 
     #[test]
     fn signature_field_is_excluded_from_the_body() {
         let mut file = PipelineFile::from_toml_str(BODY).unwrap();
-        let unsigned = file.canonical_body();
-        file.sign(&signing_key());
-        assert_eq!(unsigned, file.canonical_body());
+        let unsigned = file.canonical_body().unwrap();
+        file.sign(&signing_key()).unwrap();
+        assert_eq!(unsigned, file.canonical_body().unwrap());
     }
 
     #[test]
@@ -230,10 +252,10 @@ grant = ["stable_fields"]
 mode = "hash"
 "#;
         let mut file = PipelineFile::from_toml_str(body).unwrap();
-        file.sign(&signing_key());
+        file.sign(&signing_key()).unwrap();
         let rendered = file.to_toml_string().unwrap();
         let reparsed = PipelineFile::from_toml_str(&rendered).unwrap();
-        assert_eq!(reparsed.revision(), file.revision());
+        assert_eq!(reparsed.revision().unwrap(), file.revision().unwrap());
         assert_eq!(reparsed.signature, file.signature);
         reparsed.verify(&trust_roots(&signing_key())).unwrap();
     }
@@ -264,8 +286,41 @@ mode = "hash"
         let mut file = PipelineFile::from_toml_str(BODY).unwrap();
         file.not_before = Some(1);
         file.expires_at = Some(2);
-        file.sign(&signing_key());
+        file.sign(&signing_key()).unwrap();
         let error = file.verify(&trust_roots(&signing_key())).unwrap_err();
         assert!(error.to_string().contains("expired"));
+    }
+
+    #[test]
+    fn not_before_boundary_is_inclusive_and_future_is_rejected() {
+        let mut file = PipelineFile::from_toml_str(BODY).unwrap();
+        file.not_before = Some(100);
+        assert!(file.verify_validity_at(100).is_ok());
+        let error = file.verify_validity_at(99).unwrap_err();
+        assert!(error.to_string().contains("not valid before"));
+    }
+
+    #[test]
+    fn malformed_signatures_are_rejected_without_panicking() {
+        let mut file = PipelineFile::from_toml_str(BODY).unwrap();
+        file.signature = Some("not base64!".to_string());
+        assert!(file.verify(&trust_roots(&signing_key())).is_err());
+
+        file.signature = Some(BASE64.encode([1_u8; 12]));
+        let error = file.verify(&trust_roots(&signing_key())).unwrap_err();
+        assert!(error.to_string().contains("malformed"));
+    }
+
+    #[test]
+    fn non_finite_config_returns_controlled_canonicalization_errors() {
+        for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut file = PipelineFile::from_toml_str(BODY).unwrap();
+            file.write.as_mut().unwrap().steps[0].config = Some(toml::Value::Float(number));
+
+            assert!(file.canonical_body().is_err());
+            assert!(file.revision().is_err());
+            assert!(file.sign(&signing_key()).is_err());
+            assert!(file.signature.is_none());
+        }
     }
 }

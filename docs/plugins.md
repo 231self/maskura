@@ -106,6 +106,15 @@ Or auto-load every `.wasm` component in a directory at startup:
 MASKURA_PLUGINS_DIR=./components ./target/debug/maskura-gateway
 ```
 
+A component may have an adjacent metadata sidecar, for example
+`email-detect.component.wasm` and `email-detect.plugin.toml`. The sidecar's
+`version` and `world` fields become its signed-pipeline catalog identity. A
+legacy component without a sidecar defaults to version `0.1.0` and
+`maskura:plugin/transformer@0.1.0`.
+Name/version references rely on the component source not reusing a version for
+different bytes. Use the component's 64-hex SHA-256 digest as the pipeline
+plugin name when the policy must remain byte-for-byte pinned across restarts.
+
 `MASKURA_DEFAULT_PLUGIN` selects the initial component; local images use the
 official `pii-default` artifact. `just proof plugin` verifies runtime import
 against the published container and observes a transformation produced only by
@@ -129,8 +138,8 @@ data.
 ## Declarative pipelines (self-hosted)
 
 Self-hosted gateways can define their processing chains in a signed TOML file
-instead of relying on catalog order. Point `MASKURA_PIPELINES_FILE` at the file
-and verify it against `MASKURA_PIPELINE_TRUST_ROOTS`; author and sign with:
+instead of relying on catalog order. Configure `[wasm] pipelines_file` and
+`pipeline_trust_roots` (or their environment overrides); author and sign with:
 
 ```bash
 maskura pipelines init-key --out maskura-pipeline.key
@@ -144,6 +153,9 @@ default, `buckets.<bucket>`, `workspaces.<id>`, and
 `workspaces.<id>.buckets.<bucket>` — and the most specific assignment wins. See
 [ADR 0021](adr/0021-signed-toml-pipeline-configuration.md) and the
 [configuration reference](reference/configuration.md#signed-pipeline-files).
+All references are validated before startup. Components uploaded after startup
+require a restart before a signed file can reference them; hot reload is
+intentionally deferred.
 
 Typed binary formats can additionally use the `binary-reductor` world from the
 same WIT package. See [Binary adapters](binary-adapters.md).

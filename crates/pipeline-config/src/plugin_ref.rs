@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::error::ConfigError;
 
@@ -32,6 +33,9 @@ impl PluginRef {
         };
 
         validate_name(name)?;
+        let source = source
+            .map(|source| canonicalize_source(&source))
+            .transpose()?;
         if let Some(version) = &version {
             parse_version_req(version)?;
         }
@@ -60,6 +64,9 @@ impl PluginRef {
         let Ok(parsed) = semver::Version::parse(version) else {
             return false;
         };
+        if let Ok(exact) = semver::Version::parse(requirement) {
+            return exact == parsed;
+        }
         let Ok(requirement) = parse_version_req(requirement) else {
             return false;
         };
@@ -177,6 +184,35 @@ fn validate_name(name: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn canonicalize_source(source: &str) -> Result<String, ConfigError> {
+    let url = Url::parse(source).map_err(|error| {
+        ConfigError::invalid(format!(
+            "plugin source {source:?} is not an absolute URI: {error}"
+        ))
+    })?;
+    if !matches!(url.scheme(), "file" | "https") {
+        return Err(ConfigError::invalid(format!(
+            "plugin source {source:?} uses unsupported scheme {:?}; expected file or https",
+            url.scheme()
+        )));
+    }
+    if url.scheme() == "file" && url.host_str().is_some_and(|host| !host.is_empty()) {
+        return Err(ConfigError::invalid(format!(
+            "plugin source {source:?} must use an absolute file:/// URI without a host"
+        )));
+    }
+    if url.scheme() == "https" && url.host_str().is_none() {
+        return Err(ConfigError::invalid(format!(
+            "plugin source {source:?} must include a host"
+        )));
+    }
+    let mut canonical = url.to_string();
+    if canonical.ends_with('/') && canonical != "file:///" {
+        canonical.pop();
+    }
+    Ok(canonical)
+}
+
 fn is_digest(name: &str) -> bool {
     name.len() == DIGEST_LEN && name.chars().all(|c| c.is_ascii_hexdigit())
 }
@@ -238,6 +274,9 @@ mod tests {
         assert_eq!(reference.name, "pii-default");
         assert_eq!(reference.version.as_deref(), Some("1.2.0"));
         assert_eq!(reference.to_string(), "pii-default:1.2.0");
+        assert!(reference.accepts_version("1.2.0"));
+        assert!(!reference.accepts_version("1.2.1"));
+        assert!(!reference.accepts_version("1.9.0"));
     }
 
     #[test]
@@ -259,8 +298,11 @@ mod tests {
 
     #[test]
     fn qualified_file_source_with_omitted_version_parses_name_only() {
-        let reference = PluginRef::parse("file://dir/dirA/plugins:plugin_name").unwrap();
-        assert_eq!(reference.source.as_deref(), Some("file://dir/dirA/plugins"));
+        let reference = PluginRef::parse("file:///dir/dirA/plugins:plugin_name").unwrap();
+        assert_eq!(
+            reference.source.as_deref(),
+            Some("file:///dir/dirA/plugins")
+        );
         assert_eq!(reference.name, "plugin_name");
         assert_eq!(reference.version, None);
     }
@@ -294,6 +336,25 @@ mod tests {
             let input = format!("pii-default:{version}");
             let reference = PluginRef::parse(&input).unwrap();
             assert_eq!(reference.version.as_deref(), Some(version), "{input}");
+        }
+    }
+
+    #[test]
+    fn version_ranges_retain_semver_matching() {
+        let reference = PluginRef::parse("pii-default:^1.2.0").unwrap();
+        assert!(reference.accepts_version("1.9.0"));
+        assert!(!reference.accepts_version("2.0.0"));
+    }
+
+    #[test]
+    fn qualified_source_must_be_a_supported_absolute_uri() {
+        for input in [
+            "ftp://example.com/plugins:pii-default:1.2.0",
+            "https://:pii-default:1.2.0",
+            "custom://registry/plugins:pii-default:1.2.0",
+            "file://relative-host/plugins:pii-default:1.2.0",
+        ] {
+            assert!(PluginRef::parse(input).is_err(), "{input}");
         }
     }
 

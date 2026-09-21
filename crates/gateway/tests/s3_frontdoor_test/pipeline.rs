@@ -29,6 +29,76 @@ async fn empty_pipeline_preserves_binary_bytes() {
 }
 
 #[tokio::test]
+async fn file_backed_resolver_runs_its_selected_write_chain_over_http() {
+    let mut state = test_state().await;
+    let file = maskura_pipeline_config::PipelineFile::from_toml_str(
+        r#"
+schema_version = 1
+signer_id = "test"
+
+[write]
+[[write.steps]]
+plugin = "pii-default:0.1.0"
+
+[read]
+explicit_passthrough = true
+"#,
+    )
+    .unwrap();
+    let resolver = maskura_gateway::pipeline_config::SignedTomlPipelineResolver::from_registry(
+        file,
+        &state.plugins,
+    )
+    .unwrap();
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.auth_disabled = true;
+    state_mut.dev_memory_streaming_enabled = true;
+    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
+    state_mut.transformed_read_spool_enabled = true;
+    state_mut.gateway = Arc::new(
+        state_mut
+            .gateway
+            .as_ref()
+            .clone()
+            .with_resolver(Arc::new(resolver), state_mut.plugins.clone()),
+    );
+
+    let response = build_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/signed/object.txt")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("alice@example.com"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored = state.store.get("signed", "object.txt").unwrap();
+    assert_eq!(stored.data, Bytes::from_static(b"[REDACTED_EMAIL]"));
+
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/signed/object.txt")
+                .header("x-maskura-process", "read")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        Bytes::from_static(b"[REDACTED_EMAIL]")
+    );
+}
+
+#[tokio::test]
 async fn pipeline_expansion_past_output_cap_releases_before_sink_commit() {
     let mut state = test_state().await;
     let (access_key, secret_key) = make_key(&state).await;

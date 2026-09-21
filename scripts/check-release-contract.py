@@ -107,6 +107,9 @@ def main() -> None:
     )
     for directory in (ROOT / "sdks/python", ROOT / "sdks/typescript"):
         for path in directory.rglob("*"):
+            relative_parts = path.relative_to(directory).parts
+            if relative_parts and relative_parts[0] in {"build", "dist", "node_modules"}:
+                continue
             if not path.is_file() or path.suffix not in {".py", ".ts", ".md"}:
                 continue
             text = path.read_text(errors="replace")

@@ -67,7 +67,13 @@ pub struct StatePipelineTemplate {
     pub(crate) max_pipeline_output_bytes: u64,
     /// Optional signed TOML pipeline definition. When present it replaces the
     /// catalog-order resolver with file-based selection.
-    pub(crate) pipeline: Option<maskura_pipeline_config::PipelineFile>,
+    pub(crate) pipeline: Option<ConfiguredPipelineFile>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ConfiguredPipelineFile {
+    file: maskura_pipeline_config::PipelineFile,
+    revision: String,
 }
 
 impl StatePipelineTemplate {
@@ -100,8 +106,9 @@ impl StatePipelineTemplate {
 
         use sha2::Digest as _;
         let default_hash = hex::encode(sha2::Sha256::digest(&component_bytes));
-        plugins.import_with_capabilities(
+        plugins.import_file_with_capabilities(
             "pii-default",
+            &explicit_component_path,
             &component_bytes,
             PluginCapabilities {
                 prefix_safe_for_read: prefix_safe_hashes.contains(&default_hash),
@@ -125,7 +132,14 @@ impl StatePipelineTemplate {
             stable_demo_component.as_deref(),
             pipeline_fuel,
         )?;
-        let pipeline = configured_pipeline_file()?;
+        let pipeline = configured_pipeline_file(config)?;
+        if let Some(pipeline) = &pipeline {
+            crate::pipeline_config::SignedTomlPipelineResolver::from_registry_with_revision(
+                pipeline.file.clone(),
+                &plugins,
+                pipeline.revision.clone(),
+            )?;
+        }
         Ok(Self {
             engine,
             plugins,
@@ -141,10 +155,11 @@ impl StatePipelineTemplate {
         let plugins = Arc::new(self.plugins.isolated_clone()?);
         let gateway = match &self.pipeline {
             Some(pipeline) => {
-                let resolver = crate::pipeline_config::SignedTomlPipelineResolver::from_registry(
-                    pipeline.clone(),
+                let resolver = crate::pipeline_config::SignedTomlPipelineResolver::from_registry_with_revision(
+                    pipeline.file.clone(),
                     &plugins,
-                );
+                    pipeline.revision.clone(),
+                )?;
                 Gateway::with_shared_registry(Arc::clone(&self.engine), plugins.clone())
                     .with_resolver(Arc::new(resolver), plugins.clone())
             }
@@ -165,27 +180,31 @@ impl StatePipelineTemplate {
 
 /// Load the operator-configured signed pipeline file, if any, and verify it.
 ///
-/// `MASKURA_PIPELINES_FILE` selects the file and `MASKURA_PIPELINE_TRUST_ROOTS`
-/// supplies `signer_id=hex-public-key` entries. `MASKURA_PIPELINE_ALLOW_UNSIGNED=1`
-/// accepts an unsigned file for local development only and logs a prominent
-/// warning on every boot.
-fn configured_pipeline_file() -> anyhow::Result<Option<maskura_pipeline_config::PipelineFile>> {
-    let Some(path) = pipeline_env_value("MASKURA_PIPELINES_FILE") else {
+/// The resolved `[wasm]` configuration selects the file and trust roots; the
+/// corresponding `MASKURA_*` values are normal environment overrides.
+/// `pipeline_allow_unsigned = true` accepts an unsigned file for local
+/// development only and logs a prominent warning on every boot.
+fn configured_pipeline_file(config: &Config) -> anyhow::Result<Option<ConfiguredPipelineFile>> {
+    let Some(path) = config.wasm.pipelines_file.as_deref() else {
         return Ok(None);
     };
-    let file = maskura_pipeline_config::PipelineFile::from_file(&path)
+    let file = maskura_pipeline_config::PipelineFile::from_file(path)
         .map_err(|error| anyhow::anyhow!("invalid pipeline file {path}: {error}"))?;
     if file.signature.is_some() {
-        let trust_roots = pipeline_trust_roots()?;
+        let trust_roots = pipeline_trust_roots(config)?;
         file.verify(&trust_roots).map_err(|error| {
             anyhow::anyhow!("pipeline file {path} failed signature verification: {error}")
         })?;
+        let revision = file
+            .revision()
+            .map_err(|error| anyhow::anyhow!("pipeline file {path} is invalid: {error}"))?;
         tracing::info!(
             path = %path,
-            revision = %file.revision(),
+            revision = %revision,
             "loaded signed pipeline file"
         );
-    } else if pipeline_env_flag("MASKURA_PIPELINE_ALLOW_UNSIGNED") {
+        return Ok(Some(ConfiguredPipelineFile { file, revision }));
+    } else if config.wasm.pipeline_allow_unsigned {
         tracing::warn!(
             path = %path,
             "MASKURA_PIPELINE_ALLOW_UNSIGNED is set: loading an UNSIGNED pipeline file; pipeline policy is unverified"
@@ -195,28 +214,18 @@ fn configured_pipeline_file() -> anyhow::Result<Option<maskura_pipeline_config::
             "pipeline file {path} is not signed; set MASKURA_PIPELINE_ALLOW_UNSIGNED=1 to override"
         );
     }
-    Ok(Some(file))
+    Ok(Some(ConfiguredPipelineFile {
+        file,
+        revision: "unsigned-dev".to_string(),
+    }))
 }
 
-fn pipeline_trust_roots() -> anyhow::Result<maskura_pipeline_config::TrustRoots> {
-    let Some(raw) = pipeline_env_value("MASKURA_PIPELINE_TRUST_ROOTS") else {
+fn pipeline_trust_roots(config: &Config) -> anyhow::Result<maskura_pipeline_config::TrustRoots> {
+    let Some(raw) = config.wasm.pipeline_trust_roots.as_deref() else {
         return Ok(maskura_pipeline_config::TrustRoots::new());
     };
-    maskura_pipeline_config::parse_trust_roots(&raw)
+    maskura_pipeline_config::parse_trust_roots(raw)
         .map_err(|error| anyhow::anyhow!("MASKURA_PIPELINE_TRUST_ROOTS is invalid: {error}"))
-}
-
-fn pipeline_env_value(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn pipeline_env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        let value = value.trim();
-        value == "1" || value.eq_ignore_ascii_case("true")
-    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -412,4 +421,39 @@ pub(crate) fn derive_stable_key(secret: &str) -> Vec<u8> {
         out.extend_from_slice(&mac.finalize().into_bytes());
     }
     out
+}
+
+#[cfg(test)]
+mod pipeline_file_tests {
+    use super::*;
+
+    #[test]
+    fn unsigned_pipeline_requires_override_and_uses_auditable_revision() {
+        let path = std::env::temp_dir().join(format!(
+            "maskura-unsigned-pipeline-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+schema_version = 1
+signer_id = "development"
+[write]
+explicit_passthrough = true
+"#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.wasm.pipelines_file = Some(path.display().to_string());
+        assert!(configured_pipeline_file(&config).is_err());
+
+        config.wasm.pipeline_allow_unsigned = true;
+        let configured = configured_pipeline_file(&config).unwrap().unwrap();
+        assert_eq!(configured.revision, "unsigned-dev");
+        std::fs::remove_file(path).unwrap();
+    }
 }

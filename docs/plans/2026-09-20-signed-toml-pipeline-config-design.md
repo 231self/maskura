@@ -57,9 +57,10 @@ ordered filter list but is unused by the data plane.
    own `write` and `read` chains; there are no named pipelines and no assignment
    table. Step order is the TOML array order.
 6. **Fail closed.** A missing chain at every applicable scope, unknown plugin,
-   version mismatch, unsupported grant, config on a v0.1 component, an empty
-   chain without `explicit_passthrough`, unknown keys, and bad signatures are all
-   load or selection errors.
+   source or version mismatch, unsupported world or grant, an empty chain
+   without `explicit_passthrough`, unknown keys, and bad signatures are all load
+   or selection errors. Step configuration is allowed when the selected WIT
+   world exposes `config-json`; the current transformer v0.1 world does.
 7. **Ed25519 over canonical CBOR, reusing ADR-0003.** The parsed, validated
    model (minus the `signature` field) is canonical-CBOR encoded with sorted map
    keys and signed. TOML whitespace and comments are not part of the signed
@@ -74,8 +75,8 @@ ordered filter list but is unused by the data plane.
 10. **Plugin identity is `(source, name, version)`.** A step references a
     component with a qualified string `<source-uri>:<name>:<version>`, for
     example `https://github.com/231self/maskura/plugins:pii-default:0.x.y`.
-    Local directories use a `file://` URI, for example
-    `file://dir/dirA/plugins:plugin_name:0.2.0`. The source URI is the namespace
+    Local directories use a canonical absolute `file:///` URI, for example
+    `file:///srv/maskura/plugins:plugin_name:0.2.0`. The source URI is the namespace
     that makes names globally meaningful; the digest in the resolved
     `PipelineStep` remains authoritative. An omitted version means the latest
     available.
@@ -96,7 +97,7 @@ edit or the dashboard exports.
 ```toml
 schema_version = 1
 signer_id      = "acme-prod"
-signature      = "base64:5f3a..."          # Ed25519 over the canonical body
+signature      = "Xzo..."                  # standard Base64 Ed25519 signature
 
 [write]
 [[write.steps]]
@@ -116,7 +117,7 @@ plugin = "envelope-decrypt"
 ```toml
 schema_version = 1
 signer_id      = "acme-prod"
-signature      = "base64:5f3a..."
+signature      = "Xzo..."
 
 # ---- Default chains ----
 [write]
@@ -127,14 +128,14 @@ description = "applied to every PUT"
 plugin = "https://github.com/231self/maskura/plugins:stable-encrypt:1.2.0"
 grant  = ["stable_key", "stable_fields"]
 
-[write.steps.config]                       # v0.2 components only
+[write.steps.config]                       # worlds exposing config-json
 mode = "hash"
 
 [[write.steps]]
 plugin = "pii-default"                     # unqualified => local file:// namespace, latest
 
 [[write.steps]]
-plugin = "file://dir/dirA/plugins:custom-redactor:0.2.0"
+plugin = "file:///srv/maskura/plugins:custom-redactor:0.2.0"
 
 [read]
 description = "applied to processed GET (x-maskura-process: read)"
@@ -225,7 +226,7 @@ pub struct StepDef {
     pub plugin: PluginRef,                         // qualified ref, see "Plugin reference grammar"
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
-    pub config: Option<toml::Value>,               // v0.2 only; canonicalized to JSON
+    pub config: Option<toml::Value>,               // world must expose config-json
     #[serde(default)]
     pub grant: Vec<String>,                        // public_key_pem|entropy_seed|stable_key|stable_fields
 }
@@ -243,12 +244,12 @@ Supporting types:
 - `PipelineFile::from_toml_str` / `from_file` with `deny_unknown_fields`.
 - `PipelineFile::validate(&self) -> Result<(), ConfigError>` covering every rule
   in "Failure rules" below.
-- `PipelineFile::canonical_body(&self) -> Vec<u8>` — clone with `signature`
+- `PipelineFile::canonical_body(&self) -> Result<Vec<u8>, ConfigError>` — clone with `signature`
   cleared, canonical-CBOR encode (sorted keys, reusing the `maskura-policy`
   encoder).
-- `PipelineFile::sign(&mut self, &SigningKey)`.
+- `PipelineFile::sign(&mut self, &SigningKey) -> Result<(), ConfigError>`.
 - `PipelineFile::verify(&self, trust_roots: &BTreeMap<String, VerifyingKey>)`.
-- `PipelineFile::revision(&self) -> String` — `hex(sha256(canonical_body))`.
+- `PipelineFile::revision(&self) -> Result<String, ConfigError>` — `hex(sha256(canonical_body))`.
 - `PipelineFile::select(&self, workspace_id, bucket, direction) -> Result<&DirectionPipeline, ConfigError>`.
 - `PipelineCatalog` trait — `lookup(&self, &PluginRef) -> Result<CatalogEntry, ConfigError>`
   with `{ source, name, version, component_hash, capabilities, world_version }`.
@@ -266,8 +267,8 @@ version = semver-requirement      ; any semver form; omitted = latest
 ```
 
 - A qualified ref is `<source-uri>:<name>[:<version>]`; an unqualified ref is
-  `name[:version]`. The source is always a URI — local directories use a
-  `file://` URI.
+  `name[:version]`. The source is always a URI — local directories use their
+  canonical absolute `file:///` URI without a host.
 - Parsing: the final colon-separated segment is the version iff it parses as a
   semver requirement; otherwise it is the name. The remainder before the name is
   the source URI. This keeps `https://host:8443/path:pii-default` (no version,
@@ -276,9 +277,10 @@ version = semver-requirement      ; any semver form; omitted = latest
   wildcards (`1.x`, `*`), tilde (`~1.2.0`), caret (`^1.2.0`), and comparators
   (`>=1.2.0`, `<2.0.0` / comma-AND). The highest matching version wins.
 - `version` omitted means **latest** — the highest version available under that
-  source. Pin an exact version for reproducible resolution across restarts. The
-  resolved digest — not the requirement — enters the fingerprint, so the executed
-  chain is always pinned.
+  source. An exact version is reproducible only when that source preserves
+  version immutability; use a 64-hex digest as the plugin name to
+  cryptographically pin local bytes across restarts. The resolved digest — not
+  the requirement — enters the fingerprint, so each execution is pinned.
 
 The gateway provides a `PluginRegistryCatalog` adapter over `PluginRegistry`.
 The adapter indexes entries by `(source, name, version)` (including disabled
@@ -353,7 +355,7 @@ without the dev escape hatch, or fails verification.
   accepts an unsigned file and labels the revision `unsigned-dev`. It is allowed
   without a loopback restriction, but every boot logs a prominent warning naming
   the file and stating that policy is unverified. Default is fail closed.
-- **CLI (`s4ctl`):** `pipelines init-key`, `pipelines sign`, `pipelines verify`,
+- **CLI (`maskura`):** `pipelines init-key`, `pipelines sign`, `pipelines verify`,
   `pipelines check`.
 
 ## Failure rules (hard load errors)
@@ -364,7 +366,7 @@ without the dev escape hatch, or fails verification.
 - A version requirement that matches no available version.
 - A digest reference not present in the component source.
 - Unsupported `grant` name.
-- `config` present on a v0.1 component.
+- `config` present when the selected world does not expose `config-json`.
 - A scope chain with empty `steps` and no `explicit_passthrough = true`.
 - `signature` present but `signer_id` absent.
 - Missing, malformed, or unverifiable signature (unless the dev escape hatch is
@@ -376,7 +378,7 @@ requested direction.
 ## Testing
 
 - **Schema:** parse, defaults, `deny_unknown_fields`, empty-chain rejection,
-  passthrough acceptance, config-on-v0.1 rejection.
+  passthrough acceptance, and world/config compatibility.
 - **Plugin refs:** parse/Display round-trip for qualified, name-only, digest, and
   versioned forms; `file://` sources; omitted version resolving to latest;
   port-bearing source URIs without a version; no-match rejection; semver forms
@@ -423,6 +425,8 @@ requested direction.
   TOML is an export).
 - Fetching component bytes from remote registries.
 - Replacing catalog-order behavior when no file is configured.
+- Applying byte-oriented transformer chains to typed binary formats such as
+  Avro; those use the schema-aware binary adapter pipeline.
 
 ## Implementation order (for the follow-on plan)
 
@@ -433,6 +437,6 @@ requested direction.
    `SignedTomlPipelineResolver`.
 4. Startup wiring + layered-config/env path, trust roots, and the logged unsigned
    hack.
-5. `s4ctl pipelines` CLI.
+5. `maskura pipelines` CLI.
 6. `docs/reference/configuration.md` + ADR recording the lasting choice.
 7. Private export fixture (in `s4-private`).

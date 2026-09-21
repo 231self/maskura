@@ -53,20 +53,19 @@ fi
 
 mkdir -p "$OUT_DIR"
 
-# name|package-name
+# name|package-name|source-directory
 PLUGINS=(
-  "noop|maskura-plugin-transform-noop"
-  "pii-default|maskura-plugin-filter-pii"
-  "email-detect|maskura-plugin-filter-email"
-  "ssn-detect|maskura-plugin-filter-ssn"
-  "card-detect|maskura-plugin-filter-payment-card"
-  "envelope-encrypt|maskura-plugin-crypto-envelope"
-  "stable-encrypt|maskura-plugin-crypto-deterministic"
+  "noop|maskura-plugin-transform-noop|plugins/transforms/noop"
+  "pii-default|maskura-plugin-filter-pii|plugins/filters/pii"
+  "email-detect|maskura-plugin-filter-email|plugins/filters/email"
+  "ssn-detect|maskura-plugin-filter-ssn|plugins/filters/ssn"
+  "card-detect|maskura-plugin-filter-payment-card|plugins/filters/payment-card"
+  "envelope-encrypt|maskura-plugin-crypto-envelope|plugins/crypto/envelope"
+  "stable-encrypt|maskura-plugin-crypto-deterministic|plugins/crypto/deterministic"
 )
 
 for entry in "${PLUGINS[@]}"; do
-  name="${entry%%|*}"
-  crate="${entry##*|}"
+  IFS='|' read -r name crate source_dir <<< "$entry"
   # Rust crate names use underscores; package names use dashes.
   lib_name="${crate//-/_}"
   echo "=== Building ${crate} (WASI) ==="
@@ -75,6 +74,7 @@ for entry in "${PLUGINS[@]}"; do
     "${BIN_DIR}/${lib_name}.wasm" \
     --adapt "wasi_snapshot_preview1=${ADAPTER}" \
     -o "${OUT_DIR}/${name}.component.wasm"
+  cp "${ROOT}/${source_dir}/plugin.toml" "${OUT_DIR}/${name}.plugin.toml"
   echo "    -> ${OUT_DIR}/${name}.component.wasm (WASI)"
 done
 

@@ -27,3 +27,9 @@ ml-kem.workspace = true
 rand.workspace = true
 sha2 = "0.10"
 x25519-dalek.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

@@ -38,18 +38,23 @@ Adopt a signed TOML pipeline file as the OSS source of truth, resolved through
   pipelines and no assignment table.
 - **`(source, name, version)` plugin identity**, written as
   `<source-uri>:<name>[:<version>]`. OSS resolves references against locally
-  loaded `file://` components; an omitted version means latest. Remote component
-  fetch is not implemented.
+  loaded `file://` components; an omitted version means the highest matching
+  semantic version. Remote component fetch is not implemented. Filesystem
+  components may carry adjacent `*.plugin.toml` version/world metadata; legacy
+  components default to version `0.1.0` and the current transformer world.
+  Name/version references trust the source to keep versions immutable; a digest
+  name pins the component bytes cryptographically across restarts.
 - **Ed25519 over canonical CBOR** of the parsed, validated model (the ADR-0003
   construction); TOML whitespace and comments are not signed. The SHA-256 of
   that body is the immutable `PipelineLocator.revision`.
-- **Fail closed**: unknown keys, unknown components, bad signatures, unsupported
-  grants, config on a v0.1 component, empty chains without
-  `explicit_passthrough`, and unassigned directions are hard errors.
-- **Operator environment surface**: `MASKURA_PIPELINES_FILE`,
-  `MASKURA_PIPELINE_TRUST_ROOTS`, and a dev-only
-  `MASKURA_PIPELINE_ALLOW_UNSIGNED=1` that accepts an unsigned file and logs a
-  prominent warning on every boot.
+- **Fail closed at startup**: every declared scope and step, including disabled
+  and shadowed steps, is resolved before the gateway starts. Unknown keys,
+  sources, components, versions, digests, unsupported worlds or grants, bad
+  signatures, implicit empty chains, and ambiguous identities are hard errors.
+- **Layered operator configuration**: `[wasm] pipelines_file`,
+  `pipeline_trust_roots`, and `pipeline_allow_unsigned` use the normal TOML plus
+  environment override model. The unsigned override logs a prominent warning
+  and labels the revision `unsigned-dev`.
 - Implemented in `maskura-pipeline-config` and
   `crates/gateway/src/pipeline_config.rs`; authored and signed with
   `maskura pipelines`.
@@ -70,5 +75,7 @@ The full design is recorded in
 - Sensitive request context is deny-by-default and grantable only per step.
 - The catalog remains a catalog, not a policy; the file — not catalog order —
   decides which steps run.
+- Typed binary adapters such as Avro use their schema-aware binary transform
+  pipeline rather than these byte-oriented WASM chains.
 - Deferred: prefix and content-type routing (requires extending the resolver
   input), remote component fetch, and hot reload.

@@ -1,9 +1,13 @@
 mod common;
 
-use maskura_gateway::Format;
+use maskura_gateway::pipeline::PipelineDirection;
+use maskura_gateway::pipeline_config::SignedTomlPipelineResolver;
 use maskura_gateway::plugin_registry::PluginRegistry;
+use maskura_gateway::record::Record;
+use maskura_gateway::{Format, Gateway};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn component_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -151,4 +155,67 @@ fn full_pipeline_composition_noop_detect_encrypt() {
         s,
         "[REDACTED_EMAIL] SSN [REDACTED_SSN] card [REDACTED_CARD]"
     );
+}
+
+#[tokio::test]
+async fn file_backed_resolution_executes_selected_component_snapshot() {
+    let noop = read_component("noop.component.wasm");
+    let email = read_component("email-detect.component.wasm");
+    let registry = Arc::new(PluginRegistry::new());
+    registry.import("noop", &noop).unwrap();
+    registry.import("email-detect", &email).unwrap();
+
+    let file = maskura_pipeline_config::PipelineFile::from_toml_str(
+        r#"
+schema_version = 1
+signer_id = "test"
+
+[write]
+[[write.steps]]
+plugin = "email-detect:0.1.0"
+
+[read]
+[[read.steps]]
+plugin = "noop:0.1.0"
+"#,
+    )
+    .unwrap();
+    let resolver = SignedTomlPipelineResolver::from_registry(file, &registry).unwrap();
+    let gateway = Gateway::with_registry(
+        maskura_wasm_runtime::FilterEngine::new(&noop).unwrap(),
+        Arc::clone(&registry),
+    )
+    .with_resolver(Arc::new(resolver), registry);
+
+    let resolution = gateway
+        .resolve("workspace", "bucket", PipelineDirection::Write)
+        .await
+        .unwrap();
+    let persisted = serde_json::to_vec(&resolution).unwrap();
+    let restored: maskura_gateway::pipeline::PipelineResolution =
+        serde_json::from_slice(&persisted).unwrap();
+    let snapshot = gateway.snapshot_for(&restored).await.unwrap();
+    let mut session = snapshot
+        .start_streaming_session(
+            maskura_wasm_runtime::Session {
+                format: "text".to_string(),
+                content_type: "text/plain".to_string(),
+                policy_version: 0,
+                operation: maskura_wasm_runtime::Operation::Write,
+                config_json: None,
+                public_key_pem: None,
+                stable_key: None,
+                stable_fields: None,
+            },
+            maskura_wasm_runtime::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let output = session
+        .process(Record::new("alice@example.com", ""))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.payload, "[REDACTED_EMAIL]");
+    assert!(session.finish().await.unwrap().0.is_empty());
 }

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use maskura_error::{MaskuraError, codes};
 use maskura_pipeline_config::{
-    ConfigError, Direction as ConfigDirection, PipelineFile, PluginRef, StepDef,
+    ConfigError, Direction as ConfigDirection, DirectionPipeline, PipelineFile, PluginRef, StepDef,
 };
 use maskura_wasm_runtime::SensitiveGrant;
 
@@ -19,14 +19,18 @@ use crate::pipeline::{
     PipelineDirection, PipelineLocator, PipelineResolution, PipelineResolver, PipelineStep,
     resolution_fingerprint,
 };
-use crate::plugin_registry::{PipelineLimits, PluginCapabilities, PluginRegistry};
+use crate::plugin_registry::{
+    PipelineLimits, PluginCapabilities, PluginRegistry, TRANSFORMER_WORLD,
+};
 
 /// One component available to file-based resolution.
 #[derive(Clone, Debug)]
 struct CatalogEntry {
+    source: Option<String>,
     component_hash: String,
     name: String,
     version: String,
+    world_version: String,
     capabilities: PluginCapabilities,
 }
 
@@ -39,13 +43,15 @@ pub struct LocalPluginCatalog {
 impl LocalPluginCatalog {
     pub fn from_registry(registry: &PluginRegistry) -> Self {
         let entries = registry
-            .catalog_entries()
+            .catalog_records()
             .into_iter()
-            .map(|(info, component_hash, capabilities)| CatalogEntry {
-                component_hash,
-                name: info.name,
-                version: info.version,
-                capabilities,
+            .map(|record| CatalogEntry {
+                source: record.source,
+                component_hash: record.component_hash,
+                name: record.name,
+                version: record.version,
+                world_version: record.world_version,
+                capabilities: record.capabilities,
             })
             .collect();
         Self { entries }
@@ -56,6 +62,13 @@ impl LocalPluginCatalog {
         let mut candidates: Vec<&CatalogEntry> = self
             .entries
             .iter()
+            .filter(|entry| match &reference.source {
+                Some(source) => entry.source.as_ref() == Some(source),
+                None => entry
+                    .source
+                    .as_deref()
+                    .is_none_or(|source| source.starts_with("file://")),
+            })
             .filter(|entry| {
                 if by_digest {
                     entry.component_hash == reference.name
@@ -71,14 +84,39 @@ impl LocalPluginCatalog {
                 format!("component {reference} is not available locally"),
             ));
         }
-        // Deterministic "latest": highest version, import order breaking ties.
-        candidates.sort_by(|a, b| b.version.cmp(&a.version));
-        Ok(candidates[0])
+        candidates.sort_by(|a, b| {
+            let a = semver::Version::parse(&a.version).expect("catalog versions are validated");
+            let b = semver::Version::parse(&b.version).expect("catalog versions are validated");
+            b.cmp_precedence(&a)
+        });
+        let selected = candidates[0];
+        let selected_version =
+            semver::Version::parse(&selected.version).expect("catalog versions are validated");
+        if candidates.iter().skip(1).any(|candidate| {
+            semver::Version::parse(&candidate.version)
+                .is_ok_and(|candidate| candidate.cmp_precedence(&selected_version).is_eq())
+                && candidate.component_hash != selected.component_hash
+        }) {
+            return Err(MaskuraError::new(
+                codes::CONFIG_INVALID,
+                format!("component {reference} resolves ambiguously to multiple digests"),
+            ));
+        }
+        Ok(selected)
     }
 }
 
 impl CatalogEntry {
     fn to_pipeline_step(&self, step: &StepDef) -> Result<PipelineStep, MaskuraError> {
+        if self.world_version != TRANSFORMER_WORLD {
+            return Err(MaskuraError::new(
+                codes::CONFIG_INVALID,
+                format!(
+                    "component {} uses unsupported world {:?}",
+                    step.plugin, self.world_version
+                ),
+            ));
+        }
         Ok(PipelineStep {
             component_hash: self.component_hash.clone(),
             plugin_version_id: None,
@@ -100,24 +138,112 @@ pub struct SignedTomlPipelineResolver {
 }
 
 impl SignedTomlPipelineResolver {
-    pub fn from_registry(file: PipelineFile, registry: &PluginRegistry) -> Self {
-        let catalog = LocalPluginCatalog::from_registry(registry);
-        let limits = registry.pipeline_limits();
-        Self::new(file, catalog, limits)
+    pub fn from_registry(
+        file: PipelineFile,
+        registry: &PluginRegistry,
+    ) -> Result<Self, MaskuraError> {
+        let revision = file.revision().map_err(config_error)?;
+        Self::from_registry_with_revision(file, registry, revision)
     }
 
-    pub fn new(file: PipelineFile, catalog: LocalPluginCatalog, limits: PipelineLimits) -> Self {
-        let revision = file.revision();
-        Self {
+    pub fn from_registry_with_revision(
+        file: PipelineFile,
+        registry: &PluginRegistry,
+        revision: String,
+    ) -> Result<Self, MaskuraError> {
+        let catalog = LocalPluginCatalog::from_registry(registry);
+        let limits = registry.pipeline_limits();
+        Self::new_with_revision(file, catalog, limits, revision)
+    }
+
+    pub fn new(
+        file: PipelineFile,
+        catalog: LocalPluginCatalog,
+        limits: PipelineLimits,
+    ) -> Result<Self, MaskuraError> {
+        let revision = file.revision().map_err(config_error)?;
+        Self::new_with_revision(file, catalog, limits, revision)
+    }
+
+    pub fn new_with_revision(
+        file: PipelineFile,
+        catalog: LocalPluginCatalog,
+        limits: PipelineLimits,
+        revision: String,
+    ) -> Result<Self, MaskuraError> {
+        let resolver = Self {
             file,
             revision,
             catalog: Arc::new(catalog),
             limits,
-        }
+        };
+        resolver.validate_all()?;
+        Ok(resolver)
     }
 
     pub fn revision(&self) -> &str {
         &self.revision
+    }
+
+    pub fn validate_all(&self) -> Result<(), MaskuraError> {
+        if let Some(pipeline) = &self.file.write {
+            self.validate_pipeline("write", pipeline)?;
+        }
+        if let Some(pipeline) = &self.file.read {
+            self.validate_pipeline("read", pipeline)?;
+        }
+        for (bucket, scope) in &self.file.buckets {
+            if let Some(pipeline) = &scope.write {
+                self.validate_pipeline(&format!("buckets.{bucket}.write"), pipeline)?;
+            }
+            if let Some(pipeline) = &scope.read {
+                self.validate_pipeline(&format!("buckets.{bucket}.read"), pipeline)?;
+            }
+        }
+        for (workspace, scope) in &self.file.workspaces {
+            if let Some(pipeline) = &scope.write {
+                self.validate_pipeline(&format!("workspaces.{workspace}.write"), pipeline)?;
+            }
+            if let Some(pipeline) = &scope.read {
+                self.validate_pipeline(&format!("workspaces.{workspace}.read"), pipeline)?;
+            }
+            for (bucket, nested) in &scope.buckets {
+                if let Some(pipeline) = &nested.write {
+                    self.validate_pipeline(
+                        &format!("workspaces.{workspace}.buckets.{bucket}.write"),
+                        pipeline,
+                    )?;
+                }
+                if let Some(pipeline) = &nested.read {
+                    self.validate_pipeline(
+                        &format!("workspaces.{workspace}.buckets.{bucket}.read"),
+                        pipeline,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_pipeline(
+        &self,
+        label: &str,
+        pipeline: &DirectionPipeline,
+    ) -> Result<(), MaskuraError> {
+        let enabled = pipeline.steps.iter().filter(|step| step.enabled).count();
+        if enabled > self.limits.max_plugins {
+            return Err(MaskuraError::new(
+                codes::CONFIG_INVALID,
+                format!(
+                    "{label} has {enabled} enabled steps; maximum is {}",
+                    self.limits.max_plugins
+                ),
+            ));
+        }
+        for step in &pipeline.steps {
+            self.catalog.lookup(&step.plugin)?.to_pipeline_step(step)?;
+        }
+        Ok(())
     }
 }
 
@@ -136,15 +262,7 @@ impl PipelineResolver for SignedTomlPipelineResolver {
         let pipeline = self
             .file
             .select(workspace_id, bucket, config_direction)
-            .ok_or_else(|| {
-                MaskuraError::new(
-                    codes::CONFIG_INVALID,
-                    format!(
-                        "no {} pipeline is assigned for workspace {workspace_id:?} bucket {bucket:?}",
-                        config_direction
-                    ),
-                )
-            })?;
+            .map_err(config_error)?;
 
         let mut steps = Vec::with_capacity(pipeline.steps.len());
         for step in &pipeline.steps {
@@ -222,10 +340,19 @@ plugin = "stable-encrypt"
 
     fn entry(name: &str, version: &str, hash_byte: char) -> CatalogEntry {
         CatalogEntry {
+            source: None,
             component_hash: hash_byte.to_string().repeat(64),
             name: name.to_string(),
             version: version.to_string(),
+            world_version: TRANSFORMER_WORLD.to_string(),
             capabilities: PluginCapabilities::default(),
+        }
+    }
+
+    fn sourced_entry(source: &str, name: &str, version: &str, hash_byte: char) -> CatalogEntry {
+        CatalogEntry {
+            source: Some(source.to_string()),
+            ..entry(name, version, hash_byte)
         }
     }
 
@@ -243,7 +370,7 @@ plugin = "stable-encrypt"
 
     fn resolver() -> SignedTomlPipelineResolver {
         let file = PipelineFile::from_toml_str(FILE).unwrap();
-        SignedTomlPipelineResolver::new(file, catalog(), PipelineLimits::default())
+        SignedTomlPipelineResolver::new(file, catalog(), PipelineLimits::default()).unwrap()
     }
 
     #[test]
@@ -254,7 +381,65 @@ plugin = "stable-encrypt"
         assert_eq!(found.component_hash, "c".repeat(64));
 
         let latest = PluginRef::parse("envelope-encrypt").unwrap();
-        assert!(latest.accepts_version("1.2.0"));
+        assert_eq!(catalog.lookup(&latest).unwrap().version, "1.2.0");
+    }
+
+    #[test]
+    fn lookup_orders_versions_semantically() {
+        let catalog = LocalPluginCatalog {
+            entries: vec![
+                entry("plugin", "2.0.0", 'a'),
+                entry("plugin", "10.0.0", 'b'),
+            ],
+        };
+        let selected = catalog
+            .lookup(&PluginRef::parse("plugin").unwrap())
+            .unwrap();
+        assert_eq!(selected.version, "10.0.0");
+    }
+
+    #[test]
+    fn lookup_enforces_qualified_source() {
+        let catalog = LocalPluginCatalog {
+            entries: vec![
+                sourced_entry("file:///trusted", "plugin", "1.0.0", 'a'),
+                sourced_entry("file:///other", "plugin", "1.0.0", 'b'),
+            ],
+        };
+        let trusted = PluginRef::parse("file:///trusted:plugin:1.0.0").unwrap();
+        assert_eq!(
+            catalog.lookup(&trusted).unwrap().component_hash,
+            "a".repeat(64)
+        );
+        let missing = PluginRef::parse("file:///missing:plugin:1.0.0").unwrap();
+        assert!(catalog.lookup(&missing).is_err());
+    }
+
+    #[test]
+    fn duplicate_identity_with_different_digests_is_rejected() {
+        let catalog = LocalPluginCatalog {
+            entries: vec![entry("plugin", "1.0.0", 'a'), entry("plugin", "1.0.0", 'b')],
+        };
+        assert!(
+            catalog
+                .lookup(&PluginRef::parse("plugin:1.0.0").unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn equal_semver_precedence_with_different_digests_is_ambiguous() {
+        let catalog = LocalPluginCatalog {
+            entries: vec![
+                entry("plugin", "1.0.0+first", 'a'),
+                entry("plugin", "1.0.0+second", 'b'),
+            ],
+        };
+        assert!(
+            catalog
+                .lookup(&PluginRef::parse("plugin").unwrap())
+                .is_err()
+        );
     }
 
     #[test]
@@ -308,11 +493,49 @@ plugin = "pii-default"
 "#,
         )
         .unwrap();
-        let resolver = SignedTomlPipelineResolver::new(file, catalog(), PipelineLimits::default());
+        let resolver =
+            SignedTomlPipelineResolver::new(file, catalog(), PipelineLimits::default()).unwrap();
         let error = resolver
             .resolve("ws", "bucket", PipelineDirection::Read)
             .await
             .unwrap_err();
         assert_eq!(error.code(), codes::CONFIG_INVALID);
+    }
+
+    #[test]
+    fn invalid_shadowed_scope_fails_eager_validation() {
+        let file = PipelineFile::from_toml_str(
+            r#"
+schema_version = 1
+signer_id = "acme-prod"
+[write]
+[[write.steps]]
+plugin = "pii-default"
+[workspaces.ws.write]
+[[workspaces.ws.write.steps]]
+plugin = "missing"
+[workspaces.ws.buckets.bucket.write]
+[[workspaces.ws.buckets.bucket.write.steps]]
+plugin = "stable-encrypt"
+"#,
+        )
+        .unwrap();
+        let error = SignedTomlPipelineResolver::new(file, catalog(), PipelineLimits::default())
+            .err()
+            .expect("shadowed missing component must fail at construction");
+        assert_eq!(error.code(), codes::WASM_INIT);
+    }
+
+    #[test]
+    fn unsigned_revision_override_is_preserved() {
+        let file = PipelineFile::from_toml_str(FILE).unwrap();
+        let resolver = SignedTomlPipelineResolver::new_with_revision(
+            file,
+            catalog(),
+            PipelineLimits::default(),
+            "unsigned-dev".to_string(),
+        )
+        .unwrap();
+        assert_eq!(resolver.revision(), "unsigned-dev");
     }
 }

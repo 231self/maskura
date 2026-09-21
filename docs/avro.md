@@ -40,7 +40,9 @@ Avro OCF -> Schema/Value IR -> BinaryReductor -> BinaryTransform
 ```
 
 Text `maskura:filter` plugins are not inserted in this flow. They receive opaque
-bytes and cannot declare an output schema.
+bytes and cannot declare an output schema. Consequently, signed TOML WASM
+`write`/`read` assignments do not apply to Avro processing; Avro policy is the
+schema-aware binary pipeline described here.
 
 ## Envelope encryption
 

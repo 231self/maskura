@@ -157,23 +157,27 @@ impl PipelineFile {
         workspace_id: &str,
         bucket: &str,
         direction: Direction,
-    ) -> Option<&DirectionPipeline> {
+    ) -> Result<&DirectionPipeline, ConfigError> {
         if let Some(workspace) = self.workspaces.get(workspace_id) {
             if let Some(scope) = workspace.buckets.get(bucket)
                 && let Some(pipeline) = scope.get(direction)
             {
-                return Some(pipeline);
+                return Ok(pipeline);
             }
             if let Some(pipeline) = workspace.get(direction) {
-                return Some(pipeline);
+                return Ok(pipeline);
             }
         }
         if let Some(scope) = self.buckets.get(bucket)
             && let Some(pipeline) = scope.get(direction)
         {
-            return Some(pipeline);
+            return Ok(pipeline);
         }
-        self.get(direction)
+        self.get(direction).ok_or_else(|| {
+            ConfigError::invalid(format!(
+                "no {direction} pipeline is assigned for workspace {workspace_id:?} bucket {bucket:?}"
+            ))
+        })
     }
 
     pub fn get(&self, direction: Direction) -> Option<&DirectionPipeline> {
@@ -186,9 +190,9 @@ impl PipelineFile {
 
 impl DirectionPipeline {
     fn validate(&self, label: &str) -> Result<(), ConfigError> {
-        if self.steps.is_empty() && !self.explicit_passthrough {
+        if !self.steps.iter().any(|step| step.enabled) && !self.explicit_passthrough {
             return Err(ConfigError::invalid(format!(
-                "{label} has no steps; set explicit_passthrough = true for an identity chain"
+                "{label} has no enabled steps; set explicit_passthrough = true for an identity chain"
             )));
         }
         for (index, step) in self.steps.iter().enumerate() {
@@ -199,7 +203,8 @@ impl DirectionPipeline {
 }
 
 impl StepDef {
-    /// Canonical JSON rendering of the step config (v0.2 components only).
+    /// Canonical JSON rendering of step configuration for transformer worlds
+    /// that expose `config-json`.
     pub fn config_json(&self) -> Result<Option<String>, ConfigError> {
         let Some(config) = &self.config else {
             return Ok(None);
@@ -296,7 +301,7 @@ mode = "hash"
 [[write.steps]]
 plugin = "pii-default"
 [[write.steps]]
-plugin = "file://dir/dirA/plugins:custom-redactor:0.2.0"
+plugin = "file:///srv/maskura/plugins:custom-redactor:0.2.0"
 
 [read]
 [[read.steps]]
@@ -392,6 +397,34 @@ explicit_passthrough = true
 "#;
         let file = PipelineFile::from_toml_str(input).unwrap();
         assert!(file.write.as_ref().unwrap().steps.is_empty());
+    }
+
+    #[test]
+    fn all_disabled_chain_requires_explicit_passthrough() {
+        let input = r#"
+schema_version = 1
+signer_id = "acme-prod"
+[write]
+[[write.steps]]
+plugin = "pii-default"
+enabled = false
+"#;
+        let error = PipelineFile::from_toml_str(input).unwrap_err();
+        assert!(error.to_string().contains("no enabled steps"));
+    }
+
+    #[test]
+    fn all_disabled_chain_with_explicit_passthrough_is_accepted() {
+        let input = r#"
+schema_version = 1
+signer_id = "acme-prod"
+[write]
+explicit_passthrough = true
+[[write.steps]]
+plugin = "pii-default"
+enabled = false
+"#;
+        PipelineFile::from_toml_str(input).unwrap();
     }
 
     #[test]
@@ -496,7 +529,7 @@ signer_id = "acme-prod"
 plugin = "pii-default"
 "#;
         let file = PipelineFile::from_toml_str(write_only).unwrap();
-        assert!(file.select("ws-1", "bucket", Direction::Read).is_none());
-        assert!(file.select("ws-1", "bucket", Direction::Write).is_some());
+        assert!(file.select("ws-1", "bucket", Direction::Read).is_err());
+        assert!(file.select("ws-1", "bucket", Direction::Write).is_ok());
     }
 }

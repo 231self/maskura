@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use bytes::Bytes;
 use maskura_error::{MaskuraError, codes};
@@ -30,6 +31,7 @@ pub const DEFAULT_PIPELINE_FUEL: u64 = 1_000_000_000;
 /// guest-memory reservation of each compiled engine, so this admits roughly
 /// sixteen 64 MiB components before evicting least-recently-used entries.
 pub const DEFAULT_COMPILE_CACHE_MAX_WEIGHT: usize = 1024 * 1024 * 1024;
+pub(crate) const TRANSFORMER_WORLD: &str = "maskura:plugin/transformer@0.1.0";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct PluginInfo {
@@ -50,9 +52,28 @@ pub struct PluginCapabilities {
 #[derive(Clone)]
 struct Plugin {
     info: PluginInfo,
+    catalog_source: Option<String>,
+    catalog_name: String,
+    world_version: String,
     component_hash: String,
     capabilities: PluginCapabilities,
     engine: Arc<FilterEngine>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PluginCatalogRecord {
+    pub source: Option<String>,
+    pub name: String,
+    pub version: String,
+    pub world_version: String,
+    pub component_hash: String,
+    pub capabilities: PluginCapabilities,
+}
+
+#[derive(serde::Deserialize)]
+struct PluginManifestMetadata {
+    version: String,
+    world: String,
 }
 
 /// One entry in the bounded digest-keyed compile cache. Weight is the guest
@@ -384,6 +405,54 @@ impl PluginRegistry {
         component_bytes: &[u8],
         capabilities: PluginCapabilities,
     ) -> anyhow::Result<PluginInfo> {
+        self.import_with_catalog_metadata(
+            name,
+            component_bytes,
+            capabilities,
+            None,
+            "0.1.0",
+            TRANSFORMER_WORLD,
+        )
+    }
+
+    pub(crate) fn import_file_with_capabilities(
+        &self,
+        name: &str,
+        path: &Path,
+        component_bytes: &[u8],
+        capabilities: PluginCapabilities,
+    ) -> anyhow::Result<PluginInfo> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let source = file_source_for_directory(parent)?;
+        let (version, world_version) = component_manifest_metadata(path)?;
+        self.import_with_catalog_metadata(
+            name,
+            component_bytes,
+            capabilities,
+            Some(source),
+            &version,
+            &world_version,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn import_with_catalog_metadata(
+        &self,
+        name: &str,
+        component_bytes: &[u8],
+        capabilities: PluginCapabilities,
+        source: Option<String>,
+        version: &str,
+        world_version: &str,
+    ) -> anyhow::Result<PluginInfo> {
+        semver::Version::parse(version).map_err(|error| {
+            anyhow::anyhow!("plugin {name:?} has invalid version {version:?}: {error}")
+        })?;
+        if world_version != TRANSFORMER_WORLD {
+            anyhow::bail!(
+                "plugin {name:?} uses unsupported world {world_version:?}; expected {TRANSFORMER_WORLD:?}"
+            );
+        }
         let component_hash = hex::encode(Sha256::digest(component_bytes));
         let candidate = match self.cached_engine(&component_hash) {
             Some((engine, registered)) => {
@@ -397,14 +466,16 @@ impl PluginRegistry {
             None => {
                 // Compile outside the registry lock so a slow first compile
                 // never stalls catalog reads or other request paths.
-                Arc::new(FilterEngine::with_fuel(component_bytes, self.fuel)?)
+                let engine = Arc::new(FilterEngine::with_fuel(component_bytes, self.fuel)?);
+                engine.validate_transformer_world()?;
+                engine
             }
         };
         let id = Uuid::new_v4().to_string();
         let info = PluginInfo {
             id: id.clone(),
             name: name.to_string(),
-            version: "0.1.0".to_string(),
+            version: version.to_string(),
             enabled: true,
             description: String::new(),
         };
@@ -437,6 +508,9 @@ impl PluginRegistry {
             id.clone(),
             Plugin {
                 info: info.clone(),
+                catalog_source: source,
+                catalog_name: name.to_string(),
+                world_version: world_version.to_string(),
                 component_hash,
                 capabilities,
                 engine,
@@ -481,6 +555,24 @@ impl PluginRegistry {
                         plugin.component_hash.clone(),
                         plugin.capabilities,
                     )
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn catalog_records(&self) -> Vec<PluginCatalogRecord> {
+        let state = self.state.read().unwrap();
+        state
+            .order
+            .iter()
+            .filter_map(|id| {
+                state.plugins.get(id).map(|plugin| PluginCatalogRecord {
+                    source: plugin.catalog_source.clone(),
+                    name: plugin.catalog_name.clone(),
+                    version: plugin.info.version.clone(),
+                    world_version: plugin.world_version.clone(),
+                    component_hash: plugin.component_hash.clone(),
+                    capabilities: plugin.capabilities,
                 })
             })
             .collect()
@@ -771,6 +863,7 @@ impl PluginRegistry {
             .map(std::fs::canonicalize)
             .transpose()?
             .or_else(|| excluded_component.map(Path::to_path_buf));
+        let source = file_source_for_directory(dir)?;
         for entry in entries {
             let path = entry.path();
             let canonical_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
@@ -778,15 +871,20 @@ impl PluginRegistry {
                 continue;
             }
             let bytes = std::fs::read(&path)?;
-            let name = path
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .unwrap_or("unknown");
+            let name = component_catalog_name(&path);
+            let (version, world_version) = component_manifest_metadata(&path)?;
             let hash = hex::encode(Sha256::digest(&bytes));
             let capabilities = PluginCapabilities {
                 prefix_safe_for_read: prefix_safe_hashes.contains(&hash),
             };
-            match self.import_with_capabilities(name, &bytes, capabilities) {
+            match self.import_with_catalog_metadata(
+                &name,
+                &bytes,
+                capabilities,
+                Some(source.clone()),
+                &version,
+                &world_version,
+            ) {
                 Ok(info) => {
                     tracing::info!("loaded plugin: {} ({})", name, path.display());
                     added.push(info);
@@ -796,6 +894,48 @@ impl PluginRegistry {
         }
         Ok(added)
     }
+}
+
+pub(crate) fn file_source_for_directory(dir: &Path) -> anyhow::Result<String> {
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    url::Url::from_directory_path(&canonical)
+        .map(|url| {
+            let mut source = url.to_string();
+            if source.ends_with('/') && source != "file:///" {
+                source.pop();
+            }
+            source
+        })
+        .map_err(|()| anyhow::anyhow!("cannot represent {} as a file URI", canonical.display()))
+}
+
+fn component_catalog_name(path: &Path) -> String {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown");
+    file_name
+        .strip_suffix(".component.wasm")
+        .or_else(|| file_name.strip_suffix(".wasm"))
+        .unwrap_or(file_name)
+        .to_string()
+}
+
+fn component_manifest_metadata(path: &Path) -> anyhow::Result<(String, String)> {
+    let manifest = path.with_file_name(format!("{}.plugin.toml", component_catalog_name(path)));
+    if !manifest.exists() {
+        return Ok(("0.1.0".to_string(), TRANSFORMER_WORLD.to_string()));
+    }
+    let raw = std::fs::read_to_string(&manifest)
+        .with_context(|| format!("cannot read plugin manifest {}", manifest.display()))?;
+    let metadata: PluginManifestMetadata = toml::from_str(&raw)
+        .with_context(|| format!("invalid plugin manifest {}", manifest.display()))?;
+    Ok((metadata.version, metadata.world))
 }
 
 impl PipelineSnapshot {
@@ -1465,6 +1605,65 @@ mod tests {
         .expect("test-transformer-context.component.wasm; run just build-plugins")
     }
 
+    #[test]
+    fn component_artifact_name_is_catalog_name() {
+        assert_eq!(
+            component_catalog_name(Path::new("envelope-encrypt.component.wasm")),
+            "envelope-encrypt"
+        );
+        assert_eq!(component_catalog_name(Path::new("legacy.wasm")), "legacy");
+    }
+
+    #[test]
+    fn adjacent_manifest_supplies_version_and_world() {
+        let directory = std::env::temp_dir().join(format!(
+            "maskura-plugin-metadata-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let component = directory.join("custom.component.wasm");
+        std::fs::write(
+            directory.join("custom.plugin.toml"),
+            "version = \"10.2.0\"\nworld = \"maskura:plugin/transformer@0.1.0\"\n",
+        )
+        .unwrap();
+        let metadata = component_manifest_metadata(&component).unwrap();
+        assert_eq!(metadata.0, "10.2.0");
+        assert_eq!(metadata.1, TRANSFORMER_WORLD);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn filesystem_source_is_an_absolute_file_uri() {
+        let source = file_source_for_directory(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        assert!(source.starts_with("file:///"), "{source}");
+        assert!(file_source_for_directory(Path::new("")).is_ok());
+    }
+
+    #[test]
+    fn checked_in_components_have_metadata_sidecars() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("components");
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "wasm")
+            {
+                let sidecar =
+                    path.with_file_name(format!("{}.plugin.toml", component_catalog_name(&path)));
+                assert!(sidecar.is_file(), "missing {}", sidecar.display());
+                component_manifest_metadata(&path).unwrap();
+            }
+        }
+    }
+
     fn session() -> maskura_wasm_runtime::Session {
         maskura_wasm_runtime::Session {
             format: "text".to_string(),
@@ -1708,7 +1907,7 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
 
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].name, "intentional-copy.component");
+        assert_eq!(loaded[0].name, "intentional-copy");
         assert_eq!(registry.list().len(), 2);
         assert_eq!(registry.state.read().unwrap().engines.len(), 1);
     }

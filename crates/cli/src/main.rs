@@ -1194,21 +1194,23 @@ fn project_root() -> anyhow::Result<PathBuf> {
     }
 }
 
+#[cfg(unix)]
 fn write_private_key(path: &std::path::Path, pem: &str) -> anyhow::Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+    options.write(true).create_new(true).mode(0o600);
     let mut file = options
         .open(path)
         .with_context(|| format!("Cannot create private key at {}", path.display()))?;
     file.write_all(pem.as_bytes())
         .with_context(|| format!("Cannot write private key at {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn write_private_key(_path: &std::path::Path, _pem: &str) -> anyhow::Result<()> {
+    anyhow::bail!("secure private-key file creation is unsupported on this platform")
 }
 
 fn parse_expiry(expiry: &str) -> u64 {
@@ -1278,9 +1280,7 @@ fn pipelines_init_key(out: &std::path::Path) -> anyhow::Result<()> {
     rand::rngs::OsRng.fill_bytes(&mut seed);
     let signing_key = SigningKey::from_bytes(&seed);
     let encoded = hex::encode(signing_key.to_bytes());
-    std::fs::write(out, format!("{encoded}\n"))
-        .with_context(|| format!("cannot write signing key to {}", out.display()))?;
-    restrict_key_permissions(out)?;
+    write_private_key(out, &format!("{encoded}\n"))?;
     println!("wrote Ed25519 signing key to {}", out.display());
     println!(
         "trust root entry: <signer_id>={}",
@@ -1297,17 +1297,21 @@ fn pipelines_sign(
     let signing_key = read_signing_key(key_path)?;
     let mut pipeline = maskura_pipeline_config::PipelineFile::from_file(file)
         .with_context(|| format!("invalid pipeline file {}", file.display()))?;
-    pipeline.sign(&signing_key);
+    pipeline
+        .sign(&signing_key)
+        .map_err(|error| anyhow::anyhow!("cannot sign pipeline file: {error}"))?;
     let rendered = pipeline
         .to_toml_string()
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let target = output.unwrap_or(file);
-    std::fs::write(target, rendered)
-        .with_context(|| format!("cannot write {}", target.display()))?;
+    write_pipeline_atomically(target, rendered.as_bytes(), output.is_none())?;
+    let revision = pipeline
+        .revision()
+        .map_err(|error| anyhow::anyhow!("cannot compute pipeline revision: {error}"))?;
     println!(
         "signed {} (revision {})",
         target.display(),
-        pipeline.revision()
+        revision
     );
     Ok(())
 }
@@ -1320,10 +1324,13 @@ fn pipelines_verify(trust_roots: String, file: &std::path::Path) -> anyhow::Resu
     pipeline
         .verify(&roots)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let revision = pipeline
+        .revision()
+        .map_err(|error| anyhow::anyhow!("cannot compute pipeline revision: {error}"))?;
     println!(
         "signature valid (signer {}); revision {}",
         pipeline.signer_id,
-        pipeline.revision()
+        revision
     );
     Ok(())
 }
@@ -1347,7 +1354,12 @@ fn pipelines_check(trust_roots: Option<&str>, file: &std::path::Path) -> anyhow:
     }
     println!("schema_version: {}", pipeline.schema_version);
     println!("signer_id: {}", pipeline.signer_id);
-    println!("revision: {}", pipeline.revision());
+    println!(
+        "revision: {}",
+        pipeline
+            .revision()
+            .map_err(|error| anyhow::anyhow!("cannot compute pipeline revision: {error}"))?
+    );
     summarize_chain("write", pipeline.write.as_ref());
     summarize_chain("read", pipeline.read.as_ref());
     for (bucket, scope) in &pipeline.buckets {
@@ -1414,16 +1426,165 @@ fn read_signing_key(path: &std::path::Path) -> anyhow::Result<ed25519_dalek::Sig
     Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
 }
 
-#[cfg(unix)]
-fn restrict_key_permissions(path: &std::path::Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("cannot restrict permissions on {}", path.display()))
+fn write_pipeline_atomically(
+    target: &std::path::Path,
+    contents: &[u8],
+    replace: bool,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        parent
+    };
+    let file_name = target.file_name().context("pipeline output path has no file name")?;
+    let existing_permissions = replace
+        .then(|| std::fs::metadata(target).map(|metadata| metadata.permissions()))
+        .transpose()
+        .with_context(|| format!("cannot inspect {}", target.display()))?;
+    let mut temporary = None;
+    for attempt in 0..100_u32 {
+        let mut temporary_name = std::ffi::OsString::from(".");
+        temporary_name.push(file_name);
+        temporary_name.push(format!(".tmp-{}-{attempt}", std::process::id()));
+        let candidate = parent.join(temporary_name);
+        let opened = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate);
+        match opened {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot create temporary output in {}", parent.display()));
+            }
+        }
+    }
+    let (temporary_path, mut temporary_file) =
+        temporary.context("cannot allocate a unique temporary pipeline output")?;
+    let result = (|| -> anyhow::Result<()> {
+        temporary_file.write_all(contents)?;
+        temporary_file.sync_all()?;
+        drop(temporary_file);
+        if let Some(permissions) = existing_permissions {
+            std::fs::set_permissions(&temporary_path, permissions)?;
+        }
+        if replace {
+            replace_file_atomically(&temporary_path, target)
+                .with_context(|| format!("cannot replace {}", target.display()))?;
+        } else {
+            publish_file_atomically(&temporary_path, target)
+                .with_context(|| format!("cannot create {} without overwriting", target.display()))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
 }
 
-#[cfg(not(unix))]
-fn restrict_key_permissions(_path: &std::path::Path) -> anyhow::Result<()> {
-    Ok(())
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(source, target)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn publish_file_atomically(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
+    let target = std::ffi::CString::new(target.as_os_str().as_bytes())?;
+    // SAFETY: both paths are NUL-terminated C strings valid for this call.
+    let moved = unsafe { libc::renamex_np(source.as_ptr(), target.as_ptr(), libc::RENAME_EXCL) };
+    if moved == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn publish_file_atomically(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
+    let target = std::ffi::CString::new(target.as_os_str().as_bytes())?;
+    // SAFETY: both paths are NUL-terminated C strings valid for this call.
+    let moved = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if moved == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    ))
+))]
+fn publish_file_atomically(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    std::fs::hard_link(source, target)?;
+    std::fs::remove_file(source)
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both paths are NUL-terminated UTF-16 buffers valid for this call.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn publish_file_atomically(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both paths are NUL-terminated UTF-16 buffers valid for this call.
+    let moved = unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -2697,6 +2858,74 @@ mod tests {
         assert!(write_private_key(&path, "replacement").is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "private");
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pipeline_key_creation_does_not_overwrite_an_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "maskura-pipeline-key-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "existing key").unwrap();
+
+        assert!(pipelines_init_key(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "existing key");
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn atomic_pipeline_output_is_complete_and_does_not_overwrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "maskura-pipeline-output-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let output = dir.join("signed.toml");
+
+        write_pipeline_atomically(&output, b"complete output", false).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"complete output");
+        assert!(write_pipeline_atomically(&output, b"replacement", false).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"complete output");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_pipeline_replacement_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "maskura-pipeline-replace-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let output = dir.join("pipeline.toml");
+        std::fs::write(&output, "old").unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_pipeline_atomically(&output, b"new", true).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"new");
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
