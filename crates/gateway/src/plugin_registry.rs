@@ -465,6 +465,27 @@ impl PluginRegistry {
             .map(|plugin| plugin.info.clone())
     }
 
+    /// Every catalog entry (enabled and disabled) with its content address and
+    /// declared capabilities, in import order. Used by file-based pipeline
+    /// resolution, where the pipeline file — not the catalog — decides which
+    /// steps run.
+    pub fn catalog_entries(&self) -> Vec<(PluginInfo, String, PluginCapabilities)> {
+        let state = self.state.read().unwrap();
+        state
+            .order
+            .iter()
+            .filter_map(|id| {
+                state.plugins.get(id).map(|plugin| {
+                    (
+                        plugin.info.clone(),
+                        plugin.component_hash.clone(),
+                        plugin.capabilities,
+                    )
+                })
+            })
+            .collect()
+    }
+
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Option<PluginInfo> {
         let mut state = self.state.write().unwrap();
         state.plugins.get_mut(id).map(|plugin| {

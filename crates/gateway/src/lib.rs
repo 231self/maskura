@@ -23,6 +23,7 @@ pub(crate) mod multipart_completion;
 pub mod multipart_staging;
 pub mod object;
 pub mod pipeline;
+pub mod pipeline_config;
 pub mod plugin_registry;
 pub mod read_spool;
 pub mod record;

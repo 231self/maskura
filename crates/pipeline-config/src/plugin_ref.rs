@@ -50,6 +50,21 @@ impl PluginRef {
             .as_deref()
             .is_some_and(|version| semver::Version::parse(version).is_ok())
     }
+
+    /// True when `version` satisfies this reference's requirement. A reference
+    /// without a version asks for "latest" and accepts any version.
+    pub fn accepts_version(&self, version: &str) -> bool {
+        let Some(requirement) = &self.version else {
+            return true;
+        };
+        let Ok(parsed) = semver::Version::parse(version) else {
+            return false;
+        };
+        let Ok(requirement) = parse_version_req(requirement) else {
+            return false;
+        };
+        requirement.matches(&parsed)
+    }
 }
 
 impl std::fmt::Display for PluginRef {

@@ -2895,6 +2895,7 @@ dependencies = [
  "maskura-customer-config",
  "maskura-error",
  "maskura-mcp-protocol",
+ "maskura-pipeline-config",
  "maskura-wasm-runtime",
  "md-5 0.10.6",
  "ml-kem",

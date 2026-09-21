@@ -190,6 +190,18 @@ impl DirectionPipeline {
 }
 
 impl StepDef {
+    /// Canonical JSON rendering of the step config (v0.2 components only).
+    pub fn config_json(&self) -> Result<Option<String>, ConfigError> {
+        let Some(config) = &self.config else {
+            return Ok(None);
+        };
+        let value = serde_json::to_value(config)
+            .map_err(|error| ConfigError::invalid(format!("step config is invalid: {error}")))?;
+        let rendered = serde_json::to_string(&value)
+            .map_err(|error| ConfigError::invalid(format!("step config is invalid: {error}")))?;
+        Ok(Some(rendered))
+    }
+
     fn validate(&self, label: &str) -> Result<(), ConfigError> {
         for grant in &self.grant {
             if !ALLOWED_GRANTS.contains(&grant.as_str()) {
