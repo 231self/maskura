@@ -12,6 +12,46 @@ use crate::schema::PipelineFile;
 /// Ed25519 public keys trusted to author pipeline files, indexed by signer id.
 pub type TrustRoots = BTreeMap<String, VerifyingKey>;
 
+/// Parse `signer_id=hex-public-key` entries, separated by `;` or `,`, into a
+/// trust-root map. Empty entries are ignored.
+pub fn parse_trust_roots(raw: &str) -> Result<TrustRoots, ConfigError> {
+    let mut roots = TrustRoots::new();
+    for entry in raw.split([';', ',']) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (signer_id, key_hex) = entry.split_once('=').ok_or_else(|| {
+            ConfigError::invalid(format!(
+                "trust root {entry:?} must be formatted as signer_id=hex-public-key"
+            ))
+        })?;
+        let signer_id = signer_id.trim();
+        if signer_id.is_empty() {
+            return Err(ConfigError::invalid(format!(
+                "trust root {entry:?} has an empty signer id"
+            )));
+        }
+        let raw_key = hex::decode(key_hex.trim()).map_err(|error| {
+            ConfigError::invalid(format!(
+                "trust root {signer_id:?} public key is not valid hex: {error}"
+            ))
+        })?;
+        let bytes: [u8; 32] = raw_key.try_into().map_err(|_| {
+            ConfigError::invalid(format!(
+                "trust root {signer_id:?} public key must be 32 bytes"
+            ))
+        })?;
+        let key = VerifyingKey::from_bytes(&bytes).map_err(|error| {
+            ConfigError::invalid(format!(
+                "trust root {signer_id:?} public key is invalid: {error}"
+            ))
+        })?;
+        roots.insert(signer_id.to_string(), key);
+    }
+    Ok(roots)
+}
+
 impl PipelineFile {
     /// Canonical signed body: the parsed model without the `signature` field,
     /// JSON-normalized (sorted keys) and encoded as canonical CBOR. TOML
@@ -174,6 +214,27 @@ plugin = "envelope-decrypt"
         let unsigned = file.canonical_body();
         file.sign(&signing_key());
         assert_eq!(unsigned, file.canonical_body());
+    }
+
+    #[test]
+    fn trust_roots_parse_from_entries() {
+        let encoded = hex::encode(signing_key().verifying_key().to_bytes());
+        let roots = parse_trust_roots(&format!("acme={encoded}; other={encoded}")).unwrap();
+        assert_eq!(roots.len(), 2);
+        assert!(roots.contains_key("acme"));
+        assert!(roots.contains_key("other"));
+    }
+
+    #[test]
+    fn blank_trust_roots_is_allowed() {
+        assert!(parse_trust_roots("  ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_trust_root_is_rejected() {
+        assert!(parse_trust_roots("no-equals").is_err());
+        assert!(parse_trust_roots("signer=not-hex").is_err());
+        assert!(parse_trust_roots("signer=abcd").is_err());
     }
 
     #[test]

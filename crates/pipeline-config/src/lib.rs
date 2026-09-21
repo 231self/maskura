@@ -16,4 +16,4 @@ pub use plugin_ref::PluginRef;
 pub use schema::{
     DirectionPipeline, PipelineFile, SCHEMA_VERSION, ScopeOverride, StepDef, WorkspaceScope,
 };
-pub use signing::TrustRoots;
+pub use signing::{TrustRoots, parse_trust_roots};

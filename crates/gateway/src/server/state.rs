@@ -65,6 +65,9 @@ pub struct StatePipelineTemplate {
     pub(crate) plugins: PluginRegistry,
     pub(crate) demo: DemoPipelineTemplate,
     pub(crate) max_pipeline_output_bytes: u64,
+    /// Optional signed TOML pipeline definition. When present it replaces the
+    /// catalog-order resolver with file-based selection.
+    pub(crate) pipeline: Option<maskura_pipeline_config::PipelineFile>,
 }
 
 impl StatePipelineTemplate {
@@ -122,11 +125,13 @@ impl StatePipelineTemplate {
             stable_demo_component.as_deref(),
             pipeline_fuel,
         )?;
+        let pipeline = configured_pipeline_file()?;
         Ok(Self {
             engine,
             plugins,
             demo,
             max_pipeline_output_bytes,
+            pipeline,
         })
     }
 
@@ -134,7 +139,17 @@ impl StatePipelineTemplate {
         &self,
     ) -> anyhow::Result<(Gateway, Arc<PluginRegistry>, DemoPipelines)> {
         let plugins = Arc::new(self.plugins.isolated_clone()?);
-        let gateway = Gateway::with_shared_registry(Arc::clone(&self.engine), plugins.clone());
+        let gateway = match &self.pipeline {
+            Some(pipeline) => {
+                let resolver = crate::pipeline_config::SignedTomlPipelineResolver::from_registry(
+                    pipeline.clone(),
+                    &plugins,
+                );
+                Gateway::with_shared_registry(Arc::clone(&self.engine), plugins.clone())
+                    .with_resolver(Arc::new(resolver), plugins.clone())
+            }
+            None => Gateway::with_shared_registry(Arc::clone(&self.engine), plugins.clone()),
+        };
         Ok((gateway, plugins, self.demo.instantiate()?))
     }
 
@@ -146,6 +161,62 @@ impl StatePipelineTemplate {
             self.plugins.set_enabled(&plugin.id, false);
         }
     }
+}
+
+/// Load the operator-configured signed pipeline file, if any, and verify it.
+///
+/// `MASKURA_PIPELINES_FILE` selects the file and `MASKURA_PIPELINE_TRUST_ROOTS`
+/// supplies `signer_id=hex-public-key` entries. `MASKURA_PIPELINE_ALLOW_UNSIGNED=1`
+/// accepts an unsigned file for local development only and logs a prominent
+/// warning on every boot.
+fn configured_pipeline_file() -> anyhow::Result<Option<maskura_pipeline_config::PipelineFile>> {
+    let Some(path) = pipeline_env_value("MASKURA_PIPELINES_FILE") else {
+        return Ok(None);
+    };
+    let file = maskura_pipeline_config::PipelineFile::from_file(&path)
+        .map_err(|error| anyhow::anyhow!("invalid pipeline file {path}: {error}"))?;
+    if file.signature.is_some() {
+        let trust_roots = pipeline_trust_roots()?;
+        file.verify(&trust_roots).map_err(|error| {
+            anyhow::anyhow!("pipeline file {path} failed signature verification: {error}")
+        })?;
+        tracing::info!(
+            path = %path,
+            revision = %file.revision(),
+            "loaded signed pipeline file"
+        );
+    } else if pipeline_env_flag("MASKURA_PIPELINE_ALLOW_UNSIGNED") {
+        tracing::warn!(
+            path = %path,
+            "MASKURA_PIPELINE_ALLOW_UNSIGNED is set: loading an UNSIGNED pipeline file; pipeline policy is unverified"
+        );
+    } else {
+        anyhow::bail!(
+            "pipeline file {path} is not signed; set MASKURA_PIPELINE_ALLOW_UNSIGNED=1 to override"
+        );
+    }
+    Ok(Some(file))
+}
+
+fn pipeline_trust_roots() -> anyhow::Result<maskura_pipeline_config::TrustRoots> {
+    let Some(raw) = pipeline_env_value("MASKURA_PIPELINE_TRUST_ROOTS") else {
+        return Ok(maskura_pipeline_config::TrustRoots::new());
+    };
+    maskura_pipeline_config::parse_trust_roots(&raw)
+        .map_err(|error| anyhow::anyhow!("MASKURA_PIPELINE_TRUST_ROOTS is invalid: {error}"))
+}
+
+fn pipeline_env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn pipeline_env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true")
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
