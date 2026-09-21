@@ -60,7 +60,7 @@ a single-node S3-compatible server backed by a Docker volume:
 
 ```bash
 docker run -p 127.0.0.1:9000:9000 -v maskura-data:/data \
-  ghcr.io/231self/maskura/maskura:v0.7.9
+  ghcr.io/231self/maskura/maskura:v0.7.10
 ```
 
 The first time it starts, the gateway prints a root access key and secret. Use
