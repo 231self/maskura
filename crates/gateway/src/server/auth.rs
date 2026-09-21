@@ -3,6 +3,11 @@
 //!
 //! Extracted from `server.rs`. Items are re-exported from [`crate::server`].
 
+#![allow(
+    clippy::result_large_err,
+    reason = "these helpers return S3 XML error responses directly to axum handlers"
+)]
+
 use super::*;
 
 #[derive(Clone)]

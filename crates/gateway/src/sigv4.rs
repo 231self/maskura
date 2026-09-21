@@ -375,23 +375,20 @@ impl RequestAuthorization {
         settings.percent_encoding_mode = PercentEncodingMode::Single;
         settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
         settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
-        let target;
-        let body;
-        match self.location {
-            Location::Header => {
-                target = uri.path_and_query().map_or_else(
+        let (target, body) = match self.location {
+            Location::Header => (
+                uri.path_and_query().map_or_else(
                     || uri.path().to_string(),
                     |value| value.as_str().to_string(),
-                );
-                body = SignableBody::Precomputed(payload_hash.to_ascii_lowercase());
-            }
+                ),
+                SignableBody::Precomputed(payload_hash.to_ascii_lowercase()),
+            ),
             Location::Query { expires } => {
                 settings.signature_location = SignatureLocation::QueryParams;
                 settings.expires_in = Some(expires);
-                target = query_signing_target(uri)?;
-                body = SignableBody::UnsignedPayload;
+                (query_signing_target(uri)?, SignableBody::UnsignedPayload)
             }
-        }
+        };
 
         let identity: aws_smithy_runtime_api::client::identity::Identity = Credentials::new(
             self.access_key.clone(),
