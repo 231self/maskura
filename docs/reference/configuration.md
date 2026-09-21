@@ -91,6 +91,22 @@ and filter components replace these defaults when provided.
 | `wasm.plugins_dir` | `MASKURA_PLUGINS_DIR` | Unset. Existing components in this directory are loaded at startup. |
 | `wasm.fuel` | `MASKURA_WASM_FUEL` | `1,000,000,000` instructions per pipeline session; must be greater than zero. |
 | `wasm.prefix_safe_component_hashes` | `MASKURA_PREFIX_SAFE_COMPONENT_HASHES` | Empty list. Each entry must be a 64-character hexadecimal SHA-256 digest. Maskura trusts the declaration only for that exact component and does not allow it to change while running. |
+| `wasm.pipelines_file` | `MASKURA_PIPELINES_FILE` | Unset. Path to a signed TOML pipeline file; when set, replaces catalog-order selection. |
+| `wasm.pipeline_trust_roots` | `MASKURA_PIPELINE_TRUST_ROOTS` | Unset. Operator-only semicolon- or comma-separated `signer_id=hex-public-key` entries. |
+| `wasm.pipeline_allow_unsigned` | `MASKURA_PIPELINE_ALLOW_UNSIGNED` | `false`. Operator-only escape hatch that accepts an unsigned file, labels its revision `unsigned-dev`, and logs a prominent boot warning. Local development only. |
+
+#### Signed pipeline files
+
+A separate signed TOML file can define processing chains per workspace, bucket,
+and direction. The gateway verifies its signature and resolves every declared
+step against the local component catalog before startup succeeds. Qualified
+`file://` sources must match the component's canonical directory URI exactly;
+unqualified references search local filesystem components. See
+[ADR 0021](../adr/0021-signed-toml-pipeline-configuration.md) and
+[Plugins](../plugins.md).
+
+Author, sign, and inspect a file with `maskura pipelines init-key`,
+`maskura pipelines sign`, `maskura pipelines verify`, and `maskura pipelines check`.
 
 ### Limits and spool
 

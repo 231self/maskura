@@ -6,6 +6,7 @@ members = [
   "crates/customer-config",
   "crates/error",
   "crates/policy",
+  "crates/pipeline-config",
   "crates/wasm-runtime",
   "crates/gateway",
   "crates/mcp",

@@ -58,6 +58,20 @@ TEXT_SUFFIXES = {
     ".yml",
     ".yaml",
 }
+IGNORED_DIRS = {
+    ".git",
+    ".jj",
+    ".worktrees",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "target",
+}
+
+
+def is_ignored(path: Path) -> bool:
+    return any(part in IGNORED_DIRS or part.endswith(".egg-info") for part in path.parts)
 
 
 def fail(message: str) -> None:
@@ -109,7 +123,11 @@ def check_wit_ownership() -> None:
     host = (ROOT / "crates" / "wasm-runtime" / "src" / "lib.rs").read_text()
     if 'path: "../plugin-sdk/wit"' not in host:
         fail("host runtime is not bound to the plugin SDK WIT")
-    stray = [path for path in ROOT.rglob("*.wit") if path != wit and "target" not in path.parts]
+    stray = [
+        path
+        for path in ROOT.rglob("*.wit")
+        if path != wit and not is_ignored(path)
+    ]
     if stray:
         fail(f"WIT contract exists outside plugin-sdk: {stray[0].relative_to(ROOT)}")
 
@@ -155,7 +173,11 @@ def scan_files(root: Path):
         yield root
         return
     for path in root.rglob("*"):
-        if not path.is_file() or "target" in path.parts or path.suffix == ".pem":
+        if (
+            not path.is_file()
+            or is_ignored(path)
+            or path.suffix == ".pem"
+        ):
             continue
         if path.suffix in TEXT_SUFFIXES:
             yield path
@@ -177,7 +199,7 @@ def check_namespace() -> None:
                     f"{relative_path}"
                 )
     for path in ROOT.rglob("*"):
-        if "target" in path.parts or ".jj" in path.parts:
+        if is_ignored(path):
             continue
         if OLD_NAMESPACE.search(path.name):
             fail(f"old namespace remains in path {path.relative_to(ROOT)}")

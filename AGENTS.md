@@ -197,6 +197,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 ### Wasm Filter Plugins
 
 - **Plugin pipeline**: Enabled plugins run in order. Output of plugin N becomes input of plugin N+1.
+- **Declarative pipelines (self-hosted)**: a signed TOML file (`[wasm] pipelines_file` / `MASKURA_PIPELINES_FILE`) replaces catalog-order selection with hierarchical, ordered `write`/`read` chains per workspace/bucket. Every declared step is source/version/world-resolved before startup. Schema + Ed25519/CBOR signing live in `crates/pipeline-config/`; the resolver is `crates/gateway/src/pipeline_config.rs`; `maskura pipelines {init-key,sign,verify,check}` authors it. See ADR 0021.
 - **Plugin registry** (`crates/gateway/src/plugin_registry.rs`): Stores metadata (id, name, version, enabled) and component bytes. Supports import, enable/disable, remove, reorder.
 - **Runtime import**: `POST /dashboard/api/plugins` with `.wasm` body + `x-maskura-plugin-name` header.
 - **Runtime toggle**: `PUT /dashboard/api/plugins/{id}` with `{"enabled": true/false}`.

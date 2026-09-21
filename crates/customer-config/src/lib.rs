@@ -43,6 +43,9 @@ pub mod aliases {
     pub const TRANSFORMED_READ_SPOOL: EnvAlias = EnvAlias::new("MASKURA_TRANSFORMED_READ_SPOOL");
     pub const PREFIX_SAFE_COMPONENT_HASHES: EnvAlias =
         EnvAlias::new("MASKURA_PREFIX_SAFE_COMPONENT_HASHES");
+    pub const PIPELINES_FILE: EnvAlias = EnvAlias::new("MASKURA_PIPELINES_FILE");
+    pub const PIPELINE_TRUST_ROOTS: EnvAlias = EnvAlias::new("MASKURA_PIPELINE_TRUST_ROOTS");
+    pub const PIPELINE_ALLOW_UNSIGNED: EnvAlias = EnvAlias::new("MASKURA_PIPELINE_ALLOW_UNSIGNED");
     pub const STREAMING_S3_PROVIDER: EnvAlias = EnvAlias::new("MASKURA_STREAMING_S3_PROVIDER");
     pub const ENABLE_AVRO: EnvAlias = EnvAlias::new("MASKURA_ENABLE_AVRO");
     pub const LEGACY_MAX_OBJECT_BYTES: EnvAlias = EnvAlias::new("MASKURA_LEGACY_MAX_OBJECT_BYTES");
@@ -72,6 +75,7 @@ pub mod aliases {
         STREAMING_READ_MODE,
         TRANSFORMED_READ_SPOOL,
         PREFIX_SAFE_COMPONENT_HASHES,
+        PIPELINES_FILE,
         STREAMING_S3_PROVIDER,
         ENABLE_AVRO,
         LEGACY_MAX_OBJECT_BYTES,
@@ -175,6 +179,8 @@ mod tests {
             "MASKURA_PRESIGNED_HTTP_ALLOWLIST",
             "MASKURA_MANAGED_STREAMING_MODE",
             "MASKURA_MULTIPART_STAGING_BUCKET",
+            "MASKURA_PIPELINE_TRUST_ROOTS",
+            "MASKURA_PIPELINE_ALLOW_UNSIGNED",
         ] {
             assert!(!names.contains(operator_only));
         }

@@ -442,6 +442,30 @@ impl FilterEngine {
         self.runtime.limits.guest_memory_bytes
     }
 
+    /// Instantiate once and bind the canonical transformer exports without
+    /// invoking guest lifecycle methods. Catalog insertion uses this to reject
+    /// components whose bytes do not implement the declared world.
+    pub fn validate_transformer_world(&self) -> Result<(), MaskuraError> {
+        let cancellation = CancellationToken::new();
+        let object_deadline = Instant::now() + self.runtime.limits.object_timeout;
+        let initial_fuel = self.runtime.limits.cumulative_fuel;
+        let (mut runtime, instance) = self.runtime.instantiate(
+            cancellation,
+            object_deadline,
+            initial_fuel,
+            WasiCtxBuilder::new().build(),
+        )?;
+        Transformer::new(&mut runtime.store, &instance).map_err(|error| {
+            startup_error(
+                codes::WASM_INIT,
+                error,
+                &runtime.cancellation,
+                runtime.object_deadline,
+            )
+        })?;
+        Ok(())
+    }
+
     pub fn run_session(
         &self,
         session: &Session,

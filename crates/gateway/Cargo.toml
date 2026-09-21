@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 maskura-customer-config.workspace = true
 maskura-mcp-protocol.workspace = true
+maskura-pipeline-config = { path = "../pipeline-config" }
 maskura-error = { path = "../error" }
 maskura-wasm-runtime = { path = "../wasm-runtime" }
 anyhow = "1"
@@ -68,6 +69,9 @@ thiserror.workspace = true
 apache-avro = { version = "0.22", features = ["snappy", "zstandard"] }
 chrono = "0.4"
 num-bigint = "0.4"
+semver = "1"
+toml = "0.8"
+url = "2"
 
 [dev-dependencies]
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

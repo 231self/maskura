@@ -2832,8 +2832,12 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "dirs",
+ "ed25519-dalek",
+ "hex",
  "hkdf",
+ "libc",
  "maskura-customer-config",
+ "maskura-pipeline-config",
  "ml-kem",
  "rand 0.8.8",
  "reqwest",
@@ -2841,6 +2845,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "windows-sys 0.61.2",
  "x25519-dalek",
 ]
 
@@ -2895,6 +2900,7 @@ dependencies = [
  "maskura-customer-config",
  "maskura-error",
  "maskura-mcp-protocol",
+ "maskura-pipeline-config",
  "maskura-wasm-runtime",
  "md-5 0.10.6",
  "ml-kem",
@@ -2914,6 +2920,7 @@ dependencies = [
  "rand_core 0.6.4",
  "reqwest",
  "sea-orm",
+ "semver",
  "serde",
  "serde_json",
  "sha1 0.10.7",
@@ -2922,11 +2929,13 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
+ "toml 0.8.23",
  "tower",
  "tower-http",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
@@ -2967,6 +2976,24 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "maskura-pipeline-config"
+version = "0.7.10"
+dependencies = [
+ "base64 0.23.1",
+ "ciborium",
+ "ed25519-dalek",
+ "hex",
+ "maskura-error",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "toml 0.8.23",
+ "url",
 ]
 
 [[package]]

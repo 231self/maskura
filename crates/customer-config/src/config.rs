@@ -86,6 +86,9 @@ pub struct WasmConfig {
     pub plugins_dir: Option<String>,
     pub fuel: Option<u64>,
     pub prefix_safe_component_hashes: Vec<String>,
+    pub pipelines_file: Option<String>,
+    pub pipeline_trust_roots: Option<String>,
+    pub pipeline_allow_unsigned: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -378,6 +381,15 @@ impl Config {
         if let Some(value) = resolve(aliases::PREFIX_SAFE_COMPONENT_HASHES)? {
             self.wasm.prefix_safe_component_hashes = split_commas(&value);
         }
+        if let Some(value) = resolve(aliases::PIPELINES_FILE)? {
+            self.wasm.pipelines_file = Some(value);
+        }
+        if let Some(value) = resolve(aliases::PIPELINE_TRUST_ROOTS)? {
+            self.wasm.pipeline_trust_roots = Some(value);
+        }
+        if let Some(value) = resolve(aliases::PIPELINE_ALLOW_UNSIGNED)? {
+            self.wasm.pipeline_allow_unsigned = parse_bool("wasm.pipeline_allow_unsigned", &value)?;
+        }
         if let Some(value) = resolve(aliases::SOURCE_MAX_FRAME_BYTES)? {
             self.limits.source_max_frame_bytes =
                 Some(parse_u64("limits.source_max_frame_bytes", &value)?);
@@ -519,6 +531,14 @@ impl Config {
             && fuel == 0
         {
             return Err(invalid("wasm.fuel", "must be greater than zero"));
+        }
+        if self
+            .wasm
+            .pipelines_file
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err(invalid("wasm.pipelines_file", "must not be empty"));
         }
 
         for (path, value) in [
@@ -1260,6 +1280,28 @@ dir = "/var/lib/maskura/staging"
         assert!(!defaults.multipart_mode_is_explicit());
         assert!(!defaults.streaming_read_mode_is_explicit());
         assert!(!defaults.filter_component_is_explicit());
+    }
+
+    #[test]
+    fn parses_signed_pipeline_settings_from_wasm_table() {
+        let config = parse(
+            r#"
+[wasm]
+pipelines_file = "/etc/maskura/pipelines.toml"
+pipeline_trust_roots = "prod=001122"
+pipeline_allow_unsigned = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.wasm.pipelines_file.as_deref(),
+            Some("/etc/maskura/pipelines.toml")
+        );
+        assert_eq!(
+            config.wasm.pipeline_trust_roots.as_deref(),
+            Some("prod=001122")
+        );
+        assert!(config.wasm.pipeline_allow_unsigned);
     }
 
     #[test]
