@@ -83,10 +83,12 @@ pub struct StepDef {
     pub plugin: PluginRef,
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config: Option<toml::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub grant: Vec<String>,
+    // Keep the nested `config` table last so TOML serialization emits all
+    // key/value pairs before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<toml::Value>,
 }
 
 const fn enabled_by_default() -> bool {
@@ -98,6 +100,13 @@ impl PipelineFile {
         let file: Self = toml::from_str(input)?;
         file.validate()?;
         Ok(file)
+    }
+
+    /// Render the manifest as TOML, including any current signature.
+    pub fn to_toml_string(&self) -> Result<String, ConfigError> {
+        toml::to_string_pretty(self).map_err(|error| {
+            ConfigError::invalid(format!("cannot serialize pipeline config: {error}"))
+        })
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {

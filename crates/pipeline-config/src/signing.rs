@@ -217,6 +217,28 @@ plugin = "envelope-decrypt"
     }
 
     #[test]
+    fn signed_file_round_trips_through_toml_with_config() {
+        let body = r#"
+schema_version = 1
+signer_id = "acme-prod"
+
+[write]
+[[write.steps]]
+plugin = "redactor:0.x.y"
+grant = ["stable_fields"]
+[write.steps.config]
+mode = "hash"
+"#;
+        let mut file = PipelineFile::from_toml_str(body).unwrap();
+        file.sign(&signing_key());
+        let rendered = file.to_toml_string().unwrap();
+        let reparsed = PipelineFile::from_toml_str(&rendered).unwrap();
+        assert_eq!(reparsed.revision(), file.revision());
+        assert_eq!(reparsed.signature, file.signature);
+        reparsed.verify(&trust_roots(&signing_key())).unwrap();
+    }
+
+    #[test]
     fn trust_roots_parse_from_entries() {
         let encoded = hex::encode(signing_key().verifying_key().to_bytes());
         let roots = parse_trust_roots(&format!("acme={encoded}; other={encoded}")).unwrap();

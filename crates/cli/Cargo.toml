@@ -10,7 +10,10 @@ path = "src/maskura.rs"
 
 [dependencies]
 maskura-customer-config.workspace = true
+maskura-pipeline-config = { path = "../pipeline-config" }
 anyhow = "1"
+ed25519-dalek.workspace = true
+hex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio.workspace = true

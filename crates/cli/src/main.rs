@@ -167,6 +167,12 @@ enum Command {
         #[command(subcommand)]
         cmd: TestCmd,
     },
+
+    /// Sign, verify, and inspect signed TOML pipeline configuration files
+    Pipelines {
+        #[command(subcommand)]
+        cmd: PipelinesCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -447,6 +453,46 @@ enum LocalCmd {
 enum TestCmd {
     /// Upload PII fixture and verify redaction
     Upload,
+}
+
+#[derive(Subcommand)]
+enum PipelinesCmd {
+    /// Generate a new Ed25519 signing key
+    InitKey {
+        /// Output path for the hex-encoded secret key
+        #[arg(long)]
+        out: PathBuf,
+    },
+
+    /// Sign a pipeline configuration file
+    Sign {
+        /// Hex-encoded Ed25519 signing key (from `init-key`)
+        #[arg(long)]
+        key: PathBuf,
+        /// Write the signed TOML here instead of signing in place
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Pipeline TOML to sign
+        file: PathBuf,
+    },
+
+    /// Verify a signed pipeline configuration file
+    Verify {
+        /// Trust roots as `signer_id=hex-public-key[;...]`
+        #[arg(long, value_name = "ROOTS")]
+        trust_roots: String,
+        /// Pipeline TOML to verify
+        file: PathBuf,
+    },
+
+    /// Parse, validate, and describe a pipeline configuration file
+    Check {
+        /// Optionally verify against `signer_id=hex-public-key[;...]`
+        #[arg(long, value_name = "ROOTS")]
+        trust_roots: Option<String>,
+        /// Pipeline TOML to inspect
+        file: PathBuf,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -1224,6 +1270,162 @@ fn check_gateway_config(path: Option<&std::path::Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn pipelines_init_key(out: &std::path::Path) -> anyhow::Result<()> {
+    use ed25519_dalek::SigningKey;
+    use rand::RngCore as _;
+
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    let signing_key = SigningKey::from_bytes(&seed);
+    let encoded = hex::encode(signing_key.to_bytes());
+    std::fs::write(out, format!("{encoded}\n"))
+        .with_context(|| format!("cannot write signing key to {}", out.display()))?;
+    restrict_key_permissions(out)?;
+    println!("wrote Ed25519 signing key to {}", out.display());
+    println!(
+        "trust root entry: <signer_id>={}",
+        hex::encode(signing_key.verifying_key().to_bytes())
+    );
+    Ok(())
+}
+
+fn pipelines_sign(
+    key_path: &std::path::Path,
+    output: Option<&std::path::Path>,
+    file: &std::path::Path,
+) -> anyhow::Result<()> {
+    let signing_key = read_signing_key(key_path)?;
+    let mut pipeline = maskura_pipeline_config::PipelineFile::from_file(file)
+        .with_context(|| format!("invalid pipeline file {}", file.display()))?;
+    pipeline.sign(&signing_key);
+    let rendered = pipeline
+        .to_toml_string()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let target = output.unwrap_or(file);
+    std::fs::write(target, rendered)
+        .with_context(|| format!("cannot write {}", target.display()))?;
+    println!(
+        "signed {} (revision {})",
+        target.display(),
+        pipeline.revision()
+    );
+    Ok(())
+}
+
+fn pipelines_verify(trust_roots: String, file: &std::path::Path) -> anyhow::Result<()> {
+    let pipeline = maskura_pipeline_config::PipelineFile::from_file(file)
+        .with_context(|| format!("invalid pipeline file {}", file.display()))?;
+    let roots = maskura_pipeline_config::parse_trust_roots(&trust_roots)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    pipeline
+        .verify(&roots)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    println!(
+        "signature valid (signer {}); revision {}",
+        pipeline.signer_id,
+        pipeline.revision()
+    );
+    Ok(())
+}
+
+fn pipelines_check(trust_roots: Option<&str>, file: &std::path::Path) -> anyhow::Result<()> {
+    let pipeline = maskura_pipeline_config::PipelineFile::from_file(file)
+        .with_context(|| format!("invalid pipeline file {}", file.display()))?;
+    match trust_roots {
+        Some(raw) => {
+            let roots = maskura_pipeline_config::parse_trust_roots(raw)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            pipeline
+                .verify(&roots)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            println!("signature: valid");
+        }
+        None if pipeline.signature.is_some() => {
+            println!("signature: present (pass --trust-roots to verify)");
+        }
+        None => println!("signature: missing (unsigned)"),
+    }
+    println!("schema_version: {}", pipeline.schema_version);
+    println!("signer_id: {}", pipeline.signer_id);
+    println!("revision: {}", pipeline.revision());
+    summarize_chain("write", pipeline.write.as_ref());
+    summarize_chain("read", pipeline.read.as_ref());
+    for (bucket, scope) in &pipeline.buckets {
+        summarize_directions(
+            &format!("bucket {bucket:?}"),
+            scope.write.as_ref(),
+            scope.read.as_ref(),
+        );
+    }
+    for (workspace, scope) in &pipeline.workspaces {
+        summarize_directions(
+            &format!("workspace {workspace:?}"),
+            scope.write.as_ref(),
+            scope.read.as_ref(),
+        );
+        for (bucket, nested) in &scope.buckets {
+            summarize_directions(
+                &format!("workspace {workspace:?} bucket {bucket:?}"),
+                nested.write.as_ref(),
+                nested.read.as_ref(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn summarize_directions(
+    label: &str,
+    write: Option<&maskura_pipeline_config::DirectionPipeline>,
+    read: Option<&maskura_pipeline_config::DirectionPipeline>,
+) {
+    if write.is_some() {
+        summarize_chain(&format!("{label} write"), write);
+    }
+    if read.is_some() {
+        summarize_chain(&format!("{label} read"), read);
+    }
+}
+
+fn summarize_chain(label: &str, pipeline: Option<&maskura_pipeline_config::DirectionPipeline>) {
+    let Some(pipeline) = pipeline else {
+        return;
+    };
+    if pipeline.steps.is_empty() {
+        println!("{label}: pass-through");
+        return;
+    }
+    let steps: Vec<String> = pipeline
+        .steps
+        .iter()
+        .map(|step| step.plugin.to_string())
+        .collect();
+    println!("{label}: {}", steps.join(" -> "));
+}
+
+fn read_signing_key(path: &std::path::Path) -> anyhow::Result<ed25519_dalek::SigningKey> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read signing key {}", path.display()))?;
+    let bytes = hex::decode(raw.trim())
+        .with_context(|| format!("signing key {} is not valid hex", path.display()))?;
+    let seed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("signing key {} must be 32 bytes", path.display()))?;
+    Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
+}
+
+#[cfg(unix)]
+fn restrict_key_permissions(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("cannot restrict permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_key_permissions(_path: &std::path::Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse_for_program();
@@ -1972,6 +2174,19 @@ async fn main() -> anyhow::Result<()> {
             check_gateway_config(config.as_deref())?;
             println!("Configuration is valid.");
         }
+
+        Command::Pipelines { cmd } => match cmd {
+            PipelinesCmd::InitKey { out } => pipelines_init_key(out)?,
+            PipelinesCmd::Sign {
+                key,
+                output,
+                file,
+            } => pipelines_sign(key, output.as_deref(), file)?,
+            PipelinesCmd::Verify { trust_roots, file } => pipelines_verify(trust_roots.clone(), file)?,
+            PipelinesCmd::Check { trust_roots, file } => {
+                pipelines_check(trust_roots.as_deref(), file)?
+            }
+        },
 
         Command::Local { cmd } => {
             const LOCAL_GATEWAY_NAME: &str = "maskura-local-gateway";
