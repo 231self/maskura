@@ -117,7 +117,7 @@ PY
 
 prove_python_hybrid() {
   disable_plugins
-  enable_plugin envelope-encrypt.component
+  enable_plugin envelope-encrypt
   if command -v uv >/dev/null 2>&1; then
     MASKURA_PROOF_ENDPOINT="$ENDPOINT" \
       uv run --with "$ROOT/sdks/python" \
