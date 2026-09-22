@@ -1,6 +1,6 @@
 {
   "name": "maskura-client",
-  "version": "0.7.11",
+  "version": "0.7.12",
   "description": "OpenAPI client for the Maskura Gateway",
   "author": "OpenAPI-Generator Contributors",
   "repository": {
