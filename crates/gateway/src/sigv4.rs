@@ -381,7 +381,11 @@ impl RequestAuthorization {
                     || uri.path().to_string(),
                     |value| value.as_str().to_string(),
                 ),
-                SignableBody::Precomputed(payload_hash.to_ascii_lowercase()),
+                // Seed verification must hash the exact x-amz-content-sha256 value
+                // the client signed. Hex digests are already lowercase; streaming
+                // and unsigned tokens (`STREAMING-*`, `UNSIGNED-PAYLOAD`) are
+                // case-sensitive and must not be folded.
+                SignableBody::Precomputed(payload_hash.to_string()),
             ),
             Location::Query { expires } => {
                 settings.signature_location = SignatureLocation::QueryParams;
@@ -797,7 +801,7 @@ fn percent_decode(value: &str) -> Result<String, SigV4Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_sigv4::http_request::{SignableRequest, SigningParams};
+    use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningParams};
     use axum::http::{HeaderValue, Method};
 
     const ACCESS: &str = "AKIAIOSFODNN7EXAMPLE";
@@ -850,6 +854,55 @@ mod tests {
             uri,
             extra_headers.iter().copied(),
             SignableBody::Bytes(b"payload"),
+        )
+        .unwrap();
+        let instructions = sign(request, &params).unwrap().into_parts().0;
+        let uri: Uri = uri.parse().unwrap();
+        let mut request = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri(uri.clone())
+            .body(())
+            .unwrap();
+        for &(name, value) in extra_headers {
+            request
+                .headers_mut()
+                .append(name, HeaderValue::from_str(value).unwrap());
+        }
+        instructions.apply_to_request_http1x(&mut request);
+        request.headers_mut().insert(
+            "host",
+            HeaderValue::from_str(uri.authority().unwrap().as_str()).unwrap(),
+        );
+        (uri, request.into_parts().0.headers, time)
+    }
+
+    fn signed_request_with_body(
+        uri: &str,
+        region: &str,
+        extra_headers: &[(&'static str, &str)],
+        body: SignableBody<'_>,
+    ) -> (Uri, HeaderMap, SystemTime) {
+        let time = parse_timestamp(DATE).unwrap();
+        let mut settings = SigningSettings::default();
+        settings.percent_encoding_mode = PercentEncodingMode::Single;
+        settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+        settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+        let identity: aws_smithy_runtime_api::client::identity::Identity =
+            Credentials::new(ACCESS, SECRET, None, None, "test").into();
+        let params: SigningParams = v4::SigningParams::builder()
+            .identity(&identity)
+            .region(region)
+            .name("s3")
+            .time(time)
+            .settings(settings)
+            .build()
+            .unwrap()
+            .into();
+        let request = SignableRequest::new(
+            Method::PUT.as_str(),
+            uri,
+            extra_headers.iter().copied(),
+            body,
         )
         .unwrap();
         let instructions = sign(request, &params).unwrap().into_parts().0;
@@ -1488,7 +1541,119 @@ mod tests {
     fn timestamp_rejects_impossible_calendar_dates() {
         assert!(parse_timestamp("20260229T120000Z").is_none());
         assert!(parse_timestamp("20240229T120000Z").is_some());
-        assert!(parse_timestamp("20261301T120000Z").is_none());
+        assert!(parse_timestamp("20261301T126000Z").is_none());
         assert!(parse_timestamp("20260101T126000Z").is_none());
+    }
+
+    #[test]
+    fn seed_signature_preserves_non_hex_payload_hash_case() {
+        for (payload, headers) in [
+            (
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                vec![
+                    ("content-encoding", "aws-chunked"),
+                    ("x-amz-decoded-content-length", "16"),
+                    ("x-amz-sdk-checksum-algorithm", "CRC32"),
+                    ("x-amz-trailer", "x-amz-checksum-crc32"),
+                ],
+            ),
+            (
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+                vec![
+                    ("content-encoding", "aws-chunked"),
+                    ("x-amz-decoded-content-length", "16"),
+                    ("x-amz-sdk-checksum-algorithm", "CRC32"),
+                    ("x-amz-trailer", "x-amz-checksum-crc32"),
+                ],
+            ),
+            (
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+                vec![
+                    ("content-encoding", "aws-chunked"),
+                    ("x-amz-decoded-content-length", "16"),
+                ],
+            ),
+            ("UNSIGNED-PAYLOAD", Vec::<(&str, &str)>::new()),
+            (
+                // Lowercase hex digests remain valid (AWS clients send them).
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                Vec::<(&str, &str)>::new(),
+            ),
+        ] {
+            let body = match payload {
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => {
+                    SignableBody::StreamingUnsignedPayloadTrailer
+                }
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" => {
+                    SignableBody::StreamingSignedPayloadTrailer
+                }
+                "UNSIGNED-PAYLOAD" => SignableBody::UnsignedPayload,
+                other => SignableBody::Precomputed(other.to_string()),
+            };
+            let mut all: Vec<(&'static str, &str)> = headers;
+            all.push(("x-amz-content-sha256", payload));
+            let (uri, signed, time) = signed_request_with_body(
+                "https://maskura.local/bucket/stream",
+                "us-east-1",
+                &all,
+                body,
+            );
+            assert_eq!(
+                signed["x-amz-content-sha256"], payload,
+                "signer must emit the exact payload token for {payload}"
+            );
+            let authorization = RequestAuthorization::parse(&uri, &signed).unwrap().unwrap();
+            // https makes policy.trusted_tls(uri) true regardless of termination flag.
+            authorization
+                .authorize(
+                    "PUT",
+                    &uri,
+                    &signed,
+                    SECRET,
+                    &SigningKeyCache::standard(),
+                    &SigV4Policy::new("us-east-1", false),
+                    time,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("seed must accept exact payload hash {payload}: {error}")
+                });
+        }
+    }
+
+    #[test]
+    fn seed_signature_rejects_mutated_non_hex_payload_hash() {
+        let (uri, signed, time) = signed_request_with_body(
+            "https://maskura.local/bucket/stream",
+            "us-east-1",
+            &[
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+                ("x-amz-decoded-content-length", "16"),
+                ("x-amz-sdk-checksum-algorithm", "CRC32"),
+                ("x-amz-trailer", "x-amz-checksum-crc32"),
+            ],
+            SignableBody::StreamingUnsignedPayloadTrailer,
+        );
+        let authorization = RequestAuthorization::parse(&uri, &signed).unwrap().unwrap();
+        let mut wrong_case = signed.clone();
+        wrong_case.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_static("streaming-unsigned-payload-trailer"),
+        );
+        // Wrong case also fails signed-header integrity / seed mismatch — not accepted.
+        assert!(
+            authorization
+                .authorize(
+                    "PUT",
+                    &uri,
+                    &wrong_case,
+                    SECRET,
+                    &SigningKeyCache::standard(),
+                    &SigV4Policy::new("us-east-1", true),
+                    time,
+                )
+                .is_err(),
+            "mutated payload hash must not authorize"
+        );
     }
 }

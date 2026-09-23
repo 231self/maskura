@@ -1022,10 +1022,31 @@ fn signed_request(
     body: &[u8],
     headers: &[(&'static str, &str)],
 ) -> Request<Body> {
+    use aws_sigv4::http_request::SignableBody;
+    signed_request_with_signable(
+        access_key,
+        secret,
+        method,
+        uri,
+        body,
+        headers,
+        SignableBody::Bytes(body),
+    )
+}
+
+fn signed_request_with_signable<'a>(
+    access_key: &str,
+    secret: &str,
+    method: &str,
+    uri: &str,
+    body: &'a [u8],
+    headers: &[(&'static str, &str)],
+    signable: aws_sigv4::http_request::SignableBody<'a>,
+) -> Request<Body> {
     use aws_credential_types::Credentials;
     use aws_sigv4::http_request::{
-        PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningParams,
-        SigningSettings, UriPathNormalizationMode, sign,
+        PayloadChecksumKind, PercentEncodingMode, SignableRequest, SigningParams, SigningSettings,
+        UriPathNormalizationMode, sign,
     };
     use aws_sigv4::sign::v4;
     use std::time::SystemTime;
@@ -1061,7 +1082,7 @@ fn signed_request(
         req.headers()
             .iter()
             .map(|(name, value)| (name.as_str(), value.to_str().unwrap())),
-        SignableBody::Bytes(body),
+        signable,
     )
     .unwrap();
     let instructions = sign(signable, &params).unwrap().into_parts().0;

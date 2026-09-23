@@ -111,6 +111,9 @@ signature verification all complete before a request body is polled.
   `UNSIGNED-PAYLOAD`, `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`,
   `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`,
   `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, and a raw SHA-256 payload hash.
+  Seed verification hashes the declared `x-amz-content-sha256` value
+  exactly as signed: streaming and unsigned tokens are case-sensitive
+  and are not case-folded.
 - **Checksums** — `x-amz-checksum-*` (CRC32, CRC32C, CRC64NVME, SHA-1,
   SHA-256) declared in headers or trailers are verified against the decoded
   body. Conflicting declarations, missing trailer declarations, duplicate
