@@ -94,7 +94,7 @@ Create an MCP token in the Maskura dashboard. A remote MCP client that supports
 Streamable HTTP needs these connection values:
 
 ```text
-URL: https://api.s4.231self.com/mcp/workspaces/<workspace-id>
+URL: https://api.maskura.dev/mcp/workspaces/<workspace-id>
 Authorization: Bearer maskura_mcp_<token>
 ```
 
@@ -138,7 +138,7 @@ Claude Desktop and Cursor use the standard `mcpServers` shape:
     "maskura": {
       "command": "maskura-mcp",
       "env": {
-        "MASKURA_GATEWAY_URL": "https://api.s4.231self.com",
+        "MASKURA_GATEWAY_URL": "https://api.maskura.dev",
         "MASKURA_MCP_TOKEN": "maskura_mcp_your_token"
       }
     }
@@ -159,7 +159,7 @@ Kilo uses its local-process MCP configuration shape in `kilo.json`:
       "type": "local",
       "command": ["maskura-mcp"],
       "environment": {
-        "MASKURA_GATEWAY_URL": "https://api.s4.231self.com",
+        "MASKURA_GATEWAY_URL": "https://api.maskura.dev",
         "MASKURA_MCP_TOKEN": "maskura_mcp_your_token"
       },
       "enabled": true
@@ -176,7 +176,7 @@ A Maskura API key pair can be used instead:
 
 ```json
 {
-  "MASKURA_GATEWAY_URL": "https://maskura.dev",
+  "MASKURA_GATEWAY_URL": "https://api.maskura.dev",
   "MASKURA_ACCESS_KEY": "maskura_your_access_key",
   "MASKURA_SECRET_KEY": "maskura_secret_your_secret_key"
 }

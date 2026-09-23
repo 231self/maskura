@@ -26,7 +26,7 @@ pip install https://github.com/231self/maskura/releases/latest/download/maskura-
 ```python
 from maskura_client import Configuration, MaskuraClient
 
-configuration = Configuration(host="https://maskura.dev")
+configuration = Configuration(host="https://api.maskura.dev")
 client = MaskuraClient(
     endpoint=configuration.host,
     access_key="maskura_example",

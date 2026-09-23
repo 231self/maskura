@@ -39,7 +39,7 @@ node --test test/highlevel-attach.test.cjs
 import { MaskuraClient } from "maskura-client";
 
 const client = new MaskuraClient({
-  endpoint: "https://maskura.dev",
+  endpoint: "https://api.maskura.dev",
   accessKey: "maskura_example",
   secretKey: "maskura_secret_example",
 });
