@@ -1,6 +1,6 @@
 # ADR 0006: Dev Attestation Never Production-Valid
 
-- Status: Accepted
+- Status: Superseded by [ADR-0022](0022-policy-approval-and-execution-trust-boundary.md)
 - Date: 2026-08-09
 
 ## Context

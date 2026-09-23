@@ -20,6 +20,13 @@ runs inside the per-session Wasm sandbox. It does not persist that plaintext as
 part of the encrypted output and never holds your private key. Decryption
 happens entirely on the client.
 
+This is **not end-to-end confidentiality against the gateway operator**: the
+gateway must be trusted while it processes plaintext. Neither client-held keys
+nor Wasm isolation proves that an operator-controlled runtime did not copy that
+plaintext or that it ran the selected transform. Maskura does not currently
+provide execution attestation or computation proofs. See the
+[operator trust boundary](security.md#operator-trust-and-the-limits-of-signed-policy).
+
 ## The primitives
 
 | Role | Primitive | Why |

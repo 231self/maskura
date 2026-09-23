@@ -10,6 +10,8 @@ pub enum ConfigError {
     Invalid(String),
     #[error("pipeline config signature is invalid: {0}")]
     Signature(String),
+    #[error("policy approval verification failed: {0}")]
+    Approval(String),
 }
 
 impl ConfigError {
@@ -21,11 +23,15 @@ impl ConfigError {
         Self::Signature(message.into())
     }
 
+    pub fn approval(message: impl Into<String>) -> Self {
+        Self::Approval(message.into())
+    }
+
     /// Stable error code for the shared API envelope.
     pub fn code(&self) -> &'static str {
         match self {
             Self::Toml(_) | Self::Invalid(_) => codes::CONFIG_INVALID,
-            Self::Signature(_) => codes::POLICY_TAMPERED,
+            Self::Signature(_) | Self::Approval(_) => codes::POLICY_TAMPERED,
         }
     }
 }

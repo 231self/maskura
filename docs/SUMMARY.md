@@ -41,3 +41,5 @@
 - [ADR 0019: Zero-config local S3 appliance](adr/0019-zero-config-local-s3-appliance.md)
 - [ADR 0020: Safe OpenTelemetry observability](adr/0020-safe-opentelemetry-observability.md)
 - [ADR 0021: Signed TOML pipeline configuration](adr/0021-signed-toml-pipeline-configuration.md)
+- [ADR 0022: Policy approval and execution trust](adr/0022-policy-approval-and-execution-trust-boundary.md)
+- [ADR 0023: Policy approval verification](adr/0023-policy-approval-verification.md)

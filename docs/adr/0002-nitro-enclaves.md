@@ -1,6 +1,6 @@
 # ADR 0002: AWS Nitro Enclaves, TLS-in-Enclave, us-east-1
 
-- Status: Accepted
+- Status: Superseded by [ADR-0022](0022-policy-approval-and-execution-trust-boundary.md)
 - Date: 2026-08-09
 
 ## Context

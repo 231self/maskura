@@ -2987,6 +2987,8 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "maskura-error",
+ "p256",
+ "rand 0.8.8",
  "semver",
  "serde",
  "serde_json",
