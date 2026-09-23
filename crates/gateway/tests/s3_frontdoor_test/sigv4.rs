@@ -943,3 +943,57 @@ async fn valid_sigv4_seed_polls_then_rejects_payload_hash_mismatch() {
     assert!(polls.load(Ordering::SeqCst) > 0);
     assert!(state.store.get("bkt", "hash-mismatch.txt").is_none());
 }
+
+#[tokio::test]
+async fn aws_cli_streaming_unsigned_trailer_put_is_accepted() {
+    use aws_sigv4::http_request::SignableBody;
+    use base64::Engine as _;
+    use crc::{CRC_32_ISO_HDLC, Crc};
+
+    let mut state = test_state().await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .sigv4_policy = SigV4Policy::new("us-east-1", true);
+    let (ak, sk) = make_key(&state).await;
+    let app = build_router(state.clone());
+
+    let data = b"streaming trailer payload";
+    let crc = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+    let mut digest = crc.digest();
+    digest.update(data);
+    let checksum =
+        base64::engine::general_purpose::STANDARD.encode(digest.finalize().to_be_bytes());
+    let framed = format!(
+        "{:X}\r\n{}\r\n0\r\nx-amz-checksum-crc32:{checksum}\r\n\r\n",
+        data.len(),
+        String::from_utf8_lossy(data)
+    );
+    let headers: &[(&'static str, &str)] = &[
+        ("content-encoding", "aws-chunked"),
+        ("x-amz-decoded-content-length", "25"),
+        ("x-amz-sdk-checksum-algorithm", "CRC32"),
+        ("x-amz-trailer", "x-amz-checksum-crc32"),
+    ];
+    let request = signed_request_with_signable(
+        &ak,
+        &sk,
+        "PUT",
+        "http://maskura.local/cli/stream.txt",
+        framed.as_bytes(),
+        headers,
+        SignableBody::StreamingUnsignedPayloadTrailer,
+    );
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body).into_owned();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "aws-cli style STREAMING-UNSIGNED-PAYLOAD-TRAILER PUT must pass seed verify: {body}"
+    );
+    assert!(!body.contains("SignatureDoesNotMatch"), "{body}");
+    assert!(state.store.get("cli", "stream.txt").is_some());
+}
