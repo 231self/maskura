@@ -9,42 +9,76 @@ fi
 IMAGE_REF="$1"
 RUN_ID="${GITHUB_RUN_ID:-$$}-${GITHUB_RUN_ATTEMPT:-0}-${RANDOM}"
 NETWORK="maskura-release-smoke-${RUN_ID}"
-MINIO_NAME="maskura-minio-${RUN_ID}"
+S3_NAME="maskura-s3-${RUN_ID}"
 POSTGRES_NAME="maskura-postgres-${RUN_ID}"
 GATEWAY_NAME="maskura-gateway-${RUN_ID}"
-MINIO_IMAGE="quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+# Stable local S3 backend: the last released zero-config appliance (ADR 0019),
+# pinned by digest. MinIO's free images are gone; maskura backs itself here.
+S3_IMAGE="ghcr.io/231self/maskura/maskura:v0.7.14@sha256:4600673d46dd309f03f16a77661f1d412f55c2696045248e5dde1b7bd2c449b1"
 POSTGRES_IMAGE="postgres:17-trixie@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449"
-MC_IMAGE="quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
-MC_CONF="maskura-release-smoke-mc-${RUN_ID}"
 LOCAL_VOLUME="maskura-release-smoke-local-${RUN_ID}"
 GATEWAY_PORT="${MASKURA_RELEASE_SMOKE_PORT:-18080}"
+S3_PORT="${MASKURA_RELEASE_SMOKE_S3_PORT:-19090}"
+
+s3_aws() {
+  AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+    AWS_DEFAULT_REGION=us-east-1 aws "$@"
+}
 
 cleanup() {
-  docker rm -f "$GATEWAY_NAME" "$MINIO_NAME" "$POSTGRES_NAME" >/dev/null 2>&1 || true
+  docker rm -f "$GATEWAY_NAME" "$S3_NAME" "$POSTGRES_NAME" >/dev/null 2>&1 || true
   docker network rm "$NETWORK" >/dev/null 2>&1 || true
-  docker volume rm "$MC_CONF" "$LOCAL_VOLUME" >/dev/null 2>&1 || true
+  docker volume rm "$LOCAL_VOLUME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 docker network create "$NETWORK" >/dev/null
-docker volume create "$MC_CONF" >/dev/null
-docker run -d --name "$MINIO_NAME" --network "$NETWORK" \
-  -e MINIO_ROOT_USER=minioadmin \
-  -e MINIO_ROOT_PASSWORD=minioadmin \
-  "$MINIO_IMAGE" server /data >/dev/null
+docker run -d --name "$S3_NAME" --network "$NETWORK" \
+  -p "127.0.0.1:${S3_PORT}:9000" \
+  -e MASKURA_ROOT_USER=minioadmin \
+  -e MASKURA_ROOT_PASSWORD=minioadmin \
+  "$S3_IMAGE" >/dev/null
 
 ready=0
 for _ in $(seq 1 30); do
-  if docker exec "$MINIO_NAME" curl --fail --silent \
-      http://127.0.0.1:9000/minio/health/live >/dev/null; then
+  if curl --fail --silent "http://127.0.0.1:${S3_PORT}/ready" >/dev/null; then
     ready=1
+    break
+  fi
+  if [ "$(docker inspect --format '{{.State.Running}}' "$S3_NAME")" != "true" ]; then
     break
   fi
   sleep 1
 done
 if [ "$ready" -ne 1 ]; then
-  docker logs "$MINIO_NAME" || true
-  echo "ERROR: release-smoke MinIO did not become ready" >&2
+  docker logs "$S3_NAME" || true
+  echo "ERROR: release-smoke local S3 appliance did not become ready" >&2
+  exit 1
+fi
+
+# The appliance only auto-creates the canonical `maskura` bucket; the gateway
+# under test sinks into its own bucket, so create it explicitly. Existence is
+# probed with ListBuckets membership: the gateway serves HEAD through the
+# ListObjects handler, so `head-bucket` alone cannot detect a missing bucket.
+bucket_ready=0
+for _ in $(seq 1 15); do
+  if s3_aws s3api list-buckets --endpoint-url "http://127.0.0.1:${S3_PORT}" \
+      --query "Buckets[?Name=='maskura-release-smoke'] | length(@)" --output text 2>/dev/null \
+      | grep -qx 1; then
+    bucket_ready=1
+    break
+  fi
+  if s3_aws s3api create-bucket --endpoint-url "http://127.0.0.1:${S3_PORT}" \
+      --bucket maskura-release-smoke >/dev/null 2>&1; then
+    bucket_ready=1
+    break
+  fi
+  sleep 1
+done
+if [ "$bucket_ready" -ne 1 ]; then
+  s3_aws s3api list-buckets --endpoint-url "http://127.0.0.1:${S3_PORT}" || true
+  docker logs "$S3_NAME" || true
+  echo "ERROR: release-smoke local S3 bucket was not created" >&2
   exit 1
 fi
 
@@ -67,18 +101,13 @@ if [ "$pg_ready" -ne 1 ]; then
   exit 1
 fi
 
-docker run --rm --network "$NETWORK" -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color \
-  alias set local "http://${MINIO_NAME}:9000" minioadmin minioadmin >/dev/null
-docker run --rm --network "$NETWORK" -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color \
-  mb "local/maskura-release-smoke" --ignore-existing >/dev/null
-
 docker run -d --name "$GATEWAY_NAME" --network "$NETWORK" \
   -p "127.0.0.1:${GATEWAY_PORT}:8080" \
   -e AUTH_DISABLED=true \
   -e MASKURA_STREAMING_S3_PROVIDER=minio \
   -e DATABASE_URL="postgres://postgres:postgres@${POSTGRES_NAME}:5432/maskura" \
   -e MASKURA_KEYS_FILE=/tmp/keys.json \
-  -e S3_ENDPOINT="http://${MINIO_NAME}:9000" \
+  -e S3_ENDPOINT="http://${S3_NAME}:9000" \
   -e S3_ACCESS_KEY_ID=minioadmin \
   -e S3_SECRET_ACCESS_KEY=minioadmin \
   -e S3_REGION=us-east-1 \
@@ -108,8 +137,10 @@ curl --fail --silent --show-error \
   --data-binary "$INPUT" \
   "http://127.0.0.1:${GATEWAY_PORT}/maskura-release-smoke/object.txt" >/dev/null
 
-READBACK="$(docker run --rm --network "$NETWORK" -v "$MC_CONF:/root/.mc" "$MC_IMAGE" --no-color \
-  cat 'local/maskura-release-smoke/object.txt')"
+# Read back straight from the backend (bypassing the gateway) to prove the
+# transformed bytes were persisted, signed with the appliance root credential.
+READBACK="$(s3_aws s3 cp --endpoint-url "http://127.0.0.1:${S3_PORT}" \
+  's3://maskura-release-smoke/object.txt' -)"
 case "$READBACK" in
   *'[REDACTED_EMAIL]'*'[REDACTED_CARD]'*) ;;
   *)

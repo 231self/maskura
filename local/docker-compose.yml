@@ -1,20 +1,22 @@
 services:
-  minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-    command: server /data --console-address ":9001"
+  # Zero-config local S3 appliance (ADR 0019): the maskura gateway itself,
+  # auto-local mode, with the fixed dev root credential so SigV4 clients and
+  # the gateway's S3 sink share one well-known principal.
+  s3:
+    image: ghcr.io/231self/maskura/maskura:v0.7.14@sha256:4600673d46dd309f03f16a77661f1d412f55c2696045248e5dde1b7bd2c449b1
     ports:
       - "9000:9000"
-      - "9001:9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MASKURA_ROOT_USER: minioadmin
+      MASKURA_ROOT_PASSWORD: minioadmin
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "maskura-gateway", "--healthcheck"]
       interval: 2s
       timeout: 3s
-      retries: 5
+      retries: 15
+      start_period: 5s
     volumes:
-      - minio-data:/data
+      - s3-data:/data
 
   gateway:
     build:
@@ -23,7 +25,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      S3_ENDPOINT: http://minio:9000
+      S3_ENDPOINT: http://s3:9000
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
       S3_REGION: us-east-1
@@ -34,9 +36,9 @@ services:
     volumes:
       - maskura-keys:/app/data
     depends_on:
-      minio:
+      s3:
         condition: service_healthy
 
 volumes:
-  minio-data:
+  s3-data:
   maskura-keys:

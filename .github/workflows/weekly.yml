@@ -1,7 +1,7 @@
 name: Weekly
 
 # Deep soak and high-case property tests. Nightly already covers fixed-RSS and
-# MinIO E2E six minutes before this workflow starts each Monday.
+# e2e suite six minutes before this workflow starts each Monday.
 on:
   schedule:
     - cron: "23 3 * * 1"

@@ -201,6 +201,85 @@ async fn filestore_conformance_bucket_object_lifecycle_survives_restart() {
 }
 
 #[tokio::test]
+async fn filestore_list_and_head_on_missing_bucket_return_no_such_bucket() {
+    let root = std::env::temp_dir().join(format!("maskura-file-missing-{}", uuid::Uuid::now_v7()));
+    let mut state = test_state().await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .file_store = Some(Arc::new(FileStore::new(root.clone()).await.unwrap()));
+    let (ak, sk) = make_key(&state).await;
+    let headers = auth_headers(&ak, &sk);
+    let app = build_router(state);
+
+    // ListObjects v1, ListObjects v2, and HEAD on a bucket that was never
+    // created must all report NoSuchBucket rather than an empty success:
+    // an empty 200 hides a typo'd or missing bucket from every S3 client,
+    // and `head-bucket` would then claim the bucket exists.
+    for (method, uri) in [
+        ("GET", "/absent"),
+        ("GET", "/absent?list-type=2"),
+        ("HEAD", "/absent"),
+    ] {
+        let request = add_headers(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{method} {uri} must be NoSuchBucket"
+        );
+        if method == "GET" {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let xml = String::from_utf8_lossy(&body);
+            assert!(
+                xml.contains("<Code>NoSuchBucket</Code>"),
+                "{method} {uri}: {xml}"
+            );
+        }
+    }
+
+    // An existing bucket still lists with an empty 200, so the guard only
+    // rejects genuinely absent buckets.
+    let create = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/absent")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    assert_eq!(
+        app.clone().oneshot(create).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let list = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/absent?list-type=2")
+            .body(Body::empty())
+            .unwrap(),
+        &headers,
+    );
+    let response = app.clone().oneshot(list).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let xml = String::from_utf8_lossy(&body);
+    assert!(xml.contains("<KeyCount>0</KeyCount>"), "{xml}");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn filestore_conformance_lists_v1_v2_prefix_delimiter_and_pages() {
     let root = std::env::temp_dir().join(format!("maskura-file-list-{}", uuid::Uuid::now_v7()));
     let store = Arc::new(FileStore::new(root.clone()).await.unwrap());

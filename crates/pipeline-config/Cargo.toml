@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# Exposes the deterministic software authenticator and attestation builders so
+# dependent test suites share one fixture implementation.
+test-util = ["dep:rand"]
+
 [dependencies]
 maskura-error = { path = "../error" }
 serde.workspace = true
@@ -20,6 +25,7 @@ serde_json.workspace = true
 sha2 = "0.10"
 base64 = "0.23"
 p256 = "0.13"
+rand = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand.workspace = true

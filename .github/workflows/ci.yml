@@ -111,7 +111,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install wasm-tools
         run: cargo install --locked wasm-tools --version 1.255.0
-      - name: End-to-end (MinIO)
+      - name: End-to-end (local S3)
         if: ${{ !env.ACT }}
         run: bash scripts/e2e-local.sh
 

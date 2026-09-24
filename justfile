@@ -138,13 +138,13 @@ image-local:
 publish-local TAG='latest':
   dagger call publish --tag={{TAG}}
 
-# Start local dev environment (Docker Compose + MinIO + gateway)
+# Start local dev environment (Docker Compose + local S3 appliance + gateway)
 dev-up: build-plugins
-  docker compose -f local/docker-compose.yml up -d --build --wait minio gateway
+  docker compose -f local/docker-compose.yml up -d --build --wait s3 gateway
   echo "Local dev environment ready:"
-  echo "  MinIO:     http://localhost:9000 (API) / :9001 (Console)"
+  echo "  Local S3:   http://localhost:9000 (maskura appliance, root: minioadmin)"
   echo "  Gateway:   http://localhost:8080/health"
-  docker run --rm --network host quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 --no-color mb local/maskura-local --ignore-existing 2>/dev/null || true
+  AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_DEFAULT_REGION=us-east-1 aws s3api list-buckets --endpoint-url http://localhost:9000 --query "Buckets[?Name=='maskura-local'] | length(@)" --output text | grep -qx 1 || AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_DEFAULT_REGION=us-east-1 aws s3api create-bucket --endpoint-url http://localhost:9000 --bucket maskura-local
   echo "  S3 bucket: maskura-local (created)"
 
 # Stop local dev environment

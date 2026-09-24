@@ -44,5 +44,6 @@ pub use trust::{
 };
 pub use webauthn::{
     AssertionExpectation, CHALLENGE_VERSION, ChallengeContext, ChallengeKind, CoseEs256Key,
-    WebAuthnProof, verify_assertion,
+    RegisteredCredential, RegistrationExpectation, WebAuthnProof, parse_registration,
+    verify_assertion,
 };

@@ -3,10 +3,10 @@
 #
 # Exercises previously untested public paths: GET/DELETE /dashboard/api/keys
 # happy paths, header-authenticated PUT/HEAD/GET/DELETE on the S3 data plane,
-# and ListObjects v1 + v2 forwarded to a real S3 backend (MinIO).
+# and ListObjects v1 + v2 forwarded to the local S3 appliance.
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib.sh"
-begin_feature "API-key CRUD + authenticated S3 object lifecycle against MinIO"
+begin_feature "API-key CRUD + authenticated S3 object lifecycle against local S3"
 
 if ! command -v python3 >/dev/null 2>&1; then
     fail "python3 is required to parse dashboard API responses"
@@ -69,7 +69,7 @@ else
     fail "GET body differs from the uploaded payload"
 fi
 
-# 6. ListObjects v2 + v1 forwarded to the MinIO backend exposes the object.
+# 6. ListObjects v2 + v1 forwarded to the local S3 backend exposes the object.
 code="$(curl -sS -o "$E2E_TMP/30-list-v2.xml" -w '%{http_code}' \
     -H "x-maskura-access-key: $KEY_ID" \
     -H "x-maskura-secret-key: $SECRET" \
