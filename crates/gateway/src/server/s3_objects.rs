@@ -3264,6 +3264,19 @@ pub(crate) async fn s3_list_objects(
             .await;
         }
     };
+    // A File-backed bucket is explicit: listing (and HEAD, which is served by
+    // this same handler) a bucket that was never created must return
+    // NoSuchBucket, not an empty 200.
+    if let Some(response) = require_file_bucket(&backend, &bucket).await {
+        return release_failure(
+            state.control.as_ref(),
+            &auth.context,
+            &grant,
+            &bucket,
+            response,
+        )
+        .await;
+    }
     let response = match backend {
         ResolvedBackend::S3 { client, .. } => match list_from_s3(&client, &bucket, &params).await {
             Ok(xml) => s3_xml_ok(xml),
