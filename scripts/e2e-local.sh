@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Maskura local end-to-end suite.
 #
-# Boots MinIO + the gateway once, then runs every discrete feature script in
-# scripts/e2e/features/ against that shared environment. Each feature is an
-# independently-runnable script; `bash scripts/e2e-local.sh <name>` runs only
-# the matching feature (after boot).
+# Boots the local S3 appliance (maskura, ADR 0019) + the gateway once, then
+# runs every discrete feature script in scripts/e2e/features/ against that
+# shared environment. Each feature is an independently-runnable script;
+# `bash scripts/e2e-local.sh <name>` runs only the matching feature (after boot).
 #
 # Features covered today:
 #   10-http-surface.sh        /health, dashboard HTML, /openapi.json, /docs, legacy tombstones
 #   15-avro-gate.sh           Avro-content PUT rejected while MASKURA_ENABLE_AVRO is unset
-#   20-redaction-roundtrip.sh PII redaction on PUT -> object read-back from MinIO
+#   20-redaction-roundtrip.sh PII redaction on PUT -> object read-back from the local S3 backend
 #   25-strict-auth-denial.sh  second strict gateway (no AUTH_DISABLED): unauthenticated S3/dashboard denied
 #   30-keys-s3-lifecycle.sh   dashboard key CRUD + authenticated S3 PUT/HEAD/GET/LIST/DELETE
 #   40-plugin-admin-http.sh   plugin import / list / enable / reorder / remove over HTTP
@@ -22,9 +22,9 @@
 # without S3_ENDPOINT; staged multipart needs Postgres + a durable KEK; key
 # expiry/revocation rejection on the data plane needs an auth-enabled boot
 # that can create keys; presigned URL proxying needs a container-network
-# harness (the host process cannot deterministically reach the local MinIO's
-# loopback over IPv4 on all Docker setups and IP literals are not allowlisted);
-# SDK/MCP live round trips need their runtimes.
+# harness (the host process cannot deterministically reach the local S3
+# appliance's loopback over IPv4 on all Docker setups and IP literals are not
+# allowlisted); SDK/MCP live round trips need their runtimes.
 
 set -euo pipefail
 
@@ -33,42 +33,69 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$ROOT/scripts/e2e/lib.sh"
 
 GW_PID=""
-E2E_STARTED_MINIO=0
+E2E_STARTED_S3=0
 
 cleanup() {
     if [ -n "$GW_PID" ]; then
         kill "$GW_PID" 2>/dev/null || true
         wait "$GW_PID" 2>/dev/null || true
     fi
-    if [ "$E2E_STARTED_MINIO" -eq 1 ]; then
+    if [ "$E2E_STARTED_S3" -eq 1 ]; then
         "${E2E_COMPOSE[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
     fi
-    docker volume rm "$E2E_MC_CONF" >/dev/null 2>&1 || true
     rm -rf "$E2E_KEYS_DIR"
 }
 trap cleanup EXIT
 
 e2e_boot() {
-    echo "=== Maskura E2E: boot MinIO + gateway ==="
+    echo "=== Maskura E2E: boot local S3 + gateway ==="
 
-    # 1. MinIO on :9000: reuse a healthy instance (common when the local
-    # dev/ad MinIO is already running) or start one via docker compose.
-    if curl -fs http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
-        echo "--- Reusing running MinIO on :9000 ---"
-        E2E_STARTED_MINIO=0
+    # 1. Local S3 appliance (maskura gateway in auto-local mode) on :9000:
+    # reuse a healthy instance (common when the local dev appliance is already
+    # running) or start one via docker compose.
+    if curl -fs http://127.0.0.1:9000/health >/dev/null 2>&1; then
+        echo "--- Reusing running local S3 on :9000 ---"
+        E2E_STARTED_S3=0
     else
-        echo "--- Starting MinIO ---"
+        echo "--- Starting local S3 appliance ---"
         "${E2E_COMPOSE[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
-        docker volume rm "$E2E_MC_CONF" >/dev/null 2>&1 || true
-        "${E2E_COMPOSE[@]}" up -d --wait minio 2>&1
-        E2E_STARTED_MINIO=1
+        "${E2E_COMPOSE[@]}" up -d --wait s3 2>&1
+        E2E_STARTED_S3=1
     fi
 
-    # mc config lives in a shared volume so alias set and the read-back steps
-    # (separate --rm containers) see the same configuration.
-    local mc_opts=(--rm -i --network host -v "$E2E_MC_CONF:/root/.mc" "$E2E_MC_IMAGE" --no-color)
-    docker run "${mc_opts[@]}" alias set local http://localhost:9000 minioadmin minioadmin
-    docker run "${mc_opts[@]}" mb "local/$E2E_BUCKET" --ignore-existing
+    # The scratch bucket must exist before the gateway sinks into it. The
+    # appliance only auto-creates the canonical `maskura` bucket, so create the
+    # fixture bucket explicitly over S3 with the fixed dev root credential.
+    # Existence is probed with ListBuckets membership, not `head-bucket`:
+    # this gateway serves HEAD through the ListObjects handler, so HEAD alone
+    # cannot distinguish a missing bucket from an empty one.
+    echo "--- Ensuring bucket $E2E_BUCKET exists ---"
+    local bucket_ready=0
+    local attempt
+    for attempt in $(seq 1 15); do
+        if AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+            AWS_DEFAULT_REGION=us-east-1 \
+            aws s3api list-buckets --endpoint-url http://127.0.0.1:9000 \
+            --query "Buckets[?Name=='$E2E_BUCKET'] | length(@)" --output text 2>/dev/null \
+            | grep -qx 1; then
+            bucket_ready=1
+            break
+        fi
+        if AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+            AWS_DEFAULT_REGION=us-east-1 \
+            aws s3api create-bucket --endpoint-url http://127.0.0.1:9000 \
+            --bucket "$E2E_BUCKET" >/dev/null 2>&1; then
+            bucket_ready=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$bucket_ready" -ne 1 ]; then
+        echo "FAIL: could not create bucket $E2E_BUCKET on the local S3 appliance" >&2
+        echo "(is port 9000 serving a maskura appliance with root credential minioadmin?)" >&2
+        exit 1
+    fi
+    echo "Bucket ready"
 
     # 2. Build the filters and the debug binaries.
     echo "--- Building filters and binaries ---"

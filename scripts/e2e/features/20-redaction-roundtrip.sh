@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
 # Feature: PII redaction round trip — upload the PII fixture through the
-# gateway pipeline and verify the object stored in MinIO is redacted with no
-# plaintext leakage. This is the historical core of the MinIO e2e.
+# gateway pipeline and verify the object stored in the local S3 backend is
+# redacted with no plaintext leakage. This is the historical core of the e2e.
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib.sh"
-begin_feature "PII redaction round trip through MinIO"
+begin_feature "PII redaction round trip through local S3"
 
 # Run the CLI fixture upload (demo mode, unauthenticated local gateway).
 echo "--- Running maskura test upload ---"
 MASKURA_GATEWAY_URL="$E2E_GW_URL" "$E2E_MASKURA_BIN" test upload
 
-# Read the stored object straight out of MinIO (bypassing the gateway).
-echo "--- Reading stored object from MinIO ---"
-docker run --rm -i --network host -v "$E2E_MC_CONF:/root/.mc" "$E2E_MC_IMAGE" --no-color \
-    alias set local http://localhost:9000 minioadmin minioadmin >/dev/null
-docker run --rm -i --network host -v "$E2E_MC_CONF:/root/.mc" "$E2E_MC_IMAGE" --no-color \
-    cat "local/$E2E_BUCKET/test-upload.txt" > "$E2E_TMP/20-readback.txt" 2>"$E2E_TMP/20-readback.err" || {
+# Read the stored object straight out of the S3 backend (bypassing the
+# gateway), signed with the appliance's fixed dev root credential.
+echo "--- Reading stored object from the local S3 backend ---"
+AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+    AWS_DEFAULT_REGION=us-east-1 \
+    aws s3 cp --endpoint-url http://127.0.0.1:9000 \
+    "s3://$E2E_BUCKET/test-upload.txt" - > "$E2E_TMP/20-readback.txt" 2>"$E2E_TMP/20-readback.err" || {
     cat "$E2E_TMP/20-readback.err" >&2
-    fail "mc cat could not read local/$E2E_BUCKET/test-upload.txt from MinIO"
+    fail "aws s3 cp could not read s3://$E2E_BUCKET/test-upload.txt from the local S3 backend"
 }
 
 for marker in "REDACTED_EMAIL" "REDACTED_SSN" "REDACTED_CARD"; do
