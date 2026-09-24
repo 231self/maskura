@@ -18,7 +18,7 @@ The default is the current published image. Pin a release when you want the
 same bytes on a later run:
 
 ```bash
-MASKURA_PROOF_IMAGE=ghcr.io/231self/maskura/maskura:v0.7.13 just proof
+MASKURA_PROOF_IMAGE=ghcr.io/231self/maskura/maskura:v0.7.14 just proof
 ```
 
 The harness prints the pulled image digest before it starts its assertions. It
@@ -39,6 +39,13 @@ The orchestrator is
 [`examples/prove-maskura.sh`](../examples/prove-maskura.sh).
 
 ## What it does not prove
+
+Here, “proof” means a reproducible integration check of the tested image and
+inputs, not a cryptographic computation proof or remote execution attestation.
+Passing checks do not establish which code a hosted service ran for a customer's
+operation, that it did not copy plaintext, or that every operation used an
+approved policy. Build-provenance attestations likewise identify release
+artifacts, not a running service's per-operation behavior.
 
 This suite is narrow on purpose. It does not establish formal cryptographic
 correctness, exhaustive S3 conformance, hosted tenant isolation, or the

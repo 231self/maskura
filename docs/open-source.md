@@ -44,5 +44,11 @@ service also provides the destination storage. The selected pipeline determines
 whether supported fields are passed through, redacted, or encrypted; Maskura
 does not claim that every object is automatically confidential.
 
+In either deployment, the gateway operator is trusted during processing.
+Configuration signatures authenticate artifacts; they do not independently prove
+which code or policy ran for a read/write. Maskura does not currently provide
+end-to-end execution attestation, and client-held decryption keys do not prevent
+the gateway from seeing plaintext while transforming it.
+
 See [Security](security.md) for trust boundaries, fail-closed behavior, feature
 gates, and operator responsibilities.

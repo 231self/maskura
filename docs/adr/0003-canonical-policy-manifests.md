@@ -5,6 +5,14 @@
 
 ## Context
 
+**Trust-boundary clarification (2026-09-23):**
+[ADR 0022](0022-policy-approval-and-execution-trust-boundary.md) narrows the
+operator-resistance language below to approval of signed artifacts, not proof
+of their execution. The gateway/operator remains trusted. This original design
+record is not evidence that the hosted envelope, publish-approval, or recovery
+flows have shipped; existing signed pipeline configuration is covered by
+[ADR 0021](0021-signed-toml-pipeline-configuration.md).
+
 Tenant-defined pipeline configuration (destinations, routes, filters, limits) must be verifiably authentic. Maskura operators must not silently change policy. The signed manifest is the customer's attestable statement of intent.
 
 Options considered:

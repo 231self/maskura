@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::direction::Direction;
 use crate::error::ConfigError;
 use crate::plugin_ref::PluginRef;
+use crate::policy::PolicySection;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -40,6 +41,12 @@ pub struct PipelineFile {
     pub buckets: BTreeMap<String, ScopeOverride>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspaces: BTreeMap<String, WorkspaceScope>,
+    /// Standing policy envelope bounds. Absence keeps the historical
+    /// unsigned-bounds behavior; presence is covered by the envelope artifact
+    /// digest (`revision`). Hosted enforcement is a separate integration;
+    /// parsing or verifying this file does not enforce these bounds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicySection>,
 }
 
 /// A workspace scope: default direction chains plus per-bucket overrides.
@@ -145,6 +152,9 @@ impl PipelineFile {
         }
         for (workspace, scope) in &self.workspaces {
             scope.validate(&format!("workspaces.{workspace}"))?;
+        }
+        if let Some(policy) = &self.policy {
+            policy.validate()?;
         }
         Ok(())
     }

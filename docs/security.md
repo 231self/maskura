@@ -44,6 +44,35 @@ Trust boundaries:
    requests to the configured backend. The zero-trust presigned-URL path
    forwards without storing any backend credential at all.
 
+### Operator trust and the limits of signed policy
+
+**The gateway and its operator remain trusted during processing.** Maskura does
+not provide end-to-end execution attestation or per-operation computation proofs.
+An operator controlling the deployed binary, host, or local trust store can
+bypass the gateway's checks; those checks do not independently constrain that
+operator. Wasm isolation constrains plugins, not the administrator of the runtime.
+
+Signed TOML configuration provides artifact authenticity relative to configured
+trust roots. It does not prove that a particular read/write used that artifact.
+The hosted design for customer-signed policy envelopes, synchronous publish
+approvals, and shared-passkey MFA is planned, not an implemented guarantee of
+this document. Its intended contract is approval evidence plus fail-closed
+enforcement by the trusted gateway, not operator-proof execution.
+
+Plaintext is available transiently to the gateway while transformations execute.
+Client-held decryption keys protect encrypted output; they do not establish
+confidentiality from the gateway during processing. TLS and SigV4 protect their
+transport/authentication boundaries, not the identity of the running code.
+Signed approval artifacts do not prove absence of extra plaintext copies,
+complete PII detection, or durable storage of an output.
+
+Independent approval verification requires independently trusted signer keys.
+A server-only hash chain cannot establish complete/latest history or exclude
+split views; consistency checks need retained checkpoints and must state their
+freshness limits. Build-provenance attestations and integration-test evidence
+are separate from execution attestation. See
+[ADR 0022](adr/0022-policy-approval-and-execution-trust-boundary.md).
+
 ## 2. Authentication
 
 ### Dashboard

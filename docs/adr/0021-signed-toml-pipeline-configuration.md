@@ -5,6 +5,13 @@
 
 ## Context
 
+**Trust-boundary clarification (2026-09-23):**
+[ADR 0022](0022-policy-approval-and-execution-trust-boundary.md) scopes this ADR's
+operator-resistance language to artifact authenticity enforced by a trusted
+gateway. A valid configuration signature is not evidence of which binary or
+configuration a remote operator actually ran. The existing encoding, signing,
+and resolver decisions below remain in force.
+
 Self-hosted Maskura selected pipeline plugins from one process-global catalog
 (`PluginRegistry`): every enabled plugin ran, in catalog order, for every PUT and
 every opt-in transformed GET. There was no declarative, per-workspace/bucket way
