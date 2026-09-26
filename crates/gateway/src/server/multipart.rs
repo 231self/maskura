@@ -3,6 +3,9 @@
 //! Extracted from `server.rs`. Items are re-exported from [`crate::server`].
 
 use super::*;
+use maskura_pipeline_config::PolicyOperation;
+
+use crate::policy_gate::{PolicyRequest, enforce_policy, policy_error_response};
 
 pub(crate) struct MultipartStaging {
     pub(crate) repository: Arc<dyn MultipartRepository>,
@@ -1941,6 +1944,23 @@ pub(crate) async fn s3_upload_part(
     {
         Ok(backend) => backend,
         Err(_) => return backend_resolution_error_response(&key),
+    };
+    let _policy = match enforce_policy(
+        state.policy_gate.as_ref(),
+        PolicyRequest {
+            workspace_id: authentication.auth.workspace_id().as_str(),
+            operation: PolicyOperation::MultipartUpload,
+            bucket: &bucket,
+            key: &key,
+            resolution: None,
+            destination: &multipart_backend,
+            direction: crate::pipeline::PipelineDirection::Write,
+        },
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(error) => return policy_error_response(&key, &error),
     };
     if let Err(error) = validate_streaming_backend(&state, &multipart_backend) {
         return streaming_put_error_response(&key, error);

@@ -1209,5 +1209,6 @@ mod misc;
 mod multipart;
 mod objects;
 mod pipeline;
+mod policy_gate;
 mod sigv4;
 mod streaming;

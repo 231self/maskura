@@ -841,6 +841,7 @@ pub async fn build_state_with_pipeline_template(
         explicit_single_tenant,
         workspace_endpoint_policy,
         control,
+        policy_gate: None,
         legacy_max_object_bytes: legacy_max_object_bytes(config),
         streaming_read_mode: effective_streaming_read_mode(config, auto_local),
         source_body_limits,
