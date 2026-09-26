@@ -11,7 +11,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use maskura_error::{MaskuraError, codes};
 use maskura_pipeline_config::{
-    ConfigError, Direction as ConfigDirection, DirectionPipeline, PipelineFile, PluginRef, StepDef,
+    ConfigError, Direction as ConfigDirection, DirectionPipeline, IdentitySection, PipelineFile,
+    PluginRef, StepDef, step_config_hash,
 };
 use maskura_wasm_runtime::SensitiveGrant;
 
@@ -241,7 +242,11 @@ impl SignedTomlPipelineResolver {
             ));
         }
         for step in &pipeline.steps {
-            self.catalog.lookup(&step.plugin)?.to_pipeline_step(step)?;
+            let entry = self.catalog.lookup(&step.plugin)?;
+            if let Some(identity) = self.file.identity.as_ref() {
+                verify_identity_entry(identity, &step.plugin, &entry.component_hash, step)?;
+            }
+            entry.to_pipeline_step(step)?;
         }
         Ok(())
     }
@@ -291,6 +296,41 @@ impl PipelineResolver for SignedTomlPipelineResolver {
 
 fn is_digest(name: &str) -> bool {
     name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Fail closed unless the export identity binds this step's exact bytes (and
+/// pinned configuration) to its `slug:version` name.
+fn verify_identity_entry(
+    identity: &IdentitySection,
+    plugin: &PluginRef,
+    component_hash: &str,
+    step: &StepDef,
+) -> Result<(), MaskuraError> {
+    let entry = identity.get(plugin).ok_or_else(|| {
+        MaskuraError::new(
+            codes::CONFIG_INVALID,
+            format!("plugin {plugin} has no identity entry"),
+        )
+    })?;
+    if entry.sha256 != component_hash {
+        return Err(MaskuraError::new(
+            codes::CONFIG_INVALID,
+            format!(
+                "identity digest for {plugin} is {} but the resolved component is {component_hash}",
+                entry.sha256
+            ),
+        ));
+    }
+    if let Some(pinned) = &entry.config_hash {
+        let actual = step_config_hash(step).map_err(config_error)?;
+        if actual.as_deref() != Some(pinned.as_str()) {
+            return Err(MaskuraError::new(
+                codes::CONFIG_INVALID,
+                format!("identity config_hash for {plugin} does not match the step configuration"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn config_error(error: ConfigError) -> MaskuraError {
@@ -537,5 +577,76 @@ plugin = "stable-encrypt"
         )
         .unwrap();
         assert_eq!(resolver.revision(), "unsigned-dev");
+    }
+
+    const FILE_WITH_IDENTITY: &str = r#"
+schema_version = 1
+signer_id = "acme-prod"
+
+[write]
+[[write.steps]]
+plugin = "pii-default:0.1.0"
+
+[identity]
+version = 1
+[[identity.components]]
+plugin = "pii-default:0.1.0"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#;
+
+    #[test]
+    fn identity_binds_resolved_component_bytes() {
+        let file = PipelineFile::from_toml_str(FILE_WITH_IDENTITY).unwrap();
+        SignedTomlPipelineResolver::new(file, catalog(), PipelineLimits::default())
+            .expect("matching digest must construct");
+    }
+
+    #[test]
+    fn identity_digest_mismatch_fails_closed() {
+        let toml = FILE_WITH_IDENTITY.replace(
+            "sha256 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+            "sha256 = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
+        );
+        let file = PipelineFile::from_toml_str(&toml).unwrap();
+        let error = SignedTomlPipelineResolver::new(file, catalog(), PipelineLimits::default())
+            .err()
+            .expect("digest mismatch must fail");
+        assert_eq!(error.code(), codes::CONFIG_INVALID);
+        assert!(error.message().contains("identity digest"), "{error}");
+    }
+
+    #[test]
+    fn identity_config_hash_pin_fails_closed() {
+        let mut file = PipelineFile::from_toml_str(FILE_WITH_IDENTITY).unwrap();
+        let step = StepDef {
+            plugin: PluginRef::parse("envelope-encrypt:1.2.0").unwrap(),
+            enabled: true,
+            grant: vec![],
+            config: Some(toml::from_str::<toml::Value>("mode = \"hash\"").unwrap()),
+        };
+        file.write.as_mut().unwrap().steps.push(step.clone());
+        file.identity.as_mut().unwrap().components.push(
+            maskura_pipeline_config::IdentityComponent {
+                plugin: step.plugin.clone(),
+                sha256: "c".repeat(64),
+                config_hash: Some("0".repeat(64)),
+            },
+        );
+        let error = SignedTomlPipelineResolver::new(file, catalog(), PipelineLimits::default())
+            .err()
+            .expect("wrong config pin must fail");
+        assert_eq!(error.code(), codes::CONFIG_INVALID);
+        assert!(error.message().contains("config_hash"), "{error}");
+    }
+
+    #[test]
+    fn identity_missing_entry_fails_closed() {
+        let mut file = PipelineFile::from_toml_str(FILE_WITH_IDENTITY).unwrap();
+        file.identity.as_mut().unwrap().components.clear();
+        let error = SignedTomlPipelineResolver::new(file, catalog(), PipelineLimits::default())
+            .err()
+            .expect("missing identity entry must fail");
+        assert_eq!(error.code(), codes::CONFIG_INVALID);
+        assert!(error.message().contains("no identity entry"), "{error}");
     }
 }
