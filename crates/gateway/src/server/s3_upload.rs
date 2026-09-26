@@ -3,6 +3,9 @@
 //! Extracted from `server.rs`. Items are re-exported from [`crate::server`].
 
 use super::*;
+use maskura_pipeline_config::PolicyOperation;
+
+use crate::policy_gate::{PolicyRequest, enforce_policy, policy_error_response};
 
 #[derive(Debug)]
 pub(crate) enum StreamingPutError {
@@ -752,6 +755,32 @@ pub(crate) async fn s3_put(
                 &grant,
                 &key,
                 backend_resolution_error_response(&key),
+            )
+            .await;
+        }
+    };
+    let _policy = match enforce_policy(
+        state.policy_gate.as_ref(),
+        PolicyRequest {
+            workspace_id: auth.workspace_id().as_str(),
+            operation: PolicyOperation::Put,
+            bucket: &bucket,
+            key: &key,
+            resolution: Some(&resolution),
+            destination: &backend,
+            direction: crate::pipeline::PipelineDirection::Write,
+        },
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth_context,
+                &grant,
+                &key,
+                policy_error_response(&key, &error),
             )
             .await;
         }
