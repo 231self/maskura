@@ -3,6 +3,9 @@
 //! Extracted from `server.rs`. Items are re-exported from [`crate::server`].
 
 use super::*;
+use maskura_pipeline_config::PolicyOperation;
+
+use crate::policy_gate::{PolicyRequest, enforce_policy, policy_error_response};
 
 /// Escape a value for inclusion in an S3 XML document.
 pub(crate) fn xml_escape(s: &str) -> String {
@@ -1877,6 +1880,36 @@ pub(crate) async fn s3_get(
             .await;
         }
     };
+    let _policy = match enforce_policy(
+        state.policy_gate.as_ref(),
+        PolicyRequest {
+            workspace_id: auth.workspace_id().as_str(),
+            operation: if transformed_read {
+                PolicyOperation::ProcessedGet
+            } else {
+                PolicyOperation::RawGet
+            },
+            bucket: &bucket,
+            key: &key,
+            resolution: resolution.as_ref(),
+            destination: &backend,
+            direction: crate::pipeline::PipelineDirection::Read,
+        },
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &grant,
+                &key,
+                policy_error_response(&key, &error),
+            )
+            .await;
+        }
+    };
     // A transformed representation must be admitted from authoritative object
     // metadata before a source GET can start delivering bytes. Passthrough keeps
     // its existing one-request behavior below.
@@ -2184,6 +2217,32 @@ pub(crate) async fn s3_head(
             .await;
         }
     };
+    let _policy = match enforce_policy(
+        state.policy_gate.as_ref(),
+        PolicyRequest {
+            workspace_id: auth.workspace_id().as_str(),
+            operation: PolicyOperation::Head,
+            bucket: &bucket,
+            key: &key,
+            resolution: None,
+            destination: &backend,
+            direction: crate::pipeline::PipelineDirection::Read,
+        },
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &grant,
+                &key,
+                policy_error_response(&key, &error),
+            )
+            .await;
+        }
+    };
     match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, true).await {
         Ok(object) => {
             if let Some(status) = conditional_read_status(&headers, &object.metadata) {
@@ -2313,6 +2372,32 @@ pub(crate) async fn s3_delete(
                     .await;
                 }
             };
+        let _policy = match enforce_policy(
+            state.policy_gate.as_ref(),
+            PolicyRequest {
+                workspace_id: auth.workspace_id().as_str(),
+                operation: PolicyOperation::MultipartAbort,
+                bucket: &bucket,
+                key: &key,
+                resolution: None,
+                destination: &backend,
+                direction: crate::pipeline::PipelineDirection::Write,
+            },
+        )
+        .await
+        {
+            Ok(policy) => policy,
+            Err(error) => {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &grant,
+                    &key,
+                    policy_error_response(&key, &error),
+                )
+                .await;
+            }
+        };
         let Some(staging) = staged_multipart(&state).cloned() else {
             return release_failure(
                 state.control.as_ref(),
@@ -2452,6 +2537,32 @@ pub(crate) async fn s3_delete(
                 &grant,
                 &key,
                 backend_resolution_error_response(&key),
+            )
+            .await;
+        }
+    };
+    let _policy = match enforce_policy(
+        state.policy_gate.as_ref(),
+        PolicyRequest {
+            workspace_id: auth.workspace_id().as_str(),
+            operation: PolicyOperation::Delete,
+            bucket: &bucket,
+            key: &key,
+            resolution: None,
+            destination: &backend,
+            direction: crate::pipeline::PipelineDirection::Write,
+        },
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &grant,
+                &key,
+                policy_error_response(&key, &error),
             )
             .await;
         }
@@ -2707,6 +2818,23 @@ pub(crate) async fn s3_post(
         {
             Ok(backend) => backend,
             Err(_) => return backend_resolution_error_response(&key),
+        };
+        let _policy = match enforce_policy(
+            state.policy_gate.as_ref(),
+            PolicyRequest {
+                workspace_id: authentication.auth.workspace_id().as_str(),
+                operation: PolicyOperation::MultipartComplete,
+                bucket: &bucket,
+                key: &key,
+                resolution: Some(&persisted_resolution),
+                destination: &backend,
+                direction: crate::pipeline::PipelineDirection::Write,
+            },
+        )
+        .await
+        {
+            Ok(policy) => policy,
+            Err(error) => return policy_error_response(&key, &error),
         };
         if let Err(error) = validate_streaming_backend(&state, &backend) {
             return streaming_put_error_response(&key, error);
@@ -3084,6 +3212,23 @@ pub(crate) async fn s3_post(
                 Ok(backend) => backend,
                 Err(_) => return backend_resolution_error_response(&key),
             };
+        let _policy = match enforce_policy(
+            state.policy_gate.as_ref(),
+            PolicyRequest {
+                workspace_id: auth.workspace_id().as_str(),
+                operation: PolicyOperation::MultipartCreate,
+                bucket: &bucket,
+                key: &key,
+                resolution: Some(&resolution),
+                destination: &backend,
+                direction: crate::pipeline::PipelineDirection::Write,
+            },
+        )
+        .await
+        {
+            Ok(policy) => policy,
+            Err(error) => return policy_error_response(&key, &error),
+        };
         if let Err(error) = validate_streaming_backend(&state, &backend) {
             return streaming_put_error_response(&key, error);
         }
@@ -3260,6 +3405,32 @@ pub(crate) async fn s3_list_objects(
                 &grant,
                 &bucket,
                 backend_resolution_error_response(&bucket),
+            )
+            .await;
+        }
+    };
+    let _policy = match enforce_policy(
+        state.policy_gate.as_ref(),
+        PolicyRequest {
+            workspace_id: auth.workspace_id().as_str(),
+            operation: PolicyOperation::List,
+            bucket: &bucket,
+            key: params.prefix.as_deref().unwrap_or_default(),
+            resolution: None,
+            destination: &backend,
+            direction: crate::pipeline::PipelineDirection::Read,
+        },
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &grant,
+                &bucket,
+                policy_error_response(&bucket, &error),
             )
             .await;
         }

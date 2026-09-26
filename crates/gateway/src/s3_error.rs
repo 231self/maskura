@@ -73,6 +73,13 @@ fn s3_error_xml(
     response
 }
 
+/// Typed policy-enforcement rejection (policy-approval Slice 3). The policy
+/// code is the machine-readable S3 `<Code>` element; every policy failure is
+/// a 403.
+pub fn policy_error(key: &str, code: &str, message: &str) -> axum::response::Response {
+    s3_error_xml(code, message, key, StatusCode::FORBIDDEN)
+}
+
 pub fn no_such_key(key: &str) -> axum::response::Response {
     s3_error_xml(
         "NoSuchKey",

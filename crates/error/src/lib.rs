@@ -32,6 +32,9 @@ pub mod codes {
     pub const POLICY_UNAVAILABLE: &str = "policy.unavailable";
     pub const POLICY_EXPIRED: &str = "policy.expired";
     pub const POLICY_TAMPERED: &str = "policy.tampered";
+    pub const POLICY_DENIED: &str = "policy.denied";
+    pub const POLICY_UNPROVISIONED: &str = "policy.unprovisioned";
+    pub const RECEIPT_STALE: &str = "receipt.stale";
     pub const INTERNAL: &str = "internal";
     pub const UNSUPPORTED_FORMAT: &str = "unsupported.format";
     pub const WIT_INVALID: &str = "wit.invalid";
@@ -101,5 +104,8 @@ mod tests {
         assert_eq!(codes::WASM_REDUCTOR_LIMIT, "wasm.reductor_limit");
         assert_eq!(codes::WASM_REDUCTOR_PLAN, "wasm.reductor_plan");
         assert_eq!(codes::POLICY_TAMPERED, "policy.tampered");
+        assert_eq!(codes::POLICY_DENIED, "policy.denied");
+        assert_eq!(codes::POLICY_UNPROVISIONED, "policy.unprovisioned");
+        assert_eq!(codes::RECEIPT_STALE, "receipt.stale");
     }
 }

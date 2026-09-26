@@ -26,6 +26,9 @@ pub struct AppState {
     pub explicit_single_tenant: bool,
     pub workspace_endpoint_policy: WorkspaceEndpointPolicy,
     pub control: Arc<dyn ControlPlane>,
+    /// Request-path policy gate (policy-approval Slice 3). `None` keeps the
+    /// historical unenforced behavior (ADR 0021 OSS default).
+    pub policy_gate: Option<Arc<dyn crate::policy_gate::PolicyGate>>,
     pub legacy_max_object_bytes: usize,
     pub streaming_read_mode: StreamingReadMode,
     pub source_body_limits: BodyLimits,

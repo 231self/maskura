@@ -25,6 +25,7 @@ pub mod object;
 pub mod pipeline;
 pub mod pipeline_config;
 pub mod plugin_registry;
+pub mod policy_gate;
 pub mod read_spool;
 pub mod record;
 pub mod s3_error;
