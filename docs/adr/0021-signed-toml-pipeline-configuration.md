@@ -51,6 +51,15 @@ Adopt a signed TOML pipeline file as the OSS source of truth, resolved through
   components default to version `0.1.0` and the current transformer world.
   Name/version references trust the source to keep versions immutable; a digest
   name pins the component bytes cryptographically across restarts.
+- **Optional versioned `[identity]` bindings** (Slice 3): an export can bind
+  each exact `source/name/version` reference used by its chains to a SHA-256
+  component digest and optionally a canonical step-configuration digest.
+  Readers that participate in policy approval require this section explicitly;
+  the gateway compares every binding to resolved component bytes before startup.
+  Existing signed exports without the section remain valid as portable pipeline
+  configurations but are not policy-approval identity evidence. The new section
+  is signed by the same canonical body and changes its revision; older readers
+  reject it as an unknown field.
 - **Ed25519 over canonical CBOR** of the parsed, validated model (the ADR-0003
   construction); TOML whitespace and comments are not signed. The SHA-256 of
   that body is the immutable `PipelineLocator.revision`.

@@ -35,7 +35,8 @@ pub use receipt::{
     ReceiptStanding, SignedReceipt, receipt_body_hash, verify_receipt, verify_receipt_chain,
 };
 pub use schema::{
-    DirectionPipeline, PipelineFile, SCHEMA_VERSION, ScopeOverride, StepDef, WorkspaceScope,
+    DirectionPipeline, IDENTITY_VERSION, IdentityComponent, IdentitySection, PipelineFile,
+    SCHEMA_VERSION, ScopeOverride, StepDef, WorkspaceScope, config_hash_of, step_config_hash,
 };
 pub use signing::{TrustRoots, parse_trust_roots};
 pub use trust::{

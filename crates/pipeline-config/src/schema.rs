@@ -1,14 +1,16 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::canonical::{is_hex64, sha256_hex};
 use crate::direction::Direction;
 use crate::error::ConfigError;
 use crate::plugin_ref::PluginRef;
 use crate::policy::PolicySection;
 
 pub const SCHEMA_VERSION: u32 = 1;
+pub const IDENTITY_VERSION: u32 = 1;
 
 const ALLOWED_GRANTS: [&str; 4] = [
     "public_key_pem",
@@ -47,6 +49,97 @@ pub struct PipelineFile {
     /// parsing or verifying this file does not enforce these bounds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicySection>,
+    /// Versioned export identity: `slug:version` ↔ component digests. Names
+    /// are display; digests are the signed identity. Old readers reject files
+    /// that carry the section (fail closed); policy-aware readers must
+    /// require it via [`PipelineFile::require_identity`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentitySection>,
+}
+
+/// Versioned `slug:version` ↔ component-digest export identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentitySection {
+    /// Identity schema version; only [`IDENTITY_VERSION`] is defined.
+    pub version: u32,
+    /// One entry per distinct plugin reference used by the file's chains.
+    /// The envelope `filters` lockfile is exactly this digest set.
+    #[serde(default)]
+    pub components: Vec<IdentityComponent>,
+}
+
+/// One name ↔ digest binding, shaped like the envelope's `FilterLockEntry`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityComponent {
+    /// Exactly pinned `name:version` reference as written in `step.plugin`.
+    pub plugin: PluginRef,
+    /// 64 lowercase hex characters: the component byte digest.
+    pub sha256: String,
+    /// When present, every use of the component must hash to this config
+    /// digest; when absent, configuration is free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_hash: Option<String>,
+}
+
+impl IdentitySection {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.version != IDENTITY_VERSION {
+            return Err(ConfigError::invalid(format!(
+                "unsupported identity version {}; expected {IDENTITY_VERSION}",
+                self.version
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        for component in &self.components {
+            if !component.plugin.is_exactly_pinned() {
+                return Err(ConfigError::invalid(format!(
+                    "identity component {} must pin an exact version",
+                    component.plugin
+                )));
+            }
+            if !is_hex64(&component.sha256) {
+                return Err(ConfigError::invalid(
+                    "identity sha256 must be 64 lowercase hex characters",
+                ));
+            }
+            if let Some(config_hash) = &component.config_hash
+                && !is_hex64(config_hash)
+            {
+                return Err(ConfigError::invalid(
+                    "identity config_hash must be 64 lowercase hex characters",
+                ));
+            }
+            if !seen.insert(String::from(component.plugin.clone())) {
+                return Err(ConfigError::invalid(format!(
+                    "duplicate identity component {}",
+                    component.plugin
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, plugin: &PluginRef) -> Option<&IdentityComponent> {
+        let key = String::from(plugin.clone());
+        self.components
+            .iter()
+            .find(|component| String::from(component.plugin.clone()) == key)
+    }
+}
+
+/// Config digest for identity entries and the envelope lockfile: SHA-256 over
+/// the canonical sorted-key JSON text of the step configuration (the same
+/// encoding as [`StepDef::config_json`] and the frozen resolution's
+/// `config_json`).
+pub fn config_hash_of(config_json: &str) -> String {
+    sha256_hex(config_json.as_bytes())
+}
+
+/// Identity config digest for one step; `None` when the step has no config.
+pub fn step_config_hash(step: &StepDef) -> Result<Option<String>, ConfigError> {
+    Ok(step.config_json()?.map(|json| config_hash_of(&json)))
 }
 
 /// A workspace scope: default direction chains plus per-bucket overrides.
@@ -156,7 +249,109 @@ impl PipelineFile {
         if let Some(policy) = &self.policy {
             policy.validate()?;
         }
+        if let Some(identity) = &self.identity {
+            identity.validate()?;
+            let mut used = BTreeSet::new();
+            for (label, step) in self.each_step() {
+                let plugin = String::from(step.plugin.clone());
+                if !step.plugin.is_exactly_pinned() {
+                    return Err(ConfigError::invalid(format!(
+                        "{label} uses unpinned plugin {plugin}; identity requires exact versions"
+                    )));
+                }
+                let entry = identity.get(&step.plugin).ok_or_else(|| {
+                    ConfigError::invalid(format!(
+                        "{label} uses plugin {plugin} with no identity entry"
+                    ))
+                })?;
+                if let Some(expected) = &entry.config_hash
+                    && step_config_hash(step)?.as_deref() != Some(expected)
+                {
+                    return Err(ConfigError::invalid(format!(
+                        "{label} uses plugin {plugin} with a mismatched identity config_hash"
+                    )));
+                }
+                used.insert(plugin);
+            }
+            for entry in &identity.components {
+                if !used.contains(&String::from(entry.plugin.clone())) {
+                    return Err(ConfigError::invalid(format!(
+                        "identity component {} is not used by any chain",
+                        entry.plugin
+                    )));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Policy-aware readers must require the identity section: approving or
+    /// verifying state without name ↔ digest bindings is a silent downgrade.
+    pub fn require_identity(&self) -> Result<&IdentitySection, ConfigError> {
+        self.identity.as_ref().ok_or_else(|| {
+            ConfigError::invalid("policy identity section is required; this export carries none")
+        })
+    }
+
+    /// Every step in every chain, with its scope label.
+    fn each_step(&self) -> Vec<(String, &StepDef)> {
+        fn walk<'a>(
+            out: &mut Vec<(String, &'a StepDef)>,
+            label: &str,
+            pipeline: &'a DirectionPipeline,
+        ) {
+            for step in &pipeline.steps {
+                out.push((label.to_string(), step));
+            }
+        }
+        let mut steps = Vec::new();
+        if let Some(pipeline) = &self.write {
+            walk(&mut steps, "write", pipeline);
+        }
+        if let Some(pipeline) = &self.read {
+            walk(&mut steps, "read", pipeline);
+        }
+        for (bucket, scope) in &self.buckets {
+            if let Some(pipeline) = &scope.write {
+                walk(&mut steps, &format!("buckets.{bucket}.write"), pipeline);
+            }
+            if let Some(pipeline) = &scope.read {
+                walk(&mut steps, &format!("buckets.{bucket}.read"), pipeline);
+            }
+        }
+        for (workspace, scope) in &self.workspaces {
+            if let Some(pipeline) = &scope.write {
+                walk(
+                    &mut steps,
+                    &format!("workspaces.{workspace}.write"),
+                    pipeline,
+                );
+            }
+            if let Some(pipeline) = &scope.read {
+                walk(
+                    &mut steps,
+                    &format!("workspaces.{workspace}.read"),
+                    pipeline,
+                );
+            }
+            for (bucket, nested) in &scope.buckets {
+                if let Some(pipeline) = &nested.write {
+                    walk(
+                        &mut steps,
+                        &format!("workspaces.{workspace}.buckets.{bucket}.write"),
+                        pipeline,
+                    );
+                }
+                if let Some(pipeline) = &nested.read {
+                    walk(
+                        &mut steps,
+                        &format!("workspaces.{workspace}.buckets.{bucket}.read"),
+                        pipeline,
+                    );
+                }
+            }
+        }
+        steps
     }
 
     /// Resolve the chain for `workspace_id`/`bucket`/`direction` using the
@@ -541,5 +736,218 @@ plugin = "pii-default"
         let file = PipelineFile::from_toml_str(write_only).unwrap();
         assert!(file.select("ws-1", "bucket", Direction::Read).is_err());
         assert!(file.select("ws-1", "bucket", Direction::Write).is_ok());
+    }
+
+    const IDENTITY: &str = r#"
+schema_version = 1
+signer_id = "acme-prod"
+
+[write]
+[[write.steps]]
+plugin = "pii-default:1.0.0"
+[write.steps.config]
+mode = "redact"
+[[write.steps]]
+plugin = "envelope-decrypt:2.0.0"
+
+[identity]
+version = 1
+[[identity.components]]
+plugin = "pii-default:1.0.0"
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+[[identity.components]]
+plugin = "envelope-decrypt:2.0.0"
+sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+"#;
+
+    #[test]
+    fn identity_section_parses_and_roundtrips() {
+        let file = PipelineFile::from_toml_str(IDENTITY).unwrap();
+        let identity = file.require_identity().expect("identity present");
+        assert_eq!(identity.version, IDENTITY_VERSION);
+        assert_eq!(identity.components.len(), 2);
+        let rendered = file.to_toml_string().unwrap();
+        let reparsed = PipelineFile::from_toml_str(&rendered).unwrap();
+        assert_eq!(reparsed, file);
+    }
+
+    #[test]
+    fn require_identity_fails_closed_without_the_section() {
+        let file = PipelineFile::from_toml_str(MINIMAL).unwrap();
+        let error = file.require_identity().expect_err("identity absent");
+        assert!(error.to_string().contains("identity section is required"));
+    }
+
+    #[test]
+    fn identity_validation_matrix_fails_closed() {
+        let cases: [(&str, &str, &str); 4] = [
+            (
+                "bad version",
+                r#"
+schema_version = 1
+signer_id = "acme-prod"
+[write]
+[[write.steps]]
+plugin = "pii-default:1.0.0"
+[identity]
+version = 9
+[[identity.components]]
+plugin = "pii-default:1.0.0"
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+"#,
+                "unsupported identity version",
+            ),
+            (
+                "uppercase digest",
+                r#"
+schema_version = 1
+signer_id = "acme-prod"
+[write]
+[[write.steps]]
+plugin = "pii-default:1.0.0"
+[identity]
+version = 1
+[[identity.components]]
+plugin = "pii-default:1.0.0"
+sha256 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+"#,
+                "lowercase hex",
+            ),
+            (
+                "short digest",
+                r#"
+schema_version = 1
+signer_id = "acme-prod"
+[write]
+[[write.steps]]
+plugin = "pii-default:1.0.0"
+[identity]
+version = 1
+[[identity.components]]
+plugin = "pii-default:1.0.0"
+sha256 = "abc"
+"#,
+                "lowercase hex",
+            ),
+            (
+                "unpinned plugin",
+                r#"
+schema_version = 1
+signer_id = "acme-prod"
+[write]
+[[write.steps]]
+plugin = "pii-default:1.0.0"
+[identity]
+version = 1
+[[identity.components]]
+plugin = "pii-default"
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+"#,
+                "exact version",
+            ),
+        ];
+        for (label, toml, expected) in cases {
+            let error = PipelineFile::from_toml_str(toml)
+                .expect_err(label)
+                .to_string();
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn duplicate_identity_components_fail() {
+        let toml = IDENTITY.replace(
+            "[[identity.components]]\nplugin = \"envelope-decrypt:2.0.0\"",
+            "[[identity.components]]\nplugin = \"pii-default:1.0.0\"",
+        );
+        let error = PipelineFile::from_toml_str(&toml)
+            .expect_err("duplicate component")
+            .to_string();
+        assert!(error.contains("duplicate identity component"), "{error}");
+    }
+
+    #[test]
+    fn steps_without_identity_entries_fail() {
+        let toml = IDENTITY.replace(
+            "[[identity.components]]\nplugin = \"envelope-decrypt:2.0.0\"\nsha256 = \"2222222222222222222222222222222222222222222222222222222222222222\"",
+            "",
+        );
+        let error = PipelineFile::from_toml_str(&toml)
+            .expect_err("missing identity entry")
+            .to_string();
+        assert!(error.contains("no identity entry"), "{error}");
+    }
+
+    #[test]
+    fn config_hash_is_canonical_json_sha256() {
+        let file = PipelineFile::from_toml_str(IDENTITY).unwrap();
+        let identity = file.require_identity().unwrap();
+        let unconfigured = identity
+            .get(&file.write.as_ref().unwrap().steps[1].plugin)
+            .unwrap();
+        assert!(unconfigured.config_hash.is_none());
+        let configurable = identity
+            .get(&file.write.as_ref().unwrap().steps[0].plugin)
+            .unwrap();
+        assert!(configurable.config_hash.is_none());
+        let with_config = file.write.as_ref().unwrap().steps[0].clone();
+        let hash = step_config_hash(&with_config).unwrap().expect("has config");
+        assert_eq!(hash.len(), 64);
+        assert_eq!(
+            hash,
+            config_hash_of(&with_config.config_json().unwrap().unwrap())
+        );
+    }
+
+    #[test]
+    fn pinned_config_hash_must_match_every_occurrence() {
+        let mut file = PipelineFile::from_toml_str(IDENTITY).unwrap();
+        let first = &file.write.as_ref().unwrap().steps[0];
+        let hash = step_config_hash(first).unwrap().unwrap();
+        file.identity.as_mut().unwrap().components[0].config_hash = Some(hash);
+        file.validate().unwrap();
+        file.write.as_mut().unwrap().steps[0].config =
+            Some(toml::from_str("mode = 'drop'").unwrap());
+        assert!(
+            file.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("identity config_hash")
+        );
+    }
+
+    #[test]
+    fn identity_rejects_unreferenced_component() {
+        let mut file = PipelineFile::from_toml_str(IDENTITY).unwrap();
+        file.identity
+            .as_mut()
+            .unwrap()
+            .components
+            .push(IdentityComponent {
+                plugin: PluginRef::parse("unused:1.0.0").unwrap(),
+                sha256: "a".repeat(64),
+                config_hash: None,
+            });
+        assert!(
+            file.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("not used by any chain")
+        );
+    }
+
+    #[test]
+    fn signed_identity_digest_changes_revision_and_invalidates_signature() {
+        let mut file = PipelineFile::from_toml_str(IDENTITY).unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[37; 32]);
+        file.sign(&key).unwrap();
+        let original = file.revision().unwrap();
+        let mut roots = crate::signing::TrustRoots::new();
+        roots.insert(file.signer_id.clone(), key.verifying_key());
+        file.verify(&roots).unwrap();
+
+        file.identity.as_mut().unwrap().components[0].sha256 = "a".repeat(64);
+        assert_ne!(file.revision().unwrap(), original);
+        assert!(file.verify(&roots).is_err());
     }
 }
