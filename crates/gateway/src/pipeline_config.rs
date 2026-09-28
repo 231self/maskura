@@ -285,6 +285,7 @@ impl PipelineResolver for SignedTomlPipelineResolver {
             locator: PipelineLocator {
                 revision: self.revision.clone(),
                 fingerprint,
+                assignment_id: None,
             },
             steps,
             policy_generation: None,

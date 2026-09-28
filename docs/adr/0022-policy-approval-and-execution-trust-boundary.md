@@ -37,6 +37,14 @@ approval. These are **planned capabilities**, not a claim of current deployment.
 The planned gate requires a valid customer approval before activation and checks
 the exact approved effective state and envelope bounds in the trusted gateway.
 
+For that exact-state check, a hosted request freezes its selected assignment ID
+in the pipeline locator and a versioned fingerprint; a revision alone cannot
+distinguish two assignments targeting the same pipeline. Static OSS locators and
+historical persisted snapshots keep their prior fingerprint interpretation.
+Policy-aware hosted enforcement must reject a missing assignment identity where
+an assignment was required; looking up a mutable assignment after the freeze
+cannot establish which assignment the request originally selected.
+
 Existing canonical-CBOR/Ed25519 configuration signatures under
 [ADR 0021](0021-signed-toml-pipeline-configuration.md) remain artifact-authenticity
 evidence. Neither those signatures nor future WebAuthn approval receipts are

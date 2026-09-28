@@ -206,6 +206,7 @@ fn multipart_pipeline_restore_accepts_new_static_and_rejects_legacy_or_tampered_
                 true,
                 limits,
             ),
+            assignment_id: None,
         },
         steps: Vec::new(),
         policy_generation: None,
@@ -231,6 +232,39 @@ fn multipart_pipeline_restore_accepts_new_static_and_rejects_legacy_or_tampered_
     tampered["explicit_passthrough"] = serde_json::Value::Bool(false);
     assert!(matches!(
         restore_multipart_pipeline(&tampered),
+        Err(MultipartPipelineRestoreError::Invalid(_))
+    ));
+}
+
+#[test]
+fn multipart_pipeline_restore_freezes_hosted_assignment_and_detects_substitution() {
+    let limits = PipelineLimits::default();
+    let mut resolution = crate::pipeline::PipelineResolution {
+        locator: crate::pipeline::PipelineLocator {
+            revision: "same-revision".into(),
+            fingerprint: String::new(),
+            assignment_id: Some("assignment-a".into()),
+        },
+        steps: Vec::new(),
+        policy_generation: Some(3),
+        explicit_passthrough: true,
+        limits,
+    };
+    resolution.locator.fingerprint = crate::pipeline::resolution_fingerprint_with_assignment(
+        crate::pipeline::PipelineDirection::Write,
+        &resolution.steps,
+        resolution.explicit_passthrough,
+        limits,
+        resolution.policy_generation,
+        resolution.locator.assignment_id.as_deref(),
+    );
+    let snapshot = serde_json::to_value(&resolution).unwrap();
+    assert_eq!(restore_multipart_pipeline(&snapshot).unwrap(), resolution);
+
+    let mut substituted = snapshot;
+    substituted["locator"]["assignment_id"] = serde_json::json!("assignment-b");
+    assert!(matches!(
+        restore_multipart_pipeline(&substituted),
         Err(MultipartPipelineRestoreError::Invalid(_))
     ));
 }

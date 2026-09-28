@@ -31,6 +31,10 @@ pub struct PipelineLocator {
     /// Canonical fingerprint covering the ordered steps, limits, and
     /// pass-through flag for this direction.
     pub fingerprint: String,
+    /// Immutable assignment selected at freeze time (hosted only). Legacy
+    /// multipart snapshots and static/portable resolvers omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_id: Option<String>,
 }
 
 /// One ordered, content-addressed step in a resolved pipeline.
@@ -142,12 +146,26 @@ impl PipelineResolution {
     /// Verify persisted or externally resolved policy against the canonical
     /// public fingerprint for this request direction.
     pub fn verify_fingerprint(&self, direction: PipelineDirection) -> Result<(), MaskuraError> {
-        let recomputed = resolution_fingerprint_with_generation(
+        if self
+            .locator
+            .assignment_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+            || (self.locator.assignment_id.is_some()
+                && (self.policy_generation.is_none() || self.locator.revision == "static"))
+        {
+            return Err(MaskuraError::new(
+                codes::CONFIG_INVALID,
+                "invalid frozen assignment identity",
+            ));
+        }
+        let recomputed = resolution_fingerprint_with_assignment(
             direction,
             &self.steps,
             self.explicit_passthrough,
             self.limits,
             self.policy_generation,
+            self.locator.assignment_id.as_deref(),
         );
         if recomputed != self.locator.fingerprint {
             return Err(MaskuraError::new(
@@ -214,6 +232,7 @@ impl StaticPipelineResolver {
             locator: PipelineLocator {
                 revision: "static".to_string(),
                 fingerprint,
+                assignment_id: None,
             },
             steps,
             policy_generation: None,
@@ -273,6 +292,40 @@ pub fn resolution_fingerprint_with_generation(
         "explicit_passthrough": explicit_passthrough,
         "limits": limits,
         "policy_generation": policy_generation,
+    });
+    let encoded = serde_json::to_vec(&canonical)
+        .expect("canonical fingerprint encoding is always serializable");
+    hex::encode(Sha256::digest(&encoded))
+}
+
+/// Versioned hosted fingerprint for the assignment selected at the request's
+/// freeze point. A missing ID preserves the historical generation fingerprint
+/// byte-for-byte (including persisted pre-assignment multipart snapshots).
+pub fn resolution_fingerprint_with_assignment(
+    direction: PipelineDirection,
+    steps: &[PipelineStep],
+    explicit_passthrough: bool,
+    limits: PipelineLimits,
+    policy_generation: Option<u64>,
+    assignment_id: Option<&str>,
+) -> String {
+    let Some(assignment_id) = assignment_id else {
+        return resolution_fingerprint_with_generation(
+            direction,
+            steps,
+            explicit_passthrough,
+            limits,
+            policy_generation,
+        );
+    };
+    let canonical = serde_json::json!({
+        "fingerprint_version": 2,
+        "direction": format!("{direction:?}").to_ascii_lowercase(),
+        "steps": steps,
+        "explicit_passthrough": explicit_passthrough,
+        "limits": limits,
+        "policy_generation": policy_generation,
+        "assignment_id": assignment_id,
     });
     let encoded = serde_json::to_vec(&canonical)
         .expect("canonical fingerprint encoding is always serializable");
@@ -480,6 +533,7 @@ mod tests {
         let resolution = resolver.resolution(PipelineDirection::Write);
         let serialized = serde_json::to_value(&resolution).unwrap();
         assert!(serialized.get("policy_generation").is_none());
+        assert!(serialized["locator"].get("assignment_id").is_none());
         assert!(
             serialized["steps"]
                 .as_array()
@@ -507,6 +561,77 @@ mod tests {
                 None,
             ),
             legacy
+        );
+    }
+
+    #[test]
+    fn frozen_hosted_assignment_distinguishes_identical_revisions_and_survives_restore() {
+        let resolver = StaticPipelineResolver::new(Arc::new(PluginRegistry::new()));
+        let mut first = resolver.resolution(PipelineDirection::Write);
+        first.locator.revision = "same-revision".into();
+        first.policy_generation = Some(7);
+        first.locator.assignment_id = Some("assignment-a".into());
+        first.locator.fingerprint = resolution_fingerprint_with_assignment(
+            PipelineDirection::Write,
+            &first.steps,
+            first.explicit_passthrough,
+            first.limits,
+            first.policy_generation,
+            first.locator.assignment_id.as_deref(),
+        );
+        first.verify_fingerprint(PipelineDirection::Write).unwrap();
+        let restored: PipelineResolution =
+            serde_json::from_value(serde_json::to_value(&first).unwrap()).unwrap();
+        assert_eq!(restored, first);
+        restored
+            .verify_fingerprint(PipelineDirection::Write)
+            .unwrap();
+
+        let mut second = first.clone();
+        second.locator.assignment_id = Some("assignment-b".into());
+        assert!(second.verify_fingerprint(PipelineDirection::Write).is_err());
+        second.locator.fingerprint = resolution_fingerprint_with_assignment(
+            PipelineDirection::Write,
+            &second.steps,
+            second.explicit_passthrough,
+            second.limits,
+            second.policy_generation,
+            second.locator.assignment_id.as_deref(),
+        );
+        assert_ne!(first.locator.fingerprint, second.locator.fingerprint);
+        second.verify_fingerprint(PipelineDirection::Write).unwrap();
+
+        second.locator.assignment_id = Some(String::new());
+        assert!(second.verify_fingerprint(PipelineDirection::Write).is_err());
+    }
+
+    #[test]
+    fn pre_assignment_hosted_snapshots_keep_their_fingerprint() {
+        let resolver = StaticPipelineResolver::new(Arc::new(PluginRegistry::new()));
+        let mut legacy = resolver.resolution(PipelineDirection::Read);
+        legacy.locator.revision = "hosted-revision".into();
+        legacy.policy_generation = Some(5);
+        legacy.locator.fingerprint = resolution_fingerprint_with_generation(
+            PipelineDirection::Read,
+            &legacy.steps,
+            legacy.explicit_passthrough,
+            legacy.limits,
+            legacy.policy_generation,
+        );
+        assert_eq!(legacy.locator.assignment_id, None);
+        legacy.verify_fingerprint(PipelineDirection::Read).unwrap();
+        let restored: PipelineResolution =
+            serde_json::from_value(serde_json::to_value(&legacy).unwrap()).unwrap();
+        restored
+            .verify_fingerprint(PipelineDirection::Read)
+            .unwrap();
+
+        let mut invented = restored;
+        invented.locator.assignment_id = Some("forged-assignment".into());
+        assert!(
+            invented
+                .verify_fingerprint(PipelineDirection::Read)
+                .is_err()
         );
     }
 }

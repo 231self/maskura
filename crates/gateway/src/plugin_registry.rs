@@ -2595,6 +2595,7 @@ mod tests {
             locator: crate::pipeline::PipelineLocator {
                 revision: "test".to_string(),
                 fingerprint: "deadbeef".to_string(),
+                assignment_id: None,
             },
             steps: Vec::new(),
             policy_generation: None,
@@ -2616,6 +2617,7 @@ mod tests {
             locator: crate::pipeline::PipelineLocator {
                 revision: "test".to_string(),
                 fingerprint: "deadbeef".to_string(),
+                assignment_id: None,
             },
             steps: vec![PipelineStep {
                 component_hash: "unavailable-disabled-component".to_string(),
@@ -2645,6 +2647,7 @@ mod tests {
             locator: crate::pipeline::PipelineLocator {
                 revision: "test".to_string(),
                 fingerprint: "deadbeef".to_string(),
+                assignment_id: None,
             },
             steps: Vec::new(),
             policy_generation: None,
@@ -2675,6 +2678,7 @@ mod tests {
             locator: crate::pipeline::PipelineLocator {
                 revision: "test".to_string(),
                 fingerprint: "deadbeef".to_string(),
+                assignment_id: None,
             },
             steps: Vec::new(),
             policy_generation: None,
@@ -2703,6 +2707,7 @@ mod tests {
             locator: crate::pipeline::PipelineLocator {
                 revision: "test".to_string(),
                 fingerprint: "deadbeef".to_string(),
+                assignment_id: None,
             },
             steps: vec![step],
             policy_generation: None,
@@ -2767,6 +2772,7 @@ mod tests {
             locator: crate::pipeline::PipelineLocator {
                 revision: "test".to_string(),
                 fingerprint: "deadbeef".to_string(),
+                assignment_id: None,
             },
             steps: vec![step],
             policy_generation: None,
@@ -2797,6 +2803,7 @@ mod tests {
             locator: crate::pipeline::PipelineLocator {
                 revision: "configured".to_string(),
                 fingerprint: "configured-fingerprint".to_string(),
+                assignment_id: None,
             },
             steps: vec![PipelineStep {
                 component_hash: digest,
