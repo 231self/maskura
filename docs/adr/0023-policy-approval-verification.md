@@ -26,6 +26,14 @@ It must not imply that approval signatures prove execution.
   component identities, configs/grants, expanded operation routes, resource limits,
   adapter identity, and concrete immutable destination bindings. Export name/version
   references and download checksums alone are insufficient.
+- Effective-state schema **v2** represents destinations as tagged concrete
+  HTTPS targets or a managed weighted-rendezvous topology with sorted, uniquely
+  identified physical backends, placement/authority version and non-secret
+  credential-version evidence. Presigned approval binds a declared origin and
+  bucket, never a signature query. The v1 single-destination draft cannot
+  authorize an enforced workspace; there are no deployed v1 approvals to
+  migrate. ReceiptBody stays v2 and signs the entire v2 state; digest vectors
+  change with that state rather than silently reinterpreting old bytes.
 - Verify full history from independently pinned genesis authority, deriving each
   successor only from an authorized transition. The old authorized key signs the
   complete replacement credential/public key and retired credential identity; the

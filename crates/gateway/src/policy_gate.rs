@@ -12,10 +12,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use maskura_error::MaskuraError;
-use maskura_pipeline_config::{PolicyLimits, PolicyOperation, ResolvedDestination};
+use maskura_pipeline_config::{DestinationBinding, PolicyLimits, PolicyOperation};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::ResolvedBackend;
+use crate::backend::{DestinationSelectionSnapshot, ResolvedBackend};
 use crate::pipeline::{PipelineDirection, PipelineResolution};
 
 /// One data-plane request presented to the policy gate.
@@ -36,6 +36,9 @@ pub struct PolicyRequest<'a> {
     /// verification the request must execute against exactly this value —
     /// never a re-resolution of a mutable row (check/use discipline).
     pub destination: &'a ResolvedBackend,
+    /// Non-secret destination snapshot captured at the same resolution.
+    /// The gate verifies this against approved effective-state bindings.
+    pub snapshot: &'a DestinationSelectionSnapshot,
     pub direction: PipelineDirection,
 }
 
@@ -80,7 +83,11 @@ pub struct PolicyBinding {
     /// `signer_epoch + envelope_version + receipt seq` at verification.
     pub authorization_epoch: u64,
     /// Destination binding execution must use verbatim.
-    pub destination: ResolvedDestination,
+    pub destination: DestinationBinding,
+    /// Per-key managed placement targets frozen at verification (`None` for
+    /// non-managed destinations). Execution must select exactly these
+    /// backends — never a re-placed rendezvous of a mutable ring.
+    pub managed_placement: Option<(String, Option<String>)>,
     /// `min(policy, operator caps)` to push into the wasm session.
     pub limits: PolicyLimits,
 }
@@ -133,7 +140,10 @@ mod tests {
     use super::*;
     use maskura_error::codes;
 
-    fn request<'a>(destination: &'a ResolvedBackend) -> PolicyRequest<'a> {
+    fn request<'a>(
+        destination: &'a ResolvedBackend,
+        snapshot: &'a DestinationSelectionSnapshot,
+    ) -> PolicyRequest<'a> {
         PolicyRequest {
             workspace_id: "ws-test",
             operation: PolicyOperation::Put,
@@ -141,6 +151,7 @@ mod tests {
             key: "key",
             resolution: None,
             destination,
+            snapshot,
             direction: PipelineDirection::Write,
         }
     }
@@ -149,11 +160,30 @@ mod tests {
         ResolvedBackend::PresignedHttp(url::Url::parse("https://store.example.com/upload").unwrap())
     }
 
+    fn presigned_snapshot() -> DestinationSelectionSnapshot {
+        DestinationSelectionSnapshot {
+            binding: maskura_pipeline_config::DestinationBinding::Concrete {
+                destination: maskura_pipeline_config::ResolvedDestination {
+                    mode: maskura_pipeline_config::StorageMode::Presigned,
+                    endpoint: "https://store.example.com".into(),
+                    bucket: String::new(),
+                    region: String::new(),
+                    role_arn: None,
+                    configuration_version_id: None,
+                    configuration_sha256: "a".repeat(64),
+                },
+            },
+            selected_primary_backend_id: None,
+            selected_replica_backend_id: None,
+        }
+    }
+
     #[tokio::test]
     async fn noop_gate_approves_unbound() {
         let destination = presigned();
+        let snapshot = presigned_snapshot();
         let verdict = NoopPolicyGate
-            .enforce(&request(&destination))
+            .enforce(&request(&destination, &snapshot))
             .await
             .expect("noop gate never rejects");
         assert_eq!(verdict, VerifiedPolicy::unbound());
@@ -163,7 +193,8 @@ mod tests {
     #[tokio::test]
     async fn missing_gate_short_circuits_to_unbound() {
         let destination = presigned();
-        let verdict = enforce_policy(None, request(&destination))
+        let snapshot = presigned_snapshot();
+        let verdict = enforce_policy(None, request(&destination, &snapshot))
             .await
             .expect("missing gate never rejects");
         assert!(!verdict.is_bound());
@@ -187,8 +218,9 @@ mod tests {
         }
 
         let destination = presigned();
+        let snapshot = presigned_snapshot();
         let gate: Arc<dyn PolicyGate> = Arc::new(RejectingGate);
-        let error = enforce_policy(Some(&gate), request(&destination))
+        let error = enforce_policy(Some(&gate), request(&destination, &snapshot))
             .await
             .expect_err("gate rejects");
         assert_eq!(error.code(), codes::POLICY_DENIED);
@@ -207,14 +239,18 @@ mod tests {
                 receipt_seq: 7,
                 receipt_body_digest: "b".repeat(64),
                 authorization_epoch: 11,
-                destination: ResolvedDestination {
-                    mode: maskura_pipeline_config::StorageMode::S3Compatible,
-                    endpoint: "https://s3.example.com".into(),
-                    bucket: "objects".into(),
-                    region: "region".into(),
-                    role_arn: None,
-                    configuration_sha256: "c".repeat(64),
+                destination: DestinationBinding::Concrete {
+                    destination: maskura_pipeline_config::ResolvedDestination {
+                        mode: maskura_pipeline_config::StorageMode::S3Compatible,
+                        endpoint: "https://s3.example.com".into(),
+                        bucket: "objects".into(),
+                        region: "region".into(),
+                        role_arn: None,
+                        configuration_version_id: Some("config-version-1".into()),
+                        configuration_sha256: "c".repeat(64),
+                    },
                 },
+                managed_placement: None,
                 limits: PolicyLimits {
                     record_max_bytes: 1024,
                     object_max_bytes: 4096,

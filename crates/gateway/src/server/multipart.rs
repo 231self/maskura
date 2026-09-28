@@ -1934,7 +1934,7 @@ pub(crate) async fn s3_upload_part(
     let Some(staging) = staged_multipart(&state).cloned() else {
         return s3_error::multipart_not_supported(&key);
     };
-    let multipart_backend = match resolve_backend(
+    let multipart_selection = match resolve_backend(
         &state,
         &authentication.auth,
         &parts.headers,
@@ -1942,9 +1942,10 @@ pub(crate) async fn s3_upload_part(
     )
     .await
     {
-        Ok(backend) => backend,
+        Ok(selection) => selection,
         Err(_) => return backend_resolution_error_response(&key),
     };
+    let multipart_backend = &multipart_selection.backend;
     let _policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
@@ -1953,7 +1954,8 @@ pub(crate) async fn s3_upload_part(
             bucket: &bucket,
             key: &key,
             resolution: None,
-            destination: &multipart_backend,
+            destination: multipart_backend,
+            snapshot: &multipart_selection.snapshot,
             direction: crate::pipeline::PipelineDirection::Write,
         },
     )
@@ -1962,7 +1964,7 @@ pub(crate) async fn s3_upload_part(
         Ok(policy) => policy,
         Err(error) => return policy_error_response(&key, &error),
     };
-    if let Err(error) = validate_streaming_backend(&state, &multipart_backend) {
+    if let Err(error) = validate_streaming_backend(&state, multipart_backend) {
         return streaming_put_error_response(&key, error);
     }
     let identity = multipart_identity(&authentication.auth, &bucket, &key, &upload_id);

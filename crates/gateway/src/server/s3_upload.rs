@@ -746,19 +746,22 @@ pub(crate) async fn s3_put(
             .await;
         }
     };
-    let backend = match resolve_backend(&state, auth, &parts.headers, StorageOperation::Put).await {
-        Ok(backend) => backend,
-        Err(_) => {
-            return release_failure(
-                state.control.as_ref(),
-                &auth_context,
-                &grant,
-                &key,
-                backend_resolution_error_response(&key),
-            )
-            .await;
-        }
-    };
+    let mut selection =
+        match resolve_backend(&state, auth, &parts.headers, StorageOperation::Put).await {
+            Ok(selection) => selection,
+            Err(_) => {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth_context,
+                    &grant,
+                    &key,
+                    backend_resolution_error_response(&key),
+                )
+                .await;
+            }
+        };
+    selection.resolve_managed_placement(auth.workspace_id().as_str(), &bucket, &key);
+    let backend = &selection.backend;
     let _policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
@@ -767,7 +770,8 @@ pub(crate) async fn s3_put(
             bucket: &bucket,
             key: &key,
             resolution: Some(&resolution),
-            destination: &backend,
+            destination: backend,
+            snapshot: &selection.snapshot,
             direction: crate::pipeline::PipelineDirection::Write,
         },
     )
@@ -785,7 +789,7 @@ pub(crate) async fn s3_put(
             .await;
         }
     };
-    if let Some(response) = require_file_bucket(&backend, &bucket).await {
+    if let Some(response) = require_file_bucket(&selection.backend, &bucket).await {
         return release_failure(
             state.control.as_ref(),
             &auth_context,
@@ -795,7 +799,7 @@ pub(crate) async fn s3_put(
         )
         .await;
     }
-    if let Err(error) = validate_streaming_backend(&state, &backend) {
+    if let Err(error) = validate_streaming_backend(&state, &selection.backend) {
         let response = streaming_put_error_response(&key, error);
         return release_failure(
             state.control.as_ref(),
@@ -806,7 +810,7 @@ pub(crate) async fn s3_put(
         )
         .await;
     }
-    if let ResolvedBackend::Managed(storage) = &backend {
+    if let ResolvedBackend::Managed(storage) = &selection.backend {
         match storage.managed_mode() {
             ManagedStreamingMode::Observe => {
                 let response = s3_error::service_unavailable(
@@ -828,7 +832,7 @@ pub(crate) async fn s3_put(
     match streaming_single_put(
         &state,
         header_auth,
-        backend,
+        selection.backend,
         AuthorizedUsage { grant: &grant },
         snapshot,
         &parts.headers,

@@ -191,6 +191,44 @@ impl ResolvedBackend {
 pub struct ResolvedBackendSelection {
     pub backend: ResolvedBackend,
     pub workspace_routing: Option<WorkspaceStorageRouting>,
+    pub snapshot: DestinationSelectionSnapshot,
+}
+
+impl ResolvedBackendSelection {
+    /// Resolve per-key managed placement and freeze it into the snapshot
+    /// before the policy gate. `None` for non-managed backends.
+    ///
+    /// Writes compute a fresh rendezvous placement; reads must already carry
+    /// the placement recorded in authority metadata (check/use discipline).
+    pub fn resolve_managed_placement(
+        &mut self,
+        workspace_id: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Option<(String, Option<String>)> {
+        let ResolvedBackend::Managed(storage) = &self.backend else {
+            return None;
+        };
+        let logical = crate::managed::LogicalObjectKey::new(workspace_id, bucket, key);
+        let placement = storage.placement(&logical)?;
+        self.snapshot
+            .with_managed_placement(placement.primary_backend_id, placement.replica_backend_id);
+        self.snapshot.managed_placement()
+    }
+
+    /// Freeze a known managed placement (e.g. from authority metadata) into
+    /// the snapshot instead of recomputing the rendezvous ring.
+    pub fn freeze_managed_placement(
+        &mut self,
+        primary: String,
+        replica: Option<String>,
+    ) -> Option<(String, Option<String>)> {
+        if !matches!(self.backend, ResolvedBackend::Managed(_)) {
+            return None;
+        }
+        self.snapshot.with_managed_placement(primary, replica);
+        self.snapshot.managed_placement()
+    }
 }
 
 fn workspace_s3_http_client() -> SharedHttpClient {
@@ -277,6 +315,7 @@ impl BackendResolver {
             return Ok(ResolvedBackendSelection {
                 backend: ResolvedBackend::Managed(self.managed.clone()),
                 workspace_routing: None,
+                snapshot: managed_topology_snapshot(&self.managed),
             });
         }
 
@@ -286,9 +325,31 @@ impl BackendResolver {
         {
             let url =
                 Url::parse(raw_url).map_err(|_| "invalid presigned backend URL".to_string())?;
+            let presigned_snapshot = DestinationSelectionSnapshot {
+                binding: maskura_pipeline_config::DestinationBinding::Concrete {
+                    destination: maskura_pipeline_config::ResolvedDestination {
+                        mode: maskura_pipeline_config::StorageMode::Presigned,
+                        endpoint: url.origin().ascii_serialization(),
+                        bucket: String::new(),
+                        region: String::new(),
+                        role_arn: None,
+                        configuration_version_id: None,
+                        configuration_sha256: {
+                            use sha2::{Digest, Sha256};
+                            let mut h = Sha256::new();
+                            h.update(b"maskura-presigned\0");
+                            h.update(url.origin().ascii_serialization().as_bytes());
+                            format!("{:x}", h.finalize())
+                        },
+                    },
+                },
+                selected_primary_backend_id: None,
+                selected_replica_backend_id: None,
+            };
             return Ok(ResolvedBackendSelection {
                 backend: ResolvedBackend::PresignedHttp(url),
                 workspace_routing: None,
+                snapshot: presigned_snapshot,
             });
         }
 
@@ -313,6 +374,7 @@ impl BackendResolver {
                 return Ok(ResolvedBackendSelection {
                     backend: ResolvedBackend::Managed(self.managed.clone()),
                     workspace_routing,
+                    snapshot: managed_topology_snapshot(&self.managed),
                 });
             }
             Some(RuntimeBackendConfig::S3Compatible {
@@ -338,7 +400,7 @@ impl BackendResolver {
                 // multi-tenant mode the hostname belongs to an operator-trusted
                 // provider, so a tenant cannot control it after this validation.
                 let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .region(Region::new(region))
+                    .region(Region::new(region.clone()))
                     .endpoint_url(endpoint.as_str())
                     .credentials_provider(credentials)
                     .retry_config(s3_retry_config())
@@ -356,6 +418,32 @@ impl BackendResolver {
                         workspace_streaming,
                     },
                     workspace_routing,
+                    snapshot: DestinationSelectionSnapshot {
+                        binding: maskura_pipeline_config::DestinationBinding::Concrete {
+                            destination: maskura_pipeline_config::ResolvedDestination {
+                                mode: maskura_pipeline_config::StorageMode::S3Compatible,
+                                endpoint: endpoint.to_string(),
+                                bucket: String::new(),
+                                region: region.clone(),
+                                role_arn: None,
+                                configuration_version_id: resolution
+                                    .streaming
+                                    .as_ref()
+                                    .map(|s| s.config_version.as_str().to_string()),
+                                configuration_sha256: {
+                                    use sha2::{Digest, Sha256};
+                                    let mut h = Sha256::new();
+                                    h.update(b"maskura-s3-compatible\0");
+                                    h.update(endpoint.as_str().as_bytes());
+                                    h.update(b"\0");
+                                    h.update(region.as_bytes());
+                                    format!("{:x}", h.finalize())
+                                },
+                            },
+                        },
+                        selected_primary_backend_id: None,
+                        selected_replica_backend_id: None,
+                    },
                 });
             }
             Some(RuntimeBackendConfig::AwsRole {
@@ -404,7 +492,7 @@ impl BackendResolver {
                     "sts-assume-role",
                 );
                 let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .region(Region::new(region))
+                    .region(Region::new(region.clone()))
                     .endpoint_url(endpoint.as_str())
                     .credentials_provider(credentials)
                     .retry_config(s3_retry_config())
@@ -420,6 +508,32 @@ impl BackendResolver {
                         workspace_streaming,
                     },
                     workspace_routing,
+                    snapshot: DestinationSelectionSnapshot {
+                        binding: maskura_pipeline_config::DestinationBinding::Concrete {
+                            destination: maskura_pipeline_config::ResolvedDestination {
+                                mode: maskura_pipeline_config::StorageMode::AwsRole,
+                                endpoint: endpoint.to_string(),
+                                bucket: String::new(),
+                                region: region.clone(),
+                                role_arn: Some(role_arn.clone()),
+                                configuration_version_id: resolution
+                                    .streaming
+                                    .as_ref()
+                                    .map(|s| s.config_version.as_str().to_string()),
+                                configuration_sha256: {
+                                    use sha2::{Digest, Sha256};
+                                    let mut h = Sha256::new();
+                                    h.update(b"maskura-aws-role\0");
+                                    h.update(role_arn.as_bytes());
+                                    h.update(b"\0");
+                                    h.update(region.as_bytes());
+                                    format!("{:x}", h.finalize())
+                                },
+                            },
+                        },
+                        selected_primary_backend_id: None,
+                        selected_replica_backend_id: None,
+                    },
                 });
             }
             None => {}
@@ -429,6 +543,7 @@ impl BackendResolver {
             return Ok(ResolvedBackendSelection {
                 backend: ResolvedBackend::Managed(self.managed.clone()),
                 workspace_routing,
+                snapshot: managed_topology_snapshot(&self.managed),
             });
         }
         if !self.explicit_single_tenant {
@@ -442,17 +557,67 @@ impl BackendResolver {
                     workspace_streaming: None,
                 },
                 workspace_routing,
+                snapshot: DestinationSelectionSnapshot {
+                    binding: maskura_pipeline_config::DestinationBinding::Concrete {
+                        destination: maskura_pipeline_config::ResolvedDestination {
+                            mode: maskura_pipeline_config::StorageMode::S3Compatible,
+                            endpoint: String::new(),
+                            bucket: String::new(),
+                            region: String::new(),
+                            role_arn: None,
+                            configuration_version_id: None,
+                            configuration_sha256: {
+                                use sha2::{Digest, Sha256};
+                                let mut h = Sha256::new();
+                                h.update(b"maskura-global-s3\0");
+                                format!("{:x}", h.finalize())
+                            },
+                        },
+                    },
+                    selected_primary_backend_id: None,
+                    selected_replica_backend_id: None,
+                },
             });
         }
         if let Some(store) = &self.file {
             return Ok(ResolvedBackendSelection {
                 backend: ResolvedBackend::File(store.clone()),
                 workspace_routing,
+                snapshot: DestinationSelectionSnapshot {
+                    binding: maskura_pipeline_config::DestinationBinding::Concrete {
+                        destination: maskura_pipeline_config::ResolvedDestination {
+                            mode: maskura_pipeline_config::StorageMode::S3Compatible,
+                            endpoint: String::new(),
+                            bucket: String::new(),
+                            region: String::new(),
+                            role_arn: None,
+                            configuration_version_id: None,
+                            configuration_sha256: "0".repeat(64),
+                        },
+                    },
+                    selected_primary_backend_id: None,
+                    selected_replica_backend_id: None,
+                },
             });
         }
         Ok(ResolvedBackendSelection {
             backend: ResolvedBackend::Memory(self.memory.clone()),
             workspace_routing,
+            snapshot: DestinationSelectionSnapshot {
+                binding: maskura_pipeline_config::DestinationBinding::Concrete {
+                    destination: maskura_pipeline_config::ResolvedDestination {
+                        mode: maskura_pipeline_config::StorageMode::S3Compatible,
+                        endpoint: String::new(),
+                        bucket: String::new(),
+                        region: String::new(),
+                        role_arn: None,
+                        configuration_version_id: None,
+                        configuration_sha256: "0".repeat(64),
+                    },
+                },
+                selected_primary_backend_id: None,
+                selected_replica_backend_id: None,
+            },
         })
     }
 
@@ -504,7 +669,7 @@ impl BackendResolver {
                 .ok_or_else(|| "historical workspace storage attestation is invalid".to_string())?;
         let credentials = Credentials::new(access_key, secret_key, None, None, "maskura-recovery");
         let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(Region::new(region))
+            .region(Region::new(region.clone()))
             .endpoint_url(endpoint.as_str())
             .credentials_provider(credentials)
             .retry_config(s3_retry_config())
@@ -1177,6 +1342,7 @@ fn in_ipv6_ranges(ip: Ipv6Addr, ranges: &[(Ipv6Addr, u8)]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service_storage::ServiceBackend;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::Router;
@@ -2755,5 +2921,266 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    fn managed_service_storage() -> ServiceStorage {
+        ServiceStorage::new(vec![
+            ServiceBackend {
+                provider: "test-a".to_string(),
+                provider_instance_id: Some("ia".to_string()),
+                provider_account_id: Some("aa".to_string()),
+                credential_epoch: Some(2),
+                placement_weight: 1,
+                placement_capacity_units: 1,
+                endpoint: "https://a.example".to_string(),
+                region: "us-east-1".to_string(),
+                bucket: "bucket-a".to_string(),
+                access_key: "key-a".to_string(),
+                secret_key: "secret-a".to_string(),
+            },
+            ServiceBackend {
+                provider: "test-b".to_string(),
+                provider_instance_id: Some("ib".to_string()),
+                provider_account_id: Some("ab".to_string()),
+                credential_epoch: Some(3),
+                placement_weight: 1,
+                placement_capacity_units: 1,
+                endpoint: "https://b.example".to_string(),
+                region: "us-west-2".to_string(),
+                bucket: "bucket-b".to_string(),
+                access_key: "key-b".to_string(),
+                secret_key: "secret-b".to_string(),
+            },
+        ])
+    }
+
+    fn managed_selection() -> ResolvedBackendSelection {
+        let storage = managed_service_storage();
+        let snapshot = managed_topology_snapshot(&storage);
+        ResolvedBackendSelection {
+            backend: ResolvedBackend::Managed(Arc::new(storage)),
+            workspace_routing: None,
+            snapshot,
+        }
+    }
+
+    #[test]
+    fn managed_selection_snapshot_binds_frozen_topology_without_placement() {
+        let selection = managed_selection();
+        assert!(selection.snapshot.managed_placement().is_none());
+        assert!(
+            matches!(
+                selection.snapshot.binding,
+                maskura_pipeline_config::DestinationBinding::ManagedTopology { .. }
+            ),
+            "managed selection must carry a topology binding, not a concrete one"
+        );
+    }
+
+    #[test]
+    fn resolve_managed_placement_freezes_rendezvous_targets() {
+        let mut selection = managed_selection();
+        let placement = selection
+            .resolve_managed_placement("ws", "bucket", "key")
+            .expect("managed placement resolves for any key");
+        let (primary, replica) = placement;
+        assert!(!primary.is_empty());
+        assert_eq!(
+            selection.snapshot.managed_placement(),
+            Some((primary.clone(), replica.clone())),
+            "snapshot must carry the same placement returned to the caller"
+        );
+        assert_eq!(
+            selection.snapshot.selected_primary_backend_id,
+            Some(primary)
+        );
+        assert_eq!(selection.snapshot.selected_replica_backend_id, replica);
+    }
+
+    #[test]
+    fn resolve_managed_placement_is_stable_for_the_same_key() {
+        let mut first = managed_selection();
+        let mut second = managed_selection();
+        let a = first.resolve_managed_placement("ws", "bucket", "stable-key");
+        let b = second.resolve_managed_placement("ws", "bucket", "stable-key");
+        assert_eq!(a, b, "weighted rendezvous must be deterministic per key");
+    }
+
+    #[test]
+    fn resolve_managed_placement_returns_none_for_concrete_destinations() {
+        let mut selection = ResolvedBackendSelection {
+            backend: ResolvedBackend::Memory(Arc::new(MemoryStore::default())),
+            workspace_routing: None,
+            snapshot: DestinationSelectionSnapshot {
+                binding: maskura_pipeline_config::DestinationBinding::Concrete {
+                    destination: maskura_pipeline_config::ResolvedDestination {
+                        mode: maskura_pipeline_config::StorageMode::S3Compatible,
+                        endpoint: "https://s3.example.com".into(),
+                        bucket: "objects".into(),
+                        region: "region".into(),
+                        role_arn: None,
+                        configuration_version_id: None,
+                        configuration_sha256: "0".repeat(64),
+                    },
+                },
+                selected_primary_backend_id: None,
+                selected_replica_backend_id: None,
+            },
+        };
+        assert!(
+            selection
+                .resolve_managed_placement("ws", "bucket", "key")
+                .is_none()
+        );
+        assert!(selection.snapshot.managed_placement().is_none());
+    }
+
+    #[test]
+    fn freeze_managed_placement_overwrites_rendezvous_with_authority_targets() {
+        let mut selection = managed_selection();
+        selection
+            .resolve_managed_placement("ws", "bucket", "key")
+            .expect("managed placement resolves");
+        let frozen = selection
+            .freeze_managed_placement(
+                "authority-primary".to_string(),
+                Some("authority-replica".into()),
+            )
+            .expect("managed backend accepts frozen placement");
+        assert_eq!(
+            frozen,
+            ("authority-primary".into(), Some("authority-replica".into()))
+        );
+        assert_eq!(
+            selection.snapshot.managed_placement(),
+            Some(("authority-primary".into(), Some("authority-replica".into()))),
+            "authority placement must win over the computed rendezvous"
+        );
+    }
+
+    #[test]
+    fn freeze_managed_placement_returns_none_for_concrete_destinations() {
+        let mut selection = ResolvedBackendSelection {
+            backend: ResolvedBackend::Memory(Arc::new(MemoryStore::default())),
+            workspace_routing: None,
+            snapshot: DestinationSelectionSnapshot {
+                binding: maskura_pipeline_config::DestinationBinding::Concrete {
+                    destination: maskura_pipeline_config::ResolvedDestination {
+                        mode: maskura_pipeline_config::StorageMode::Presigned,
+                        endpoint: "https://store.example.com".into(),
+                        bucket: String::new(),
+                        region: String::new(),
+                        role_arn: None,
+                        configuration_version_id: None,
+                        configuration_sha256: "0".repeat(64),
+                    },
+                },
+                selected_primary_backend_id: None,
+                selected_replica_backend_id: None,
+            },
+        };
+        assert!(
+            selection
+                .freeze_managed_placement("p".into(), Some("r".into()))
+                .is_none()
+        );
+        assert!(selection.snapshot.managed_placement().is_none());
+    }
+}
+
+/// Non-secret destination facts captured at backend-resolution time and bound
+/// into policy verification. The gate verifies this snapshot against approved
+/// effective-state destination bindings; storage execution must use the same
+/// frozen selection (check/use discipline).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DestinationSelectionSnapshot {
+    /// The v2 destination binding (concrete or managed topology).
+    pub binding: maskura_pipeline_config::DestinationBinding,
+    /// For managed storage: the per-key selected primary backend.
+    pub selected_primary_backend_id: Option<String>,
+    /// For managed storage: the per-key selected replica backend.
+    pub selected_replica_backend_id: Option<String>,
+}
+
+impl DestinationSelectionSnapshot {
+    pub fn managed_placement(&self) -> Option<(String, Option<String>)> {
+        self.selected_primary_backend_id
+            .as_ref()
+            .map(|p| (p.clone(), self.selected_replica_backend_id.clone()))
+    }
+
+    /// Fill in the per-key managed placement targets before the gate.
+    pub fn with_managed_placement(
+        &mut self,
+        primary: String,
+        replica: Option<String>,
+    ) -> &mut Self {
+        self.selected_primary_backend_id = Some(primary);
+        self.selected_replica_backend_id = replica;
+        self
+    }
+}
+
+/// Build the non-secret managed topology snapshot from service backends.
+fn managed_topology_snapshot(storage: &ServiceStorage) -> DestinationSelectionSnapshot {
+    use maskura_pipeline_config::{ManagedBackend, ManagedPlacementAlgorithm};
+    use sha2::{Digest, Sha256};
+
+    let mut backends: Vec<ManagedBackend> = Vec::with_capacity(storage.backends.len());
+    for sb in &storage.backends {
+        let config_sha = {
+            let mut h = Sha256::new();
+            h.update(b"maskura-managed-backend\0");
+            h.update(sb.provider.as_bytes());
+            h.update(b"\0");
+            h.update(sb.provider_instance_id.as_deref().unwrap_or("").as_bytes());
+            h.update(b"\0");
+            h.update(sb.provider_account_id.as_deref().unwrap_or("").as_bytes());
+            h.update(b"\0");
+            h.update(sb.endpoint.as_bytes());
+            h.update(b"\0");
+            h.update(sb.region.as_bytes());
+            h.update(b"\0");
+            h.update(sb.bucket.as_bytes());
+            h.update(b"\0");
+            h.update(sb.placement_weight.to_be_bytes());
+            h.update(sb.placement_capacity_units.to_be_bytes());
+            h.update(sb.credential_epoch.unwrap_or(0).to_be_bytes());
+            format!("{:x}", h.finalize())
+        };
+        backends.push(ManagedBackend {
+            backend_id: sb.id(),
+            provider_kind: sb.provider.clone(),
+            provider_instance_id: sb.provider_instance_id.clone().unwrap_or_default(),
+            provider_account_id: sb.provider_account_id.clone().unwrap_or_default(),
+            endpoint: sb.endpoint.clone(),
+            region: sb.region.clone(),
+            bucket: sb.bucket.clone(),
+            placement_weight: sb.placement_weight,
+            placement_capacity_units: sb.placement_capacity_units,
+            credential_epoch: sb.credential_epoch.unwrap_or(0),
+            configuration_sha256: config_sha,
+        });
+    }
+    backends.sort_by(|a, b| a.backend_id.cmp(&b.backend_id));
+    let authority_sha = crate::managed::placement_policy_fingerprint(
+        storage.placement_version(),
+        backends.iter().map(|b| {
+            (
+                b.backend_id.clone(),
+                b.placement_weight,
+                b.placement_capacity_units,
+            )
+        }),
+    );
+    DestinationSelectionSnapshot {
+        binding: maskura_pipeline_config::DestinationBinding::ManagedTopology {
+            placement_version: storage.placement_version(),
+            algorithm: ManagedPlacementAlgorithm::WeightedRendezvous,
+            authority_sha256: authority_sha,
+            backends,
+        },
+        selected_primary_backend_id: None,
+        selected_replica_backend_id: None,
     }
 }

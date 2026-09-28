@@ -8,13 +8,15 @@ use crate::{
     canonical::{digest_of, is_hex64},
 };
 
+pub const EFFECTIVE_STATE_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectiveState {
     pub schema_version: u32,
     pub audience: String,
     pub workspace_id: String,
-    pub destinations: BTreeMap<String, ResolvedDestination>,
+    pub destinations: BTreeMap<String, DestinationBinding>,
     /// Expanded effective routes. Unlisted operations/buckets/prefixes are denied.
     pub routes: Vec<ResolvedRoute>,
 }
@@ -27,8 +29,52 @@ pub struct ResolvedDestination {
     pub bucket: String,
     pub region: String,
     pub role_arn: Option<String>,
+    /// Append-only workspace backend configuration snapshot used to build the
+    /// execution client. Presigned requests bind a declared target instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_version_id: Option<String>,
     /// Digest of the immutable normalized storage configuration, including
     /// credential/key-version references and managed placement policy. No secrets.
+    pub configuration_sha256: String,
+}
+
+/// The v2 signed destination: a concrete physical target or the complete
+/// managed placement topology from which physical targets are frozen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DestinationBinding {
+    Concrete {
+        destination: ResolvedDestination,
+    },
+    ManagedTopology {
+        placement_version: u32,
+        algorithm: ManagedPlacementAlgorithm,
+        authority_sha256: String,
+        /// Sorted by backend_id, with unique IDs and non-secret version facts.
+        backends: Vec<ManagedBackend>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedPlacementAlgorithm {
+    WeightedRendezvous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedBackend {
+    pub backend_id: String,
+    pub provider_kind: String,
+    pub provider_instance_id: String,
+    pub provider_account_id: String,
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    pub placement_weight: u64,
+    pub placement_capacity_units: u64,
+    pub credential_epoch: u64,
+    /// SHA-256 of immutable normalized non-secret configuration facts.
     pub configuration_sha256: String,
 }
 
@@ -97,7 +143,7 @@ pub struct ResolvedStep {
 
 impl EffectiveState {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.schema_version != 1
+        if self.schema_version != EFFECTIVE_STATE_SCHEMA_VERSION
             || self.workspace_id.trim().is_empty()
             || self.audience.trim().is_empty()
         {
@@ -111,23 +157,10 @@ impl EffectiveState {
             ));
         }
         for (id, destination) in &self.destinations {
-            let url = url::Url::parse(&destination.endpoint)
-                .map_err(|_| ConfigError::invalid("invalid destination endpoint"))?;
-            if id.trim().is_empty()
-                || destination.bucket.trim().is_empty()
-                || !is_hex64(&destination.configuration_sha256)
-                || url.scheme() != "https"
-                || url.host_str().is_none()
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.query().is_some()
-                || url.fragment().is_some()
-                || (destination.mode == StorageMode::AwsRole
-                    && (destination.region.trim().is_empty()
-                        || destination.role_arn.as_deref().is_none_or(str::is_empty)))
-            {
-                return Err(ConfigError::invalid("invalid resolved destination"));
+            if id.trim().is_empty() {
+                return Err(ConfigError::invalid("invalid resolved destination id"));
             }
+            destination.validate()?;
         }
         let mut scopes = BTreeSet::new();
         for route in &self.routes {
@@ -217,21 +250,106 @@ impl EffectiveState {
     }
 }
 
+fn valid_https_endpoint(endpoint: &str) -> bool {
+    let Ok(url) = url::Url::parse(endpoint) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.to_string() == endpoint
+}
+
+impl DestinationBinding {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        match self {
+            Self::Concrete { destination } => {
+                if !valid_https_endpoint(&destination.endpoint)
+                    || destination.bucket.trim().is_empty()
+                    || !is_hex64(&destination.configuration_sha256)
+                    || destination.mode == StorageMode::Managed
+                    || (destination.mode != StorageMode::Presigned
+                        && destination.region.trim().is_empty())
+                    || (destination.mode != StorageMode::Presigned
+                        && destination
+                            .configuration_version_id
+                            .as_deref()
+                            .is_none_or(|id| id.trim().is_empty()))
+                    || (destination.mode == StorageMode::Presigned
+                        && (destination.configuration_version_id.is_some()
+                            || url::Url::parse(&destination.endpoint)
+                                .is_ok_and(|url| url.path() != "/")))
+                    || (destination.mode == StorageMode::AwsRole
+                        && (destination.region.trim().is_empty()
+                            || destination.role_arn.as_deref().is_none_or(str::is_empty)))
+                    || (destination.mode != StorageMode::AwsRole && destination.role_arn.is_some())
+                {
+                    return Err(ConfigError::invalid("invalid concrete destination"));
+                }
+            }
+            Self::ManagedTopology {
+                placement_version,
+                authority_sha256,
+                backends,
+                ..
+            } => {
+                if *placement_version == 0
+                    || !is_hex64(authority_sha256)
+                    || backends.is_empty()
+                    || backends.len() > 64
+                {
+                    return Err(ConfigError::invalid("invalid managed topology"));
+                }
+                let mut previous = "";
+                for backend in backends {
+                    if backend.backend_id.trim().is_empty()
+                        || backend.backend_id.as_str() <= previous
+                        || backend.provider_kind.trim().is_empty()
+                        || backend.provider_instance_id.trim().is_empty()
+                        || backend.provider_account_id.trim().is_empty()
+                        || !valid_https_endpoint(&backend.endpoint)
+                        || backend.region.trim().is_empty()
+                        || backend.bucket.trim().is_empty()
+                        || backend.placement_weight == 0
+                        || backend.placement_capacity_units == 0
+                        || backend
+                            .placement_weight
+                            .checked_mul(backend.placement_capacity_units)
+                            .is_none()
+                        || backend.credential_epoch == 0
+                        || !is_hex64(&backend.configuration_sha256)
+                    {
+                        return Err(ConfigError::invalid("invalid managed backend binding"));
+                    }
+                    previous = &backend.backend_id;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn fixture() -> EffectiveState {
     EffectiveState {
-        schema_version: 1,
+        schema_version: EFFECTIVE_STATE_SCHEMA_VERSION,
         workspace_id: "ws-1".into(),
         audience: "https://maskura.dev".into(),
         destinations: [(
             "dest".into(),
-            ResolvedDestination {
-                mode: StorageMode::S3Compatible,
-                endpoint: "https://s3.example.com".into(),
-                bucket: "objects".into(),
-                region: "region".into(),
-                role_arn: None,
-                configuration_sha256: "d".repeat(64),
+            DestinationBinding::Concrete {
+                destination: ResolvedDestination {
+                    mode: StorageMode::S3Compatible,
+                    endpoint: "https://s3.example.com/".into(),
+                    bucket: "objects".into(),
+                    region: "region".into(),
+                    role_arn: None,
+                    configuration_version_id: Some("config-version-1".into()),
+                    configuration_sha256: "d".repeat(64),
+                },
             },
         )]
         .into(),
@@ -276,6 +394,37 @@ pub(crate) fn fixture() -> EffectiveState {
 mod tests {
     use super::*;
 
+    fn concrete(state: &mut EffectiveState) -> &mut ResolvedDestination {
+        match state.destinations.get_mut("dest").unwrap() {
+            DestinationBinding::Concrete { destination } => destination,
+            DestinationBinding::ManagedTopology { .. } => panic!("expected concrete destination"),
+        }
+    }
+
+    fn managed() -> DestinationBinding {
+        DestinationBinding::ManagedTopology {
+            placement_version: 2,
+            algorithm: ManagedPlacementAlgorithm::WeightedRendezvous,
+            authority_sha256: "e".repeat(64),
+            backends: ["aws", "b2"]
+                .into_iter()
+                .map(|name| ManagedBackend {
+                    backend_id: name.into(),
+                    provider_kind: name.into(),
+                    provider_instance_id: format!("{name}-instance"),
+                    provider_account_id: format!("{name}-account"),
+                    endpoint: format!("https://{name}.example.com/"),
+                    region: "region".into(),
+                    bucket: format!("{name}-physical"),
+                    placement_weight: 2,
+                    placement_capacity_units: 1,
+                    credential_epoch: 3,
+                    configuration_sha256: "a".repeat(64),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn runtime_and_storage_changes_change_commitment() {
         let original = fixture();
@@ -296,12 +445,10 @@ mod tests {
             |s| s.routes[0].limits.processing.fuel += 1,
             |s| s.routes[0].limits.stack_bytes += 1,
             |s| s.routes[0].limits.output_max_bytes += 1,
-            |s| {
-                s.destinations.get_mut("dest").unwrap().endpoint =
-                    "https://other.example.com".into()
-            },
-            |s| s.destinations.get_mut("dest").unwrap().bucket.push('2'),
-            |s| s.destinations.get_mut("dest").unwrap().configuration_sha256 = "c".repeat(64),
+            |s| concrete(s).endpoint = "https://other.example.com/".into(),
+            |s| concrete(s).bucket.push('2'),
+            |s| concrete(s).configuration_sha256 = "c".repeat(64),
+            |s| concrete(s).configuration_version_id = Some("config-version-2".into()),
             |s| {
                 s.routes[0].format = "avro".into();
                 s.routes[0].adapter_sha256 = Some("a".repeat(64));
@@ -331,5 +478,152 @@ mod tests {
         let mut state = fixture();
         state.routes[0].steps[0].config_json = Some("{\"a\":1,\"a\":2}".into());
         assert!(state.validate().is_err());
+    }
+
+    #[test]
+    fn v2_concrete_and_managed_topology_round_trip_and_bind_all_physical_facts() {
+        let mut state = fixture();
+        let original = state.digest().unwrap();
+        state.destinations.insert("dest".into(), managed());
+        let managed_digest = state.digest().unwrap();
+        assert_eq!(
+            managed_digest,
+            "3e38f445301ba62a1ebc18eda0a4b27ecd4d942fae89ac63ddf7eb7f76829374"
+        );
+        assert_ne!(managed_digest, original);
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert_eq!(encoded["destinations"]["dest"]["kind"], "managed_topology");
+        assert!(encoded.to_string().find("secret_key").is_none());
+        assert_eq!(
+            serde_json::from_value::<EffectiveState>(encoded).unwrap(),
+            state
+        );
+
+        let mut variants: Vec<fn(&mut DestinationBinding)> = vec![
+            |value| {
+                if let DestinationBinding::ManagedTopology {
+                    placement_version, ..
+                } = value
+                {
+                    *placement_version += 1
+                }
+            },
+            |value| {
+                if let DestinationBinding::ManagedTopology {
+                    authority_sha256, ..
+                } = value
+                {
+                    *authority_sha256 = "f".repeat(64)
+                }
+            },
+            |value| {
+                if let DestinationBinding::ManagedTopology { backends, .. } = value {
+                    backends[0].bucket.push('2')
+                }
+            },
+            |value| {
+                if let DestinationBinding::ManagedTopology { backends, .. } = value {
+                    backends[0].provider_kind.push('2')
+                }
+            },
+            |value| {
+                if let DestinationBinding::ManagedTopology { backends, .. } = value {
+                    backends[0].credential_epoch += 1
+                }
+            },
+            |value| {
+                if let DestinationBinding::ManagedTopology { backends, .. } = value {
+                    backends[0].placement_capacity_units += 1
+                }
+            },
+            |value| {
+                if let DestinationBinding::ManagedTopology { backends, .. } = value {
+                    backends[0].configuration_sha256 = "b".repeat(64)
+                }
+            },
+        ];
+        for mutate in variants.drain(..) {
+            let mut changed = state.clone();
+            mutate(changed.destinations.get_mut("dest").unwrap());
+            assert_ne!(changed.digest().unwrap(), managed_digest);
+        }
+    }
+
+    #[test]
+    fn invalid_topology_and_legacy_schema_fail_closed() {
+        let mut state = fixture();
+        state.schema_version = 1;
+        assert!(state.digest().is_err());
+        state.schema_version = 2;
+        concrete(&mut state).configuration_version_id = None;
+        assert!(
+            state.validate().is_err(),
+            "unversioned workspace config cannot be approved"
+        );
+        state = fixture();
+        concrete(&mut state).mode = StorageMode::Managed;
+        assert!(
+            state.validate().is_err(),
+            "managed requires an approved topology"
+        );
+        state = fixture();
+        let target = concrete(&mut state);
+        target.mode = StorageMode::Presigned;
+        target.configuration_version_id = None;
+        target.region.clear();
+        state.validate().unwrap();
+        concrete(&mut state).endpoint = "https://s3.example.com/other-bucket/key".into();
+        assert!(
+            state.validate().is_err(),
+            "presigned target must be an origin"
+        );
+        state = fixture();
+        state.destinations.insert("dest".into(), managed());
+
+        let invalid: Vec<fn(&mut ManagedBackend)> = vec![
+            |backend| backend.credential_epoch = 0,
+            |backend| backend.provider_account_id.clear(),
+            |backend| backend.endpoint = "http://example.com/".into(),
+            |backend| backend.placement_weight = 0,
+            |backend| backend.configuration_sha256 = "short".into(),
+        ];
+        for mutate in invalid {
+            let mut changed = state.clone();
+            if let DestinationBinding::ManagedTopology { backends, .. } =
+                changed.destinations.get_mut("dest").unwrap()
+            {
+                mutate(&mut backends[0]);
+            }
+            assert!(changed.validate().is_err());
+        }
+
+        let mut changed = state.clone();
+        if let DestinationBinding::ManagedTopology { backends, .. } =
+            changed.destinations.get_mut("dest").unwrap()
+        {
+            backends.reverse();
+        }
+        assert!(
+            changed.validate().is_err(),
+            "provider list must be canonical"
+        );
+
+        let mut changed = state.clone();
+        if let DestinationBinding::ManagedTopology { backends, .. } =
+            changed.destinations.get_mut("dest").unwrap()
+        {
+            backends[1].backend_id = backends[0].backend_id.clone();
+        }
+        assert!(
+            changed.validate().is_err(),
+            "duplicate providers are forbidden"
+        );
+
+        let mut unknown = serde_json::to_value(&state).unwrap();
+        unknown["destinations"]["dest"]["unapproved"] = true.into();
+        assert!(serde_json::from_value::<EffectiveState>(unknown).is_err());
+        let mut leaked = serde_json::to_value(&state).unwrap();
+        leaked["destinations"]["dest"]["backends"][0]["secret_key"] = "forbidden".into();
+        assert!(serde_json::from_value::<EffectiveState>(leaked).is_err());
     }
 }

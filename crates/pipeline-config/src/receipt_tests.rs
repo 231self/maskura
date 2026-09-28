@@ -282,13 +282,17 @@ fn resolved_state_tamper_fails_even_if_export_metadata_is_unchanged() {
     let root = initial(&old);
     let signed = sign(genesis_body(&root), &old, None);
     let mut edited = signed.clone();
-    edited
+    if let crate::DestinationBinding::Concrete { destination } = edited
         .body
         .effective_state
         .destinations
         .get_mut("dest")
         .unwrap()
-        .endpoint = "https://other.example.com".into();
+    {
+        destination.endpoint = "https://other.example.com/".into();
+    } else {
+        panic!("fixture must bind a concrete destination");
+    }
     assert!(verify_receipt(&edited, &root).is_err());
     edited.body.effective_state_digest = edited.body.effective_state.digest().unwrap();
     assert!(verify_receipt(&edited, &root).is_err());
@@ -405,18 +409,18 @@ fn v2_protocol_golden_vectors() {
     );
     assert_eq!(
         genesis.body.effective_state_digest,
-        "f5d7895b527bd61aa3f4fefc5289ee369921c24451c3066393ffd5edaebdb486"
+        "81946e0052fde1e880ae3d95bd13f6226d2f427ab1869c1bf526b5c8f094d92f"
     );
     assert_eq!(
         genesis.body.receipt_digest().unwrap(),
-        "f01425f056518fcf17996fb84ab88339e173b9cedcdc02c8a923b06a73e3470e"
+        "c34aeee409d48d3a0703a6a1b329bd7ebdf9c914a630cce15d6a9dea29b9aff1"
     );
     assert_eq!(
         transition.body.receipt_digest().unwrap(),
-        "b55803efd83b83beaf8a8b23d56e5c83dccf9137683749ccab6cb26313812e7a"
+        "a948cf61aa7e352bd425395079a66fb1e91756b805c353afbbff56e1e8747e30"
     );
     assert_eq!(
         digest_of(&report.checkpoint(1200)).unwrap(),
-        "948f74f4a580f85283e03ef8805fe392b3b6c7b188a96264fe4dab2190dc299d"
+        "ed6811993889f0be0ef95508c34c788d0359cc8cf7c350baaca2fce507044ea4"
     );
 }

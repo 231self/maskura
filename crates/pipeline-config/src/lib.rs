@@ -24,7 +24,8 @@ pub mod webauthn;
 
 pub use direction::Direction;
 pub use effective_state::{
-    EffectiveState, PolicyOperation, ResolvedDestination, ResolvedLimits, ResolvedRoute,
+    DestinationBinding, EFFECTIVE_STATE_SCHEMA_VERSION, EffectiveState, ManagedBackend,
+    ManagedPlacementAlgorithm, PolicyOperation, ResolvedDestination, ResolvedLimits, ResolvedRoute,
     ResolvedStep, StorageMode,
 };
 pub use error::ConfigError;
@@ -45,6 +46,6 @@ pub use trust::{
 };
 pub use webauthn::{
     AssertionExpectation, CHALLENGE_VERSION, ChallengeContext, ChallengeKind, CoseEs256Key,
-    RegisteredCredential, RegistrationExpectation, WebAuthnProof, parse_registration,
-    verify_assertion,
+    RegisteredCredential, RegistrationExpectation, SignerBootstrapBinding, WebAuthnProof,
+    parse_registration, signer_bootstrap_digest, verify_assertion,
 };
