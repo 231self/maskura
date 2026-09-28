@@ -762,6 +762,7 @@ mod tests {
         .with_pipeline(&crate::pipeline::PipelineLocator {
             revision: "revision-a".to_string(),
             fingerprint: "a".repeat(64),
+            assignment_id: None,
         });
         let grant = AuthorizationGrant::new(&authorization, Utc::now(), 1);
         assert_eq!(grant.pipeline_revision(), Some("revision-a"));
@@ -781,6 +782,7 @@ mod tests {
         .with_pipeline(&crate::pipeline::PipelineLocator {
             revision: "revision-b".to_string(),
             fingerprint: "b".repeat(64),
+            assignment_id: None,
         });
         assert!(!grant.matches(&changed));
     }
