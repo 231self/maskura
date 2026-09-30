@@ -51,7 +51,9 @@ evidence. Neither those signatures nor future WebAuthn approval receipts are
 per-operation execution proofs. This narrows the operator-resistance language
 in ADRs 0003 and 0021 without changing their existing signing formats. Future
 WebAuthn schemas, signer lifecycle, and enforcement rollout need their own
-implementation evidence and protocol specification.
+implementation evidence and protocol specification; trust-root lineage and
+per-lineage receipt-head retention are decided in
+[ADR 0024](0024-trust-root-lineage-and-receipt-head-retention.md).
 
 Ordinary S3 onboarding remains endpoint + access key + secret. TLS/SigV4 does
 not attest server code. Native scale-to-zero remains a product constraint;

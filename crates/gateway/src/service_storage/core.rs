@@ -1244,6 +1244,16 @@ impl ServiceStorage {
             .is_some())
     }
 
+    /// Read the authoritative generation for a logical object. Read paths use
+    /// this to freeze the physical placement recorded at write time (check/use
+    /// discipline) instead of recomputing the rendezvous ring.
+    pub async fn get_authority(
+        &self,
+        logical: &LogicalObjectKey,
+    ) -> Result<Option<ObjectAuthority>, ManagedError> {
+        self.authority_repository_required()?.get(logical).await
+    }
+
     pub(crate) fn metadata_matches(
         metadata: Option<&std::collections::HashMap<String, String>>,
         content_length: Option<i64>,

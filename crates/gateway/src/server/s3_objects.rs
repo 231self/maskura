@@ -45,10 +45,41 @@ pub(crate) async fn resolve_backend(
     auth: &Auth,
     headers: &HeaderMap,
     operation: StorageOperation,
-) -> Result<ResolvedBackend, String> {
+) -> Result<crate::backend::ResolvedBackendSelection, String> {
     backend_resolver(state)
-        .resolve(auth.workspace_id(), headers, operation)
+        .resolve_with_routing(auth.workspace_id(), headers, operation)
         .await
+}
+
+/// Freeze managed placement from authority metadata before the policy gate
+/// (check/use discipline). Reads must execute against the physical targets
+/// recorded at write time, never a re-placed rendezvous of a mutable ring.
+/// Non-managed backends and objects without authority are left unchanged.
+pub(crate) async fn freeze_read_placement(
+    selection: &mut crate::backend::ResolvedBackendSelection,
+    workspace_id: &str,
+    bucket: &str,
+    key: &str,
+) {
+    let crate::backend::ResolvedBackend::Managed(storage) = &selection.backend else {
+        return;
+    };
+    let logical = crate::managed::LogicalObjectKey::new(workspace_id, bucket, key);
+    match storage.get_authority(&logical).await {
+        Ok(Some(authority)) => {
+            selection.freeze_managed_placement(
+                authority.primary_backend_id,
+                authority.replica_backend_id,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!(
+                %error,
+                "managed authority lookup failed; proceeding without frozen placement"
+            );
+        }
+    }
 }
 
 pub(crate) fn backend_resolution_error_response(key: &str) -> axum::response::Response {
@@ -1709,11 +1740,12 @@ pub(crate) async fn s3_get(
     }
     let transformed_read = wants_transformed_read(&headers);
     if params.upload_id.is_some() {
-        let backend =
+        let selection =
             match resolve_backend(&state, &auth, &headers, StorageOperation::Multipart).await {
-                Ok(backend) => backend,
+                Ok(selection) => selection,
                 Err(_) => return backend_resolution_error_response(&key),
             };
+        let backend = &selection.backend;
         let Some(staging) = staged_multipart(&state).cloned() else {
             return s3_error::multipart_not_supported(&key);
         };
@@ -1867,8 +1899,9 @@ pub(crate) async fn s3_get(
         )
         .await;
     }
-    let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Get).await {
-        Ok(backend) => backend,
+    let mut selection = match resolve_backend(&state, &auth, &headers, StorageOperation::Get).await
+    {
+        Ok(selection) => selection,
         Err(_) => {
             return release_failure(
                 state.control.as_ref(),
@@ -1880,6 +1913,8 @@ pub(crate) async fn s3_get(
             .await;
         }
     };
+    freeze_read_placement(&mut selection, auth.workspace_id().as_str(), &bucket, &key).await;
+    let backend = &selection.backend;
     let _policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
@@ -1892,7 +1927,8 @@ pub(crate) async fn s3_get(
             bucket: &bucket,
             key: &key,
             resolution: resolution.as_ref(),
-            destination: &backend,
+            destination: backend,
+            snapshot: &selection.snapshot,
             direction: crate::pipeline::PipelineDirection::Read,
         },
     )
@@ -1965,13 +2001,20 @@ pub(crate) async fn s3_get(
                     ),
                 );
             }
-            let object =
-                match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, false)
-                    .await
-                {
-                    Ok(object) => object,
-                    Err(error) => return open_error_response(&key, error),
-                };
+            let object = match open_backend_object(
+                &state,
+                backend.clone(),
+                &auth,
+                &bucket,
+                &key,
+                &headers,
+                false,
+            )
+            .await
+            {
+                Ok(object) => object,
+                Err(error) => return open_error_response(&key, error),
+            };
             let source_bytes = content_length(&object.metadata.headers);
             let response_metadata = object.metadata.clone();
             let (response, completed_source_bytes) = avro_transformed_read_response(
@@ -2007,21 +2050,29 @@ pub(crate) async fn s3_get(
                 .await;
             }
         };
-        let object =
-            match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, false).await
-            {
-                Ok(object) => object,
-                Err(error) => {
-                    return release_failure(
-                        state.control.as_ref(),
-                        &auth.context,
-                        &grant,
-                        &key,
-                        open_error_response(&key, error),
-                    )
-                    .await;
-                }
-            };
+        let object = match open_backend_object(
+            &state,
+            backend.clone(),
+            &auth,
+            &bucket,
+            &key,
+            &headers,
+            false,
+        )
+        .await
+        {
+            Ok(object) => object,
+            Err(error) => {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &grant,
+                    &key,
+                    open_error_response(&key, error),
+                )
+                .await;
+            }
+        };
         let source_preflight = match transformed_read_preflight(&headers, &params, &object.metadata)
         {
             Ok(preflight) => preflight,
@@ -2114,20 +2165,29 @@ pub(crate) async fn s3_get(
         )
         .await;
     }
-    let object =
-        match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, false).await {
-            Ok(object) => object,
-            Err(error) => {
-                return release_failure(
-                    state.control.as_ref(),
-                    &auth.context,
-                    &grant,
-                    &key,
-                    open_error_response(&key, error),
-                )
-                .await;
-            }
-        };
+    let object = match open_backend_object(
+        &state,
+        backend.clone(),
+        &auth,
+        &bucket,
+        &key,
+        &headers,
+        false,
+    )
+    .await
+    {
+        Ok(object) => object,
+        Err(error) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &grant,
+                &key,
+                open_error_response(&key, error),
+            )
+            .await;
+        }
+    };
     if let Some(status) = conditional_read_status(&headers, &object.metadata) {
         let response = conditional_read_response(object, status);
         return release_failure(
@@ -2204,8 +2264,9 @@ pub(crate) async fn s3_head(
         .await;
     }
 
-    let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Head).await {
-        Ok(backend) => backend,
+    let mut selection = match resolve_backend(&state, &auth, &headers, StorageOperation::Head).await
+    {
+        Ok(selection) => selection,
         Err(_) => {
             return release_failure(
                 state.control.as_ref(),
@@ -2217,6 +2278,8 @@ pub(crate) async fn s3_head(
             .await;
         }
     };
+    freeze_read_placement(&mut selection, auth.workspace_id().as_str(), &bucket, &key).await;
+    let backend = &selection.backend;
     let _policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
@@ -2225,7 +2288,8 @@ pub(crate) async fn s3_head(
             bucket: &bucket,
             key: &key,
             resolution: None,
-            destination: &backend,
+            destination: backend,
+            snapshot: &selection.snapshot,
             direction: crate::pipeline::PipelineDirection::Read,
         },
     )
@@ -2243,7 +2307,17 @@ pub(crate) async fn s3_head(
             .await;
         }
     };
-    match open_backend_object(&state, backend, &auth, &bucket, &key, &headers, true).await {
+    match open_backend_object(
+        &state,
+        backend.clone(),
+        &auth,
+        &bucket,
+        &key,
+        &headers,
+        true,
+    )
+    .await
+    {
         Ok(object) => {
             if let Some(status) = conditional_read_status(&headers, &object.metadata) {
                 let response = conditional_read_response(object, status);
@@ -2358,9 +2432,9 @@ pub(crate) async fn s3_delete(
     );
 
     if params.upload_id.is_some() {
-        let backend =
+        let selection =
             match resolve_backend(&state, &auth, &headers, StorageOperation::Multipart).await {
-                Ok(backend) => backend,
+                Ok(selection) => selection,
                 Err(_) => {
                     return release_failure(
                         state.control.as_ref(),
@@ -2372,6 +2446,7 @@ pub(crate) async fn s3_delete(
                     .await;
                 }
             };
+        let backend = &selection.backend;
         let _policy = match enforce_policy(
             state.policy_gate.as_ref(),
             PolicyRequest {
@@ -2380,7 +2455,8 @@ pub(crate) async fn s3_delete(
                 bucket: &bucket,
                 key: &key,
                 resolution: None,
-                destination: &backend,
+                destination: backend,
+                snapshot: &selection.snapshot,
                 direction: crate::pipeline::PipelineDirection::Write,
             },
         )
@@ -2528,19 +2604,22 @@ pub(crate) async fn s3_delete(
         };
     }
 
-    let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::Delete).await {
-        Ok(backend) => backend,
-        Err(_) => {
-            return release_failure(
-                state.control.as_ref(),
-                &auth.context,
-                &grant,
-                &key,
-                backend_resolution_error_response(&key),
-            )
-            .await;
-        }
-    };
+    let mut selection =
+        match resolve_backend(&state, &auth, &headers, StorageOperation::Delete).await {
+            Ok(selection) => selection,
+            Err(_) => {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &grant,
+                    &key,
+                    backend_resolution_error_response(&key),
+                )
+                .await;
+            }
+        };
+    freeze_read_placement(&mut selection, auth.workspace_id().as_str(), &bucket, &key).await;
+    let backend = &selection.backend;
     let _policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
@@ -2549,7 +2628,8 @@ pub(crate) async fn s3_delete(
             bucket: &bucket,
             key: &key,
             resolution: None,
-            destination: &backend,
+            destination: backend,
+            snapshot: &selection.snapshot,
             direction: crate::pipeline::PipelineDirection::Write,
         },
     )
@@ -2571,7 +2651,7 @@ pub(crate) async fn s3_delete(
         ResolvedBackend::PresignedHttp(url) => {
             let client = match state
                 .presigned_http_policy
-                .client_for_destination(&url, Duration::from_secs(30))
+                .client_for_destination(url, Duration::from_secs(30))
                 .await
             {
                 Ok(client) => client,
@@ -2586,7 +2666,7 @@ pub(crate) async fn s3_delete(
                     .await;
                 }
             };
-            match client.delete(url).send().await {
+            match client.delete(url.clone()).send().await {
                 Ok(response) if response.status().is_success() => {
                     if let Err(response) = record_operation(
                         state.control.clone(),
@@ -2808,7 +2888,7 @@ pub(crate) async fn s3_post(
                 return pipeline_error_response(&key, &error);
             }
         };
-        let backend = match resolve_backend(
+        let mut selection = match resolve_backend(
             &state,
             &authentication.auth,
             &parts.headers,
@@ -2816,9 +2896,15 @@ pub(crate) async fn s3_post(
         )
         .await
         {
-            Ok(backend) => backend,
+            Ok(selection) => selection,
             Err(_) => return backend_resolution_error_response(&key),
         };
+        selection.resolve_managed_placement(
+            authentication.auth.workspace_id().as_str(),
+            &bucket,
+            &key,
+        );
+        let backend = &selection.backend;
         let _policy = match enforce_policy(
             state.policy_gate.as_ref(),
             PolicyRequest {
@@ -2827,7 +2913,8 @@ pub(crate) async fn s3_post(
                 bucket: &bucket,
                 key: &key,
                 resolution: Some(&persisted_resolution),
-                destination: &backend,
+                destination: backend,
+                snapshot: &selection.snapshot,
                 direction: crate::pipeline::PipelineDirection::Write,
             },
         )
@@ -2836,7 +2923,7 @@ pub(crate) async fn s3_post(
             Ok(policy) => policy,
             Err(error) => return policy_error_response(&key, &error),
         };
-        if let Err(error) = validate_streaming_backend(&state, &backend) {
+        if let Err(error) = validate_streaming_backend(&state, backend) {
             return streaming_put_error_response(&key, error);
         }
         let (auth, body) =
@@ -3033,7 +3120,7 @@ pub(crate) async fn s3_post(
             );
         let recovered = match reconcile_existing_direct_completion(
             &state,
-            &backend,
+            backend,
             destination_operation_id,
             auth.workspace_id().as_str(),
             &bucket,
@@ -3117,7 +3204,7 @@ pub(crate) async fn s3_post(
                         auth: &auth,
                         grant: &grant,
                     },
-                    backend,
+                    backend.clone(),
                     &persisted_resolution,
                 ),
             )
@@ -3206,12 +3293,14 @@ pub(crate) async fn s3_post(
                 return pipeline_error_response(&key, &error);
             }
         };
-        let backend =
+        let mut selection =
             match resolve_backend(&state, &auth, &parts.headers, StorageOperation::Multipart).await
             {
-                Ok(backend) => backend,
+                Ok(selection) => selection,
                 Err(_) => return backend_resolution_error_response(&key),
             };
+        selection.resolve_managed_placement(auth.workspace_id().as_str(), &bucket, &key);
+        let backend = &selection.backend;
         let _policy = match enforce_policy(
             state.policy_gate.as_ref(),
             PolicyRequest {
@@ -3220,7 +3309,8 @@ pub(crate) async fn s3_post(
                 bucket: &bucket,
                 key: &key,
                 resolution: Some(&resolution),
-                destination: &backend,
+                destination: backend,
+                snapshot: &selection.snapshot,
                 direction: crate::pipeline::PipelineDirection::Write,
             },
         )
@@ -3229,13 +3319,13 @@ pub(crate) async fn s3_post(
             Ok(policy) => policy,
             Err(error) => return policy_error_response(&key, &error),
         };
-        if let Err(error) = validate_streaming_backend(&state, &backend) {
+        if let Err(error) = validate_streaming_backend(&state, backend) {
             return streaming_put_error_response(&key, error);
         }
-        if let Some(response) = require_file_bucket(&backend, &bucket).await {
+        if let Some(response) = require_file_bucket(backend, &bucket).await {
             return response;
         }
-        if let ResolvedBackend::Managed(storage) = &backend
+        if let ResolvedBackend::Managed(storage) = backend
             && storage
                 .assert_namespace_active(auth.workspace_id().as_str())
                 .await
@@ -3279,7 +3369,7 @@ pub(crate) async fn s3_post(
             namespace_epoch: managed_registration.as_ref().map(|(_, epoch)| *epoch),
             snapshot: multipart_snapshot(
                 &parts.headers,
-                &backend,
+                backend,
                 plugin_snapshot,
                 state.source_body_limits.max_bytes,
             ),
@@ -3396,8 +3486,8 @@ pub(crate) async fn s3_list_objects(
         }
         return response;
     }
-    let backend = match resolve_backend(&state, &auth, &headers, StorageOperation::List).await {
-        Ok(backend) => backend,
+    let selection = match resolve_backend(&state, &auth, &headers, StorageOperation::List).await {
+        Ok(selection) => selection,
         Err(_) => {
             return release_failure(
                 state.control.as_ref(),
@@ -3409,6 +3499,7 @@ pub(crate) async fn s3_list_objects(
             .await;
         }
     };
+    let backend = &selection.backend;
     let _policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
@@ -3417,7 +3508,8 @@ pub(crate) async fn s3_list_objects(
             bucket: &bucket,
             key: params.prefix.as_deref().unwrap_or_default(),
             resolution: None,
-            destination: &backend,
+            destination: backend,
+            snapshot: &selection.snapshot,
             direction: crate::pipeline::PipelineDirection::Read,
         },
     )
@@ -3438,7 +3530,7 @@ pub(crate) async fn s3_list_objects(
     // A File-backed bucket is explicit: listing (and HEAD, which is served by
     // this same handler) a bucket that was never created must return
     // NoSuchBucket, not an empty 200.
-    if let Some(response) = require_file_bucket(&backend, &bucket).await {
+    if let Some(response) = require_file_bucket(backend, &bucket).await {
         return release_failure(
             state.control.as_ref(),
             &auth.context,
@@ -3449,24 +3541,24 @@ pub(crate) async fn s3_list_objects(
         .await;
     }
     let response = match backend {
-        ResolvedBackend::S3 { client, .. } => match list_from_s3(&client, &bucket, &params).await {
+        ResolvedBackend::S3 { client, .. } => match list_from_s3(client, &bucket, &params).await {
             Ok(xml) => s3_xml_ok(xml),
             Err(failure) => s3_error::internal_error(&bucket, failure.client_message()),
         },
         ResolvedBackend::Memory(store) => {
-            match list_from_memory(&store, &bucket, &params, &state.continuation_token_key) {
+            match list_from_memory(store, &bucket, &params, &state.continuation_token_key) {
                 Ok(xml) => s3_xml_ok(xml),
                 Err(error) => s3_error::invalid_request(&bucket, &error),
             }
         }
         ResolvedBackend::File(store) => {
-            match list_from_file(&store, &bucket, &params, &state.continuation_token_key).await {
+            match list_from_file(store, &bucket, &params, &state.continuation_token_key).await {
                 Ok(xml) => s3_xml_ok(xml),
                 Err(error) => s3_error::invalid_request(&bucket, &error),
             }
         }
         ResolvedBackend::Managed(storage) => match list_from_managed(
-            &storage,
+            storage,
             auth.workspace_id().as_str(),
             &bucket,
             &params,
@@ -3483,7 +3575,7 @@ pub(crate) async fn s3_list_objects(
             }
         },
         ResolvedBackend::PresignedHttp(url) => {
-            match open_http_object(&state, url, &headers, false).await {
+            match open_http_object(&state, url.clone(), &headers, false).await {
                 Ok(object) => object.into_response(),
                 Err(error) => open_error_response(&bucket, error),
             }

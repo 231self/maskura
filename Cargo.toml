@@ -25,7 +25,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.18"
+version = "0.7.19"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/231self/maskura"
@@ -51,8 +51,8 @@ ml-kem = "0.3"
 x25519-dalek = { version = "3", default-features = false }
 hkdf = "0.12"
 
-wasmtime = "47"
-wasmtime-wasi = "47"
+wasmtime = "48"
+wasmtime-wasi = "48"
 wit-bindgen = "0.61"
 
 addr-spec = "0.9"

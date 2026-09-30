@@ -155,6 +155,7 @@ pub(crate) async fn list_buckets(
     match resolve_backend(state, auth, headers, StorageOperation::List)
         .await
         .map_err(anyhow::Error::msg)?
+        .backend
     {
         ResolvedBackend::S3 { client, .. } => {
             let out = client
@@ -213,7 +214,10 @@ pub(crate) async fn s3_bucket_put(
         Ok(auth) => auth,
         Err(error) => return authentication_error_response(&bucket, error),
     };
-    match resolve_backend(&state, &auth, &headers, StorageOperation::Put).await {
+    match resolve_backend(&state, &auth, &headers, StorageOperation::Put)
+        .await
+        .map(|selection| selection.backend)
+    {
         Ok(ResolvedBackend::File(store)) => match store.bucket_exists(&bucket).await {
             Ok(true) => s3_error::bucket_already_exists(&bucket),
             Ok(false) => match store.create_bucket(&bucket).await {
@@ -239,7 +243,10 @@ pub(crate) async fn s3_bucket_delete(
         Ok(auth) => auth,
         Err(error) => return authentication_error_response(&bucket, error),
     };
-    match resolve_backend(&state, &auth, &headers, StorageOperation::Delete).await {
+    match resolve_backend(&state, &auth, &headers, StorageOperation::Delete)
+        .await
+        .map(|selection| selection.backend)
+    {
         Ok(ResolvedBackend::File(store)) => match store.bucket_exists(&bucket).await {
             Ok(false) => s3_error::no_such_bucket(&bucket),
             Ok(true) => match store.delete_bucket(&bucket).await {

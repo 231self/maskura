@@ -16,7 +16,7 @@ use p256::ecdsa::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::canonical::{canonical_cbor, is_hex64, sha256_hex};
+use crate::canonical::{canonical_cbor, digest_of, is_hex64, sha256_hex};
 use crate::error::ConfigError;
 
 /// Version of the challenge context format.
@@ -89,6 +89,43 @@ pub struct AssertionExpectation {
     pub artifact_digest: String,
     pub rp_id: String,
     pub origins: Vec<String>,
+}
+
+/// The exact statement a bootstrap signer assertion approves (spec §5): the
+/// workspace, the new signer's COSE key, and the `signer_epoch` it is
+/// authorized from. Bootstrap establishes a genesis `TrustBundle` and emits no
+/// chained receipt, so the challenge's `artifact_digest` binds this statement
+/// directly rather than a `receipt_digest()`.
+///
+/// `purpose` is a fixed domain discriminant so a bootstrap binding can never
+/// collide with a receipt digest or any other artifact digest (the same
+/// separation `ReceiptBody.purpose` provides inside `digest_of`).
+#[derive(Debug, Serialize)]
+pub struct SignerBootstrapBinding<'a> {
+    pub purpose: &'static str,
+    pub workspace_id: &'a str,
+    /// base64url of the COSE_Key CBOR bytes — the exact `cose_public_key`
+    /// form served in `TrustCredential`.
+    pub cose_public_key: &'a str,
+    pub signer_epoch: u64,
+}
+
+/// The 64-hex `artifact_digest` a bootstrap `kind='signer'` challenge binds:
+/// `sha256(canonical_cbor(SignerBootstrapBinding { purpose: "signer_bootstrap",
+/// workspace_id, cose_public_key, signer_epoch }))`. The assertion over this
+/// digest is what authorizes the first signer for `(workspace, COSE key,
+/// signer_epoch)`; the epoch is covered by the digest, not just asserted.
+pub fn signer_bootstrap_digest(
+    workspace_id: &str,
+    cose_public_key: &str,
+    signer_epoch: u64,
+) -> Result<String, ConfigError> {
+    digest_of(&SignerBootstrapBinding {
+        purpose: "signer_bootstrap",
+        workspace_id,
+        cose_public_key,
+        signer_epoch,
+    })
 }
 
 /// The exact bytes retained for offline verification of one assertion.
@@ -930,6 +967,55 @@ mod tests {
 
     fn cred() -> TestCredential {
         test_credential([7u8; 32])
+    }
+
+    #[test]
+    fn signer_bootstrap_digest_binds_workspace_key_and_epoch() {
+        let key = BASE64URL.encode([9_u8; 64]);
+        let base = signer_bootstrap_digest("ws-1", &key, 1).unwrap();
+        assert!(is_hex64(&base), "digest must be 64 lowercase hex");
+
+        // Deterministic for the same statement.
+        assert_eq!(base, signer_bootstrap_digest("ws-1", &key, 1).unwrap());
+
+        // Each bound field changes the digest: the epoch is covered by the
+        // binding, not merely asserted alongside it.
+        assert_ne!(base, signer_bootstrap_digest("ws-2", &key, 1).unwrap());
+        let other_key = BASE64URL.encode([8_u8; 64]);
+        assert_ne!(
+            base,
+            signer_bootstrap_digest("ws-1", &other_key, 1).unwrap()
+        );
+        assert_ne!(base, signer_bootstrap_digest("ws-1", &key, 2).unwrap());
+    }
+
+    #[test]
+    fn signer_bootstrap_digest_is_domain_separated_from_receipts() {
+        // A fixed purpose discriminant keeps a bootstrap binding from ever
+        // colliding with a receipt digest over identical bytes.
+        let key = BASE64URL.encode([9_u8; 64]);
+        let binding = SignerBootstrapBinding {
+            purpose: "signer_bootstrap",
+            workspace_id: "ws-1",
+            cose_public_key: &key,
+            signer_epoch: 1,
+        };
+        assert_eq!(
+            signer_bootstrap_digest("ws-1", &key, 1).unwrap(),
+            digest_of(&binding).unwrap()
+        );
+        // Changing only the purpose (i.e. a different artifact kind) yields a
+        // different digest.
+        let other = SignerBootstrapBinding {
+            purpose: "receipt",
+            workspace_id: "ws-1",
+            cose_public_key: &key,
+            signer_epoch: 1,
+        };
+        assert_ne!(
+            signer_bootstrap_digest("ws-1", &key, 1).unwrap(),
+            digest_of(&other).unwrap()
+        );
     }
 
     #[test]
