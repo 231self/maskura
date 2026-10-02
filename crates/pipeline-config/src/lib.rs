@@ -11,6 +11,7 @@
 //! enforcement — not per-operation execution proofs.
 
 pub mod canonical;
+pub mod destination_digest;
 pub mod direction;
 pub mod effective_state;
 pub mod error;

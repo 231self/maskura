@@ -334,13 +334,9 @@ impl BackendResolver {
                         region: String::new(),
                         role_arn: None,
                         configuration_version_id: None,
-                        configuration_sha256: {
-                            use sha2::{Digest, Sha256};
-                            let mut h = Sha256::new();
-                            h.update(b"maskura-presigned\0");
-                            h.update(url.origin().ascii_serialization().as_bytes());
-                            format!("{:x}", h.finalize())
-                        },
+                        configuration_sha256: maskura_pipeline_config::destination_digest::presigned_configuration_sha256(
+                            &url.origin().ascii_serialization(),
+                        ),
                     },
                 },
                 selected_primary_backend_id: None,
@@ -430,15 +426,10 @@ impl BackendResolver {
                                     .streaming
                                     .as_ref()
                                     .map(|s| s.config_version.as_str().to_string()),
-                                configuration_sha256: {
-                                    use sha2::{Digest, Sha256};
-                                    let mut h = Sha256::new();
-                                    h.update(b"maskura-s3-compatible\0");
-                                    h.update(endpoint.as_str().as_bytes());
-                                    h.update(b"\0");
-                                    h.update(region.as_bytes());
-                                    format!("{:x}", h.finalize())
-                                },
+                                configuration_sha256: maskura_pipeline_config::destination_digest::s3_compatible_configuration_sha256(
+                                    endpoint.as_str(),
+                                    &region,
+                                ),
                             },
                         },
                         selected_primary_backend_id: None,
@@ -520,15 +511,10 @@ impl BackendResolver {
                                     .streaming
                                     .as_ref()
                                     .map(|s| s.config_version.as_str().to_string()),
-                                configuration_sha256: {
-                                    use sha2::{Digest, Sha256};
-                                    let mut h = Sha256::new();
-                                    h.update(b"maskura-aws-role\0");
-                                    h.update(role_arn.as_bytes());
-                                    h.update(b"\0");
-                                    h.update(region.as_bytes());
-                                    format!("{:x}", h.finalize())
-                                },
+                                configuration_sha256: maskura_pipeline_config::destination_digest::aws_role_configuration_sha256(
+                                    &role_arn,
+                                    &region,
+                                ),
                             },
                         },
                         selected_primary_backend_id: None,
@@ -566,12 +552,8 @@ impl BackendResolver {
                             region: String::new(),
                             role_arn: None,
                             configuration_version_id: None,
-                            configuration_sha256: {
-                                use sha2::{Digest, Sha256};
-                                let mut h = Sha256::new();
-                                h.update(b"maskura-global-s3\0");
-                                format!("{:x}", h.finalize())
-                            },
+                            configuration_sha256:
+                                maskura_pipeline_config::destination_digest::global_s3_configuration_sha256(),
                         },
                     },
                     selected_primary_backend_id: None,
@@ -3124,30 +3106,21 @@ impl DestinationSelectionSnapshot {
 /// Build the non-secret managed topology snapshot from service backends.
 fn managed_topology_snapshot(storage: &ServiceStorage) -> DestinationSelectionSnapshot {
     use maskura_pipeline_config::{ManagedBackend, ManagedPlacementAlgorithm};
-    use sha2::{Digest, Sha256};
 
     let mut backends: Vec<ManagedBackend> = Vec::with_capacity(storage.backends.len());
     for sb in &storage.backends {
-        let config_sha = {
-            let mut h = Sha256::new();
-            h.update(b"maskura-managed-backend\0");
-            h.update(sb.provider.as_bytes());
-            h.update(b"\0");
-            h.update(sb.provider_instance_id.as_deref().unwrap_or("").as_bytes());
-            h.update(b"\0");
-            h.update(sb.provider_account_id.as_deref().unwrap_or("").as_bytes());
-            h.update(b"\0");
-            h.update(sb.endpoint.as_bytes());
-            h.update(b"\0");
-            h.update(sb.region.as_bytes());
-            h.update(b"\0");
-            h.update(sb.bucket.as_bytes());
-            h.update(b"\0");
-            h.update(sb.placement_weight.to_be_bytes());
-            h.update(sb.placement_capacity_units.to_be_bytes());
-            h.update(sb.credential_epoch.unwrap_or(0).to_be_bytes());
-            format!("{:x}", h.finalize())
-        };
+        let config_sha =
+            maskura_pipeline_config::destination_digest::managed_backend_configuration_sha256(
+                &sb.provider,
+                sb.provider_instance_id.as_deref().unwrap_or(""),
+                sb.provider_account_id.as_deref().unwrap_or(""),
+                &sb.endpoint,
+                &sb.region,
+                &sb.bucket,
+                sb.placement_weight,
+                sb.placement_capacity_units,
+                sb.credential_epoch.unwrap_or(0),
+            );
         backends.push(ManagedBackend {
             backend_id: sb.id(),
             provider_kind: sb.provider.clone(),
