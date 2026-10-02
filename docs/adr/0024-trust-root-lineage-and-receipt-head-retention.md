@@ -61,6 +61,35 @@ The design rationale is recorded normatively in the Slice-3 protocol
 specification §8 (the record ADR 0022 defers schema detail to); this ADR
 captures the lasting storage/trust-boundary choice.
 
+**Bootstrap `artifact_digest` preimage.** The first signer (bootstrap) and a
+trust reset establish a genesis `TrustBundle` and emit **no** chained receipt —
+`SignerAuthority`/`ReplaceSigner` is the only signer receipt and requires a
+replacement plus a retired credential that bootstrap lacks. So
+`receipt_digest()` does not apply, and the challenge's `artifact_digest` needs
+its own preimage. We bind it to the exact authorized-signer statement from spec
+§5:
+
+```
+artifact_digest = sha256(canonical_cbor(SignerBootstrapBinding {
+    purpose: "signer_bootstrap",   // fixed domain discriminant
+    workspace_id,
+    cose_public_key,               // base64url of the COSE_Key CBOR
+    signer_epoch,
+}))
+```
+
+Implemented as `signer_bootstrap_digest()` in `maskura-pipeline-config` (the
+single source of truth) and wrapped by `policy_trust::bootstrap_artifact_digest()`
+so ceremony issuance and assertion verification can never derive different
+bytes. The `purpose` discriminant gives the same domain separation
+`ReceiptBody.purpose` provides inside `digest_of`, so a bootstrap binding can
+never collide with a receipt or any other artifact digest. This is option (b)
+of the candidate preimages — a purpose-built statement digest over
+`(workspace, COSE key, signer_epoch)` — chosen for the most literal match to
+spec §5 and the easiest independent audit; `(a)` reusing `digest_of(TrustCredential)`
+was rejected because `TrustCredential` carries fields (label, status) not part
+of the authorized-signer statement.
+
 ## Consequences
 
 - **Enables:** the hot seq-assignment path stays a single-row update on

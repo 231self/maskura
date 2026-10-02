@@ -29,21 +29,15 @@ pub struct ManagedPlacementBackendFact {
 /// Canonical fingerprint of a placement policy: the version plus every
 /// backend's identity, weight, and capacity in a stable order. A policy edit
 /// changes the fingerprint, so a version bump is required to admit it.
+///
+/// The preimage is shared signed material: it lives in
+/// `maskura_pipeline_config::destination_digest` so the control plane and the
+/// gateway compute byte-identical fingerprints. This is a thin wrapper.
 pub fn placement_policy_fingerprint(
     version: u32,
     backends: impl IntoIterator<Item = (String, u64, u64)>,
 ) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"s4-placement-policy\0");
-    hasher.update(version.to_be_bytes());
-    let mut facts: Vec<_> = backends.into_iter().collect();
-    facts.sort();
-    for (backend_id, weight, capacity) in facts {
-        hash_field(&mut hasher, backend_id.as_bytes());
-        hash_field(&mut hasher, &weight.to_be_bytes());
-        hash_field(&mut hasher, &capacity.to_be_bytes());
-    }
-    hex::encode(hasher.finalize())
+    maskura_pipeline_config::destination_digest::placement_policy_fingerprint(version, backends)
 }
 
 pub(crate) fn hash_field(hasher: &mut Sha256, value: &[u8]) {

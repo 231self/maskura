@@ -38,8 +38,11 @@ SCAN_ROOTS = (
 OLD_NAMESPACE = re.compile(r"\bs4\b|(?<!aw)s4[-_:]|s4m_|S4Client", re.IGNORECASE)
 FROZEN_PROTOCOL_LITERALS = {
     Path("crates/gateway/src/managed/placement.rs"): (
-        'b"s4-placement-policy\\0"',
         'b"s4-rendezvous\\0"',
+    ),
+    Path("crates/pipeline-config/src/destination_digest.rs"): (
+        's4-placement-policy\\0',
+        'b"s4-placement-policy\\0"',
     ),
 }
 TEXT_SUFFIXES = {
