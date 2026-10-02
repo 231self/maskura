@@ -1,6 +1,6 @@
 [project]
 name = "maskura-client"
-version = "0.7.19"
+version = "0.7.20"
 description = "Maskura Gateway API"
 authors = [
   {name = "OpenAPI Generator Community",email = "team@openapitools.org"},
