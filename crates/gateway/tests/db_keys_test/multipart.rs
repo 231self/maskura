@@ -25,6 +25,7 @@ fn postgres_multipart_completion_cas_replay_and_fencing_are_durable() {
                     destination: serde_json::json!({"kind":"test"}),
                     plugin_snapshot: serde_json::json!([]),
                     max_staged_bytes: 1024,
+                    verified_policy: None,
                 },
                 lifecycle: MultipartLifecycle::Open,
                 staged_bytes: 0,

@@ -29,6 +29,7 @@ fn upload(identity: MultipartIdentity, max_staged_bytes: u64) -> MultipartUpload
             destination: json!({"mode": "local"}),
             plugin_snapshot: json!({"revision": "one"}),
             max_staged_bytes,
+            verified_policy: None,
         },
         lifecycle: MultipartLifecycle::Open,
         staged_bytes: 0,

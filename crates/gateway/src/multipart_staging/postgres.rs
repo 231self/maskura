@@ -169,6 +169,13 @@ pub(crate) fn upload_model(
         destination: Set(upload.snapshot.destination.clone()),
         plugin_snapshot: Set(upload.snapshot.plugin_snapshot.clone()),
         limits: Set(serde_json::json!({"max_staged_bytes": upload.snapshot.max_staged_bytes})),
+        verified_policy: Set(upload
+            .snapshot
+            .verified_policy
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(json_error)?),
         staged_bytes: Set(
             i64::try_from(upload.staged_bytes).map_err(|_| StagingError::QuotaExceeded)?
         ),
@@ -261,6 +268,11 @@ pub(crate) fn upload_from_model(
             destination: model.destination,
             plugin_snapshot: model.plugin_snapshot,
             max_staged_bytes,
+            verified_policy: model
+                .verified_policy
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(json_error)?,
         },
         lifecycle: lifecycle(&model.lifecycle)?,
         staged_bytes: u64::try_from(model.staged_bytes)

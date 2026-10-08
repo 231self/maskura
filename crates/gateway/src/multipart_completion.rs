@@ -943,6 +943,7 @@ mod tests {
                         destination: serde_json::json!({"kind": "file"}),
                         plugin_snapshot: serde_json::json!({}),
                         max_staged_bytes: 1024 * 1024,
+                        verified_policy: None,
                     },
                     lifecycle: MultipartLifecycle::Open,
                     staged_bytes: 0,

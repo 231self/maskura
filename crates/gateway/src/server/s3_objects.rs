@@ -1739,12 +1739,21 @@ pub(crate) async fn s3_get(
         return response;
     }
     let transformed_read = wants_transformed_read(&headers);
+    // ListParts lists the parts of a caller-owned upload and is deliberately
+    // out of the v1 policy claim (part listings are not object-data policy
+    // surface); the create-time frozen verdict is still re-checked below.
     if params.upload_id.is_some() {
-        let selection =
+        let mut selection =
             match resolve_backend(&state, &auth, &headers, StorageOperation::Multipart).await {
                 Ok(selection) => selection,
                 Err(_) => return backend_resolution_error_response(&key),
             };
+        // Present the same per-key managed placement the frozen binding was
+        // approved under, so the check/use comparison below is apples-to-apples
+        // across the multipart lifecycle (the rendezvous is deterministic for an
+        // unchanged ring; ring/topology drift correctly denies — re-approval
+        // required). Mutates only the snapshot, never the resolved backend.
+        selection.resolve_managed_placement(auth.workspace_id().as_str(), &bucket, &key);
         let backend = &selection.backend;
         let Some(staging) = staged_multipart(&state).cloned() else {
             return s3_error::multipart_not_supported(&key);
@@ -1761,6 +1770,14 @@ pub(crate) async fn s3_get(
                 Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
                 Err(error) => return s3_error::internal_error(&key, &error.to_string()),
             };
+            // Frozen create-time verdict re-checked against the fresh resolution
+            // (check/use; state/bounds mismatch → policy.denied).
+            if let Err(error) = crate::policy_gate::consume_frozen_policy(
+                upload.snapshot.verified_policy.as_ref(),
+                &selection.snapshot,
+            ) {
+                return policy_error_response(&key, &error);
+            }
             let Some(epoch) = upload.namespace_epoch else {
                 return s3_error::service_unavailable(
                     &key,
@@ -1861,7 +1878,7 @@ pub(crate) async fn s3_get(
         Ok(grant) => grant,
         Err(response) => return response,
     };
-    let pipeline_snapshot = if let Some(resolution) = &resolution {
+    let mut pipeline_snapshot = if let Some(resolution) = &resolution {
         match state.gateway.snapshot_for(resolution).await {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
@@ -1915,7 +1932,7 @@ pub(crate) async fn s3_get(
     };
     freeze_read_placement(&mut selection, auth.workspace_id().as_str(), &bucket, &key).await;
     let backend = &selection.backend;
-    let _policy = match enforce_policy(
+    let policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
             workspace_id: auth.workspace_id().as_str(),
@@ -1946,6 +1963,45 @@ pub(crate) async fn s3_get(
             .await;
         }
     };
+    // Check/use: the bound verdict freezes the destination and the effective
+    // limits execution must use. A transformed read tightens its wasm session
+    // to `min(policy, operator)` for the fields a policy governs; raw GET has
+    // no wasm session, so its snapshot stays untouched.
+    let policy_binding = match crate::policy_gate::consume_policy(&policy, &selection.snapshot) {
+        Ok(binding) => binding,
+        Err(error) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &grant,
+                &key,
+                policy_error_response(&key, &error),
+            )
+            .await;
+        }
+    };
+    if let Some(binding) = policy_binding {
+        pipeline_snapshot = match pipeline_snapshot {
+            Some(snapshot) => Some(
+                match snapshot
+                    .constrained(crate::policy_gate::policy_session_limits(&binding.limits))
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        return release_failure(
+                            state.control.as_ref(),
+                            &auth.context,
+                            &grant,
+                            &key,
+                            policy_error_response(&key, &error),
+                        )
+                        .await;
+                    }
+                },
+            ),
+            None => None,
+        };
+    }
     // A transformed representation must be admitted from authoritative object
     // metadata before a source GET can start delivering bytes. Passthrough keeps
     // its existing one-request behavior below.
@@ -2280,7 +2336,7 @@ pub(crate) async fn s3_head(
     };
     freeze_read_placement(&mut selection, auth.workspace_id().as_str(), &bucket, &key).await;
     let backend = &selection.backend;
-    let _policy = match enforce_policy(
+    let policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
             workspace_id: auth.workspace_id().as_str(),
@@ -2307,6 +2363,16 @@ pub(crate) async fn s3_head(
             .await;
         }
     };
+    if let Err(error) = crate::policy_gate::consume_policy(&policy, &selection.snapshot) {
+        return release_failure(
+            state.control.as_ref(),
+            &auth.context,
+            &grant,
+            &key,
+            policy_error_response(&key, &error),
+        )
+        .await;
+    }
     match open_backend_object(
         &state,
         backend.clone(),
@@ -2432,7 +2498,7 @@ pub(crate) async fn s3_delete(
     );
 
     if params.upload_id.is_some() {
-        let selection =
+        let mut selection =
             match resolve_backend(&state, &auth, &headers, StorageOperation::Multipart).await {
                 Ok(selection) => selection,
                 Err(_) => {
@@ -2446,8 +2512,14 @@ pub(crate) async fn s3_delete(
                     .await;
                 }
             };
+        // Present the same per-key managed placement the frozen binding was
+        // approved under, so the check/use comparison below is apples-to-apples
+        // across the multipart lifecycle (the rendezvous is deterministic for an
+        // unchanged ring; ring/topology drift correctly denies — re-approval
+        // required). Mutates only the snapshot, never the resolved backend.
+        selection.resolve_managed_placement(auth.workspace_id().as_str(), &bucket, &key);
         let backend = &selection.backend;
-        let _policy = match enforce_policy(
+        let policy = match enforce_policy(
             state.policy_gate.as_ref(),
             PolicyRequest {
                 workspace_id: auth.workspace_id().as_str(),
@@ -2474,6 +2546,16 @@ pub(crate) async fn s3_delete(
                 .await;
             }
         };
+        if let Err(error) = crate::policy_gate::consume_policy(&policy, &selection.snapshot) {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &grant,
+                &key,
+                policy_error_response(&key, &error),
+            )
+            .await;
+        }
         let Some(staging) = staged_multipart(&state).cloned() else {
             return release_failure(
                 state.control.as_ref(),
@@ -2509,6 +2591,21 @@ pub(crate) async fn s3_delete(
                 .await;
             }
         };
+        // Frozen create-time verdict re-checked against the fresh resolution
+        // (check/use; state/bounds mismatch → policy.denied).
+        if let Err(error) = crate::policy_gate::consume_frozen_policy(
+            upload.snapshot.verified_policy.as_ref(),
+            &selection.snapshot,
+        ) {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &grant,
+                &key,
+                policy_error_response(&key, &error),
+            )
+            .await;
+        }
         if let ResolvedBackend::Managed(storage) = &backend {
             let Some(epoch) = upload.namespace_epoch else {
                 let response = s3_error::service_unavailable(
@@ -2620,7 +2717,7 @@ pub(crate) async fn s3_delete(
         };
     freeze_read_placement(&mut selection, auth.workspace_id().as_str(), &bucket, &key).await;
     let backend = &selection.backend;
-    let _policy = match enforce_policy(
+    let policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
             workspace_id: auth.workspace_id().as_str(),
@@ -2647,6 +2744,16 @@ pub(crate) async fn s3_delete(
             .await;
         }
     };
+    if let Err(error) = crate::policy_gate::consume_policy(&policy, &selection.snapshot) {
+        return release_failure(
+            state.control.as_ref(),
+            &auth.context,
+            &grant,
+            &key,
+            policy_error_response(&key, &error),
+        )
+        .await;
+    }
     match backend {
         ResolvedBackend::PresignedHttp(url) => {
             let client = match state
@@ -2905,7 +3012,7 @@ pub(crate) async fn s3_post(
             &key,
         );
         let backend = &selection.backend;
-        let _policy = match enforce_policy(
+        let policy = match enforce_policy(
             state.policy_gate.as_ref(),
             PolicyRequest {
                 workspace_id: authentication.auth.workspace_id().as_str(),
@@ -2922,6 +3029,35 @@ pub(crate) async fn s3_post(
         {
             Ok(policy) => policy,
             Err(error) => return policy_error_response(&key, &error),
+        };
+        // Check/use: capture the fresh bound verdict so completion can tighten
+        // the wasm session to its effective limits below.
+        let fresh_binding = match crate::policy_gate::consume_policy(&policy, &selection.snapshot) {
+            Ok(binding) => binding,
+            Err(error) => return policy_error_response(&key, &error),
+        };
+        // Frozen create-time verdict re-checked against the fresh resolution
+        // (check/use; state/bounds mismatch → policy.denied).
+        let frozen_binding = match crate::policy_gate::consume_frozen_policy(
+            upload.snapshot.verified_policy.as_ref(),
+            &selection.snapshot,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => return policy_error_response(&key, &error),
+        };
+        // Effective completion limits (owner decision 2026-10-08 — fail-closed
+        // composition): both bound → field-wise min; one bound → that one;
+        // neither → none. The completion session never exceeds EITHER the
+        // create-time admission (frozen state retained across policy changes)
+        // OR the current policy (tightening applies immediately).
+        let effective_policy_limits = match (frozen_binding, fresh_binding) {
+            (Some(frozen), Some(fresh)) => Some(crate::policy_gate::min_policy_limits(
+                &frozen.limits,
+                &fresh.limits,
+            )),
+            (Some(frozen), None) => Some(frozen.limits),
+            (None, Some(fresh)) => Some(fresh.limits),
+            (None, None) => None,
         };
         if let Err(error) = validate_streaming_backend(&state, backend) {
             return streaming_put_error_response(&key, error);
@@ -3206,6 +3342,7 @@ pub(crate) async fn s3_post(
                     },
                     backend.clone(),
                     &persisted_resolution,
+                    effective_policy_limits.as_ref(),
                 ),
             )
             .await;
@@ -3301,7 +3438,7 @@ pub(crate) async fn s3_post(
             };
         selection.resolve_managed_placement(auth.workspace_id().as_str(), &bucket, &key);
         let backend = &selection.backend;
-        let _policy = match enforce_policy(
+        let policy = match enforce_policy(
             state.policy_gate.as_ref(),
             PolicyRequest {
                 workspace_id: auth.workspace_id().as_str(),
@@ -3319,6 +3456,9 @@ pub(crate) async fn s3_post(
             Ok(policy) => policy,
             Err(error) => return policy_error_response(&key, &error),
         };
+        if let Err(error) = crate::policy_gate::consume_policy(&policy, &selection.snapshot) {
+            return policy_error_response(&key, &error);
+        }
         if let Err(error) = validate_streaming_backend(&state, backend) {
             return streaming_put_error_response(&key, error);
         }
@@ -3372,6 +3512,12 @@ pub(crate) async fn s3_post(
                 backend,
                 plugin_snapshot,
                 state.source_body_limits.max_bytes,
+                // Freeze only bound verdicts: an unbound verdict freezes
+                // nothing (there is no approval evidence to retain), which
+                // keeps the OSS staged-artifact digest preimage at the
+                // historical layout. `None` means "no frozen approval" for
+                // both legacy uploads and unbound-at-create alike.
+                policy.is_bound().then_some(policy),
             ),
             lifecycle: MultipartLifecycle::Open,
             staged_bytes: 0,
@@ -3458,6 +3604,61 @@ pub(crate) async fn s3_list_objects(
         Ok(grant) => grant,
         Err(response) => return response,
     };
+    // In-progress upload listings disclose key names — the same disclosure
+    // surface ListObjects scopes to approved prefixes — so `?uploads` presents
+    // as `List` with the requested prefix and runs behind the same gate as the
+    // plain LIST path. The gate runs before either branch.
+    let selection = match resolve_backend(&state, &auth, &headers, StorageOperation::List).await {
+        Ok(selection) => selection,
+        Err(_) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &grant,
+                &bucket,
+                backend_resolution_error_response(&bucket),
+            )
+            .await;
+        }
+    };
+    let backend = &selection.backend;
+    let policy = match enforce_policy(
+        state.policy_gate.as_ref(),
+        PolicyRequest {
+            workspace_id: auth.workspace_id().as_str(),
+            operation: PolicyOperation::List,
+            bucket: &bucket,
+            key: params.prefix.as_deref().unwrap_or_default(),
+            resolution: None,
+            destination: backend,
+            snapshot: &selection.snapshot,
+            direction: crate::pipeline::PipelineDirection::Read,
+        },
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &grant,
+                &bucket,
+                policy_error_response(&bucket, &error),
+            )
+            .await;
+        }
+    };
+    if let Err(error) = crate::policy_gate::consume_policy(&policy, &selection.snapshot) {
+        return release_failure(
+            state.control.as_ref(),
+            &auth.context,
+            &grant,
+            &bucket,
+            policy_error_response(&bucket, &error),
+        )
+        .await;
+    }
     if params.uploads.is_some() {
         let response = list_multipart_uploads_response(&state, &auth, &bucket, &params).await;
         if !response.status().is_success() {
@@ -3486,47 +3687,6 @@ pub(crate) async fn s3_list_objects(
         }
         return response;
     }
-    let selection = match resolve_backend(&state, &auth, &headers, StorageOperation::List).await {
-        Ok(selection) => selection,
-        Err(_) => {
-            return release_failure(
-                state.control.as_ref(),
-                &auth.context,
-                &grant,
-                &bucket,
-                backend_resolution_error_response(&bucket),
-            )
-            .await;
-        }
-    };
-    let backend = &selection.backend;
-    let _policy = match enforce_policy(
-        state.policy_gate.as_ref(),
-        PolicyRequest {
-            workspace_id: auth.workspace_id().as_str(),
-            operation: PolicyOperation::List,
-            bucket: &bucket,
-            key: params.prefix.as_deref().unwrap_or_default(),
-            resolution: None,
-            destination: backend,
-            snapshot: &selection.snapshot,
-            direction: crate::pipeline::PipelineDirection::Read,
-        },
-    )
-    .await
-    {
-        Ok(policy) => policy,
-        Err(error) => {
-            return release_failure(
-                state.control.as_ref(),
-                &auth.context,
-                &grant,
-                &bucket,
-                policy_error_response(&bucket, &error),
-            )
-            .await;
-        }
-    };
     // A File-backed bucket is explicit: listing (and HEAD, which is served by
     // this same handler) a bucket that was never created must return
     // NoSuchBucket, not an empty 200.

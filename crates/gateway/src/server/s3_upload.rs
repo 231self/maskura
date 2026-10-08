@@ -762,7 +762,7 @@ pub(crate) async fn s3_put(
         };
     selection.resolve_managed_placement(auth.workspace_id().as_str(), &bucket, &key);
     let backend = &selection.backend;
-    let _policy = match enforce_policy(
+    let policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
             workspace_id: auth.workspace_id().as_str(),
@@ -788,6 +788,41 @@ pub(crate) async fn s3_put(
             )
             .await;
         }
+    };
+    // Check/use: the bound verdict freezes the destination and effective
+    // limits execution must use. Reject if the resolved selection drifted from
+    // the approved binding; otherwise tighten the wasm session to
+    // `min(policy, operator)` for the fields a policy governs.
+    let policy_binding = match crate::policy_gate::consume_policy(&policy, &selection.snapshot) {
+        Ok(binding) => binding,
+        Err(error) => {
+            return release_failure(
+                state.control.as_ref(),
+                &auth_context,
+                &grant,
+                &key,
+                policy_error_response(&key, &error),
+            )
+            .await;
+        }
+    };
+    let snapshot = match policy_binding {
+        Some(binding) => {
+            match snapshot.constrained(crate::policy_gate::policy_session_limits(&binding.limits)) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return release_failure(
+                        state.control.as_ref(),
+                        &auth_context,
+                        &grant,
+                        &key,
+                        policy_error_response(&key, &error),
+                    )
+                    .await;
+                }
+            }
+        }
+        None => snapshot,
     };
     if let Some(response) = require_file_bucket(&selection.backend, &bucket).await {
         return release_failure(

@@ -80,6 +80,7 @@ fn snapshot() -> MultipartSnapshot {
         destination: serde_json::json!({"backend":"test"}),
         plugin_snapshot: serde_json::json!([]),
         max_staged_bytes: 1024,
+        verified_policy: None,
     }
 }
 fn upload() -> MultipartUpload {
@@ -953,4 +954,326 @@ async fn zero_byte_part_can_be_uploaded_listed_and_selected_as_the_final_part() 
     };
     assert_eq!(lease.selected_parts.len(), 1);
     assert_eq!(lease.selected_parts[0].size_bytes, 0);
+}
+
+/// A `MultipartSnapshot` serialized before the Slice 3 / P4.1h `verified_policy`
+/// field existed. Staged part artifacts carry a `metadata_digest` over exactly
+/// this byte layout (`EncryptedPartWriter::begin` / `EncryptedPartReader::open`
+/// in `artifact.rs`), so snapshots with `verified_policy: None` must reproduce
+/// it verbatim.
+const PRE_VERIFIED_POLICY_SNAPSHOT_JSON: &str = r#"{"metadata":{},"tags":{},"checksum_mode":null,"destination":{"backend":"test"},"plugin_snapshot":[],"max_staged_bytes":1024}"#;
+
+/// A bound gate verdict in the style of the `crate::policy_gate` tests.
+fn bound_verified_policy() -> crate::policy_gate::VerifiedPolicy {
+    crate::policy_gate::VerifiedPolicy {
+        binding: Some(crate::policy_gate::PolicyBinding {
+            workspace_id: "ws-test".to_string(),
+            operation: maskura_pipeline_config::PolicyOperation::Put,
+            route_prefix: String::new(),
+            envelope_digest: "e".repeat(64),
+            envelope_version: 1,
+            effective_state_digest: "d".repeat(64),
+            receipt_seq: 1,
+            receipt_body_digest: "b".repeat(64),
+            authorization_epoch: 1,
+            destination: maskura_pipeline_config::DestinationBinding::Concrete {
+                destination: maskura_pipeline_config::ResolvedDestination {
+                    mode: maskura_pipeline_config::StorageMode::S3Compatible,
+                    endpoint: "https://s3.example.com".into(),
+                    bucket: "bucket".into(),
+                    region: "region-1".into(),
+                    role_arn: None,
+                    configuration_version_id: Some("cfg-1".into()),
+                    configuration_sha256: "c".repeat(64),
+                },
+            },
+            managed_placement: None,
+            limits: maskura_pipeline_config::PolicyLimits {
+                record_max_bytes: 1024,
+                object_max_bytes: 4096,
+                memory_bytes: 67_108_864,
+                fuel: 10_000_000,
+                deadline_ms: 30_000,
+            },
+        }),
+    }
+}
+
+#[test]
+fn snapshot_json_without_verified_policy_deserializes_unbound() {
+    let legacy: serde_json::Value =
+        serde_json::from_str(PRE_VERIFIED_POLICY_SNAPSHOT_JSON).unwrap();
+    assert!(legacy.get("verified_policy").is_none());
+    let parsed: MultipartSnapshot = serde_json::from_value(legacy).unwrap();
+    assert!(parsed.verified_policy.is_none());
+    assert_eq!(parsed, snapshot());
+}
+
+#[test]
+fn verified_policy_none_serializes_without_key_in_pre_change_layout() {
+    let value = serde_json::to_value(snapshot()).unwrap();
+    assert!(value.get("verified_policy").is_none());
+    assert_eq!(
+        serde_json::to_vec(&snapshot()).unwrap(),
+        PRE_VERIFIED_POLICY_SNAPSHOT_JSON.as_bytes(),
+        "None must reproduce the exact pre-verified_policy byte layout"
+    );
+}
+
+#[test]
+fn metadata_digest_layout_is_unchanged_when_verified_policy_is_none() {
+    use sha2::Digest as _;
+    // `EncryptedPartWriter::begin` digests `serde_json::to_vec(snapshot)` when a
+    // part is staged and `EncryptedPartReader::open` re-verifies the digest
+    // after reloading the snapshot from the repository. Both sides must
+    // serialize a `None` verdict exactly as before the field existed, or every
+    // legacy staged part fails its identity check.
+    let legacy: serde_json::Value =
+        serde_json::from_str(PRE_VERIFIED_POLICY_SNAPSHOT_JSON).unwrap();
+    let legacy_snapshot: MultipartSnapshot = serde_json::from_value(legacy).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&legacy_snapshot).unwrap(),
+        serde_json::to_vec(&snapshot()).unwrap(),
+    );
+    assert_eq!(
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&legacy_snapshot).unwrap()
+        )),
+        hex::encode(Sha256::digest(serde_json::to_vec(&snapshot()).unwrap())),
+    );
+}
+
+#[test]
+fn unbound_create_verdict_freezes_nothing_and_keeps_the_historical_digest_layout() {
+    // The MultipartCreate handler freezes only bound verdicts
+    // (`policy.is_bound().then_some(policy)`): an unbound verdict freezes
+    // nothing — there is no approval evidence to retain — so a gate-less or
+    // unbound-at-create upload reproduces the exact pre-verified_policy byte
+    // layout and the staged-artifact `metadata_digest` stays compatible across
+    // a mixed-version deploy/rollback window.
+    let unbound = crate::policy_gate::VerifiedPolicy::unbound();
+    let frozen = unbound.is_bound().then_some(unbound);
+    assert!(frozen.is_none());
+    let mut created = snapshot();
+    created.verified_policy = frozen;
+    assert_eq!(
+        serde_json::to_vec(&created).unwrap(),
+        PRE_VERIFIED_POLICY_SNAPSHOT_JSON.as_bytes(),
+        "an unbound-at-create verdict must reproduce the historical digest preimage"
+    );
+}
+
+#[tokio::test]
+async fn freezing_an_unbound_verdict_would_skew_the_staged_part_digest() {
+    // The failure mode the bound-only freeze rule prevents: a part staged
+    // before the deploy carries a `metadata_digest` over the historical
+    // preimage; a version that froze `Some(unbound)` would digest the reloaded
+    // snapshot differently and `EncryptedPartReader::open` would reject the
+    // in-flight part with "staging artifact identity mismatch" for the whole
+    // deploy/rollback window.
+    let directory = std::env::temp_dir().join(format!("maskura-stage-skew-{}", Uuid::now_v7()));
+    let wrapping = Arc::new(LocalKeyWrapping::with_kek([9; 32]));
+    let mut writer = EncryptedPartWriter::begin(
+        &directory,
+        &identity(),
+        1,
+        1,
+        &snapshot(),
+        1024,
+        wrapping.clone(),
+    )
+    .await
+    .unwrap();
+    writer.write(Bytes::from_static(b"payload")).await.unwrap();
+    let finished = writer.finish().await.unwrap();
+    let part = MultipartPart {
+        upload_id: "upload".to_string(),
+        part_number: 1,
+        attempt: 1,
+        artifact_key: "artifact-1".to_string(),
+        etag: finished.etag.clone(),
+        checksum_sha256: finished.checksum_sha256.clone(),
+        size_bytes: finished.size_bytes,
+        created_at_ms: now_ms(),
+    };
+    let ciphertext = tokio::fs::read(&finished.path).await.unwrap();
+    // Control: the unchanged snapshot opens the artifact.
+    EncryptedPartReader::open(
+        aws_sdk_s3::primitives::ByteStream::from(ciphertext.clone()).into_async_read(),
+        &identity(),
+        &part,
+        &snapshot(),
+        wrapping.clone(),
+    )
+    .await
+    .expect("the unchanged snapshot must open the staged part");
+    // The skewed snapshot: identical upload, but the unbound verdict was
+    // frozen as `Some(unbound)` instead of `None`.
+    let mut skewed = snapshot();
+    skewed.verified_policy = Some(crate::policy_gate::VerifiedPolicy::unbound());
+    let error = EncryptedPartReader::open(
+        aws_sdk_s3::primitives::ByteStream::from(ciphertext).into_async_read(),
+        &identity(),
+        &part,
+        &skewed,
+        wrapping,
+    )
+    .await
+    .err()
+    .expect("a frozen unbound verdict must skew the staged-part digest");
+    assert!(
+        error
+            .to_string()
+            .contains("staging artifact identity mismatch"),
+        "unexpected error: {error}"
+    );
+    finished.remove().await;
+    let _ = tokio::fs::remove_dir(directory).await;
+}
+
+#[test]
+fn verified_policy_round_trips_through_snapshot_json() {
+    let mut frozen = snapshot();
+    frozen.verified_policy = Some(bound_verified_policy());
+    let json = serde_json::to_string(&frozen).unwrap();
+    let parsed: MultipartSnapshot = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, frozen);
+    assert!(
+        parsed
+            .verified_policy
+            .as_ref()
+            .is_some_and(crate::policy_gate::VerifiedPolicy::is_bound)
+    );
+    assert!(
+        serde_json::to_value(&frozen)
+            .unwrap()
+            .get("verified_policy")
+            .is_some(),
+        "a frozen verdict must serialize the key"
+    );
+}
+
+/// A bound verdict with a managed-topology destination and the given per-key
+/// placement — the two serde shapes the persisted freeze must round-trip
+/// exactly: the tuple-`Option` `managed_placement` field, and the internally
+/// tagged `DestinationBinding::ManagedTopology` under `deny_unknown_fields`.
+fn managed_verified_policy(
+    managed_placement: Option<(String, Option<String>)>,
+) -> crate::policy_gate::VerifiedPolicy {
+    fn backend(id: &str) -> maskura_pipeline_config::ManagedBackend {
+        maskura_pipeline_config::ManagedBackend {
+            backend_id: id.into(),
+            provider_kind: "b2".into(),
+            provider_instance_id: String::new(),
+            provider_account_id: String::new(),
+            endpoint: "https://s3.example.com".into(),
+            region: "region-1".into(),
+            bucket: "physical".into(),
+            placement_weight: 1,
+            placement_capacity_units: 1,
+            credential_epoch: 1,
+            configuration_sha256: "a".repeat(64),
+        }
+    }
+    let mut policy = bound_verified_policy();
+    let binding = policy.binding.as_mut().expect("bound verdict");
+    binding.destination = maskura_pipeline_config::DestinationBinding::ManagedTopology {
+        placement_version: 1,
+        algorithm: maskura_pipeline_config::ManagedPlacementAlgorithm::WeightedRendezvous,
+        authority_sha256: "f".repeat(64),
+        backends: vec![backend("b1"), backend("b2")],
+    };
+    binding.managed_placement = managed_placement;
+    policy
+}
+
+/// Round-trip a frozen verdict through the snapshot JSON *and* through the
+/// upload model's JSON column (the simulated repository reload), comparing
+/// structs at every hop.
+fn assert_frozen_policy_round_trips(verdict: crate::policy_gate::VerifiedPolicy) {
+    let mut frozen = snapshot();
+    frozen.verified_policy = Some(verdict);
+    let json = serde_json::to_string(&frozen).unwrap();
+    let parsed: MultipartSnapshot = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, frozen, "snapshot JSON round-trip must be lossless");
+    // Simulated repository reload: persist through the upload model's JSON
+    // column and parse the stored value back into equal structs.
+    let mut stored = upload();
+    stored.snapshot.verified_policy = frozen.verified_policy.clone();
+    let active = upload_model(&stored).expect("upload_model succeeds");
+    let model = crate::entity::multipart_upload::Model::try_from(active)
+        .expect("upload_model sets every column");
+    let reloaded = upload_from_model(model).expect("upload_from_model succeeds");
+    assert_eq!(
+        reloaded.snapshot.verified_policy, frozen.verified_policy,
+        "repository reload must preserve the frozen verdict exactly"
+    );
+}
+
+#[test]
+fn verified_policy_round_trips_managed_topology_with_replica_placement() {
+    // The `Some((primary, Some(replica)))` tuple-Option arm under the
+    // internally tagged `ManagedTopology` binding — both under
+    // `deny_unknown_fields` on `VerifiedPolicy`/`PolicyBinding`.
+    let verdict = managed_verified_policy(Some(("b1".into(), Some("b2".into()))));
+    let value = serde_json::to_value(&verdict).unwrap();
+    assert_eq!(
+        value["binding"]["managed_placement"],
+        serde_json::json!(["b1", "b2"]),
+        "the tuple-Option placement must serialize as a JSON tuple"
+    );
+    assert_eq!(
+        value["binding"]["destination"]["kind"],
+        serde_json::json!("managed_topology"),
+        "the internally tagged managed binding must serialize its tag"
+    );
+    assert_frozen_policy_round_trips(verdict);
+}
+
+#[test]
+fn verified_policy_round_trips_placement_without_replica() {
+    // The other tuple-Option arm: `Some((primary, None))`.
+    let verdict = managed_verified_policy(Some(("b1".into(), None)));
+    let value = serde_json::to_value(&verdict).unwrap();
+    assert_eq!(
+        value["binding"]["managed_placement"],
+        serde_json::json!(["b1", null]),
+        "a missing replica must serialize as the null tuple arm"
+    );
+    assert_frozen_policy_round_trips(verdict);
+}
+
+#[test]
+fn completion_fingerprint_ignores_verified_policy() {
+    // The fingerprint preimage (types.rs `completion_fingerprint`) covers only
+    // immutable upload inputs; the frozen verdict is re-checked at every reuse
+    // point instead, so pre- and post-freeze snapshots keep matching
+    // fingerprints across the schema change.
+    let mut frozen = upload();
+    frozen.snapshot.verified_policy = Some(bound_verified_policy());
+    assert_eq!(
+        completion_fingerprint(&upload(), &[]).unwrap(),
+        completion_fingerprint(&frozen, &[]).unwrap(),
+    );
+}
+
+#[test]
+fn postgres_model_roundtrip_preserves_verified_policy() {
+    for verdict in [None, Some(bound_verified_policy())] {
+        let mut stored = upload();
+        stored.snapshot.verified_policy = verdict.clone();
+        let active = upload_model(&stored).expect("upload_model succeeds");
+        let model = crate::entity::multipart_upload::Model::try_from(active)
+            .expect("upload_model sets every column");
+        assert_eq!(
+            model.verified_policy,
+            verdict
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .expect("verdict serializes")
+        );
+        let restored = upload_from_model(model).expect("upload_from_model succeeds");
+        assert_eq!(restored.snapshot.verified_policy, verdict);
+    }
 }

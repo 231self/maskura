@@ -707,6 +707,7 @@ mod multipart_listing_validation_tests {
                 destination: serde_json::json!({"kind": "file"}),
                 plugin_snapshot: serde_json::json!({}),
                 max_staged_bytes: 0,
+                verified_policy: None,
             },
             lifecycle: MultipartLifecycle::Open,
             staged_bytes: 0,
@@ -868,6 +869,7 @@ mod multipart_listing_validation_tests {
             destination: serde_json::json!({"kind": "file"}),
             plugin_snapshot: serde_json::json!({}),
             max_staged_bytes: 0,
+            verified_policy: None,
         };
         snapshot
             .metadata
