@@ -421,6 +421,7 @@ async fn multipart_recovery_orders_artifacts_before_expiry_and_retries_on_next_r
                 destination: serde_json::json!({"kind":"file"}),
                 plugin_snapshot: serde_json::json!({}),
                 max_staged_bytes: 1024,
+                verified_policy: None,
             },
             lifecycle: MultipartLifecycle::Open,
             staged_bytes: 0,

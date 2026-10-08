@@ -71,6 +71,7 @@ pub(crate) fn multipart_snapshot(
     backend: &ResolvedBackend,
     plugin_snapshot: serde_json::Value,
     max_bytes: u64,
+    verified_policy: Option<crate::policy_gate::VerifiedPolicy>,
 ) -> MultipartSnapshot {
     let mut metadata: std::collections::BTreeMap<String, String> = headers
         .iter()
@@ -116,6 +117,7 @@ pub(crate) fn multipart_snapshot(
         destination,
         plugin_snapshot,
         max_staged_bytes: max_bytes,
+        verified_policy,
     }
 }
 
@@ -741,6 +743,11 @@ pub(crate) enum MultipartCompletionError {
     Staging(StagingError),
     Streaming(StreamingPutError),
     Invalid(String),
+    /// Policy-gate failure at the completion freeze point: the effective
+    /// policy limits could not be imposed on the completion session (e.g. a
+    /// policy publishing zero limits). Fail closed; the machine-readable code
+    /// rides through to the S3 error document.
+    Policy(maskura_error::MaskuraError),
     PreserveReservation(Box<MultipartCompletionError>),
 }
 
@@ -880,6 +887,7 @@ pub(crate) async fn complete_staged_multipart(
     operation: AuthorizedOperation<'_>,
     backend: ResolvedBackend,
     resolution: &crate::pipeline::PipelineResolution,
+    policy_limits: Option<&maskura_pipeline_config::PolicyLimits>,
 ) -> Result<MultipartCompletionResult, MultipartCompletionError> {
     use sha2::Digest as _;
 
@@ -905,6 +913,16 @@ pub(crate) async fn complete_staged_multipart(
     // assignment. Legacy raw PluginInfo snapshots are rejected explicitly:
     // their process-local UUID identities cannot be proven restart-safe.
     let snapshot = state.gateway.snapshot_for(resolution).await?;
+    // Tighten the completion wasm session to the effective policy limits the
+    // complete-time gate composed (Slice 3 / P4.1g): `min(create-time frozen
+    // admission, current policy)`. Zeroed limits make `constrained` fail with
+    // CONFIG_INVALID — fail closed via `MultipartCompletionError::Policy`.
+    let snapshot = match policy_limits {
+        Some(limits) => snapshot
+            .constrained(crate::policy_gate::policy_session_limits(limits))
+            .map_err(MultipartCompletionError::Policy)?,
+        None => snapshot,
+    };
     let pipeline_started = std::time::Instant::now();
     let content_type = upload
         .snapshot
@@ -1169,6 +1187,7 @@ pub(crate) fn multipart_completion_error_response(
         }
         MultipartCompletionError::Streaming(error) => streaming_put_error_response(key, error),
         MultipartCompletionError::Invalid(error) => s3_error::invalid_request(key, &error),
+        MultipartCompletionError::Policy(error) => policy_error_response(key, &error),
         MultipartCompletionError::PreserveReservation(_) => unreachable!("cause is unwrapped"),
     }
 }
@@ -1934,7 +1953,7 @@ pub(crate) async fn s3_upload_part(
     let Some(staging) = staged_multipart(&state).cloned() else {
         return s3_error::multipart_not_supported(&key);
     };
-    let multipart_selection = match resolve_backend(
+    let mut multipart_selection = match resolve_backend(
         &state,
         &authentication.auth,
         &parts.headers,
@@ -1945,8 +1964,18 @@ pub(crate) async fn s3_upload_part(
         Ok(selection) => selection,
         Err(_) => return backend_resolution_error_response(&key),
     };
+    // Present the same per-key managed placement the frozen binding was
+    // approved under, so the check/use comparison below is apples-to-apples
+    // across the multipart lifecycle (the rendezvous is deterministic for an
+    // unchanged ring; ring/topology drift correctly denies — re-approval
+    // required). Mutates only the snapshot, never the resolved backend.
+    multipart_selection.resolve_managed_placement(
+        authentication.auth.workspace_id().as_str(),
+        &bucket,
+        &key,
+    );
     let multipart_backend = &multipart_selection.backend;
-    let _policy = match enforce_policy(
+    let policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
             workspace_id: authentication.auth.workspace_id().as_str(),
@@ -1964,6 +1993,9 @@ pub(crate) async fn s3_upload_part(
         Ok(policy) => policy,
         Err(error) => return policy_error_response(&key, &error),
     };
+    if let Err(error) = crate::policy_gate::consume_policy(&policy, &multipart_selection.snapshot) {
+        return policy_error_response(&key, &error);
+    }
     if let Err(error) = validate_streaming_backend(&state, multipart_backend) {
         return streaming_put_error_response(&key, error);
     }
@@ -1973,6 +2005,14 @@ pub(crate) async fn s3_upload_part(
         Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
         Err(error) => return s3_error::internal_error(&key, &error.to_string()),
     };
+    // Frozen create-time verdict re-checked against the fresh resolution
+    // (check/use; state/bounds mismatch → policy.denied).
+    if let Err(error) = crate::policy_gate::consume_frozen_policy(
+        upload.snapshot.verified_policy.as_ref(),
+        &multipart_selection.snapshot,
+    ) {
+        return policy_error_response(&key, &error);
+    }
     if let ResolvedBackend::Managed(storage) = &multipart_backend {
         let Some(epoch) = upload.namespace_epoch else {
             return s3_error::service_unavailable(&key, "managed multipart upload has no epoch");

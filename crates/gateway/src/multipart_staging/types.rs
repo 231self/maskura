@@ -60,6 +60,15 @@ pub struct MultipartSnapshot {
     pub destination: serde_json::Value,
     pub plugin_snapshot: serde_json::Value,
     pub max_staged_bytes: u64,
+    /// Policy-gate verdict frozen at MultipartCreate (Slice 3 / P4.1h, ADR 0022).
+    /// `None` = the upload was created before this field existed, OR the gate
+    /// approved unbound — unbound verdicts freeze nothing (there is no approval
+    /// evidence to retain), which keeps the OSS staged-artifact digest preimage
+    /// at the historical layout. `Some` = a frozen *bound* approval, re-checked
+    /// against the request-time destination selection at every later multipart
+    /// operation (part upload, abort, complete, list-parts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_policy: Option<crate::policy_gate::VerifiedPolicy>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

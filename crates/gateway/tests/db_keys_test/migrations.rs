@@ -114,6 +114,7 @@ fn public_migrations_apply_fresh_after_private_shared_history() {
                 20260909000001,
                 20260916000001,
                 20260917000001,
+                20261008000001,
             ]
         );
         isolated.close().await;

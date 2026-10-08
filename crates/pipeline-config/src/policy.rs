@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::canonical::is_hex64;
+use crate::canonical::{digest_of, is_hex64};
 use crate::error::ConfigError;
 
 /// The `[policy]` envelope section of a signed export: standing bounds that
@@ -158,6 +158,15 @@ impl PolicySection {
             )));
         }
         Ok(())
+    }
+
+    /// Canonical artifact digest: `sha256(canonical_cbor(policy))` as 64
+    /// lowercase hex. This is the signed `artifact_digest` the envelope ceremony
+    /// binds and stores in `policy_envelopes` (same CBOR digest discipline as
+    /// [`crate::EffectiveState::digest`]).
+    pub fn digest(&self) -> Result<String, ConfigError> {
+        self.validate()?;
+        digest_of(self)
     }
 }
 

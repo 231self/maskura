@@ -18,6 +18,7 @@ pub struct Model {
     pub destination: Json,
     pub plugin_snapshot: Json,
     pub limits: Json,
+    pub verified_policy: Option<Json>,
     pub staged_bytes: i64,
     pub reserved_bytes: i64,
     pub expires_at_ms: i64,
