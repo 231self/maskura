@@ -54,10 +54,38 @@ operator. Wasm isolation constrains plugins, not the administrator of the runtim
 
 Signed TOML configuration provides artifact authenticity relative to configured
 trust roots. It does not prove that a particular read/write used that artifact.
-The hosted design for customer-signed policy envelopes, synchronous publish
-approvals, and shared-passkey MFA is planned, not an implemented guarantee of
-this document. Its intended contract is approval evidence plus fail-closed
-enforcement by the trusted gateway, not operator-proof execution.
+The contract for customer-signed policy approvals is approval evidence plus
+fail-closed enforcement by the trusted gateway, not operator-proof execution.
+
+Policy approval has three deployment states that must not be conflated:
+
+1. **Shipped in the public engine** — the request-path `PolicyGate` seam
+   (`crates/gateway/src/policy_gate.rs`), inert by default and behaviorally
+   identical to OSS when no gate is configured; typed policy errors surfaced as
+   the S3 XML `<Code>` element (`policy.denied`, `policy.unprovisioned`,
+   `policy.expired`, `policy.tampered`; HTTP 403); and verdict *consumption*: a
+   bound verdict is consumed at storage execution (the request-time destination
+   is re-verified against the frozen binding before commit; drift answers
+   `policy.denied`), staged multipart uploads persist their create-time verdict
+   and continue under it across envelope rotation/expiry with complete-time
+   limits composed as `min(create-time, current)`, and frozen verdicts are
+   schema-versioned with unknown future versions failing closed.
+2. **The hosted enforcement gate — deploying now**, per workspace, behind a
+   policy-enforcement state (`inactive` = inert; `enforced` = fail-closed
+   `policy.unprovisioned` without a valid customer approval). For v1, managed
+   storage is the only enforced destination mode; concrete/BYO destinations
+   fail closed at provisioning until their destination wiring lands.
+3. **Future enrollment/cutover** — no workspace is enforced today; flipping a
+   workspace to `enforced` is a separate enrollment step that shipping the gate
+   does not authorize.
+
+Approval evidence is versioned canonical-CBOR (a sorted-JSON-keys convention,
+explicitly not RFC 8949 canonical) `ReceiptBody`/`Checkpoint` v2 with SHA-256
+digests, carried by WebAuthn ASN.1 DER ES256 assertions bound to the complete
+receipt digest. Recovery after loss of all authorized keys is a new
+independently pinned root recorded as a marked discontinuity; a reset never
+signs an old-chain receipt, and a server-served trust bundle is never an
+independent pin.
 
 Plaintext is available transiently to the gateway while transformations execute.
 Client-held decryption keys protect encrypted output; they do not establish
