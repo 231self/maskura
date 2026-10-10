@@ -227,3 +227,47 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 The normative construction, key sizes, client-tooling status, and security
 properties are in `docs/encryption.md` and ADR 0011.
+
+### Policy approval (Slice 3) — module map and config surface
+
+- **Gate seam** (`crates/gateway/src/policy_gate.rs`): `PolicyGate` /
+  `NoopPolicyGate` / `enforce_policy` at every data-plane call site (the S3
+  handlers and the hosted MCP dispatch, which calls them in process);
+  `VerifiedPolicy` / `PolicyBinding` are the verdict types. Consumption is
+  check/use: `consume_policy` / `consume_frozen_policy` /
+  `binding_matches_selection` re-verify the request-time
+  `DestinationSelectionSnapshot` against the frozen binding before storage
+  execution (drift → `policy.denied`), and `min_policy_limits` composes session
+  limits as `min(create-time, current)`. A bound verdict execution can discard
+  is not authorization.
+- **Multipart freeze** (`crates/gateway/src/multipart_staging/types.rs`):
+  `MultipartSnapshot.verified_policy` persists the create-time verdict;
+  continuation requests carry it as `PolicyRequest.frozen` and re-check via
+  `consume_frozen_policy`, so in-flight uploads keep their approved state across
+  envelope rotation/expiry.
+- **Protocol types** (`crates/pipeline-config/src/`): `policy.rs`
+  (`PolicySection::valid_at` / `digest`), `effective_state.rs` (v2
+  `DestinationBinding` concrete/managed topology), `receipt.rs` (`ReceiptBody`
+  v2), `trust.rs` (`Checkpoint` v2), `canonical.rs` (sorted-JSON-keys CBOR
+  digest convention — explicitly not RFC 8949 canonical), `webauthn.rs` (ASN.1
+  DER ES256 approval proofs bound to the complete receipt digest),
+  `destination_digest.rs` (signed destination digest preimages).
+- **Evidence schema versioning**: `VERIFIED_POLICY_SCHEMA_VERSION = 1` on
+  `VerifiedPolicy.schema_version`; pre-versioning verdicts read as 0; readers
+  fail closed (`policy.tampered`) on newer versions — never reinterpret old
+  bytes or accept unknown future evidence.
+- **Enforcement surface**: per-workspace policy-enforcement state
+  (`inactive` → `enforced`, forward-only) in the hosted control plane.
+  `inactive` is inert/OSS-identical; `enforced` fails closed
+  (`policy.unprovisioned`) without a valid approval. Errors `policy.denied` /
+  `policy.unprovisioned` / `policy.expired` / `policy.tampered` surface as the
+  S3 XML `<Code>` element (HTTP 403). Managed storage is the only enforced
+  destination mode for v1; concrete/BYO destinations fail closed until wired.
+  The hosted gate behind this seam is deploying per workspace; no workspace is
+  enforced until a separate enrollment/cutover step — never claim runtime
+  enforcement beyond that deployment state.
+- **Recovery linkage**: loss of all authorized keys requires a new independently
+  pinned root (recorded discontinuity); a reset never signs an old-chain
+  receipt, and a server-served trust bundle is never an independent pin.
+- Decisions and deployment state: ADR 0022 (Slice 3 refinement), verification
+  contract ADR 0023, trust-root lineage ADR 0024.
