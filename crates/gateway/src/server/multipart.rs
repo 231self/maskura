@@ -1975,6 +1975,15 @@ pub(crate) async fn s3_upload_part(
         &key,
     );
     let multipart_backend = &multipart_selection.backend;
+    // Load the staged upload before the gate so the create-time frozen
+    // verdict can be threaded into the request (Slice 3 / spec §7.4): a
+    // missing upload answers no_such_upload regardless of gate outcome.
+    let identity = multipart_identity(&authentication.auth, &bucket, &key, &upload_id);
+    let upload = match staging.repository.get_authorized(&identity).await {
+        Ok(upload) => upload,
+        Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
+        Err(error) => return s3_error::internal_error(&key, &error.to_string()),
+    };
     let policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
@@ -1986,6 +1995,7 @@ pub(crate) async fn s3_upload_part(
             destination: multipart_backend,
             snapshot: &multipart_selection.snapshot,
             direction: crate::pipeline::PipelineDirection::Write,
+            frozen: upload.snapshot.verified_policy.as_ref(),
         },
     )
     .await
@@ -1999,12 +2009,6 @@ pub(crate) async fn s3_upload_part(
     if let Err(error) = validate_streaming_backend(&state, multipart_backend) {
         return streaming_put_error_response(&key, error);
     }
-    let identity = multipart_identity(&authentication.auth, &bucket, &key, &upload_id);
-    let upload = match staging.repository.get_authorized(&identity).await {
-        Ok(upload) => upload,
-        Err(StagingError::NotFound) => return s3_error::no_such_upload(&key),
-        Err(error) => return s3_error::internal_error(&key, &error.to_string()),
-    };
     // Frozen create-time verdict re-checked against the fresh resolution
     // (check/use; state/bounds mismatch → policy.denied).
     if let Err(error) = crate::policy_gate::consume_frozen_policy(

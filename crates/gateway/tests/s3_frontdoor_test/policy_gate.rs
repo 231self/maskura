@@ -22,23 +22,39 @@ use maskura_customer_config::config::{
     MultipartMode as ConfigMultipartMode, StreamingReadMode as ConfigStreamingReadMode,
 };
 use maskura_error::MaskuraError;
-use maskura_gateway::policy_gate::{PolicyBinding, PolicyGate, PolicyRequest, VerifiedPolicy};
+use maskura_gateway::policy_gate::{
+    PolicyBinding, PolicyGate, PolicyRequest, VERIFIED_POLICY_SCHEMA_VERSION, VerifiedPolicy,
+};
 use maskura_pipeline_config::{
     DestinationBinding, PolicyLimits, PolicyOperation, ResolvedDestination, StorageMode,
 };
 
 #[derive(Default)]
 struct RecordingPolicyGate {
-    calls: Mutex<Vec<(PolicyOperation, String, String)>>,
+    calls: Mutex<Vec<(PolicyOperation, String, String, bool)>>,
+    /// Return bound verdicts (mirroring each request's snapshot and
+    /// [`roomy_limits`]) instead of unbound ones, so `MultipartCreate`
+    /// freezes evidence the continuation requests must carry back to the
+    /// gate.
+    bind: bool,
 }
 
 impl RecordingPolicyGate {
+    /// A recording gate whose verdicts are bound, so the multipart freeze
+    /// point persists a frozen admission for continuations to present.
+    fn bound() -> Self {
+        Self {
+            bind: true,
+            ..Default::default()
+        }
+    }
+
     fn operations(&self) -> BTreeSet<PolicyOperation> {
         self.calls
             .lock()
             .unwrap()
             .iter()
-            .map(|(operation, _, _)| *operation)
+            .map(|(operation, _, _, _)| *operation)
             .collect()
     }
 
@@ -47,7 +63,7 @@ impl RecordingPolicyGate {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(seen, _, _)| *seen == operation)
+            .filter(|(seen, _, _, _)| *seen == operation)
             .count()
     }
 }
@@ -59,7 +75,11 @@ impl PolicyGate for RecordingPolicyGate {
             request.operation,
             request.bucket.to_string(),
             request.key.to_string(),
+            request.frozen.is_some(),
         ));
+        if self.bind {
+            return Ok(bound_verdict(request, roomy_limits()));
+        }
         Ok(VerifiedPolicy::unbound())
     }
 }
@@ -236,10 +256,15 @@ async fn policy_gate_covers_every_data_plane_operation() {
     );
     let upload_id = upload_id_from(&String::from_utf8_lossy(&create_body));
 
+    // Continuation requests load the staged upload before the gate (a missing
+    // upload answers no_such_upload regardless of gate outcome), so the part
+    // and abort branches need real upload ids to reach the gate seam.
     let part = add_headers(
         Request::builder()
             .method("PUT")
-            .uri("/bucket/multipart-object?partNumber=1&uploadId=untrusted")
+            .uri(format!(
+                "/bucket/multipart-object?partNumber=1&uploadId={upload_id}"
+            ))
             .header(header::CONTENT_LENGTH, "7")
             .body(Body::from("payload"))
             .unwrap(),
@@ -260,10 +285,11 @@ async fn policy_gate_covers_every_data_plane_operation() {
     );
     app.clone().oneshot(complete).await.unwrap();
 
+    let abort_target = create_upload(&app, &hdrs, "abort-target").await;
     let abort = add_headers(
         Request::builder()
             .method("DELETE")
-            .uri("/bucket/multipart-object?uploadId=untrusted")
+            .uri(format!("/bucket/abort-target?uploadId={abort_target}"))
             .body(Body::empty())
             .unwrap(),
         &hdrs,
@@ -308,7 +334,7 @@ async fn policy_gate_covers_every_data_plane_operation() {
         let calls = gate.calls.lock().unwrap();
         assert!(
             calls.iter().any(
-                |(operation, bucket, key)| *operation == PolicyOperation::List
+                |(operation, bucket, key, _)| *operation == PolicyOperation::List
                     && bucket == "bucket"
                     && key == "data/"
             ),
@@ -316,7 +342,7 @@ async fn policy_gate_covers_every_data_plane_operation() {
         );
         assert!(
             calls.iter().any(
-                |(operation, bucket, key)| *operation == PolicyOperation::List
+                |(operation, bucket, key, _)| *operation == PolicyOperation::List
                     && bucket == "bucket"
                     && key.is_empty()
             ),
@@ -447,6 +473,7 @@ async fn check_use_drift_denies_the_request() {
                 },
             };
             Ok(VerifiedPolicy {
+                schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
                 binding: Some(PolicyBinding {
                     workspace_id: request.workspace_id.to_string(),
                     operation: request.operation,
@@ -522,6 +549,7 @@ async fn check_use_match_allows_the_request() {
             request: &PolicyRequest<'_>,
         ) -> Result<VerifiedPolicy, MaskuraError> {
             Ok(VerifiedPolicy {
+                schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
                 binding: Some(PolicyBinding {
                     workspace_id: request.workspace_id.to_string(),
                     operation: request.operation,
@@ -616,6 +644,7 @@ fn tiny_limits() -> PolicyLimits {
 /// snapshot (so check/use consumes it) and whose limits come from the caller.
 fn bound_verdict(request: &PolicyRequest<'_>, limits: PolicyLimits) -> VerifiedPolicy {
     VerifiedPolicy {
+        schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
         binding: Some(PolicyBinding {
             workspace_id: request.workspace_id.to_string(),
             operation: request.operation,
@@ -1036,6 +1065,129 @@ async fn frozen_policy_survives_the_multipart_lifecycle() {
         StatusCode::NO_CONTENT,
         "frozen verdict must accept abort of a caller-owned upload"
     );
+}
+
+#[tokio::test]
+async fn multipart_continuations_carry_the_frozen_verdict_to_the_gate() {
+    // Slice 3 / spec §7.4: `MultipartCreate` is the freeze point and presents
+    // no frozen verdict; part upload, complete, and abort are continuation
+    // requests and must present the create-time frozen admission to the gate
+    // (`frozen: Some`) so in-flight uploads keep their approved state across
+    // envelope rotation/expiry. Single-shot operations (PUT/GET) carry no
+    // frozen verdict.
+    let gate = Arc::new(RecordingPolicyGate::bound());
+    let (app, state) = gated_router(gate.clone()).await;
+    let (ak, sk) = make_key(&state).await;
+    let hdrs = auth_headers(&ak, &sk);
+    create_bucket(&app, &hdrs).await;
+    put_object(&app, &hdrs).await;
+    let raw_get = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/bucket/object")
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let get_response = app.clone().oneshot(raw_get).await.unwrap();
+    assert_eq!(
+        get_response.status(),
+        StatusCode::OK,
+        "the single-shot raw GET must succeed under the bound gate"
+    );
+
+    // create → part → list-parts → complete
+    let upload_id = create_upload(&app, &hdrs, "lifecycle-object").await;
+    let etag = upload_part(&app, &hdrs, "lifecycle-object", &upload_id).await;
+    let list_parts = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri(format!("/bucket/lifecycle-object?uploadId={upload_id}"))
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let list_response = app.clone().oneshot(list_parts).await.unwrap();
+    let list_status = list_response.status();
+    let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        list_status,
+        StatusCode::OK,
+        "list-parts must accept the frozen verdict: {}",
+        String::from_utf8_lossy(&list_body)
+    );
+    let complete = complete_upload(&app, &hdrs, "lifecycle-object", &upload_id, &etag).await;
+    let complete_status = complete.status();
+    let complete_body = axum::body::to_bytes(complete.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        complete_status,
+        StatusCode::OK,
+        "complete must accept the frozen verdict: {}",
+        String::from_utf8_lossy(&complete_body)
+    );
+
+    // create → part → abort
+    let aborted_id = create_upload(&app, &hdrs, "aborted-object").await;
+    upload_part(&app, &hdrs, "aborted-object", &aborted_id).await;
+    let abort = add_headers(
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/bucket/aborted-object?uploadId={aborted_id}"))
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let abort_response = app.clone().oneshot(abort).await.unwrap();
+    assert_eq!(
+        abort_response.status(),
+        StatusCode::NO_CONTENT,
+        "abort must accept the frozen verdict"
+    );
+
+    let calls = gate.calls.lock().unwrap();
+    // Continuations present the create-time frozen admission to the gate.
+    for operation in [
+        PolicyOperation::MultipartUpload,
+        PolicyOperation::MultipartComplete,
+        PolicyOperation::MultipartAbort,
+    ] {
+        assert!(
+            calls
+                .iter()
+                .any(|(seen, _, _, frozen)| *seen == operation && *frozen),
+            "{operation:?} must present the frozen create-time verdict to the gate; calls: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .filter(|(seen, _, _, _)| *seen == operation)
+                .all(|(_, _, _, frozen)| *frozen),
+            "every {operation:?} call must carry the frozen verdict; calls: {calls:?}"
+        );
+    }
+    // The freeze point and single-shot operations carry none.
+    assert!(
+        calls
+            .iter()
+            .any(|(seen, _, _, frozen)| *seen == PolicyOperation::MultipartCreate && !*frozen),
+        "MultipartCreate must reach the gate as the freeze point without a frozen verdict; calls: {calls:?}"
+    );
+    for operation in [
+        PolicyOperation::MultipartCreate,
+        PolicyOperation::Put,
+        PolicyOperation::RawGet,
+    ] {
+        assert!(
+            calls
+                .iter()
+                .all(|(seen, _, _, frozen)| *seen != operation || !*frozen),
+            "{operation:?} must present no frozen verdict to the gate; calls: {calls:?}"
+        );
+    }
 }
 
 #[tokio::test]

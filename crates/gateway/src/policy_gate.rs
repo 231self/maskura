@@ -40,13 +40,31 @@ pub struct PolicyRequest<'a> {
     /// The gate verifies this against approved effective-state bindings.
     pub snapshot: &'a DestinationSelectionSnapshot,
     pub direction: PipelineDirection,
+    /// Create-time frozen verdict retained on a staged multipart upload
+    /// (Slice 3 / spec §7.4). `Some` only on multipart continuation requests
+    /// (part upload, abort, complete) that carry the frozen admission;
+    /// `None` for single-shot operations and for `MultipartCreate` (which is
+    /// the freeze point). The gate validates continuations against it so
+    /// in-flight uploads keep their approved state across envelope
+    /// rotation/expiry.
+    pub frozen: Option<&'a VerifiedPolicy>,
 }
+
+/// The evidence schema version written by this gateway into
+/// [`VerifiedPolicy::schema_version`].
+pub const VERIFIED_POLICY_SCHEMA_VERSION: u32 = 1;
 
 /// Approval evidence returned by the gate and retained in request context
 /// through actual storage selection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifiedPolicy {
+    /// Evidence schema version. Written as [`VERIFIED_POLICY_SCHEMA_VERSION`].
+    /// Pre-versioning verdicts (v0.7.21) deserialize as 0 via `#[serde(default)]`
+    /// and carry identical semantics; readers fail closed on versions above
+    /// current (unknown future evidence).
+    #[serde(default)]
+    pub schema_version: u32,
     /// `None` when no gate is configured or the gate approved an unbound
     /// request; execution proceeds unconstrained (historical behavior).
     pub binding: Option<PolicyBinding>,
@@ -56,7 +74,10 @@ impl VerifiedPolicy {
     /// The unbound verdict used by [`NoopPolicyGate`] and the absent-gate
     /// path.
     pub fn unbound() -> Self {
-        Self { binding: None }
+        Self {
+            schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
+            binding: None,
+        }
     }
 
     pub fn is_bound(&self) -> bool {
@@ -70,7 +91,11 @@ impl VerifiedPolicy {
 pub struct PolicyBinding {
     pub workspace_id: String,
     pub operation: PolicyOperation,
-    /// Longest-prefix route match inside the approved effective state.
+    /// Longest-prefix route match inside the approved effective state: the
+    /// matched approved effective route's key prefix. Effective routes are
+    /// whole-bucket today, so this is currently always `""`; it becomes
+    /// meaningful when per-assignment key prefixes land. The envelope's
+    /// declared key prefixes remain the gate-time key bound.
     pub route_prefix: String,
     /// Active envelope identity at verification time.
     pub envelope_digest: String,
@@ -132,12 +157,16 @@ pub async fn enforce_policy(
 ///
 /// A bound verdict whose selection no longer matches the binding is rejected
 /// with [`codes::POLICY_DENIED`] (a state/bounds mismatch: the destination the
-/// request would use is not the approved one). An unbound verdict is inert
-/// (OSS behavior) and returns `Ok(None)`.
+/// request would use is not the approved one). A verdict whose
+/// [`VerifiedPolicy::schema_version`] is newer than
+/// [`VERIFIED_POLICY_SCHEMA_VERSION`] is unknown future evidence and is
+/// rejected with [`codes::POLICY_TAMPERED`] (fail closed). An unbound verdict
+/// is inert (OSS behavior) and returns `Ok(None)`.
 pub fn consume_policy<'a>(
     verdict: &'a VerifiedPolicy,
     snapshot: &DestinationSelectionSnapshot,
 ) -> Result<Option<&'a PolicyBinding>, MaskuraError> {
+    reject_future_evidence(verdict)?;
     let Some(binding) = verdict.binding.as_ref() else {
         return Ok(None);
     };
@@ -174,14 +203,37 @@ pub fn consume_policy<'a>(
 /// expired envelope, an advanced receipt head) is deliberately not a freeze
 /// failure — fresh per-request enforcement and [`min_policy_limits`] are the
 /// tightening path.
+///
+/// As at [`consume_policy`], a frozen verdict carrying unknown future evidence
+/// (a [`VerifiedPolicy::schema_version`] above
+/// [`VERIFIED_POLICY_SCHEMA_VERSION`]) is rejected with
+/// [`codes::POLICY_TAMPERED`] (fail closed) before any binding is handed to
+/// execution.
 pub fn consume_frozen_policy<'a>(
     frozen: Option<&'a VerifiedPolicy>,
     snapshot: &DestinationSelectionSnapshot,
 ) -> Result<Option<&'a PolicyBinding>, MaskuraError> {
     match frozen {
-        Some(verdict) => consume_policy(verdict, snapshot),
+        Some(verdict) => {
+            reject_future_evidence(verdict)?;
+            consume_policy(verdict, snapshot)
+        }
         None => Ok(None),
     }
+}
+
+/// The reader rule for durable verdict evidence: versions 0 (pre-versioning,
+/// v0.7.21) and [`VERIFIED_POLICY_SCHEMA_VERSION`] are accepted; anything
+/// newer is unknown future evidence and fails closed with
+/// [`codes::POLICY_TAMPERED`].
+fn reject_future_evidence(verdict: &VerifiedPolicy) -> Result<(), MaskuraError> {
+    if verdict.schema_version > VERIFIED_POLICY_SCHEMA_VERSION {
+        return Err(MaskuraError::new(
+            maskura_error::codes::POLICY_TAMPERED,
+            "verified policy evidence schema version is newer than this gateway",
+        ));
+    }
+    Ok(())
 }
 
 /// The check/use predicate: does the request-time selection still equal the
@@ -323,6 +375,7 @@ mod tests {
             destination,
             snapshot,
             direction: PipelineDirection::Write,
+            frozen: None,
         }
     }
 
@@ -399,6 +452,7 @@ mod tests {
     #[test]
     fn verified_policy_serde_roundtrip() {
         let bound = VerifiedPolicy {
+            schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
             binding: Some(PolicyBinding {
                 workspace_id: "ws-test".into(),
                 operation: PolicyOperation::ProcessedGet,
@@ -434,6 +488,131 @@ mod tests {
             let json = serde_json::to_string(&verdict).expect("serialize");
             let parsed: VerifiedPolicy = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(parsed, verdict);
+        }
+    }
+
+    // --- evidence schema versioning (Slice 3) ---
+
+    fn verdict_with_schema_version(schema_version: u32) -> VerifiedPolicy {
+        VerifiedPolicy {
+            schema_version,
+            binding: None,
+        }
+    }
+
+    #[test]
+    fn unbound_carries_the_current_schema_version() {
+        assert_eq!(
+            VerifiedPolicy::unbound().schema_version,
+            VERIFIED_POLICY_SCHEMA_VERSION
+        );
+        assert_eq!(VERIFIED_POLICY_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn schema_version_round_trips_through_verdict_json() {
+        let verdict = VerifiedPolicy {
+            schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
+            binding: Some(policy_binding(concrete_binding("my-bucket"), None)),
+        };
+        let json = serde_json::to_string(&verdict).expect("serialize");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(
+            value["schema_version"],
+            serde_json::json!(1),
+            "written evidence must carry the schema version"
+        );
+        let parsed: VerifiedPolicy = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.schema_version, VERIFIED_POLICY_SCHEMA_VERSION);
+        assert_eq!(parsed, verdict, "round-trip must preserve the field");
+    }
+
+    #[test]
+    fn schema_version_parses_from_json_with_or_without_the_key() {
+        // Pre-versioning (v0.7.21) verdicts carry no key and parse as 0 with
+        // identical semantics.
+        let pre_versioning: VerifiedPolicy =
+            serde_json::from_str(r#"{"binding":null}"#).expect("pre-versioning verdict parses");
+        assert_eq!(pre_versioning.schema_version, 0);
+        assert_eq!(
+            pre_versioning,
+            VerifiedPolicy {
+                schema_version: 0,
+                binding: None
+            }
+        );
+        // Explicit current version parses as written.
+        let current: VerifiedPolicy =
+            serde_json::from_str(r#"{"schema_version":1,"binding":null}"#)
+                .expect("current-version verdict parses");
+        assert_eq!(current.schema_version, VERIFIED_POLICY_SCHEMA_VERSION);
+        assert_eq!(current, VerifiedPolicy::unbound());
+    }
+
+    #[test]
+    fn consume_policy_accepts_pre_versioning_schema_version() {
+        // Version 0 (pre-versioning) carries identical semantics and must be
+        // consumed normally, bound and unbound alike.
+        let snapshot = concrete_snapshot("");
+        let unbound = verdict_with_schema_version(0);
+        assert!(
+            consume_policy(&unbound, &snapshot)
+                .expect("pre-versioning unbound verdict is inert")
+                .is_none()
+        );
+        let bound = VerifiedPolicy {
+            schema_version: 0,
+            binding: Some(policy_binding(concrete_binding("my-bucket"), None)),
+        };
+        assert!(
+            consume_policy(&bound, &snapshot)
+                .expect("pre-versioning bound verdict is consumable")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn consume_policy_rejects_future_schema_version() {
+        // Unknown future evidence fails closed before any binding reaches
+        // execution — for bound and unbound verdicts alike.
+        let snapshot = concrete_snapshot("");
+        let future_unbound = verdict_with_schema_version(VERIFIED_POLICY_SCHEMA_VERSION + 1);
+        let error = consume_policy(&future_unbound, &snapshot)
+            .expect_err("future evidence must fail closed");
+        assert_eq!(error.code(), codes::POLICY_TAMPERED);
+        assert_eq!(
+            error.message(),
+            "verified policy evidence schema version is newer than this gateway"
+        );
+        let future_bound = VerifiedPolicy {
+            schema_version: VERIFIED_POLICY_SCHEMA_VERSION + 1,
+            binding: Some(policy_binding(concrete_binding("my-bucket"), None)),
+        };
+        let error = consume_policy(&future_bound, &snapshot)
+            .expect_err("future bound evidence must fail closed");
+        assert_eq!(error.code(), codes::POLICY_TAMPERED);
+    }
+
+    #[test]
+    fn consume_frozen_policy_rejects_future_schema_version() {
+        // The frozen-reuse seam applies the same reader rule as consume_policy:
+        // a persisted verdict from a newer gateway is unknown evidence.
+        let snapshot = concrete_snapshot("");
+        let future = verdict_with_schema_version(VERIFIED_POLICY_SCHEMA_VERSION + 1);
+        let error = consume_frozen_policy(Some(&future), &snapshot)
+            .expect_err("future frozen evidence must fail closed");
+        assert_eq!(error.code(), codes::POLICY_TAMPERED);
+        assert_eq!(
+            error.message(),
+            "verified policy evidence schema version is newer than this gateway"
+        );
+        // Versions 0 and 1 stay consumable through the frozen seam.
+        for verdict in [verdict_with_schema_version(0), VerifiedPolicy::unbound()] {
+            assert!(
+                consume_frozen_policy(Some(&verdict), &snapshot)
+                    .expect("known evidence versions are consumable")
+                    .is_none()
+            );
         }
     }
 
@@ -550,6 +729,7 @@ mod tests {
         // pass — the bucket is checked separately against the route.
         let snapshot = concrete_snapshot("");
         let verdict = VerifiedPolicy {
+            schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
             binding: Some(policy_binding(concrete_binding("my-bucket"), None)),
         };
         let binding = consume_policy(&verdict, &snapshot)
@@ -566,6 +746,7 @@ mod tests {
             destination.endpoint = "https://evil.example.com".into();
         }
         let verdict = VerifiedPolicy {
+            schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
             binding: Some(binding),
         };
         let error = consume_policy(&verdict, &snapshot).expect_err("endpoint drift is denied");
@@ -580,6 +761,7 @@ mod tests {
             destination.configuration_sha256 = "0".repeat(64);
         }
         let verdict = VerifiedPolicy {
+            schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
             binding: Some(binding),
         };
         let error = consume_policy(&verdict, &snapshot).expect_err("digest drift is denied");
@@ -594,6 +776,7 @@ mod tests {
             selected_replica_backend_id: Some("b2".into()),
         };
         let verdict = VerifiedPolicy {
+            schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
             binding: Some(policy_binding(
                 managed_binding(vec![managed_backend("b1"), managed_backend("b2")]),
                 Some(("b1".into(), Some("b2".into()))),
@@ -618,6 +801,7 @@ mod tests {
             selected_replica_backend_id: None,
         };
         let verdict = VerifiedPolicy {
+            schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
             binding: Some(policy_binding(
                 managed_binding(vec![managed_backend("b1")]),
                 Some(("b1".into(), None)),
@@ -636,6 +820,7 @@ mod tests {
             selected_replica_backend_id: None,
         };
         let verdict = VerifiedPolicy {
+            schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
             binding: Some(policy_binding(
                 managed_binding(vec![managed_backend("b1")]),
                 None,
@@ -730,6 +915,7 @@ mod tests {
         // selection hands back exactly the binding consume_policy returns.
         let snapshot = concrete_snapshot("");
         let verdict = VerifiedPolicy {
+            schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
             binding: Some(policy_binding(concrete_binding("my-bucket"), None)),
         };
         let frozen = consume_frozen_policy(Some(&verdict), &snapshot)
@@ -754,6 +940,7 @@ mod tests {
             destination.endpoint = "https://evil.example.com".into();
         }
         let verdict = VerifiedPolicy {
+            schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
             binding: Some(binding),
         };
         let error =
@@ -771,6 +958,7 @@ mod tests {
             selected_replica_backend_id: None,
         };
         let verdict = VerifiedPolicy {
+            schema_version: VERIFIED_POLICY_SCHEMA_VERSION,
             binding: Some(policy_binding(
                 managed_binding(vec![managed_backend("b1")]),
                 None,

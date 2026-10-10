@@ -966,6 +966,7 @@ const PRE_VERIFIED_POLICY_SNAPSHOT_JSON: &str = r#"{"metadata":{},"tags":{},"che
 /// A bound gate verdict in the style of the `crate::policy_gate` tests.
 fn bound_verified_policy() -> crate::policy_gate::VerifiedPolicy {
     crate::policy_gate::VerifiedPolicy {
+        schema_version: crate::policy_gate::VERIFIED_POLICY_SCHEMA_VERSION,
         binding: Some(crate::policy_gate::PolicyBinding {
             workspace_id: "ws-test".to_string(),
             operation: maskura_pipeline_config::PolicyOperation::Put,
@@ -1138,19 +1139,57 @@ fn verified_policy_round_trips_through_snapshot_json() {
     let json = serde_json::to_string(&frozen).unwrap();
     let parsed: MultipartSnapshot = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed, frozen);
+    assert_eq!(
+        parsed
+            .verified_policy
+            .as_ref()
+            .expect("frozen verdict")
+            .schema_version,
+        crate::policy_gate::VERIFIED_POLICY_SCHEMA_VERSION,
+        "round-trip must preserve the evidence schema version"
+    );
     assert!(
         parsed
             .verified_policy
             .as_ref()
             .is_some_and(crate::policy_gate::VerifiedPolicy::is_bound)
     );
+    let value = serde_json::to_value(&frozen).unwrap();
     assert!(
-        serde_json::to_value(&frozen)
-            .unwrap()
-            .get("verified_policy")
-            .is_some(),
+        value.get("verified_policy").is_some(),
         "a frozen verdict must serialize the key"
     );
+    assert_eq!(
+        value["verified_policy"]["schema_version"],
+        serde_json::json!(1),
+        "a frozen verdict must carry the evidence schema version in the snapshot wire shape"
+    );
+}
+
+#[test]
+fn verified_policy_schema_version_parses_with_or_without_the_key() {
+    // The durable freeze must accept the current written shape
+    // (`"schema_version":1`) and the pre-versioning absence (v0.7.21 bound
+    // freezes, which deserialize as 0 with identical semantics).
+    let mut frozen = snapshot();
+    frozen.verified_policy = Some(bound_verified_policy());
+    let value = serde_json::to_value(&frozen).unwrap();
+    let stored = value["verified_policy"].clone();
+    assert_eq!(stored["schema_version"], serde_json::json!(1));
+    let parsed: crate::policy_gate::VerifiedPolicy =
+        serde_json::from_value(stored).expect("current written shape parses");
+    assert_eq!(parsed.schema_version, 1);
+    assert!(parsed.is_bound());
+    // Pre-versioning bound freeze: the key's absence deserializes as 0.
+    let mut pre_versioning = serde_json::to_value(bound_verified_policy()).unwrap();
+    pre_versioning
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
+    let parsed: crate::policy_gate::VerifiedPolicy =
+        serde_json::from_value(pre_versioning).expect("pre-versioning freeze parses");
+    assert_eq!(parsed.schema_version, 0, "absent key deserializes as 0");
+    assert!(parsed.is_bound());
 }
 
 /// A bound verdict with a managed-topology destination and the given per-key
@@ -1218,6 +1257,11 @@ fn verified_policy_round_trips_managed_topology_with_replica_placement() {
     let verdict = managed_verified_policy(Some(("b1".into(), Some("b2".into()))));
     let value = serde_json::to_value(&verdict).unwrap();
     assert_eq!(
+        value["schema_version"],
+        serde_json::json!(1),
+        "a written verdict must carry the evidence schema version"
+    );
+    assert_eq!(
         value["binding"]["managed_placement"],
         serde_json::json!(["b1", "b2"]),
         "the tuple-Option placement must serialize as a JSON tuple"
@@ -1235,6 +1279,11 @@ fn verified_policy_round_trips_placement_without_replica() {
     // The other tuple-Option arm: `Some((primary, None))`.
     let verdict = managed_verified_policy(Some(("b1".into(), None)));
     let value = serde_json::to_value(&verdict).unwrap();
+    assert_eq!(
+        value["schema_version"],
+        serde_json::json!(1),
+        "a written verdict must carry the evidence schema version"
+    );
     assert_eq!(
         value["binding"]["managed_placement"],
         serde_json::json!(["b1", null]),

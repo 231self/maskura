@@ -773,6 +773,7 @@ pub(crate) async fn s3_put(
             destination: backend,
             snapshot: &selection.snapshot,
             direction: crate::pipeline::PipelineDirection::Write,
+            frozen: None,
         },
     )
     .await

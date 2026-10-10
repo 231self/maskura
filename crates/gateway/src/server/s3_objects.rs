@@ -1947,6 +1947,7 @@ pub(crate) async fn s3_get(
             destination: backend,
             snapshot: &selection.snapshot,
             direction: crate::pipeline::PipelineDirection::Read,
+            frozen: None,
         },
     )
     .await
@@ -2347,6 +2348,7 @@ pub(crate) async fn s3_head(
             destination: backend,
             snapshot: &selection.snapshot,
             direction: crate::pipeline::PipelineDirection::Read,
+            frozen: None,
         },
     )
     .await
@@ -2519,43 +2521,9 @@ pub(crate) async fn s3_delete(
         // required). Mutates only the snapshot, never the resolved backend.
         selection.resolve_managed_placement(auth.workspace_id().as_str(), &bucket, &key);
         let backend = &selection.backend;
-        let policy = match enforce_policy(
-            state.policy_gate.as_ref(),
-            PolicyRequest {
-                workspace_id: auth.workspace_id().as_str(),
-                operation: PolicyOperation::MultipartAbort,
-                bucket: &bucket,
-                key: &key,
-                resolution: None,
-                destination: backend,
-                snapshot: &selection.snapshot,
-                direction: crate::pipeline::PipelineDirection::Write,
-            },
-        )
-        .await
-        {
-            Ok(policy) => policy,
-            Err(error) => {
-                return release_failure(
-                    state.control.as_ref(),
-                    &auth.context,
-                    &grant,
-                    &key,
-                    policy_error_response(&key, &error),
-                )
-                .await;
-            }
-        };
-        if let Err(error) = crate::policy_gate::consume_policy(&policy, &selection.snapshot) {
-            return release_failure(
-                state.control.as_ref(),
-                &auth.context,
-                &grant,
-                &key,
-                policy_error_response(&key, &error),
-            )
-            .await;
-        }
+        // Load the staged upload before the gate so the create-time frozen
+        // verdict can be threaded into the request (Slice 3 / spec §7.4): a
+        // missing upload answers no_such_upload regardless of gate outcome.
         let Some(staging) = staged_multipart(&state).cloned() else {
             return release_failure(
                 state.control.as_ref(),
@@ -2591,6 +2559,44 @@ pub(crate) async fn s3_delete(
                 .await;
             }
         };
+        let policy = match enforce_policy(
+            state.policy_gate.as_ref(),
+            PolicyRequest {
+                workspace_id: auth.workspace_id().as_str(),
+                operation: PolicyOperation::MultipartAbort,
+                bucket: &bucket,
+                key: &key,
+                resolution: None,
+                destination: backend,
+                snapshot: &selection.snapshot,
+                direction: crate::pipeline::PipelineDirection::Write,
+                frozen: upload.snapshot.verified_policy.as_ref(),
+            },
+        )
+        .await
+        {
+            Ok(policy) => policy,
+            Err(error) => {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth.context,
+                    &grant,
+                    &key,
+                    policy_error_response(&key, &error),
+                )
+                .await;
+            }
+        };
+        if let Err(error) = crate::policy_gate::consume_policy(&policy, &selection.snapshot) {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &grant,
+                &key,
+                policy_error_response(&key, &error),
+            )
+            .await;
+        }
         // Frozen create-time verdict re-checked against the fresh resolution
         // (check/use; state/bounds mismatch → policy.denied).
         if let Err(error) = crate::policy_gate::consume_frozen_policy(
@@ -2728,6 +2734,7 @@ pub(crate) async fn s3_delete(
             destination: backend,
             snapshot: &selection.snapshot,
             direction: crate::pipeline::PipelineDirection::Write,
+            frozen: None,
         },
     )
     .await
@@ -3023,6 +3030,7 @@ pub(crate) async fn s3_post(
                 destination: backend,
                 snapshot: &selection.snapshot,
                 direction: crate::pipeline::PipelineDirection::Write,
+                frozen: upload.snapshot.verified_policy.as_ref(),
             },
         )
         .await
@@ -3449,6 +3457,8 @@ pub(crate) async fn s3_post(
                 destination: backend,
                 snapshot: &selection.snapshot,
                 direction: crate::pipeline::PipelineDirection::Write,
+                // MultipartCreate is the freeze point: nothing is frozen yet.
+                frozen: None,
             },
         )
         .await
@@ -3633,6 +3643,7 @@ pub(crate) async fn s3_list_objects(
             destination: backend,
             snapshot: &selection.snapshot,
             direction: crate::pipeline::PipelineDirection::Read,
+            frozen: None,
         },
     )
     .await
