@@ -15,6 +15,469 @@ use axum::routing::any;
 
 type ProviderRequests = Arc<Mutex<Vec<(Method, String)>>>;
 
+#[tokio::test]
+async fn scratch_repro_managed_multipart_record_usage() {
+    use crate::control::{AuthorizationGrant, UsageAuthorization};
+    use crate::managed::{
+        ManagedLogicalOperationIntent, ManagedLogicalOperationState, ManagedMutationKind,
+        ManagedPublicationRecipe, ManagedRouteFence, PhysicalWriteIntent,
+    };
+
+    let repository = Arc::new(InMemoryManagedRepository::new());
+    let logical = LogicalObjectKey::new("tenant-a", "bucket-a", "key-a");
+    // Deterministic multipart identity exactly like the server derives it.
+    let upload_id = "upload-scratch";
+    let fingerprint = "fingerprint-a";
+    let identity_bytes = format!("{upload_id}\0{fingerprint}");
+    let operation_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, identity_bytes.as_bytes());
+    let receipt_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, identity_bytes.as_bytes());
+    let fence: ManagedRouteFence = repository.route_fence("tenant-a").await.unwrap();
+    let generation = uuid::Uuid::now_v7();
+    let physical_key = generation_physical_key(&logical, generation);
+    let destination = crate::transaction::ObjectDestination {
+        backend_id: "primary".to_string(),
+        bucket: "provider-bucket".to_string(),
+        logical_key: logical.object_key(),
+        physical_key: physical_key.clone(),
+        workspace_binding: None,
+    };
+    let child_scope = crate::transaction::ManagedOperationScope::deterministic_child(
+        operation_id,
+        "tenant-a".to_string(),
+        fence.namespace_epoch,
+        &destination,
+        crate::transaction::ManagedChildRole::Primary,
+    );
+    let max_processed_bytes = 1024 * 1024;
+    let intent = ManagedLogicalOperationIntent {
+        operation_id,
+        receipt_id,
+        logical: logical.clone(),
+        kind: ManagedMutationKind::Put,
+        generation,
+        fence,
+        expected_authority_cas: None,
+        prior_logical_size: 0,
+        primary_child_operation_id: child_scope.operation_id,
+        backend_id: "primary".to_string(),
+        provider_bucket: "provider-bucket".to_string(),
+        physical_key: physical_key.clone(),
+        occurred_at_ms: crate::transaction::unix_time_ms(),
+        rate_version: 1,
+        route: UsageRoute::PutObject,
+        request_kind: RequestKind::Write,
+        max_processed_bytes,
+        publication_recipe: Some(ManagedPublicationRecipe {
+            version: MANAGED_PUBLICATION_RECIPE_VERSION,
+            placement_version: 1,
+            primary_backend_id: "primary".to_string(),
+            replica_backend_id: None,
+            metadata: BTreeMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            primary_status: CopyStatus::Ready,
+            replica_status: CopyStatus::Absent,
+        }),
+    };
+    repository
+        .admit_logical_operation(intent.clone(), max_processed_bytes * 4)
+        .await
+        .expect("admit logical operation");
+    let child = PhysicalWriteIntent {
+        intent_id: child_scope.operation_id,
+        tenant_id: "tenant-a".to_string(),
+        backend_id: "primary".to_string(),
+        storage_identity: test_storage_identity(),
+        credential_epoch: 1,
+        provider_bucket: "provider-bucket".to_string(),
+        physical_key: physical_key.clone(),
+        versioning_mode: crate::managed::BackendVersioningMode::Enabled,
+        versioning_capability: crate::managed::BackendVersioningCapability::Required,
+        lease_owner: "writer".to_string(),
+    };
+    repository
+        .begin_physical_write(child)
+        .await
+        .expect("begin physical write");
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (primary, _) = FakeDestination::new("primary", None, events.clone());
+    let inner = ManagedReplicatedSink {
+        repository: repository.clone(),
+        logical: logical.clone(),
+        generation,
+        placement: Placement {
+            version: 1,
+            primary_backend_id: "primary".to_string(),
+            replica_backend_id: None,
+        },
+        logical_operation_id: Some(operation_id),
+        expected_cas: None,
+        metadata: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        primary: Box::new(primary),
+        replica: None,
+        output: None,
+        finished: false,
+    };
+    let mut sink = ManagedLogicalSink {
+        inner: Box::new(inner),
+        repository: repository.clone(),
+        operation_id,
+        expected_output_size: None,
+        expected_output_digest: None,
+        usage_recorded: false,
+        committed: false,
+    };
+
+    let body = b"abc";
+    sink.write(Bytes::copy_from_slice(body)).await.unwrap();
+    sink.verify_output(
+        3,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    )
+    .await
+    .unwrap();
+
+    let authorization = UsageAuthorization::new(
+        operation_id,
+        receipt_id,
+        "bucket-a".to_string(),
+        UsageRoute::CompleteMultipartUpload,
+        RequestKind::Write,
+        max_processed_bytes,
+    );
+    let grant = AuthorizationGrant::new(&authorization, chrono::Utc::now(), 1);
+    let usage = UsageEvent::from_grant(&grant, 3, 3).with_operation_id(operation_id);
+    sink.record_usage_evidence(&usage)
+        .await
+        .expect("record usage evidence (managed logical)");
+    let operation = repository
+        .logical_operation(operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.state, ManagedLogicalOperationState::Completing);
+    assert!(operation.evidence.is_some());
+}
+
+#[tokio::test]
+async fn scratch_repro_managed_multipart_full_publish() {
+    use crate::control::{AuthorizationGrant, UsageAuthorization};
+    use crate::managed::{
+        ManagedLogicalOperationIntent, ManagedLogicalOperationState, ManagedMutationKind,
+        ManagedPublicationRecipe, ManagedRouteFence, PhysicalWriteIntent,
+    };
+    use crate::multipart_completion::MultipartCompletionCoordinator;
+    use crate::multipart_staging::{
+        CompletePart, CompletionAcquire, MultipartLifecycle, MultipartPart,
+        MultipartRepository as _, MultipartSnapshot, MultipartUpload, now_ms,
+    };
+    use crate::transaction::{
+        DirectOperationScope, FileOperationJournal, ObjectDestination as TxObjectDestination,
+        OperationRecord, StoredObjectMeta,
+    };
+    use sha2::Digest;
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("maskura-scratch-{}", uuid::Uuid::now_v7())))
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let directory = TempDir::new();
+    let staging = Arc::new(
+        FileMultipartRepository::open(
+            directory.path().join("multipart"),
+            StagingQuotaLimits::new(1024 * 1024, 1024 * 1024).unwrap(),
+        )
+        .unwrap(),
+    );
+    let journal = Arc::new(FileOperationJournal::open(directory.path().join("journal")).unwrap());
+    let identity = MultipartIdentity {
+        tenant_id: "tenant-a".to_string(),
+        credential_policy_id: "policy-a".to_string(),
+        bucket: "bucket-a".to_string(),
+        key: "key-a".to_string(),
+        upload_id: uuid::Uuid::now_v7().to_string(),
+    };
+    let now = now_ms();
+    staging
+        .create(MultipartUpload {
+            identity: identity.clone(),
+            namespace_epoch: None,
+            snapshot: MultipartSnapshot {
+                metadata: BTreeMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                tags: BTreeMap::new(),
+                checksum_mode: None,
+                destination: serde_json::json!({"kind": "managed"}),
+                plugin_snapshot: serde_json::json!({}),
+                max_staged_bytes: 1024 * 1024,
+                verified_policy: None,
+            },
+            lifecycle: MultipartLifecycle::Open,
+            staged_bytes: 0,
+            reserved_bytes: 0,
+            created_at_ms: now,
+            expires_at_ms: now + 60_000,
+            updated_at_ms: now,
+            tombstone_until_ms: None,
+            complete_request_fingerprint: None,
+            completion_lease_owner: None,
+            completion_lease_expires_at_ms: None,
+            completion_fencing_token: 0,
+            destination_operation_id: None,
+            publishing_started_at_ms: None,
+            destination_commit: None,
+            completion_result: None,
+        })
+        .await
+        .unwrap();
+    let pending = staging.begin_part(&identity, 1, 8, now).await.unwrap();
+    let artifact_key = pending.artifact_key.clone();
+    staging
+        .commit_part(
+            &identity,
+            &pending,
+            MultipartPart {
+                upload_id: identity.upload_id.clone(),
+                part_number: 1,
+                attempt: pending.attempt,
+                artifact_key: artifact_key.clone(),
+                etag: "\"part\"".to_string(),
+                checksum_sha256: "part-sha".to_string(),
+                size_bytes: 8,
+                created_at_ms: now,
+            },
+        )
+        .await
+        .unwrap();
+    let lease = match staging
+        .acquire_completion(
+            &identity,
+            "fingerprint-a",
+            &[CompletePart {
+                part_number: 1,
+                etag: "\"part\"".to_string(),
+                checksum_sha256: Some("part-sha".to_string()),
+            }],
+            "worker-a",
+            now_ms() + 60_000,
+            now_ms(),
+        )
+        .await
+        .unwrap()
+    {
+        CompletionAcquire::Acquired(lease) => lease,
+        _ => panic!("completion lease was not acquired"),
+    };
+    let fingerprint = "fingerprint-a";
+    let operation_id = DestinationCommitPermit::deterministic_operation_id(&identity, fingerprint);
+    let receipt_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_X500, operation_id.as_bytes());
+
+    // Managed side, exactly like begin_managed_put_sink.
+    let repository = Arc::new(InMemoryManagedRepository::new());
+    let logical = LogicalObjectKey::new(&identity.tenant_id, &identity.bucket, &identity.key);
+    let fence: ManagedRouteFence = repository.route_fence(&identity.tenant_id).await.unwrap();
+    let generation = uuid::Uuid::now_v7();
+    let physical_key = generation_physical_key(&logical, generation);
+    let destination = crate::transaction::ObjectDestination {
+        backend_id: "primary".to_string(),
+        bucket: "provider-bucket".to_string(),
+        logical_key: logical.object_key(),
+        physical_key: physical_key.clone(),
+        workspace_binding: None,
+    };
+    let child_scope = crate::transaction::ManagedOperationScope::deterministic_child(
+        operation_id,
+        identity.tenant_id.clone(),
+        fence.namespace_epoch,
+        &destination,
+        crate::transaction::ManagedChildRole::Primary,
+    );
+    let max_processed_bytes = 1024 * 1024;
+    let intent = ManagedLogicalOperationIntent {
+        operation_id,
+        receipt_id,
+        logical: logical.clone(),
+        kind: ManagedMutationKind::Put,
+        generation,
+        fence,
+        expected_authority_cas: None,
+        prior_logical_size: 0,
+        primary_child_operation_id: child_scope.operation_id,
+        backend_id: "primary".to_string(),
+        provider_bucket: "provider-bucket".to_string(),
+        physical_key: physical_key.clone(),
+        occurred_at_ms: crate::transaction::unix_time_ms(),
+        rate_version: 1,
+        route: UsageRoute::PutObject,
+        request_kind: RequestKind::Write,
+        max_processed_bytes,
+        publication_recipe: Some(ManagedPublicationRecipe {
+            version: MANAGED_PUBLICATION_RECIPE_VERSION,
+            placement_version: 1,
+            primary_backend_id: "primary".to_string(),
+            replica_backend_id: None,
+            metadata: BTreeMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+            primary_status: CopyStatus::Ready,
+            replica_status: CopyStatus::Absent,
+        }),
+    };
+    repository
+        .admit_logical_operation(intent.clone(), max_processed_bytes * 4)
+        .await
+        .expect("admit logical operation");
+    let child = PhysicalWriteIntent {
+        intent_id: child_scope.operation_id,
+        tenant_id: identity.tenant_id.clone(),
+        backend_id: "primary".to_string(),
+        storage_identity: test_storage_identity(),
+        credential_epoch: 1,
+        provider_bucket: "provider-bucket".to_string(),
+        physical_key: physical_key.clone(),
+        versioning_mode: crate::managed::BackendVersioningMode::Enabled,
+        versioning_capability: crate::managed::BackendVersioningCapability::Required,
+        lease_owner: "writer".to_string(),
+    };
+    let physical_lease = repository
+        .begin_physical_write(child)
+        .await
+        .expect("begin physical write");
+
+    // Journal destination operation, exactly like begin_streaming_sink does.
+    let coordinator =
+        MultipartCompletionCoordinator::new(staging.clone(), journal.clone()).unwrap();
+    coordinator
+        .open_operation(
+            OperationRecord::direct_intent(
+                DirectOperationScope {
+                    operation_id,
+                    tenant_id: identity.tenant_id.clone(),
+                },
+                TxObjectDestination {
+                    backend_id: "Managed".to_string(),
+                    bucket: identity.bucket.clone(),
+                    logical_key: identity.key.clone(),
+                    physical_key: identity.key.clone(),
+                    workspace_binding: None,
+                },
+                crate::transaction::ExpectedObject {
+                    metadata: BTreeMap::from([(
+                        "content-type".to_string(),
+                        "application/json".to_string(),
+                    )]),
+                    ..crate::transaction::ExpectedObject::default()
+                },
+            ),
+            &identity,
+            fingerprint,
+        )
+        .await
+        .unwrap();
+
+    // Managed sink over a fake provider destination.
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (primary, _) = FakeDestination::new("primary", None, events.clone());
+    let primary = primary.with_lease(physical_lease);
+    let inner = ManagedReplicatedSink {
+        repository: repository.clone(),
+        logical: logical.clone(),
+        generation,
+        placement: Placement {
+            version: 1,
+            primary_backend_id: "primary".to_string(),
+            replica_backend_id: None,
+        },
+        logical_operation_id: Some(operation_id),
+        expected_cas: None,
+        metadata: BTreeMap::new(),
+        primary: Box::new(primary),
+        replica: None,
+        output: None,
+        finished: false,
+    };
+    let mut sink: Box<dyn ObjectSinkTransaction> = Box::new(ManagedLogicalSink {
+        inner: Box::new(inner),
+        repository: repository.clone(),
+        operation_id,
+        expected_output_size: None,
+        expected_output_digest: None,
+        usage_recorded: false,
+        committed: false,
+    });
+
+    let transformed = b"transformed-output";
+    sink.write(Bytes::copy_from_slice(transformed))
+        .await
+        .unwrap();
+    let digest = hex::encode(sha2::Sha256::digest(transformed));
+    sink.verify_output(transformed.len() as u64, &digest)
+        .await
+        .unwrap();
+
+    let precommit = crate::multipart_staging::MultipartCompletionResult {
+        etag: None,
+        checksum_sha256: digest.clone(),
+        version_id: None,
+        source_bytes: 8,
+        size_bytes: transformed.len() as u64,
+        pipeline_evidence: None,
+    };
+    let authorization = UsageAuthorization::new(
+        operation_id,
+        receipt_id,
+        identity.bucket.clone(),
+        UsageRoute::CompleteMultipartUpload,
+        RequestKind::Write,
+        max_processed_bytes,
+    );
+    let grant = AuthorizationGrant::new(&authorization, chrono::Utc::now(), 1);
+    let usage = UsageEvent::from_grant(&grant, precommit.source_bytes, precommit.size_bytes)
+        .with_operation_id(operation_id);
+
+    let result = coordinator
+        .publish(
+            &identity,
+            fingerprint,
+            lease.fencing_token,
+            precommit,
+            &usage,
+            &mut sink,
+        )
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => panic!("publish failed: {error:?} / {error}"),
+    };
+    assert_eq!(result.size_bytes, transformed.len() as u64);
+    let operation = repository
+        .logical_operation(operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.state, ManagedLogicalOperationState::Committed);
+    assert!(operation.evidence.is_some());
+    let _ = StoredObjectMeta::default();
+}
+
+use std::path::{Path, PathBuf};
+
 #[test]
 fn service_backend_parser_accepts_exact_valid_entries() {
     let backends = parse_service_backends(
@@ -937,6 +1400,7 @@ struct FakeDestination {
     failure: Option<FailurePoint>,
     state: SharedFakeState,
     events: SharedEvents,
+    lease: Option<crate::managed::PhysicalWriteLease>,
 }
 
 impl FakeDestination {
@@ -952,9 +1416,15 @@ impl FakeDestination {
                 failure,
                 state: state.clone(),
                 events,
+                lease: None,
             },
             state,
         )
+    }
+
+    fn with_lease(mut self, lease: crate::managed::PhysicalWriteLease) -> Self {
+        self.lease = Some(lease);
+        self
     }
 
     fn fail(&self, point: FailurePoint) -> Result<(), TransactionError> {
@@ -972,12 +1442,14 @@ impl FakeDestination {
 #[async_trait::async_trait]
 impl ManagedDestination for FakeDestination {
     fn physical_lease(&self) -> crate::managed::PhysicalWriteLease {
-        crate::managed::PhysicalWriteLease {
-            intent_id: uuid::Uuid::nil(),
-            namespace_epoch: 1,
-            owner: self.label.to_string(),
-            token: uuid::Uuid::nil(),
-        }
+        self.lease
+            .clone()
+            .unwrap_or(crate::managed::PhysicalWriteLease {
+                intent_id: uuid::Uuid::nil(),
+                namespace_epoch: 1,
+                owner: self.label.to_string(),
+                token: uuid::Uuid::nil(),
+            })
     }
 
     async fn write(&mut self, chunk: Bytes) -> Result<(), TransactionError> {
@@ -1022,7 +1494,15 @@ impl ManagedDestination for FakeDestination {
                 DestinationCommitAuthority::ClientMultipart(_) => "client-multipart",
             });
         self.fail(FailurePoint::Complete)?;
-        Ok(StoredObjectMeta::default())
+        // The tests admit physical writes against a versioning-enabled backend
+        // (`versioning_capability: Required`), so a successful completion proves
+        // exact version history the way a real versioning provider does.
+        Ok(StoredObjectMeta {
+            etag: Some("fake-etag".to_string()),
+            version_id: Some("fake-version".to_string()),
+            superseded_version_ids: Vec::new(),
+            version_history_complete: true,
+        })
     }
 
     async fn abort(&mut self) -> Result<(), TransactionError> {
