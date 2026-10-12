@@ -11,6 +11,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 mod hybrid;
+mod policy;
 
 const DEFAULT_GATEWAY: &str = "http://localhost:9000";
 const HOSTED_WORKSPACE_ID_ENV: EnvAlias = EnvAlias::new("MASKURA_WORKSPACE_ID");
@@ -172,6 +173,13 @@ enum Command {
     Pipelines {
         #[command(subcommand)]
         cmd: PipelinesCmd,
+    },
+
+    /// Verify policy-approval evidence against your local trust store
+    /// (customer-verifiable approval history — not execution attestation)
+    Policy {
+        #[command(subcommand)]
+        cmd: PolicyCmd,
     },
 }
 
@@ -492,6 +500,99 @@ enum PipelinesCmd {
         trust_roots: Option<String>,
         /// Pipeline TOML to inspect
         file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyCmd {
+    /// Manage the local policy trust store (trust-root pins)
+    Trust {
+        #[command(subcommand)]
+        cmd: PolicyTrustCmd,
+    },
+
+    /// Verify an EvidenceBundle export (kind "evidence" or "chain")
+    Verify {
+        /// EvidenceBundle JSON file obtained through your own channel
+        file: PathBuf,
+        /// Trust store directory (default: ~/.config/maskura/policy or
+        /// MASKURA_POLICY_TRUST_DIR)
+        #[arg(long, value_name = "DIR")]
+        trust_dir: Option<PathBuf>,
+        /// Evaluate validity at this instant (unix seconds or RFC3339 UTC);
+        /// default is now with the ±60s skew convention
+        #[arg(long, value_name = "TIME")]
+        at: Option<String>,
+        /// Emit the machine-readable verification report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List retained checkpoints and flag gaps
+    Checkpoints {
+        /// Workspace to list (default: all)
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        trust_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyTrustCmd {
+    /// Import your own EvidenceBundle: verifies its self-consistency and
+    /// approval proof, then auto-establishes the root pin on first import
+    Import {
+        /// EvidenceBundle JSON file (customer-controlled input)
+        file: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        trust_dir: Option<PathBuf>,
+        /// Replace an existing pin with a different root fingerprint
+        /// (explicit acceptance of a recorded discontinuity)
+        #[arg(long)]
+        force: bool,
+        /// Confirm --force non-interactively
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Pin a trust-root fingerprint manually (documented strict path)
+    Add {
+        /// Trust-root fingerprint (64 lowercase hex)
+        fingerprint: String,
+        /// Workspace ID
+        #[arg(long)]
+        workspace: String,
+        /// Optional COSE trust bundle (JSON) to snapshot; must digest to the
+        /// fingerprint
+        #[arg(long, value_name = "FILE")]
+        bundle: Option<PathBuf>,
+        #[arg(long, value_name = "DIR")]
+        trust_dir: Option<PathBuf>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Show locally pinned trust roots
+    Show {
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        trust_dir: Option<PathBuf>,
+    },
+
+    /// Download a served trust bundle to compare or refresh one already
+    /// matching a local pin. A server-fetched bundle never establishes a pin.
+    Fetch {
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Bundle URL (default: the gateway trust endpoint)
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        trust_dir: Option<PathBuf>,
     },
 }
 
@@ -2348,6 +2449,80 @@ async fn main() -> anyhow::Result<()> {
                 pipelines_check(trust_roots.as_deref(), file)?
             }
         },
+
+        Command::Policy { cmd } => {
+            let open_store = |trust_dir: &Option<PathBuf>| -> anyhow::Result<policy::TrustStore> {
+                policy::TrustStore::open(policy::TrustStore::resolve(trust_dir.clone()))
+            };
+            match cmd {
+                PolicyCmd::Trust { cmd } => match cmd {
+                    PolicyTrustCmd::Import {
+                        file,
+                        trust_dir,
+                        force,
+                        yes,
+                    } => {
+                        let store = open_store(trust_dir)?;
+                        policy::trust_import(&store, file, *force, *yes)?;
+                    }
+                    PolicyTrustCmd::Add {
+                        fingerprint,
+                        workspace,
+                        bundle,
+                        trust_dir,
+                        force,
+                        yes,
+                    } => {
+                        let store = open_store(trust_dir)?;
+                        policy::trust_add(
+                            &store,
+                            fingerprint,
+                            workspace,
+                            bundle.as_deref(),
+                            *force,
+                            *yes,
+                        )?;
+                    }
+                    PolicyTrustCmd::Show {
+                        workspace,
+                        trust_dir,
+                    } => {
+                        let store = open_store(trust_dir)?;
+                        policy::trust_show(&store, workspace.as_deref())?;
+                    }
+                    PolicyTrustCmd::Fetch {
+                        workspace,
+                        url,
+                        trust_dir,
+                    } => {
+                        let store = open_store(trust_dir)?;
+                        policy::trust_fetch(
+                            &store,
+                            workspace.as_deref(),
+                            url.as_deref(),
+                            cli.requested_gateway(),
+                        )
+                        .await?;
+                    }
+                },
+                PolicyCmd::Verify {
+                    file,
+                    trust_dir,
+                    at,
+                    json,
+                } => {
+                    let store = open_store(trust_dir)?;
+                    policy::policy_verify(&store, file, at.as_deref(), *json)?;
+                }
+                PolicyCmd::Checkpoints {
+                    workspace,
+                    trust_dir,
+                } => {
+                    let store = open_store(trust_dir)?;
+                    policy::checkpoints(&store, workspace.as_deref())?;
+                }
+            }
+        }
 
         Command::Local { cmd } => {
             const LOCAL_GATEWAY_NAME: &str = "maskura-local-gateway";

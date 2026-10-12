@@ -1,0 +1,32 @@
+{
+  "schema_version": 2,
+  "workspace_id": "ws-1",
+  "receipt_seq": 2,
+  "receipt_sha256": "27f66a5209738fd4458ae84432824b26805ce26719b23ca3b05f9e456b7d747f",
+  "envelope_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "envelope_version": 1,
+  "effective_state_digest": "81946e0052fde1e880ae3d95bd13f6226d2f427ab1869c1bf526b5c8f094d92f",
+  "initial_bundle_sha256": "e63aab8dbe12dd363d00d1f27ad6dd4d7bb42176943e78a489db7e9a8232bf4e",
+  "authorization": {
+    "schema_version": 1,
+    "workspace_id": "ws-1",
+    "rp_id": "maskura.dev",
+    "origins": [
+      "https://maskura.dev"
+    ],
+    "audience": "https://maskura.dev",
+    "signer_epoch": 1,
+    "credentials": [
+      {
+        "credential_id": "YzhmMTkzZTY3OGU3NjJmOWM0YjI4ZmM5ZTExYTZlNDNkNWNkNzkyZDJlMWUzNzZlNTZiODBhNzZmMjI3NDRhYw",
+        "label": "test",
+        "alg": -7,
+        "cose_public_key": "pQECAyYgASFYIB4YUy_UdUwC8wQdnHXOszuD_9gax85P6ILMscmLxYluIlggpGwxHE4v9A3ZajZT5uRURdMt_khuztdcepDGoYiBwKM",
+        "status": "active",
+        "authorized_from_epoch": 1
+      }
+    ],
+    "trust_resets": []
+  },
+  "verified_at": 1300
+}

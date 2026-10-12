@@ -15,13 +15,18 @@ pub mod destination_digest;
 pub mod direction;
 pub mod effective_state;
 pub mod error;
+pub mod evidence;
 pub mod plugin_ref;
 pub mod policy;
 pub mod receipt;
 pub mod schema;
 pub mod signing;
 pub mod trust;
+pub mod verify;
 pub mod webauthn;
+
+#[cfg(test)]
+pub(crate) mod fixtures;
 
 pub use direction::Direction;
 pub use effective_state::{
@@ -30,11 +35,16 @@ pub use effective_state::{
     ResolvedStep, StorageMode,
 };
 pub use error::ConfigError;
+pub use evidence::{
+    ApprovalEvidence, ChainArtifact, EVIDENCE_SCHEMA_VERSION, EvidenceArtifact, EvidenceBundle,
+    EvidenceKind, WitnessAcknowledgement,
+};
 pub use plugin_ref::PluginRef;
 pub use policy::{FailBehavior, FilterLockEntry, PolicyLimits, PolicyRoute, PolicySection};
 pub use receipt::{
     ChainReport, GENESIS_PREV, RECEIPT_SCHEMA_VERSION, ReceiptAction, ReceiptBody, ReceiptPurpose,
     ReceiptStanding, SignedReceipt, receipt_body_hash, verify_receipt, verify_receipt_chain,
+    verify_receipt_suffix,
 };
 pub use schema::{
     DirectionPipeline, IDENTITY_VERSION, IdentityComponent, IdentitySection, PipelineFile,
@@ -44,6 +54,11 @@ pub use signing::{TrustRoots, parse_trust_roots};
 pub use trust::{
     CHECKPOINT_SCHEMA_VERSION, Checkpoint, CredentialStatus, TRUST_BUNDLE_SCHEMA_VERSION,
     TrustBundle, TrustCredential, parse_trust_bundle_json,
+};
+pub use verify::{
+    ArtifactSummary, CLOCK_SKEW_SECONDS, Completeness, Finding, FindingCode, TrustPin, TrustState,
+    VERIFICATION_REPORT_SCHEMA_VERSION, Verdict, VerificationReport, VerificationStep,
+    VerifyOptions, WITNESS_STATUS, WitnessStatus, verify_artifact,
 };
 pub use webauthn::{
     AssertionExpectation, CHALLENGE_VERSION, ChallengeContext, ChallengeKind, CoseEs256Key,

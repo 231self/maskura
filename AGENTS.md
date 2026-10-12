@@ -148,7 +148,7 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 ### CLI (`maskura`)
 
 - Binary crate at `crates/cli/`. Full-featured CLI for Maskura operations.
-- Subcommands: `login`, `logout`, `whoami`, `key {create,list,revoke}`, `backend {get,set-aws,set-r2,set-b2,set-minio,presign}`, `put`, `get`, `list`, `health`, `local {init,down}`, `test upload`. `set-aws` configures an `aws_role` backend (role ARN + region + optional external ID).
+- Subcommands: `login`, `logout`, `whoami`, `key {create,list,revoke}`, `backend {get,set-aws,set-r2,set-b2,set-minio,presign}`, `put`, `get`, `list`, `health`, `local {init,down}`, `test upload`, `pipelines {init-key,sign,verify,check}`, `policy {trust {import,add,show,fetch},verify,checkpoints}`. `set-aws` configures an `aws_role` backend (role ARN + region + optional external ID).
 - Auth from `~/.config/maskura/config.json`, `MASKURA_ACCESS_KEY`/`MASKURA_SECRET_KEY`, or demo mode.
 - Key expiry support: `--expiry never|30d|90d|1y` (or raw seconds).
 - Backend presign: generates presigned URLs via local AWS CLI for use with the Maskura proxy.
@@ -271,3 +271,45 @@ properties are in `docs/encryption.md` and ADR 0011.
   receipt, and a server-served trust bundle is never an independent pin.
 - Decisions and deployment state: ADR 0022 (Slice 3 refinement), verification
   contract ADR 0023, trust-root lineage ADR 0024.
+
+### Policy approval (Slice 4) — EvidenceBundle and customer verification
+
+- **EvidenceBundle v1** (`crates/pipeline-config/src/evidence.rs`): the
+  customer export container. `kind: "evidence"` (landed receipt +
+  post-publish Checkpoint v2 + approval proof (ASN.1 DER ES256 bytes with the
+  retained clientDataJSON / authenticator data / credential id / COSE
+  algorithm association) + optional bounded `chain_tail` + optional witness
+  records) and `kind: "chain"` (`receipts[]` + `checkpoints[]`). Explicit
+  `schema_version: 1`; JSON presentation around the existing typed
+  serializations; fail-closed serde (unknown schema versions/fields rejected).
+  Golden vectors in `tests/fixtures/policy/`.
+- **Verification facade** (`crates/pipeline-config/src/verify.rs`):
+  `verify_artifact(input, trust_state, opts) -> VerificationReport` — the spec
+  §3 pipeline as one entry point: container/schema gate → canonical-CBOR
+  digest re-derivation → receipt body validation → chain links → approval
+  proof against the COSE key of the trust bundle matching the local pin
+  (unpinned → refuse) → signer transitions with trust resets rendered as
+  discontinuities ("discontinuity: new root not accepted" unless explicitly
+  accepted) → checkpoint extension/freshness vs customer-retained checkpoints
+  (`extended-ok` / `gap` / `rollback-suspect` / `first-run`) → validity
+  (`--at <time>` or now, ±60s skew). The report is stable/versioned:
+  `verdict`, `findings[]`, `completeness` (always
+  `UNVERIFIED (no prior checkpoint)` without retained checkpoints),
+  `witness: "not-witness-verified"`. No new crypto — it composes the
+  receipt/trust/webauthn verifiers (`verify_receipt_suffix` resumes a chain
+  from a retained checkpoint bound to the pinned root fingerprint).
+- **CLI + trust store** (`crates/cli/src/policy.rs`): `maskura policy trust
+  {import,add,show,fetch}`, `policy verify [--trust-dir] [--at] [--json]`,
+  `policy checkpoints`. Trust store `~/.config/maskura/policy/`
+  (`--trust-dir` / `MASKURA_POLICY_TRUST_DIR`): `trust.json` pins (workspace →
+  root fingerprint + imported COSE bundle snapshot; **written only from
+  customer-controlled input** — `trust import` auto-pins from the customer's
+  own artifact after verification, `trust add` is the manual path, and a
+  server-fetched bundle can never establish a pin), `checkpoints/<workspace>/
+  <seq>.json` append-only by sequence (forced root replacement archives the
+  old lineage to `<workspace>-retired-<fp8>/`), `index.json` artifact digests.
+  Atomic temp+rename writes; the directory is portable. The existing
+  `pipelines --trust-roots` Ed25519 format is unrelated and unchanged.
+- **Claim discipline**: customer-verifiable approval history against
+  customer-retained checkpoints — not execution attestation, not
+  witness-verified. Customer guide: `docs/policy-verification.md`.

@@ -49,6 +49,28 @@ It must not imply that approval signatures prove execution.
 The concrete contract and tests are described in the
 [corrected Slice 1 protocol](../plans/2026-09-24-policy-approval-protocol.md).
 
+## Slice 4 status (2026-10-12)
+
+The verification contract is now customer-executable. `verify_artifact` in
+`maskura-pipeline-config` implements the fail-closed pipeline as one entry
+point — container/schema gate, canonical-CBOR digest re-derivation, the
+receipt-body invariants above, chain-link checks, approval-proof verification
+against the COSE key of a customer-pinned trust root (unpinned verification is
+refused), signer transitions with trust resets rendered as discontinuities
+("discontinuity: new root not accepted" unless explicitly accepted),
+checkpoint extension/freshness against customer-retained checkpoints
+(`extended-ok` / `gap` / `rollback-suspect` / `first-run`), and validity at an
+evaluated instant (`--at`, default now with the ±60 s skew convention). The
+report is stable and versioned (`verdict`, `findings[]`, `completeness`,
+`witness: "not-witness-verified"`) and enforces completeness honesty: with no
+prior checkpoint it says `UNVERIFIED (no prior checkpoint)` and never claims a
+complete history. The `maskura policy` CLI wraps this for customers with a
+portable trust store whose pins are written only from customer-controlled
+input — a server-fetched trust bundle can never establish a pin. Golden
+vectors accompany the crate for third-party interoperability. Witness
+verification remains a gated program and is never claimed. See
+[docs/policy-verification.md](../policy-verification.md).
+
 ## Consequences
 
 - These shared-library corrections are implemented locally without enabling hosted

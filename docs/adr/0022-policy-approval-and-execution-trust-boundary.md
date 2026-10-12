@@ -144,6 +144,20 @@ attestation: a compromised gateway can still serve unapproved bytes in real
 time; that serving contradicts the signed record and is forensically visible
 afterwards — detection, not prevention.
 
+**Slice 4 note: customer verification shipped (2026-10-12).** The
+customer-facing half of the boundary is now implemented and public: the
+EvidenceBundle v1 export format, a fail-closed verification facade over the
+shared protocol types, and the `maskura policy` CLI group with a
+customer-controlled trust store (see
+[docs/policy-verification.md](../policy-verification.md) and ADR 0023's status
+note). The claim stays exactly "customer-verifiable approval history against
+customer-retained checkpoints" — **not** execution attestation and **not**
+witness-verified. The external consistency witness (A3) remains a separately
+gated program: artifacts may carry witness acknowledgement records, but they
+parse only, absence is never blocking, and reports always carry
+`witness: not-witness-verified`. This slice is enforcement-neutral; the
+deployment states above are unchanged and no workspace is enforced.
+
 ## Consequences
 
 - The operator, deployed gateway, host environment, and local enforcement state
