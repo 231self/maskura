@@ -1654,3 +1654,185 @@ fn postgres_managed_quota_and_cursor_limits_hold_under_concurrency() {
             .unwrap();
     });
 }
+
+#[test]
+fn managed_multipart_completion_begin_records_usage_and_advances_state() {
+    // Repro for managed client-multipart completion: `record_logical_usage_and_begin_completion`
+    // must record evidence and advance a freshly admitted `Open` operation to `Completing`
+    // for multipart-shaped evidence (source bytes != output bytes). Runs identically on
+    // the in-memory and Postgres managed repositories.
+    async fn drive(repository: &dyn ManagedRepository, tenant: &str) {
+        let logical = LogicalObjectKey::new(tenant, "bucket", "data/multipart");
+        let generation = uuid::Uuid::now_v7();
+        let fence = repository.route_fence(tenant).await.unwrap();
+        let intent = ManagedLogicalOperationIntent {
+            operation_id: uuid::Uuid::now_v7(),
+            receipt_id: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, tenant.as_bytes()),
+            logical: logical.clone(),
+            kind: ManagedMutationKind::Put,
+            generation,
+            fence,
+            expected_authority_cas: None,
+            prior_logical_size: 0,
+            primary_child_operation_id: uuid::Uuid::now_v7(),
+            backend_id: "primary".to_string(),
+            provider_bucket: "provider-bucket".to_string(),
+            physical_key: generation_physical_key(&logical, generation),
+            occurred_at_ms: unix_time_ms(),
+            rate_version: 1,
+            route: UsageRoute::PutObject,
+            request_kind: RequestKind::Write,
+            max_processed_bytes: 1024 * 1024,
+            publication_recipe: Some(publication_recipe("primary")),
+        };
+        // Admission reserves the workspace slot and drives the operation to `Open`,
+        // exactly like `begin_managed_put_sink` does before streaming the sink.
+        let (admitted, _usage) = repository
+            .admit_logical_operation(intent.clone(), 1024 * 1024 * 4)
+            .await
+            .expect("admit managed logical operation");
+        assert_eq!(admitted.state, ManagedLogicalOperationState::Open);
+        assert!(admitted.evidence.is_none());
+
+        // Multipart completion records evidence whose `processed_bytes` is
+        // `max(source, output)` while `source != output` (assembled parts differ from
+        // the transformed output) and advances `Open -> Completing` in one call.
+        let evidence = ManagedUsageEvidence {
+            expected_output_digest: Some("output-digest".to_string()),
+            expected_output_size: 18,
+            source_bytes: 8,
+            processed_bytes: 18,
+            payload: serde_json::json!({"route": "CompleteMultipartUpload", "kind": "WRITE"}),
+        };
+        let completing = repository
+            .record_logical_usage_and_begin_completion(intent.operation_id, evidence.clone())
+            .await
+            .expect("record usage and begin completion");
+        assert_eq!(completing.state, ManagedLogicalOperationState::Completing);
+        assert_eq!(completing.evidence.as_ref(), Some(&evidence));
+    }
+
+    with_pool(|pool| async move {
+        drive(
+            &InMemoryManagedRepository::new(),
+            "multipart-completion-memory",
+        )
+        .await;
+
+        let db = sea_db(pool.clone());
+        let tenant = format!("multipart-completion-pg-{}", uuid::Uuid::new_v4());
+        let repository = PostgresManagedRepository::new(pool.clone());
+        drive(&repository, &tenant).await;
+
+        managed_workspace_usage::Entity::delete_by_id(&tenant)
+            .exec(&db)
+            .await
+            .unwrap();
+        managed_logical_operation::Entity::delete_many()
+            .filter(managed_logical_operation::Column::TenantId.eq(&tenant))
+            .exec(&db)
+            .await
+            .unwrap();
+        managed_namespace::Entity::delete_by_id(&tenant)
+            .exec(&db)
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn managed_completion_begin_rejects_without_partial_evidence_on_stale_state() {
+    // A begin-completion rejected because the operation is no longer `Open` must
+    // not record evidence as a side effect (the in-memory repository used to leak
+    // evidence through its two-step record+transition; Postgres is atomic).
+    async fn drive(repository: &dyn ManagedRepository, tenant: &str) {
+        let logical = LogicalObjectKey::new(tenant, "bucket", "data/multipart");
+        let generation = uuid::Uuid::now_v7();
+        let fence = repository.route_fence(tenant).await.unwrap();
+        let intent = ManagedLogicalOperationIntent {
+            operation_id: uuid::Uuid::now_v7(),
+            receipt_id: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, tenant.as_bytes()),
+            logical: logical.clone(),
+            kind: ManagedMutationKind::Put,
+            generation,
+            fence,
+            expected_authority_cas: None,
+            prior_logical_size: 0,
+            primary_child_operation_id: uuid::Uuid::now_v7(),
+            backend_id: "primary".to_string(),
+            provider_bucket: "provider-bucket".to_string(),
+            physical_key: generation_physical_key(&logical, generation),
+            occurred_at_ms: unix_time_ms(),
+            rate_version: 1,
+            route: UsageRoute::PutObject,
+            request_kind: RequestKind::Write,
+            max_processed_bytes: 1024 * 1024,
+            publication_recipe: Some(publication_recipe("primary")),
+        };
+        repository
+            .admit_logical_operation(intent.clone(), 1024 * 1024 * 4)
+            .await
+            .expect("admit managed logical operation");
+        // Move the operation out of `Open` without recording usage, exactly as a
+        // crash/recovery path would leave it.
+        repository
+            .transition_logical_operation(
+                intent.operation_id,
+                ManagedLogicalOperationState::Open,
+                ManagedLogicalOperationState::CommitUnknown,
+                None,
+            )
+            .await
+            .expect("Open -> CommitUnknown");
+        let evidence = ManagedUsageEvidence {
+            expected_output_digest: Some("output-digest".to_string()),
+            expected_output_size: 18,
+            source_bytes: 8,
+            processed_bytes: 18,
+            payload: serde_json::json!({"route": "PutObject", "kind": "WRITE"}),
+        };
+        assert!(matches!(
+            repository
+                .record_logical_usage_and_begin_completion(intent.operation_id, evidence)
+                .await,
+            Err(maskura_gateway::managed::ManagedError::Conflict)
+        ));
+        let after = repository
+            .logical_operation(intent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after.evidence.is_none(),
+            "a rejected begin-completion must not record usage evidence"
+        );
+        assert_eq!(
+            after.state,
+            ManagedLogicalOperationState::CommitUnknown,
+            "a rejected begin-completion must not advance the operation"
+        );
+    }
+
+    with_pool(|pool| async move {
+        drive(&InMemoryManagedRepository::new(), "multipart-atomic-memory").await;
+
+        let db = sea_db(pool.clone());
+        let tenant = format!("multipart-atomic-pg-{}", uuid::Uuid::new_v4());
+        let repository = PostgresManagedRepository::new(pool.clone());
+        drive(&repository, &tenant).await;
+
+        managed_workspace_usage::Entity::delete_by_id(&tenant)
+            .exec(&db)
+            .await
+            .unwrap();
+        managed_logical_operation::Entity::delete_many()
+            .filter(managed_logical_operation::Column::TenantId.eq(&tenant))
+            .exec(&db)
+            .await
+            .unwrap();
+        managed_namespace::Entity::delete_by_id(&tenant)
+            .exec(&db)
+            .await
+            .unwrap();
+    });
+}

@@ -1470,14 +1470,44 @@ impl ManagedRepository for InMemoryManagedRepository {
         operation_id: Uuid,
         evidence: ManagedUsageEvidence,
     ) -> Result<ManagedLogicalOperation, ManagedError> {
-        self.record_logical_usage(operation_id, evidence).await?;
-        self.transition_logical_operation(
-            operation_id,
-            ManagedLogicalOperationState::Open,
-            ManagedLogicalOperationState::Completing,
-            None,
-        )
-        .await
+        // Atomically record the evidence and advance `Open -> Completing` in one
+        // critical section. Unlike the two-step `record_logical_usage` then
+        // `transition_logical_operation`, this never leaves evidence recorded on
+        // an operation whose state did not advance: a rejected request must not
+        // mutate the ledger (matching the Postgres implementation's transaction).
+        if evidence.processed_bytes != evidence.source_bytes.max(evidence.expected_output_size) {
+            return Err(ManagedError::Conflict);
+        }
+        let mut state = self.state.lock().await;
+        let operation = state
+            .logical_operations
+            .get_mut(&operation_id)
+            .ok_or(ManagedError::Conflict)?;
+        if operation.evidence.as_ref() == Some(&evidence) {
+            // Idempotent retry: only an operation still in `Open` advances,
+            // matching the two-step `record` then `Open -> Completing` behavior.
+            if operation.state != ManagedLogicalOperationState::Open {
+                return Err(ManagedError::Conflict);
+            }
+        } else {
+            if operation.evidence.is_some()
+                || operation.state != ManagedLogicalOperationState::Open
+                || evidence.processed_bytes > operation.intent.max_processed_bytes
+                || (operation.intent.kind == ManagedMutationKind::Put
+                    && evidence.expected_output_digest.is_none())
+                || (operation.intent.kind == ManagedMutationKind::Delete
+                    && (evidence.expected_output_size != 0
+                        || evidence.source_bytes != 0
+                        || evidence.processed_bytes != 0))
+            {
+                return Err(ManagedError::Conflict);
+            }
+        }
+        operation.evidence = Some(evidence);
+        operation.state = ManagedLogicalOperationState::Completing;
+        operation.last_error_class = None;
+        operation.updated_at_ms = crate::transaction::unix_time_ms();
+        Ok(operation.clone())
     }
 
     async fn prove_logical_abort(

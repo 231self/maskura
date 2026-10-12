@@ -107,7 +107,8 @@ pub fn bucket_already_exists(bucket: &str) -> axum::response::Response {
     )
 }
 
-pub fn internal_error(key: &str, _detail: &str) -> axum::response::Response {
+pub fn internal_error(key: &str, detail: &str) -> axum::response::Response {
+    tracing::warn!(target: "maskura_gateway::s3_error", key, detail, "internal error surfaced as an opaque S3 response");
     s3_error_xml(
         "InternalError",
         "We encountered an internal error.",
@@ -233,7 +234,8 @@ pub fn slow_down(key: &str) -> axum::response::Response {
     )
 }
 
-pub fn service_unavailable(key: &str, _detail: &str) -> axum::response::Response {
+pub fn service_unavailable(key: &str, detail: &str) -> axum::response::Response {
+    tracing::warn!(target: "maskura_gateway::s3_error", key, detail, "service unavailable surfaced as an opaque S3 response");
     s3_error_xml(
         "ServiceUnavailable",
         "The service is temporarily unavailable.",
