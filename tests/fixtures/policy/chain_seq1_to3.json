@@ -1,0 +1,346 @@
+{
+  "kind": "chain",
+  "schema_version": 1,
+  "workspace_id": "ws-1",
+  "trust_root_fingerprint": "e63aab8dbe12dd363d00d1f27ad6dd4d7bb42176943e78a489db7e9a8232bf4e",
+  "receipts": [
+    {
+      "body": {
+        "schema_version": 2,
+        "purpose": "policy_envelope",
+        "action": "activate",
+        "audience": "https://maskura.dev",
+        "workspace_id": "ws-1",
+        "effective_state": {
+          "schema_version": 2,
+          "audience": "https://maskura.dev",
+          "workspace_id": "ws-1",
+          "destinations": {
+            "dest": {
+              "kind": "concrete",
+              "destination": {
+                "mode": "s3_compatible",
+                "endpoint": "https://s3.example.com/",
+                "bucket": "objects",
+                "region": "region",
+                "role_arn": null,
+                "configuration_version_id": "config-version-1",
+                "configuration_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+              }
+            }
+          },
+          "routes": [
+            {
+              "bucket": "tenant",
+              "prefix": "data/",
+              "operation": "put",
+              "destination_id": "dest",
+              "assignment_id": "assignment",
+              "revision_id": "revision",
+              "resolution_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+              "explicit_passthrough": false,
+              "format": "bytes",
+              "adapter_sha256": null,
+              "limits": {
+                "processing": {
+                  "record_max_bytes": 1024,
+                  "object_max_bytes": 4096,
+                  "memory_bytes": 67108864,
+                  "fuel": 10000000,
+                  "deadline_ms": 30000
+                },
+                "output_max_bytes": 8192,
+                "table_entries": 10000,
+                "stack_bytes": 524288,
+                "max_plugins": 10
+              },
+              "steps": [
+                {
+                  "component_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "plugin_version_id": "plugin-version",
+                  "world": "maskura:plugin/transformer@0.1.0",
+                  "enabled": true,
+                  "config_json": "{\"mode\":\"redact\"}",
+                  "grants": [],
+                  "prefix_safe_for_read": false
+                }
+              ]
+            }
+          ]
+        },
+        "effective_state_digest": "81946e0052fde1e880ae3d95bd13f6226d2f427ab1869c1bf526b5c8f094d92f",
+        "envelope_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "envelope_version": 1,
+        "signer_epoch": 1,
+        "authority_digest": "e63aab8dbe12dd363d00d1f27ad6dd4d7bb42176943e78a489db7e9a8232bf4e",
+        "seq": 1,
+        "prev_receipt_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "issued_at": 1100
+      },
+      "proof": {
+        "credential_id": "YzhmMTkzZTY3OGU3NjJmOWM0YjI4ZmM5ZTExYTZlNDNkNWNkNzkyZDJlMWUzNzZlNTZiODBhNzZmMjI3NDRhYw",
+        "client_data_json": "{\"challenge\":\"q29hcnRpZmFjdF9kaWdlc3R4QGMzNGFlZWU0MDlkNDhkM2EwNzAzYTZhMWIzMjliZDdlYmRmOWM5MTRhNjMwY2NlMTVkNmE5ZGVhMjliOWFmZjFoYXVkaWVuY2VzaHR0cHM6Ly9tYXNrdXJhLmRldmtjZXJlbW9ueV9pZGpjZXJlbW9ueS0xamV4cGlyZXNfYXQZBLBpaXNzdWVkX2F0GQRMZGtpbmRoZW52ZWxvcGVlbm9uY2V4K0FRRUJBUUVCQVFFQkFRRUJBUUVCQVFFQkFRRUJBUUVCQVFFQkFRRUJBUUVqc2Vzc2lvbl9pZGlzZXNzaW9uLTFndXNlcl9pZGZ1c2VyLTFhdgFsd29ya3NwYWNlX2lkZHdzLTE\",\"crossOrigin\":false,\"origin\":\"https://maskura.dev\",\"type\":\"webauthn.get\"}",
+        "authenticator_data": "3qJj-BmIFWcrTPv2_4RPPdDVepH91iKabyX5vRtwMEMFAAAAAA",
+        "signature": "MEUCIQCNmCTcYbXCNPl-61N7Svj4Oed0weMtpjYV84m7GoncVgIgU-tBCADw0xnMbNhUGa8DCvs7YXaB1OGjwvi5-udftBc"
+      }
+    },
+    {
+      "body": {
+        "schema_version": 2,
+        "purpose": "pipeline_export",
+        "action": "activate",
+        "audience": "https://maskura.dev",
+        "workspace_id": "ws-1",
+        "effective_state": {
+          "schema_version": 2,
+          "audience": "https://maskura.dev",
+          "workspace_id": "ws-1",
+          "destinations": {
+            "dest": {
+              "kind": "concrete",
+              "destination": {
+                "mode": "s3_compatible",
+                "endpoint": "https://s3.example.com/",
+                "bucket": "objects",
+                "region": "region",
+                "role_arn": null,
+                "configuration_version_id": "config-version-1",
+                "configuration_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+              }
+            }
+          },
+          "routes": [
+            {
+              "bucket": "tenant",
+              "prefix": "data/",
+              "operation": "put",
+              "destination_id": "dest",
+              "assignment_id": "assignment",
+              "revision_id": "revision",
+              "resolution_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+              "explicit_passthrough": false,
+              "format": "bytes",
+              "adapter_sha256": null,
+              "limits": {
+                "processing": {
+                  "record_max_bytes": 1024,
+                  "object_max_bytes": 4096,
+                  "memory_bytes": 67108864,
+                  "fuel": 10000000,
+                  "deadline_ms": 30000
+                },
+                "output_max_bytes": 8192,
+                "table_entries": 10000,
+                "stack_bytes": 524288,
+                "max_plugins": 10
+              },
+              "steps": [
+                {
+                  "component_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "plugin_version_id": "plugin-version",
+                  "world": "maskura:plugin/transformer@0.1.0",
+                  "enabled": true,
+                  "config_json": "{\"mode\":\"redact\"}",
+                  "grants": [],
+                  "prefix_safe_for_read": false
+                }
+              ]
+            }
+          ]
+        },
+        "effective_state_digest": "81946e0052fde1e880ae3d95bd13f6226d2f427ab1869c1bf526b5c8f094d92f",
+        "envelope_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "envelope_version": 1,
+        "signer_epoch": 1,
+        "authority_digest": "e63aab8dbe12dd363d00d1f27ad6dd4d7bb42176943e78a489db7e9a8232bf4e",
+        "seq": 2,
+        "prev_receipt_sha256": "c34aeee409d48d3a0703a6a1b329bd7ebdf9c914a630cce15d6a9dea29b9aff1",
+        "issued_at": 1200
+      },
+      "proof": {
+        "credential_id": "YzhmMTkzZTY3OGU3NjJmOWM0YjI4ZmM5ZTExYTZlNDNkNWNkNzkyZDJlMWUzNzZlNTZiODBhNzZmMjI3NDRhYw",
+        "client_data_json": "{\"challenge\":\"q29hcnRpZmFjdF9kaWdlc3R4QDI3ZjY2YTUyMDk3MzhmZDQ0NThhZTg0NDMyODI0YjI2ODA1Y2UyNjcxOWIyM2NhM2IwNWY5ZTQ1NmI3ZDc0N2ZoYXVkaWVuY2VzaHR0cHM6Ly9tYXNrdXJhLmRldmtjZXJlbW9ueV9pZGpjZXJlbW9ueS0xamV4cGlyZXNfYXQZBRRpaXNzdWVkX2F0GQSwZGtpbmRncmVjZWlwdGVub25jZXgrQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSWpzZXNzaW9uX2lkaXNlc3Npb24tMWd1c2VyX2lkZnVzZXItMWF2AWx3b3Jrc3BhY2VfaWRkd3MtMQ\",\"crossOrigin\":false,\"origin\":\"https://maskura.dev\",\"type\":\"webauthn.get\"}",
+        "authenticator_data": "3qJj-BmIFWcrTPv2_4RPPdDVepH91iKabyX5vRtwMEMFAAAAAA",
+        "signature": "MEYCIQC1iRZWmQ7A_XL_JWNqh3wjwEvHxf16S_xUym_tlcNgSgIhAPwF4YGzBRv-2HsH4mU4vojrzTslfVfDU72HLiglzLV3"
+      }
+    },
+    {
+      "body": {
+        "schema_version": 2,
+        "purpose": "pipeline_export",
+        "action": "activate",
+        "audience": "https://maskura.dev",
+        "workspace_id": "ws-1",
+        "effective_state": {
+          "schema_version": 2,
+          "audience": "https://maskura.dev",
+          "workspace_id": "ws-1",
+          "destinations": {
+            "dest": {
+              "kind": "concrete",
+              "destination": {
+                "mode": "s3_compatible",
+                "endpoint": "https://s3.example.com/",
+                "bucket": "objects",
+                "region": "region",
+                "role_arn": null,
+                "configuration_version_id": "config-version-1",
+                "configuration_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+              }
+            }
+          },
+          "routes": [
+            {
+              "bucket": "tenant",
+              "prefix": "data/",
+              "operation": "put",
+              "destination_id": "dest",
+              "assignment_id": "assignment",
+              "revision_id": "revision",
+              "resolution_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+              "explicit_passthrough": false,
+              "format": "bytes",
+              "adapter_sha256": null,
+              "limits": {
+                "processing": {
+                  "record_max_bytes": 1024,
+                  "object_max_bytes": 4096,
+                  "memory_bytes": 67108864,
+                  "fuel": 10000000,
+                  "deadline_ms": 30000
+                },
+                "output_max_bytes": 8192,
+                "table_entries": 10000,
+                "stack_bytes": 524288,
+                "max_plugins": 10
+              },
+              "steps": [
+                {
+                  "component_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "plugin_version_id": "plugin-version",
+                  "world": "maskura:plugin/transformer@0.1.0",
+                  "enabled": true,
+                  "config_json": "{\"mode\":\"redact\"}",
+                  "grants": [],
+                  "prefix_safe_for_read": false
+                }
+              ]
+            }
+          ]
+        },
+        "effective_state_digest": "81946e0052fde1e880ae3d95bd13f6226d2f427ab1869c1bf526b5c8f094d92f",
+        "envelope_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "envelope_version": 1,
+        "signer_epoch": 1,
+        "authority_digest": "e63aab8dbe12dd363d00d1f27ad6dd4d7bb42176943e78a489db7e9a8232bf4e",
+        "seq": 3,
+        "prev_receipt_sha256": "27f66a5209738fd4458ae84432824b26805ce26719b23ca3b05f9e456b7d747f",
+        "issued_at": 1300
+      },
+      "proof": {
+        "credential_id": "YzhmMTkzZTY3OGU3NjJmOWM0YjI4ZmM5ZTExYTZlNDNkNWNkNzkyZDJlMWUzNzZlNTZiODBhNzZmMjI3NDRhYw",
+        "client_data_json": "{\"challenge\":\"q29hcnRpZmFjdF9kaWdlc3R4QDFjYTFlMzU1NTYzOWI2ODllNGIzMTMyNGI1MjViMGY0YmNiMzBhMjZlZGQzN2NiNzY4Zjk4ZjExM2JmYWViYTVoYXVkaWVuY2VzaHR0cHM6Ly9tYXNrdXJhLmRldmtjZXJlbW9ueV9pZGpjZXJlbW9ueS0xamV4cGlyZXNfYXQZBXhpaXNzdWVkX2F0GQUUZGtpbmRncmVjZWlwdGVub25jZXgrQXdNREF3TURBd01EQXdNREF3TURBd01EQXdNREF3TURBd01EQXdNREF3TWpzZXNzaW9uX2lkaXNlc3Npb24tMWd1c2VyX2lkZnVzZXItMWF2AWx3b3Jrc3BhY2VfaWRkd3MtMQ\",\"crossOrigin\":false,\"origin\":\"https://maskura.dev\",\"type\":\"webauthn.get\"}",
+        "authenticator_data": "3qJj-BmIFWcrTPv2_4RPPdDVepH91iKabyX5vRtwMEMFAAAAAA",
+        "signature": "MEUCIQCy7x43JgYPN8yi4AnJpQ1DoV4ZJS0YagWQlIEnpvf-AgIgKjinBZiMr5HvsGCdLZl1AHR43_iUhEvQpgs8g5NSw7o"
+      }
+    }
+  ],
+  "checkpoints": [
+    {
+      "schema_version": 2,
+      "workspace_id": "ws-1",
+      "receipt_seq": 1,
+      "receipt_sha256": "c34aeee409d48d3a0703a6a1b329bd7ebdf9c914a630cce15d6a9dea29b9aff1",
+      "envelope_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "envelope_version": 1,
+      "effective_state_digest": "81946e0052fde1e880ae3d95bd13f6226d2f427ab1869c1bf526b5c8f094d92f",
+      "initial_bundle_sha256": "e63aab8dbe12dd363d00d1f27ad6dd4d7bb42176943e78a489db7e9a8232bf4e",
+      "authorization": {
+        "schema_version": 1,
+        "workspace_id": "ws-1",
+        "rp_id": "maskura.dev",
+        "origins": [
+          "https://maskura.dev"
+        ],
+        "audience": "https://maskura.dev",
+        "signer_epoch": 1,
+        "credentials": [
+          {
+            "credential_id": "YzhmMTkzZTY3OGU3NjJmOWM0YjI4ZmM5ZTExYTZlNDNkNWNkNzkyZDJlMWUzNzZlNTZiODBhNzZmMjI3NDRhYw",
+            "label": "test",
+            "alg": -7,
+            "cose_public_key": "pQECAyYgASFYIB4YUy_UdUwC8wQdnHXOszuD_9gax85P6ILMscmLxYluIlggpGwxHE4v9A3ZajZT5uRURdMt_khuztdcepDGoYiBwKM",
+            "status": "active",
+            "authorized_from_epoch": 1
+          }
+        ],
+        "trust_resets": []
+      },
+      "verified_at": 1200
+    },
+    {
+      "schema_version": 2,
+      "workspace_id": "ws-1",
+      "receipt_seq": 2,
+      "receipt_sha256": "27f66a5209738fd4458ae84432824b26805ce26719b23ca3b05f9e456b7d747f",
+      "envelope_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "envelope_version": 1,
+      "effective_state_digest": "81946e0052fde1e880ae3d95bd13f6226d2f427ab1869c1bf526b5c8f094d92f",
+      "initial_bundle_sha256": "e63aab8dbe12dd363d00d1f27ad6dd4d7bb42176943e78a489db7e9a8232bf4e",
+      "authorization": {
+        "schema_version": 1,
+        "workspace_id": "ws-1",
+        "rp_id": "maskura.dev",
+        "origins": [
+          "https://maskura.dev"
+        ],
+        "audience": "https://maskura.dev",
+        "signer_epoch": 1,
+        "credentials": [
+          {
+            "credential_id": "YzhmMTkzZTY3OGU3NjJmOWM0YjI4ZmM5ZTExYTZlNDNkNWNkNzkyZDJlMWUzNzZlNTZiODBhNzZmMjI3NDRhYw",
+            "label": "test",
+            "alg": -7,
+            "cose_public_key": "pQECAyYgASFYIB4YUy_UdUwC8wQdnHXOszuD_9gax85P6ILMscmLxYluIlggpGwxHE4v9A3ZajZT5uRURdMt_khuztdcepDGoYiBwKM",
+            "status": "active",
+            "authorized_from_epoch": 1
+          }
+        ],
+        "trust_resets": []
+      },
+      "verified_at": 1300
+    },
+    {
+      "schema_version": 2,
+      "workspace_id": "ws-1",
+      "receipt_seq": 3,
+      "receipt_sha256": "1ca1e3555639b689e4b31324b525b0f4bcb30a26edd37cb768f98f113bfaeba5",
+      "envelope_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "envelope_version": 1,
+      "effective_state_digest": "81946e0052fde1e880ae3d95bd13f6226d2f427ab1869c1bf526b5c8f094d92f",
+      "initial_bundle_sha256": "e63aab8dbe12dd363d00d1f27ad6dd4d7bb42176943e78a489db7e9a8232bf4e",
+      "authorization": {
+        "schema_version": 1,
+        "workspace_id": "ws-1",
+        "rp_id": "maskura.dev",
+        "origins": [
+          "https://maskura.dev"
+        ],
+        "audience": "https://maskura.dev",
+        "signer_epoch": 1,
+        "credentials": [
+          {
+            "credential_id": "YzhmMTkzZTY3OGU3NjJmOWM0YjI4ZmM5ZTExYTZlNDNkNWNkNzkyZDJlMWUzNzZlNTZiODBhNzZmMjI3NDRhYw",
+            "label": "test",
+            "alg": -7,
+            "cose_public_key": "pQECAyYgASFYIB4YUy_UdUwC8wQdnHXOszuD_9gax85P6ILMscmLxYluIlggpGwxHE4v9A3ZajZT5uRURdMt_khuztdcepDGoYiBwKM",
+            "status": "active",
+            "authorized_from_epoch": 1
+          }
+        ],
+        "trust_resets": []
+      },
+      "verified_at": 1400
+    }
+  ]
+}

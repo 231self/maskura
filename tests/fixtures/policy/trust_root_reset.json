@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "workspace_id": "ws-1",
+  "rp_id": "maskura.dev",
+  "origins": [
+    "https://maskura.dev"
+  ],
+  "audience": "https://maskura.dev",
+  "signer_epoch": 1,
+  "credentials": [
+    {
+      "credential_id": "ZDhjNmIwYzcwNDRmYWJiYmZlNmMzMDUyOWZkZWEyNjJmMzVhNjZiYjQ1NGNkMzIzNTM1M2YxZGQzYjVhNDkzMQ",
+      "label": "test",
+      "alg": -7,
+      "cose_public_key": "pQECAyYgASFYIHE1-k_ZOgnc6Yu_aBtL_PUOfA1jVOYq-wv_KjQpYXhlIlgg7UwfAt25Aj7lalV-UV1qncZsEfIglg3llDNN9Yh3ZyQ",
+      "status": "active",
+      "authorized_from_epoch": 1
+    }
+  ],
+  "trust_resets": [
+    {
+      "epoch": 1,
+      "recorded_at": 2000,
+      "reason": "all authorized keys lost"
+    }
+  ]
+}

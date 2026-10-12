@@ -101,6 +101,18 @@ freshness limits. Build-provenance attestations and integration-test evidence
 are separate from execution attestation. See
 [ADR 0022](adr/0022-policy-approval-and-execution-trust-boundary.md).
 
+Customer verification is available: `maskura policy verify` checks exported
+approval evidence (EvidenceBundle v1) offline against customer-retained
+checkpoints and a customer-pinned trust root
+([docs/policy-verification.md](policy-verification.md)). The claim is
+customer-verifiable approval history against customer-retained checkpoints —
+not execution attestation and not witness-verified. A trust store pin is
+written only from customer-controlled input (an imported customer artifact or
+a manual fingerprint); a server-fetched trust bundle can never establish a
+pin, and a trust reset renders as a recorded discontinuity accepted only
+explicitly. This changes nothing about the deployment states above: the
+enforcement rollout state is unchanged.
+
 ## 2. Authentication
 
 ### Dashboard

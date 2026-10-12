@@ -193,7 +193,7 @@ impl ReceiptBody {
         Ok(())
     }
 
-    fn challenge_kind(&self) -> ChallengeKind {
+    pub(crate) fn challenge_kind(&self) -> ChallengeKind {
         match self.purpose {
             ReceiptPurpose::PolicyEnvelope => ChallengeKind::Envelope,
             ReceiptPurpose::PipelineExport => ChallengeKind::Receipt,
@@ -319,8 +319,7 @@ pub fn verify_receipt_chain(
         ));
     }
     let root = initial.digest()?;
-    let (mut authority, mut seq, mut head, mut envelope, mut version, mut state) = match checkpoint
-    {
+    let start = match checkpoint {
         Some(cp) => {
             cp.validate()?;
             if cp.initial_bundle_sha256 != root
@@ -334,29 +333,89 @@ pub fn verify_receipt_chain(
                     "checkpoint does not belong to pinned trust history",
                 ));
             }
-            (
-                cp.authorization.clone(),
-                cp.receipt_seq,
-                cp.receipt_sha256.clone(),
-                cp.envelope_digest.clone(),
-                cp.envelope_version,
-                cp.effective_state_digest.clone(),
-            )
+            ChainStart {
+                authority: cp.authorization.clone(),
+                seq: cp.receipt_seq,
+                head: cp.receipt_sha256.clone(),
+                envelope: cp.envelope_digest.clone(),
+                version: cp.envelope_version,
+                state: cp.effective_state_digest.clone(),
+            }
         }
-        None => (
-            initial.clone(),
-            0,
-            GENESIS_PREV.into(),
-            String::new(),
-            0,
-            String::new(),
-        ),
+        None => ChainStart {
+            authority: initial.clone(),
+            seq: 0,
+            head: GENESIS_PREV.into(),
+            envelope: String::new(),
+            version: 0,
+            state: String::new(),
+        },
     };
     if receipts.is_empty() && checkpoint.is_none() {
         return Err(ConfigError::approval(
             "receipt chain must not be empty without a checkpoint",
         ));
     }
+    advance_chain(receipts, start, root, checkpoint.is_some())
+}
+
+/// Verify a suffix of the chain from an independently retained checkpoint,
+/// binding the lineage to `root_fingerprint` (the customer's local pin) by the
+/// checkpoint's recorded `initial_bundle_sha256`. Per ADR 0023, suffix
+/// verification resumes the carried authorization state machine (including
+/// revocation and epoch checks); the genesis bundle bytes are not required.
+pub fn verify_receipt_suffix(
+    receipts: &[SignedReceipt],
+    checkpoint: &Checkpoint,
+    root_fingerprint: &str,
+) -> Result<ChainReport, ConfigError> {
+    checkpoint.validate()?;
+    if !is_hex64(root_fingerprint) || checkpoint.initial_bundle_sha256 != root_fingerprint {
+        return Err(ConfigError::approval(
+            "checkpoint does not belong to the pinned trust root",
+        ));
+    }
+    if receipts.is_empty() {
+        return Err(ConfigError::approval("receipt suffix must not be empty"));
+    }
+    advance_chain(
+        receipts,
+        ChainStart {
+            authority: checkpoint.authorization.clone(),
+            seq: checkpoint.receipt_seq,
+            head: checkpoint.receipt_sha256.clone(),
+            envelope: checkpoint.envelope_digest.clone(),
+            version: checkpoint.envelope_version,
+            state: checkpoint.effective_state_digest.clone(),
+        },
+        root_fingerprint.to_string(),
+        true,
+    )
+}
+
+struct ChainStart {
+    authority: TrustBundle,
+    seq: u64,
+    head: String,
+    envelope: String,
+    version: u64,
+    state: String,
+}
+
+fn advance_chain(
+    receipts: &[SignedReceipt],
+    start: ChainStart,
+    root: String,
+    extends_checkpoint: bool,
+) -> Result<ChainReport, ConfigError> {
+    let ChainStart {
+        mut authority,
+        mut seq,
+        mut head,
+        mut envelope,
+        mut version,
+        mut state,
+    } = start;
     for receipt in receipts {
         let body = &receipt.body;
         let next = seq
@@ -417,7 +476,7 @@ pub fn verify_receipt_chain(
         initial_bundle_sha256: root,
         authorization: authority,
         receipt_count: receipts.len(),
-        extends_checkpoint: checkpoint.is_some(),
+        extends_checkpoint,
     })
 }
 
