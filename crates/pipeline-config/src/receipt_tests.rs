@@ -96,6 +96,194 @@ fn rotation(body: ReceiptBody, old: &TestCredential, new: &TestCredential) -> Si
     sign(body, old, Some(new))
 }
 
+fn addition(
+    mut body: ReceiptBody,
+    primary: &TestCredential,
+    backup: &TestCredential,
+) -> SignedReceipt {
+    body.purpose = ReceiptPurpose::SignerAuthority;
+    body.action = ReceiptAction::AddSigner;
+    body.replacement = Some(credential(backup, body.signer_epoch + 1));
+    body.replaced_credential_id = None;
+    sign(body, primary, Some(backup))
+}
+
+#[test]
+fn signer_addition_retains_primary_and_authorizes_backup_at_the_next_epoch() {
+    let primary = test_credential([7; 32]);
+    let backup = test_credential([8; 32]);
+    let root = initial(&primary);
+    let genesis = sign(genesis_body(&root), &primary, None);
+    let start = verify_receipt_chain(std::slice::from_ref(&genesis), &root, None).unwrap();
+    let added = addition(next(&start), &primary, &backup);
+    let report = verify_receipt_chain(&[genesis, added.clone()], &root, None).unwrap();
+    assert_eq!(report.authorization.signer_epoch, 2);
+    assert_eq!(report.authorization.credentials.len(), 2);
+    for cred in [&primary, &backup] {
+        assert_eq!(
+            report
+                .authorization
+                .authorize(&cred.credential_id, 2)
+                .unwrap(),
+            ReceiptStanding::Current
+        );
+        let publish = sign(next(&report), cred, None);
+        verify_receipt_suffix(
+            &[publish],
+            &report.checkpoint(1200),
+            &root.digest().unwrap(),
+        )
+        .unwrap();
+    }
+    assert_eq!(report.authorization.credentials[0].revoked_epoch, None);
+    let suffix =
+        verify_receipt_suffix(&[added], &start.checkpoint(1200), &root.digest().unwrap()).unwrap();
+    assert_eq!(suffix.authorization, report.authorization);
+    assert_eq!(suffix.head_receipt_sha256, report.head_receipt_sha256);
+}
+
+#[test]
+fn signer_addition_requires_both_proofs_and_rejects_id_or_key_reuse() {
+    let primary = test_credential([7; 32]);
+    let backup = test_credential([8; 32]);
+    let attacker = test_credential([9; 32]);
+    let root = initial(&primary);
+    let start =
+        verify_receipt_chain(&[sign(genesis_body(&root), &primary, None)], &root, None).unwrap();
+    let valid = addition(next(&start), &primary, &backup);
+    verify_receipt(&valid, &root).unwrap();
+    let mut missing = valid.clone();
+    missing.counter_proof = None;
+    assert!(verify_receipt(&missing, &root).is_err());
+    let mut same_proof = valid.clone();
+    same_proof.counter_proof = Some(same_proof.proof.clone());
+    assert!(verify_receipt(&same_proof, &root).is_err());
+    let unauthorized = addition(next(&start), &attacker, &backup);
+    assert!(verify_receipt(&unauthorized, &root).is_err());
+    let reused = addition(next(&start), &primary, &primary);
+    assert!(verify_receipt(&reused, &root).is_err());
+    let mut body = valid.body.clone();
+    body.replacement.as_mut().unwrap().credential_id = primary.credential_id.clone();
+    assert!(verify_receipt(&sign(body, &primary, Some(&backup)), &root).is_err());
+    let mut body = valid.body.clone();
+    body.replacement.as_mut().unwrap().cose_public_key =
+        B64.encode(primary.cose.to_cose().unwrap());
+    assert!(verify_receipt(&sign(body, &primary, Some(&backup)), &root).is_err());
+    let mut substituted = valid;
+    substituted
+        .body
+        .replacement
+        .as_mut()
+        .unwrap()
+        .cose_public_key = B64.encode(attacker.cose.to_cose().unwrap());
+    assert!(verify_receipt(&substituted, &root).is_err());
+}
+
+#[test]
+fn signer_addition_cannot_retire_keys_skip_epochs_or_change_approved_state() {
+    let primary = test_credential([7; 32]);
+    let backup = test_credential([8; 32]);
+    let root = initial(&primary);
+    let start =
+        verify_receipt_chain(&[sign(genesis_body(&root), &primary, None)], &root, None).unwrap();
+    let valid = addition(next(&start), &primary, &backup);
+    let mut body = valid.body.clone();
+    body.replaced_credential_id = Some(primary.credential_id.clone());
+    assert!(body.validate().is_err());
+    let mut body = valid.body.clone();
+    body.replacement.as_mut().unwrap().authorized_from_epoch += 1;
+    assert!(body.validate().is_err());
+    let mut body = valid.body.clone();
+    body.signer_epoch = u64::MAX;
+    assert!(body.validate().is_err());
+    let mut body = valid.body.clone();
+    body.effective_state.routes[0].steps[0].component_sha256 = "b".repeat(64);
+    body.effective_state_digest = body.effective_state.digest().unwrap();
+    let changed = sign(body, &primary, Some(&backup));
+    assert!(
+        verify_receipt_suffix(&[changed], &start.checkpoint(1200), &root.digest().unwrap())
+            .is_err()
+    );
+    let mut wrong_link = valid.clone();
+    wrong_link.body.prev_receipt_sha256 = "a".repeat(64);
+    assert!(
+        verify_receipt_suffix(
+            &[wrong_link],
+            &start.checkpoint(1200),
+            &root.digest().unwrap()
+        )
+        .is_err()
+    );
+    let mut wrong_authority = valid;
+    wrong_authority.body.authority_digest = "a".repeat(64);
+    assert!(verify_receipt(&wrong_authority, &root).is_err());
+}
+
+#[test]
+fn backup_added_by_receipt_can_replace_lost_primary_without_retiring_itself() {
+    let primary = test_credential([7; 32]);
+    let backup = test_credential([8; 32]);
+    let successor = test_credential([9; 32]);
+    let root = initial(&primary);
+    let genesis = sign(genesis_body(&root), &primary, None);
+    let start = verify_receipt_chain(std::slice::from_ref(&genesis), &root, None).unwrap();
+    let added = addition(next(&start), &primary, &backup);
+    let approved = verify_receipt_chain(&[genesis.clone(), added.clone()], &root, None).unwrap();
+    let mut replacement = next(&approved);
+    replacement.purpose = ReceiptPurpose::SignerAuthority;
+    replacement.action = ReceiptAction::ReplaceSigner;
+    replacement.replacement = Some(credential(&successor, 3));
+    replacement.replaced_credential_id = Some(primary.credential_id.clone());
+    let replaced = sign(replacement, &backup, Some(&successor));
+    let report = verify_receipt_chain(&[genesis, added, replaced], &root, None).unwrap();
+    assert_eq!(report.authorization.signer_epoch, 3);
+    assert!(
+        report
+            .authorization
+            .authorize(&primary.credential_id, 3)
+            .is_err()
+    );
+    for cred in [&backup, &successor] {
+        assert_eq!(
+            report
+                .authorization
+                .authorize(&cred.credential_id, 3)
+                .unwrap(),
+            ReceiptStanding::Current
+        );
+    }
+}
+
+#[test]
+fn v2_receipts_keep_their_bytes_and_can_precede_v3_authority_addition() {
+    let primary = test_credential([7; 32]);
+    let backup = test_credential([8; 32]);
+    let root = initial(&primary);
+    let mut body = genesis_body(&root);
+    body.schema_version = 2;
+    let genesis = sign(body, &primary, None);
+    let json = serde_json::to_string(&genesis).unwrap();
+    let decoded: SignedReceipt = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded.body.schema_version, 2);
+    assert_eq!(
+        decoded.body.canonical_body().unwrap(),
+        genesis.body.canonical_body().unwrap()
+    );
+    assert_eq!(
+        decoded.body.receipt_digest().unwrap(),
+        genesis.body.receipt_digest().unwrap()
+    );
+    let start = verify_receipt_chain(&[decoded], &root, None).unwrap();
+    let added = addition(next(&start), &primary, &backup);
+    let mut illegal_v2 = added.body.clone();
+    illegal_v2.schema_version = 2;
+    assert!(illegal_v2.validate().is_err());
+    let mut future = added.body.clone();
+    future.schema_version = RECEIPT_SCHEMA_VERSION + 1;
+    assert!(future.validate().is_err());
+    verify_receipt_chain(&[genesis, added], &root, None).unwrap();
+}
+
 #[test]
 fn envelope_metadata_is_signed_and_cannot_be_rebased_on_checkpoint() {
     let old = test_credential([7; 32]);
@@ -399,9 +587,13 @@ fn v2_protocol_golden_vectors() {
     let old = test_credential([7; 32]);
     let new = test_credential([8; 32]);
     let root = initial(&old);
-    let genesis = sign(genesis_body(&root), &old, None);
+    let mut body = genesis_body(&root);
+    body.schema_version = 2;
+    let genesis = sign(body, &old, None);
     let start = verify_receipt_chain(std::slice::from_ref(&genesis), &root, None).unwrap();
-    let transition = rotation(next(&start), &old, &new);
+    let mut body = next(&start);
+    body.schema_version = 2;
+    let transition = rotation(body, &old, &new);
     let report = verify_receipt_chain(&[genesis.clone(), transition.clone()], &root, None).unwrap();
     assert_eq!(
         root.digest().unwrap(),

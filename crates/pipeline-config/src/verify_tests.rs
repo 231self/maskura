@@ -52,6 +52,67 @@ fn message(report: &VerificationReport, code: FindingCode) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn added_backup_evidence_verifies_only_when_linked_to_pinned_history() {
+    use crate::webauthn::test_support::test_credential;
+    use crate::{CredentialStatus, RECEIPT_SCHEMA_VERSION, ReceiptPurpose, TrustCredential};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
+
+    let golden = golden();
+    let primary = test_credential([7; 32]);
+    let backup = test_credential([8; 32]);
+    let start = checkpoint_report(&golden.checkpoints[0]);
+    let mut body = crate::fixtures::next_body(&start, 1150);
+    body.schema_version = RECEIPT_SCHEMA_VERSION;
+    body.purpose = ReceiptPurpose::SignerAuthority;
+    body.action = ReceiptAction::AddSigner;
+    body.replacement = Some(
+        TrustCredential::new(
+            &backup.credential_id,
+            "backup",
+            B64.encode(backup.cose.to_cose().unwrap()),
+            CredentialStatus::Active,
+            2,
+            None,
+        )
+        .unwrap(),
+    );
+    let mut receipt = crate::fixtures::sign_with(body.clone(), &primary, 7);
+    receipt.counter_proof = Some(crate::fixtures::sign_with(body, &backup, 7).proof);
+    let advanced = crate::receipt::verify_receipt_suffix(
+        std::slice::from_ref(&receipt),
+        &golden.checkpoints[0],
+        &golden.root_fingerprint,
+    )
+    .unwrap();
+    let artifact = crate::fixtures::evidence_bundle(
+        &receipt,
+        &advanced.checkpoint(1200),
+        &golden.root_fingerprint,
+        Vec::new(),
+    )
+    .to_json()
+    .unwrap();
+    let anchored = state(Some(pin(&golden)), vec![golden.checkpoints[0].clone()]);
+    let report = verify(&artifact, &anchored, Some(1200));
+    assert_eq!(report.verdict, Verdict::Verified);
+    assert!(has(&report, FindingCode::ExtendedOk));
+    let unlinked = state(Some(pin(&golden)), Vec::new());
+    assert_eq!(
+        verify(&artifact, &unlinked, Some(1200)).verdict,
+        Verdict::Failed,
+        "post-state alone must never establish backup authority"
+    );
+    let mut tampered: serde_json::Value = serde_json::from_str(&artifact).unwrap();
+    tampered["checkpoint"]["authorization"]["credentials"][0]["status"] = "revoked".into();
+    tampered["checkpoint"]["authorization"]["credentials"][0]["revoked_epoch"] = 2.into();
+    assert_eq!(
+        verify(&tampered.to_string(), &anchored, Some(1200)).verdict,
+        Verdict::Failed,
+        "carried authority cannot retire the primary on an addition receipt"
+    );
+}
+
+#[test]
 fn first_run_verifies_self_consistently_with_unverified_completeness() {
     let golden = golden();
     let report = verify(

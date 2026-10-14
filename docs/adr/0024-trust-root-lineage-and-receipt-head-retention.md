@@ -3,6 +3,11 @@
 - Status: Accepted
 - Date: 2026-09-29
 
+**Refinement:** [ADR 0025](0025-signed-backup-policy-authority.md) supersedes the
+one-active-signer restriction and the replacement-only signer receipt surface
+with signed backup-authority addition. The lineage/head-retention decisions and
+bootstrap preimage below remain unchanged.
+
 ## Context
 
 [ADR 0022](0022-policy-approval-and-execution-trust-boundary.md) introduced

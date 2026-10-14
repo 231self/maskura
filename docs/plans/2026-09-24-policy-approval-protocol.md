@@ -91,7 +91,11 @@ projection from real gateway resolution, checking it against envelope bounds,
 and enforcing it across every operation are **Slice 3 work**. Do not advertise
 runtime protection before that integration exists.
 
-## 4. ReceiptBody v2
+## 4. ReceiptBody v2/v3
+
+Writers use schema v3; readers retain v2 verification and canonical digests
+unchanged. Unknown versions fail closed. The v3 refinement is recorded in
+[ADR 0025](../adr/0025-signed-backup-policy-authority.md).
 
 The authoritative Rust fields are in `receipt.rs`. Every statement carries:
 
@@ -101,9 +105,11 @@ The authoritative Rust fields are in `receipt.rs`. Every statement carries:
 - Current signer epoch and `authority_digest` of the pre-activation trust bundle.
 - Contiguous sequence, `prev_receipt_sha256` (also the signed expected head).
 - `issued_at`, frozen at begin; not a trusted completion timestamp.
-- For signer replacement only: the full replacement `TrustCredential` (including
+- For signer replacement or addition: the full new `TrustCredential` in the
+  historical `replacement` field (including
   credential ID, COSE public key, algorithm, label and next authorization epoch),
-  plus `replaced_credential_id` naming the credential to retire.
+   plus `replaced_credential_id` naming the credential to retire for replacement;
+   addition requires that retired ID to be absent.
 
 Purpose/action combinations:
 
@@ -112,6 +118,7 @@ Purpose/action combinations:
 | `policy_envelope` | `activate` | `envelope` | Version advances; artifact changes; initial receipt must be an envelope activation |
 | `pipeline_export` | `activate` or `rollback` | `receipt` | Same active envelope; rollback is a fresh activation of resolved old content |
 | `signer_authority` | `replace_signer` | `signer` | Same active envelope and resolved configuration; two assertions over the same complete receipt digest |
+| `signer_authority` | `add_signer` (v3 only) | `signer` | Same envelope/configuration; current-authority proof and exact new-key counter-proof; next epoch without retirement |
 
 All kinds use `artifact_digest = SHA256(canonical ReceiptBody)`. No receipt has
 unsigned sequence, predecessor, epoch, timestamp, or version metadata.

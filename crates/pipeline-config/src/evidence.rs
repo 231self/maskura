@@ -70,7 +70,7 @@ pub struct EvidenceArtifact {
     /// anchored to (equal to the post-publish checkpoint's
     /// `initial_bundle_sha256`).
     pub trust_root_fingerprint: String,
-    /// The landed receipt (ReceiptBody v2 in its canonical-CBOR-signed form).
+    /// The landed receipt (ReceiptBody v2/v3 in its canonical-CBOR-signed form).
     pub receipt: SignedReceipt,
     /// The post-publish Checkpoint v2.
     pub checkpoint: Checkpoint,
