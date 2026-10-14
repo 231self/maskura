@@ -158,6 +158,38 @@ parse only, absence is never blocking, and reports always carry
 `witness: not-witness-verified`. This slice is enforcement-neutral; the
 deployment states above are unchanged and no workspace is enforced.
 
+### Slice 5 enrollment and recovery refinement (2026-10-14)
+
+**Implementation status:** the shared backup-authority protocol is merged in
+v0.7.25. Hosted enrollment/recovery and dashboard changes pass the complete
+private local gate, but are not yet merged/deployed: **not a deployment claim**.
+
+The first landed customer state approval atomically advances the receipt head
+and transitions absent or `inactive` workspace enforcement to `enforced`.
+The authenticated approver and first activation time are retained on later
+approvals. Customer publish and rollback require completed enrollment;
+internal system-default seeding is unchanged. There is no operator flip or
+recovery bypass that clears enforcement.
+
+The dashboard sequence is signer bootstrap → signed standing envelope → signed
+effective state. A separately registered passkey can become the single backup
+through a signed `AddSigner` transition with existing-authority approval and
+the exact new key's counter-proof ([ADR 0025](0025-signed-backup-policy-authority.md)).
+The backup can authorize replacement of a lost primary; login recovery codes
+are not policy-signing authority. Multi-owner recovery is deferred.
+
+Loss of all policy keys starts a new root, not a continuation of the old chain.
+Explicit dashboard acceptance requires owner/full passkey step-up and the
+exact current root fingerprint. It retains browser-local old-root history,
+does not establish CLI pins, and does not mutate enforcement. Customer-controlled
+CLI import/confirmation remains separate. After reset the data plane stays
+fail-closed until the new root's signed envelope and state land.
+
+Configuration mutation still precedes its approval receipt: enforcement rejects
+the resulting mismatched state, but configuration-plane atomic staging remains
+deferred hardening. External witnesses remain separately gated and execution
+assurance remains unassessed; neither is supplied by enrollment or recovery.
+
 ## Consequences
 
 - The operator, deployed gateway, host environment, and local enforcement state

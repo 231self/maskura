@@ -272,6 +272,24 @@ properties are in `docs/encryption.md` and ADR 0011.
 - Decisions and deployment state: ADR 0022 (Slice 3 refinement), verification
   contract ADR 0023, trust-root lineage ADR 0024.
 
+### Policy enrollment and recovery (Slice 5) — locally verified, not deployed
+
+- Shared backup transitions are defined by ADR 0025 and receipt v3. One primary
+  plus one backup, both proofs over the bound transition; existing v2 evidence
+  remains readable. Do not expand to multi-owner or operator-only recovery.
+- Private hosted `policy_trust.rs` owns bootstrap, envelope, activation, signed
+  signer addition/replacement, explicit reset and root-acceptance routes.
+  The first activation atomically enforces the workspace and preserves first
+  activation metadata; publish/rollback preconditions live in `filter_api.rs`.
+- Private web `policy-enrollment.mjs` and `policy-approval-modal.mjs` present
+  ceremonies and explicit browser-local acceptance. Server fetches never pin
+  roots; dashboard acceptance never changes CLI pins or enforcement.
+- No new enforcement-disable configuration or admin flip exists. Fleet MFA-off
+  does not relax the owner/full-step-up requirement for root acceptance.
+- Hosted changes pass local gates, but are not merged/deployed. Staged
+  publish atomicity and external witnesses are deferred; execution assurance is
+  unassessed. See ADR 0022's Slice 5 status and `docs/policy-verification.md`.
+
 ### Policy approval (Slice 4) — EvidenceBundle and customer verification
 
 - **EvidenceBundle v1** (`crates/pipeline-config/src/evidence.rs`): the
