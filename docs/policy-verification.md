@@ -210,6 +210,33 @@ In the tooling this means:
 - accepting a new root archives (never deletes) the previous lineage's
   checkpoints.
 
+### Hosted enrollment and recovery status (2026-10-14)
+
+The shared signed backup-authority protocol is available in v0.7.25. The
+following hosted/dashboard flow passes the complete private local gate, but is
+not yet merged/deployed:
+
+1. In **Passkeys → Policy enrollment**, register the first policy signer,
+   review and sign the standing envelope, then approve the effective state.
+   The first state approval permanently activates workspace enforcement.
+2. Register a separate passkey and enroll it as the one backup policy signer.
+   Both the existing authority and exact new key approve the bound transition.
+   Use that backup to replace a lost primary; recovery codes only recover
+   account access and cannot approve policy changes.
+3. If all policy keys are lost, register a fresh passkey and explicitly reset
+   policy trust. Review and accept the new root fingerprint with owner/full
+   passkey step-up. Old history remains retained and the discontinuity remains
+   visible; acceptance never turns enforcement off.
+4. Browser acceptance retains only browser-local root history. It does not
+   establish or replace CLI pins. Separately accept customer-controlled new-root
+   evidence using `maskura policy trust import ./new-evidence.json --force`
+   and confirmation; keep previous checkpoints backed up.
+
+After a reset, enforcement denies until the new root's envelope and state have
+been approved. Publication/rollback requires enrollment. Approval history remains
+customer-verifiable against retained checkpoints, not execution attestation or
+witness verification.
+
 ## Limitations to keep in mind
 
 - Verification is limited to **detectable** inconsistency against the
