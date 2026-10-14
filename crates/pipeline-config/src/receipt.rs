@@ -9,8 +9,9 @@ use crate::{
     webauthn::{AssertionExpectation, ChallengeKind, WebAuthnProof, verify_assertion},
 };
 
-/// Version 2 rejects the unshipped draft's partially signed envelope receipts.
-pub const RECEIPT_SCHEMA_VERSION: u32 = 2;
+/// Version 3 adds explicit, dual-proof authority addition without retiring a key.
+/// Version 2 remains a read format for the existing actions, with unchanged digests.
+pub const RECEIPT_SCHEMA_VERSION: u32 = 3;
 pub const GENESIS_PREV: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +28,7 @@ pub enum ReceiptAction {
     Activate,
     Rollback,
     ReplaceSigner,
+    AddSigner,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,7 +50,8 @@ pub struct ReceiptBody {
     pub prev_receipt_sha256: String,
     /// Frozen at begin; not an independently trusted completion timestamp.
     pub issued_at: u64,
-    /// Complete replacement authority, including the public key, signed by both keys.
+    /// Complete new authority, including its public key, signed by both keys.
+    /// The historical wire name is retained for replacement and v3 addition alike.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement: Option<TrustCredential>,
     /// Credential being retired; an authorized backup may approve its replacement.
@@ -116,7 +119,9 @@ impl ReceiptBody {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.schema_version != RECEIPT_SCHEMA_VERSION
+        if !matches!(self.schema_version, 2 | RECEIPT_SCHEMA_VERSION)
+            || (self.action == ReceiptAction::AddSigner
+                && self.schema_version != RECEIPT_SCHEMA_VERSION)
             || self.seq == 0
             || self.signer_epoch == 0
             || self.envelope_version == 0
@@ -155,7 +160,10 @@ impl ReceiptBody {
             (ReceiptPurpose::PipelineExport, ReceiptAction::Activate | ReceiptAction::Rollback)
             | (ReceiptPurpose::PolicyEnvelope, ReceiptAction::Activate)
                 if self.replacement.is_none() && self.replaced_credential_id.is_none() => {}
-            (ReceiptPurpose::SignerAuthority, ReceiptAction::ReplaceSigner) => {
+            (
+                ReceiptPurpose::SignerAuthority,
+                ReceiptAction::ReplaceSigner | ReceiptAction::AddSigner,
+            ) => {
                 let next = self
                     .signer_epoch
                     .checked_add(1)
@@ -163,13 +171,20 @@ impl ReceiptBody {
                 let replacement = self.replacement.as_ref().ok_or_else(|| {
                     ConfigError::invalid("signer transition requires replacement authority")
                 })?;
-                if self
-                    .replaced_credential_id
-                    .as_deref()
-                    .is_none_or(|id| id.trim().is_empty())
+                if self.action == ReceiptAction::ReplaceSigner
+                    && self
+                        .replaced_credential_id
+                        .as_deref()
+                        .is_none_or(|id| id.trim().is_empty())
                 {
                     return Err(ConfigError::invalid(
                         "signer transition must identify the retired credential",
+                    ));
+                }
+                if self.action == ReceiptAction::AddSigner && self.replaced_credential_id.is_some()
+                {
+                    return Err(ConfigError::invalid(
+                        "authority addition must not retire a credential",
                     ));
                 }
                 replacement.parsed_key()?;
@@ -240,14 +255,16 @@ pub fn verify_receipt(
 
     match &body.replacement {
         Some(replacement) => {
-            let retired = body
-                .replaced_credential_id
-                .as_deref()
-                .ok_or_else(|| ConfigError::approval("missing retired credential"))?;
-            if authority.authorize(retired, body.signer_epoch)? != ReceiptStanding::Current {
-                return Err(ConfigError::approval(
-                    "retired credential is not in the current authority",
-                ));
+            if body.action == ReceiptAction::ReplaceSigner {
+                let retired = body
+                    .replaced_credential_id
+                    .as_deref()
+                    .ok_or_else(|| ConfigError::approval("missing retired credential"))?;
+                if authority.authorize(retired, body.signer_epoch)? != ReceiptStanding::Current {
+                    return Err(ConfigError::approval(
+                        "retired credential is not in the current authority",
+                    ));
+                }
             }
             let counter = receipt
                 .counter_proof
@@ -451,13 +468,17 @@ fn advance_chain(
                 .signer_epoch
                 .checked_add(1)
                 .ok_or_else(|| ConfigError::approval("authorization epoch overflow"))?;
-            let old = authority
-                .credentials
-                .iter_mut()
-                .find(|c| Some(c.credential_id.as_str()) == body.replaced_credential_id.as_deref())
-                .ok_or_else(|| ConfigError::approval("unknown transition authorizer"))?;
-            old.status = CredentialStatus::Revoked;
-            old.revoked_epoch = Some(authority.signer_epoch);
+            if body.action == ReceiptAction::ReplaceSigner {
+                let old = authority
+                    .credentials
+                    .iter_mut()
+                    .find(|c| {
+                        Some(c.credential_id.as_str()) == body.replaced_credential_id.as_deref()
+                    })
+                    .ok_or_else(|| ConfigError::approval("unknown transition authorizer"))?;
+                old.status = CredentialStatus::Revoked;
+                old.revoked_epoch = Some(authority.signer_epoch);
+            }
             authority.credentials.push(replacement.clone());
             authority.validate()?;
         }

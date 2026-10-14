@@ -579,6 +579,25 @@ pub fn verify_artifact(
         }
     };
 
+    // Transition checkpoints carry post-state, unlike ordinary approvals.
+    // Compare it with the state derived from pinned/retained history before a
+    // caller can persist that checkpoint. A valid proof cannot authorize an
+    // unrelated retirement/addition hidden only in the carried authority.
+    if let Some(carried) = carried_authority(&bundle, head.body.seq) {
+        match (carried.digest(), report_head.authorization.digest()) {
+            (Ok(carried), Ok(derived)) if carried == derived => {}
+            _ => {
+                builder.fail(
+                    VerificationStep::SignerTransition,
+                    FindingCode::TransitionInvalid,
+                    "checkpoint authority does not match the verified post-transition state"
+                        .to_string(),
+                );
+                return builder.finish();
+            }
+        }
+    }
+
     // Approval-block consistency (the retained R6 material must be the exact
     // assertion that was verified).
     if let EvidenceBundle::Evidence(artifact) = &bundle
@@ -910,7 +929,11 @@ fn verify_self_contained(
     head: &SignedReceipt,
     authority: &TrustBundle,
 ) -> Result<crate::receipt::ReceiptStanding, ConfigError> {
-    if head.body.action == ReceiptAction::ReplaceSigner || head.body.replacement.is_some() {
+    if matches!(
+        head.body.action,
+        ReceiptAction::ReplaceSigner | ReceiptAction::AddSigner
+    ) || head.body.replacement.is_some()
+    {
         return Err(ConfigError::approval(
             "signer transitions require a link to retained history or the pinned root",
         ));

@@ -11,8 +11,8 @@ use crate::evidence::{
     WitnessAcknowledgement,
 };
 use crate::receipt::{
-    ChainReport, GENESIS_PREV, RECEIPT_SCHEMA_VERSION, ReceiptAction, ReceiptBody, ReceiptPurpose,
-    SignedReceipt, verify_receipt_chain,
+    ChainReport, GENESIS_PREV, ReceiptAction, ReceiptBody, ReceiptPurpose, SignedReceipt,
+    verify_receipt_chain,
 };
 use crate::trust::{Checkpoint, CredentialStatus, TrustBundle, TrustCredential, TrustReset};
 use crate::webauthn::test_support::{
@@ -62,7 +62,8 @@ pub(crate) fn genesis_bundle(cred: &TestCredential, resets: Vec<TrustReset>) -> 
 pub(crate) fn genesis_body(root: &TrustBundle, issued_at: u64) -> ReceiptBody {
     let effective_state = fixture();
     ReceiptBody {
-        schema_version: RECEIPT_SCHEMA_VERSION,
+        // Preserve the published v2 interoperability vectors byte-for-byte.
+        schema_version: 2,
         purpose: ReceiptPurpose::PolicyEnvelope,
         action: ReceiptAction::Activate,
         audience: root.audience.clone(),
@@ -84,7 +85,7 @@ pub(crate) fn genesis_body(root: &TrustBundle, issued_at: u64) -> ReceiptBody {
 pub(crate) fn next_body(report: &ChainReport, issued_at: u64) -> ReceiptBody {
     let effective_state = fixture();
     ReceiptBody {
-        schema_version: RECEIPT_SCHEMA_VERSION,
+        schema_version: 2,
         purpose: ReceiptPurpose::PipelineExport,
         action: ReceiptAction::Activate,
         audience: report.authorization.audience.clone(),

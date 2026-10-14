@@ -44,3 +44,4 @@
 - [ADR 0022: Policy approval and execution trust](adr/0022-policy-approval-and-execution-trust-boundary.md)
 - [ADR 0023: Policy approval verification](adr/0023-policy-approval-verification.md)
 - [ADR 0024: Trust-root lineage and receipt-head retention](adr/0024-trust-root-lineage-and-receipt-head-retention.md)
+- [ADR 0025: Signed backup policy authority](adr/0025-signed-backup-policy-authority.md)
