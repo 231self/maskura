@@ -33,12 +33,11 @@ historical context.
 
 Retain the hosted design for standing policy envelopes, synchronous approval of
 effective-state changes, and purpose-separated passkey login MFA and policy
-approval. These are **planned capabilities**, not a claim of current deployment.
-The planned gate requires a valid customer approval before activation and checks
+approval. The gate requires a valid customer approval before activation and checks
 the exact approved effective state and envelope bounds in the trusted gateway.
-Deployment status as of 2026-10-10 — what has shipped, what is deploying, and
-what remains future — is recorded in the Slice 3 refinement below and must be
-kept distinct in every claim.
+The dated refinements below distinguish historical rollout state, deployed Slice 5
+enrollment/recovery, and accepted but unshipped staged-publication hardening.
+Accepting an architectural decision is not evidence of implementation or deployment.
 
 For that exact-state check, a hosted request freezes its selected assignment ID
 in the pipeline locator and a versioned fingerprint; a revision alone cannot
@@ -50,10 +49,10 @@ cannot establish which assignment the request originally selected.
 
 Existing canonical-CBOR/Ed25519 configuration signatures under
 [ADR 0021](0021-signed-toml-pipeline-configuration.md) remain artifact-authenticity
-evidence. Neither those signatures nor future WebAuthn approval receipts are
+evidence. Neither those signatures nor WebAuthn approval receipts are
 per-operation execution proofs. This narrows the operator-resistance language
 in ADRs 0003 and 0021 without changing their existing signing formats. Future
-WebAuthn schemas, signer lifecycle, and enforcement rollout need their own
+changes to WebAuthn schemas, signer lifecycle, and enforcement rollout need their own
 implementation evidence and protocol specification; trust-root lineage and
 per-lineage receipt-head retention are decided in
 [ADR 0024](0024-trust-root-lineage-and-receipt-head-retention.md).
@@ -127,7 +126,9 @@ wiring lands. Every S3 data-plane handler passes through the gate seam,
 including hosted MCP object operations dispatched in process (MCP tool
 listing/metadata is outside this claim).
 
-**Status and deployment state (2026-10-10).** Three states must not be
+**Historical status and deployment state (2026-10-10).** This is the rollout
+snapshot at that date, not the current enrollment status; see Slice 5 below.
+Three states must not be
 conflated. (1) **Shipped in the public engine**: the `PolicyGate` seam and typed
 policy errors (v0.7.16), the v2 effective-state/destination bindings and shared
 digest preimages (v0.7.19–v0.7.20), and verdict consumption — check/use at
@@ -160,9 +161,10 @@ deployment states above are unchanged and no workspace is enforced.
 
 ### Slice 5 enrollment and recovery refinement (2026-10-14)
 
-**Implementation status:** the shared backup-authority protocol is merged in
-v0.7.25. Hosted enrollment/recovery and dashboard changes pass the complete
-private local gate, but are not yet merged/deployed: **not a deployment claim**.
+**Deployment status (updated 2026-10-16):** the shared backup-authority protocol
+is merged in v0.7.25. Hosted enrollment/recovery and dashboard changes are deployed
+and accepted in hosted control 0.5.44. This confirms the Slice 5 flow below, not
+staged publication, fleet-wide enrollment, witness verification, or execution assurance.
 
 The first landed customer state approval atomically advances the receipt head
 and transitions absent or `inactive` workspace enforcement to `enforced`.
@@ -185,10 +187,80 @@ does not establish CLI pins, and does not mutate enforcement. Customer-controlle
 CLI import/confirmation remains separate. After reset the data plane stays
 fail-closed until the new root's signed envelope and state land.
 
-Configuration mutation still precedes its approval receipt: enforcement rejects
-the resulting mismatched state, but configuration-plane atomic staging remains
-deferred hardening. External witnesses remain separately gated and execution
-assurance remains unassessed; neither is supplied by enrollment or recovery.
+In that deployed release, configuration mutation still precedes its approval
+receipt: enforcement rejects the resulting mismatched state. Atomic staging is
+the accepted, unshipped hardening decision below. External witnesses remain
+separately gated and execution assurance remains unassessed; neither is supplied
+by enrollment or recovery.
+
+### Atomic filter-state publication refinement (2026-10-16)
+
+**Decision accepted; implementation not shipped or deployed.** This section
+specifies the target contract, not behavior available in hosted control 0.5.44.
+The existing mutation-first limitation remains until implementation and exact-release
+deployment acceptance establish otherwise.
+
+**Durable immutable review.** For an enforced workspace, stage a separate durable
+candidate rather than changing serving configuration before approval. Freeze the
+operation, proposed effective state, exact receipt body, component/config digests,
+prospective publication/assignment identities, baseline preconditions and
+purpose-bound ceremony. Draft authoring remains separate. Review holds no database
+transaction or locks while the owner signs. Candidate payloads cannot be edited;
+changes require a fresh candidate and review. Pending work and retained terminal
+metadata must be bounded, and component holds retain bytes without authorizing
+retired or revoked components.
+
+**Atomic landing.** Completion must freshly reauthorize the owner, session, full
+passkey step-up and signer under shared writer/revocation fences, recheck expiry
+after lock waits, and verify the proof against the stored body. Reject changed
+draft, assignment, head, root, authority, envelope or storage preconditions as
+stale; never silently rebase. Shared projection logic must match the frozen
+proposal both before mutation and against the actual written rows. Publish the
+configuration, receipt and authorization head, consume the ceremony and retain
+the committed result in one database transaction, or roll everything back.
+All competing effective-state and authority writers must share the fencing
+discipline; a lock used only by the completion endpoint is insufficient.
+
+**Coverage and retry semantics.** Stage draft publication, forward rollback as a
+new generation, default/bucket assignment changes and bucket-assignment removal,
+including inherited outcomes. Retirement is refused with a typed error in this
+slice. Legacy/alternate mutation routes must refuse before mutation rather than
+bypass staging. Initial enrollment retains its existing signed activation flow.
+Pending review, cancellation and expiry leave the previous valid approved state
+serving; they do not extend envelope validity or undo revocation. A committed
+operation cannot be cancelled. Idempotent issuance and exact authenticated
+completion replay return the original candidate/result without another generation
+or receipt. After a lost response, reconcile committed status or retry the exact
+proof; never automatically compensate, restage or generate a new publication.
+Current authorization remains required for status/replay, and a new login session
+cannot complete a pending ceremony bound to an old session.
+
+**Protocol compatibility.** No public signed-schema change is currently needed:
+existing receipt actions and `EffectiveState` bind the publication/rollback
+outcome. Private candidate/intent metadata is immutably associated with that exact
+signed body and cannot alter its effect. Preserve v2/v3 receipt verification,
+EvidenceBundle v1 and compatibility with the published v0.7.25 CLI. These are
+implementation requirements, not a claim that staged exports have passed
+acceptance. A newly discovered signed-semantic change requires explicit protocol
+review, not a silent extension or relaxed verification.
+
+**Admission and exclusions.** Atomic writers do not turn request admission's
+multiple reads into one database snapshot: a reader straddling the commit may
+briefly fail closed on an old-resolution/new-head mismatch. Denial-free admission
+is not promised, and accepting an arbitrary previous receipt is not a workaround.
+Frozen multipart create-time admission and `min(create-time, current)` limits
+remain unchanged. Storage/probe rebinding is excluded; a concurrent storage
+identity/epoch change invalidates the candidate, and an invalid live approval
+continues to deny. This decision adds no witness, execution assurance, multi-owner
+recovery, new prefix routing or cryptographic algorithm.
+
+Compensating after a mutation was rejected because it exposes an unapproved state
+and races with other changes. Holding a transaction across human approval was
+rejected because locks/timeouts are not a durable review or recovery mechanism.
+Deployment must be verified separately, including atomic-failure, stale/replay,
+serving-during-review and verifier-compatibility checks. After enabling this
+contract, operational rollback must retain compatible enforcing behavior or hold
+mutations fail-closed, not return to a mutation-first binary.
 
 ## Consequences
 
@@ -216,7 +288,7 @@ assurance remains unassessed; neither is supplied by enrollment or recovery.
   distinct: they do not identify what a remote service ran for an individual
   customer operation.
 - Enforcement is opt-in per workspace and forward-only; an `inactive` workspace
-  (every workspace today) sees identical behavior to the OSS engine, and only an
+  sees identical behavior to the OSS engine, and only an
   `enforced` workspace's requests can be refused for missing or mismatched
   approval evidence.
 - Fail-closed evidence evolution costs compatibility: unknown fields and newer
