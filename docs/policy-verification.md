@@ -210,11 +210,12 @@ In the tooling this means:
 - accepting a new root archives (never deletes) the previous lineage's
   checkpoints.
 
-### Hosted enrollment and recovery status (2026-10-14)
+### Hosted enrollment and recovery status (updated 2026-10-16)
 
 The shared signed backup-authority protocol is available in v0.7.25. The
-following hosted/dashboard flow passes the complete private local gate, but is
-not yet merged/deployed:
+following hosted/dashboard flow is deployed and accepted in hosted control 0.5.44.
+This does not mean every workspace is enrolled, and does not include the staged
+publication hardening described below:
 
 1. In **Passkeys → Policy enrollment**, register the first policy signer,
    review and sign the standing envelope, then approve the effective state.
@@ -237,6 +238,49 @@ been approved. Publication/rollback requires enrollment. Approval history remain
 customer-verifiable against retained checkpoints, not execution attestation or
 witness verification.
 
+## Staged publication: accepted design, not yet shipped (2026-10-16)
+
+The architecture decision in
+[ADR 0022](adr/0022-policy-approval-and-execution-trust-boundary.md#atomic-filter-state-publication-refinement-2026-10-16)
+replaces mutation-before-approval with durable immutable review and one atomic
+commit. **It is not shipped or deployed in hosted control 0.5.44; the current
+limitation below still applies.** The target workflow is:
+
+1. Stage a frozen candidate containing the exact proposed state, receipt body,
+   component/config digests and allocated publication identities. Review the
+   baseline/proposed diff and export without changing serving configuration.
+2. Approve that exact stored body with a fresh, purpose-bound passkey assertion.
+   Completion rechecks current authority, expiry, artifacts and baseline state.
+   A changed draft, assignment, policy head/root/envelope or storage binding makes
+   the candidate stale: fresh review is required, never a silent rebase.
+3. Commit the configuration, receipt and authorization head together, or none of
+   them. Pending review, cancellation, expiry and failed completion preserve the
+   previous valid approved state. This does not keep an expired, revoked or
+   otherwise invalid baseline usable.
+4. Reconcile a lost completion response through authorized status or exact retry.
+   Exact replay returns the original committed result, not another publication.
+   Cancellation cannot undo a commit; do not infer rollback from a network error.
+
+The accepted scope covers publication, rollback as a new forward generation,
+default/bucket assignments and assignment removal/inheritance. Retirement is
+refused in this slice, and old mutation routes must refuse rather than bypass
+staging. Storage/probe rebinding is not included; concurrent storage changes
+invalidate pending candidates rather than gain a new availability guarantee.
+
+No public signed-schema change is currently required. Existing receipt actions,
+v2/v3 receipt verification and EvidenceBundle v1 remain the compatibility contract,
+including the published v0.7.25 CLI. Staged-export compatibility must still pass
+acceptance before availability is claimed. Use v0.7.25 for v3 backup-authority
+evidence; a reader that cannot interpret an evidence version must reject it.
+Candidate/status metadata is not itself a landed receipt or execution proof.
+
+Even with atomic completion, a request reading resolution and authorization head
+on opposite sides of the commit may briefly fail closed. This design does not
+promise denial-free admission or permit arbitrary older receipts to mask a
+mismatch. Frozen multipart admission and current-limit composition stay unchanged.
+Neither staging nor its acceptance adds witnesses or execution assurance; the
+verification claim and `witness: not-witness-verified` report remain unchanged.
+
 ## Limitations to keep in mind
 
 - Verification is limited to **detectable** inconsistency against the
@@ -248,13 +292,14 @@ witness verification.
   who approved it.
 - Approval evidence is not per-operation execution proof, not PII-detection
   completeness, and not a storage acknowledgment.
-- Approval receipts land after the configuration publish they approve (the
+- In hosted control 0.5.44, approval receipts land after the configuration publish they approve (the
   publish is not staged behind the signature). An unapproved publish therefore
   leaves **no receipt** — detectable by absence when you compare exports
   against your configuration history — but it is not prevented by the
   ceremony. Workspaces under enforcement cannot serve data from an unapproved
-  configuration; closing the configuration-plane gap (staged publish committed
-  by the approval) is planned hardening.
+  configuration under the trusted gateway's enforcement. Closing the
+  configuration-plane gap (staged publish committed by the approval) is accepted
+  but unshipped hardening, not an implementation or deployment acceptance claim.
 
 ## Related records
 
