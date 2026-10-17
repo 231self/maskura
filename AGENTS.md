@@ -155,8 +155,8 @@ Document every infrastructure, auth, storage, and deployment choice so automatio
 
 ### OpenAPI & SDK Generation
 
-- OpenAPI 3.1 spec auto-generated from Rust types via `utoipa` + `utoipa-swagger-ui`.
-- Served at `/openapi.json` (raw spec) and `/docs` (Swagger UI).
+- OpenAPI 3.1 spec auto-generated from Rust types via `utoipa`.
+- Served at `/openapi.json` (raw spec) and `/docs` (self-contained OpenAPI reference).
 - `utoipa::ToSchema` on all API types, including API key workspace scope and hosted MCP credential UUID/workspace fields.
 - `#[utoipa::path(...)]` annotations on all dashboard API handlers.
 - `just build-sdks` extracts spec, runs `openapi-generator` (Docker) to produce Python and TypeScript SDKs in `sdks/python/` and `sdks/typescript/`.

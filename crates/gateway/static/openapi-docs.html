@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Maskura Gateway API - OpenAPI reference</title>
+    <style>
+      :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+      body { margin: 0; background: #f6f7f9; color: #17202a; }
+      main { max-width: 1100px; margin: 0 auto; padding: 32px 20px 64px; }
+      header { border-bottom: 1px solid #cfd6dd; padding-bottom: 20px; margin-bottom: 24px; }
+      h1 { margin: 0 0 8px; font-size: 2rem; }
+      h2 { margin: 32px 0 12px; font-size: 1.25rem; }
+      p { line-height: 1.55; }
+      a { color: #0b57d0; }
+      code { background: #e9edf1; padding: 2px 5px; border-radius: 4px; }
+      .meta { color: #4b5965; }
+      .operation { background: #fff; border: 1px solid #d8dee4; border-radius: 10px; padding: 14px 16px; margin: 10px 0; }
+      .method { display: inline-block; min-width: 64px; text-align: center; border-radius: 4px; padding: 3px 8px; font-weight: 700; color: #fff; }
+      .get { background: #146c43; }
+      .post { background: #0b57d0; }
+      .put { background: #9a6700; }
+      .delete { background: #b42318; }
+      .head { background: #6941c6; }
+      .patch { background: #0e7490; }
+      .path { margin-left: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .summary { margin: 10px 0 0; color: #34424e; }
+      .error { color: #b42318; white-space: pre-wrap; }
+      @media (prefers-color-scheme: dark) {
+        body { background: #101418; color: #e8edf2; }
+        header { border-color: #34424e; }
+        a { color: #8ab4f8; }
+        code { background: #27313a; }
+        .meta, .summary { color: #b7c2cc; }
+        .operation { background: #18212a; border-color: #34424e; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Maskura Gateway API</h1>
+        <p class="meta" id="meta">Loading the generated OpenAPI document...</p>
+        <p>This self-contained reference renders the same machine-readable schema served at <a href="/openapi.json"><code>/openapi.json</code></a>.</p>
+      </header>
+      <section id="operations" aria-live="polite"></section>
+    </main>
+    <script>
+      const methodOrder = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'trace'];
+      const operations = document.getElementById('operations');
+
+      function render(doc) {
+        document.getElementById('meta').textContent = `OpenAPI ${doc.openapi || 'unknown'} - ${doc.info?.title || 'API'} ${doc.info?.version || ''}`;
+        operations.replaceChildren();
+        Object.entries(doc.paths || {}).forEach(([path, item]) => {
+          const heading = document.createElement('h2');
+          heading.textContent = path;
+          operations.append(heading);
+          methodOrder.forEach((method) => {
+            const operation = item[method];
+            if (!operation) return;
+            const card = document.createElement('article');
+            card.className = 'operation';
+            const badge = document.createElement('span');
+            badge.className = `method ${method}`;
+            badge.textContent = method.toUpperCase();
+            const route = document.createElement('span');
+            route.className = 'path';
+            route.textContent = path;
+            const title = document.createElement('div');
+            title.append(badge, route);
+            card.append(title);
+            if (operation.summary || operation.description) {
+              const summary = document.createElement('p');
+              summary.className = 'summary';
+              summary.textContent = operation.summary || operation.description;
+              card.append(summary);
+            }
+            operations.append(card);
+          });
+        });
+      }
+
+      fetch('/openapi.json')
+        .then((response) => {
+          if (!response.ok) throw new Error(`Failed to load /openapi.json: HTTP ${response.status}`);
+          return response.json();
+        })
+        .then(render)
+        .catch((error) => {
+          const message = document.createElement('p');
+          message.className = 'error';
+          message.textContent = error.message;
+          operations.replaceChildren(message);
+        });
+    </script>
+  </body>
+</html>

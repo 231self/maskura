@@ -71,7 +71,7 @@ environment variables, secrets, or network access are required.
 
 | Script | Concern | What it proves |
 | --- | --- | --- |
-| `10-http-surface.sh` | HTTP surface | `/health`; `/` serves the dashboard HTML and is not an S3 `ListBuckets` XML response; `/openapi.json` is OpenAPI 3.1 and documents `/dashboard/api/keys` and `/dashboard/api/backend`; `/docs` serves Swagger UI (following the redirect); retired `/dashboard/api/demo/store` returns 410 for every method |
+| `10-http-surface.sh` | HTTP surface | `/health`; `/` serves the dashboard HTML and is not an S3 `ListBuckets` XML response; `/openapi.json` is OpenAPI 3.1 and documents `/dashboard/api/keys` and `/dashboard/api/backend`; `/docs` serves the self-contained OpenAPI reference; retired `/dashboard/api/demo/store` returns 410 for every method |
 | `15-avro-gate.sh` | Avro gate | A PUT with `Content-Type: application/avro` is rejected (501) while `MASKURA_ENABLE_AVRO` is unset, and nothing is stored |
 | `20-redaction-roundtrip.sh` | Core redaction | `maskura test upload` stores a PII fixture through the pipeline; the object read directly back from MinIO contains `[REDACTED_EMAIL]`/`[REDACTED_SSN]`/`[REDACTED_CARD]` and no plaintext |
 | `25-strict-auth-denial.sh` | Auth enforcement | Boots a second, isolated gateway on `$MASKURA_STRICT_GW_PORT` (default `9011`) **without** `AUTH_DISABLED` and an empty keystore: unauthenticated S3 PUT/GET/List are denied 403 and the dashboard key API is denied 401 — no demo fallback |
