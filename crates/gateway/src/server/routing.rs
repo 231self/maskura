@@ -124,5 +124,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/dashboard/api/demo/store", any(legacy_demo_gone))
         .route("/dashboard/api/demo/read", any(legacy_demo_gone))
         .with_state(state)
-        .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+        .route("/openapi.json", get(openapi_document))
+        .route("/docs", get(openapi_docs))
+        .route("/docs/", get(openapi_docs))
+}
+
+/// Serve the generated OpenAPI 3.1 document.
+pub(crate) async fn openapi_document() -> Json<utoipa::openapi::OpenApi> {
+    Json(ApiDoc::openapi())
+}
+
+/// Serve the self-contained OpenAPI reference without build-time archive extraction.
+pub(crate) async fn openapi_docs() -> Html<&'static str> {
+    Html(include_str!("../../static/openapi-docs.html"))
 }

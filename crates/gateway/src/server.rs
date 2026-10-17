@@ -40,7 +40,6 @@ use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::{OpenApi, ToSchema};
-use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
