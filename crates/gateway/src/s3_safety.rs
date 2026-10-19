@@ -4,6 +4,7 @@ use std::time::Duration;
 use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
 use aws_smithy_runtime_api::client::result::SdkError;
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
 const S3_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const S3_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -56,14 +57,33 @@ impl S3FailureCategory {
     }
 }
 
+/// Provider-reported condition that S3 itself surfaces to clients as a typed
+/// 404 error document. Preserved so the S3 data plane can mirror S3 instead of
+/// hiding these expected conditions behind `InternalError`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum S3Missing {
+    Bucket,
+    Object,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct S3Failure {
     category: S3FailureCategory,
+    missing: Option<S3Missing>,
 }
 
 impl S3Failure {
     pub(crate) fn category(self) -> S3FailureCategory {
         self.category
+    }
+
+    pub(crate) fn missing(self) -> Option<S3Missing> {
+        self.missing
+    }
+
+    fn with_missing(mut self, missing: Option<S3Missing>) -> Self {
+        self.missing = missing;
+        self
     }
 
     pub(crate) fn client_message(self) -> &'static str {
@@ -89,7 +109,39 @@ fn classify_s3_failure<E, R>(error: &SdkError<E, R>) -> S3Failure {
         SdkError::ServiceError(_) => S3FailureCategory::Provider,
         _ => S3FailureCategory::Request,
     };
-    S3Failure { category }
+    S3Failure {
+        category,
+        missing: None,
+    }
+}
+
+/// Provider-documented missing conditions, keyed by the service error code S3
+/// clients already understand (`NoSuchBucket`, `NoSuchKey`).
+pub(crate) fn classify_provider_missing<E, R>(error: &SdkError<E, R>) -> Option<S3Missing>
+where
+    E: ProvideErrorMetadata,
+{
+    let SdkError::ServiceError(context) = error else {
+        return None;
+    };
+    match context.err().code() {
+        Some("NoSuchBucket") => Some(S3Missing::Bucket),
+        Some("NoSuchKey") | Some("NotFound") => Some(S3Missing::Object),
+        _ => None,
+    }
+}
+
+/// [`record_s3_failure`] for requests answered with client-facing S3 error
+/// documents: also preserves the provider's missing-object/bucket condition so
+/// callers can mirror S3's own 404 responses.
+pub(crate) fn record_s3_client_failure<E, R>(
+    operation: &'static str,
+    error: &SdkError<E, R>,
+) -> S3Failure
+where
+    E: ProvideErrorMetadata,
+{
+    record_s3_failure(operation, error).with_missing(classify_provider_missing(error))
 }
 
 pub(crate) fn record_s3_failure<E, R>(
@@ -177,5 +229,51 @@ mod tests {
             SdkError::service_error(SecretError, SECRET.to_string()),
             S3FailureCategory::Provider,
         );
+    }
+
+    fn provider_error(code: &'static str) -> ProviderError {
+        ProviderError {
+            meta: aws_smithy_types::error::metadata::ErrorMetadata::builder()
+                .code(code)
+                .build(),
+        }
+    }
+
+    struct ProviderError {
+        meta: aws_smithy_types::error::metadata::ErrorMetadata,
+    }
+
+    impl ProvideErrorMetadata for ProviderError {
+        fn code(&self) -> Option<&str> {
+            self.meta.code()
+        }
+
+        fn meta(&self) -> &aws_smithy_types::error::metadata::ErrorMetadata {
+            &self.meta
+        }
+    }
+
+    #[test]
+    fn provider_missing_conditions_are_preserved_for_s3_documents() {
+        for (code, expected) in [
+            ("NoSuchBucket", Some(S3Missing::Bucket)),
+            ("NoSuchKey", Some(S3Missing::Object)),
+            ("NotFound", Some(S3Missing::Object)),
+            ("AccessDenied", None),
+            ("", None),
+        ] {
+            let error = SdkError::service_error(provider_error(code), SECRET.to_string());
+            let failure = record_s3_client_failure("list_objects_v2", &error);
+            assert_eq!(failure.missing(), expected, "provider code {code:?}");
+            assert_eq!(failure.category(), S3FailureCategory::Provider);
+            assert_redacted(error, S3FailureCategory::Provider);
+        }
+        let failure = record_s3_client_failure(
+            "get_object",
+            &SdkError::<ProviderError, String>::dispatch_failure(ConnectorError::io(Box::new(
+                SecretError,
+            ))),
+        );
+        assert_eq!(failure.missing(), None);
     }
 }
