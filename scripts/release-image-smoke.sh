@@ -139,8 +139,24 @@ curl --fail --silent --show-error \
 
 # Read back straight from the backend (bypassing the gateway) to prove the
 # transformed bytes were persisted, signed with the appliance root credential.
-READBACK="$(s3_aws s3 cp --endpoint-url "http://127.0.0.1:${S3_PORT}" \
-  's3://maskura-release-smoke/object.txt' -)"
+# The readback races transient appliance states on loaded runners (the aws
+# CLI's HeadObject intermittently receives a bare 400 from the pinned
+# appliance), so retry briefly; the content assertions below stay strict.
+READBACK=""
+for _ in $(seq 1 15); do
+  if READBACK="$(s3_aws s3 cp --endpoint-url "http://127.0.0.1:${S3_PORT}" \
+      's3://maskura-release-smoke/object.txt' - 2>/dev/null)"; then
+    break
+  fi
+  READBACK=""
+  sleep 2
+done
+if [ -z "$READBACK" ]; then
+  s3_aws s3 cp --endpoint-url "http://127.0.0.1:${S3_PORT}" \
+    's3://maskura-release-smoke/object.txt' - || true
+  echo "ERROR: release-smoke backend readback failed" >&2
+  exit 1
+fi
 case "$READBACK" in
   *'[REDACTED_EMAIL]'*'[REDACTED_CARD]'*) ;;
   *)
