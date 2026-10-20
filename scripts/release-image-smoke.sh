@@ -32,6 +32,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo "--- toolchain ---"
+aws --version 2>&1 || true
+echo "arch: $(uname -m)"
+
 docker network create "$NETWORK" >/dev/null
 docker run -d --name "$S3_NAME" --network "$NETWORK" \
   -p "127.0.0.1:${S3_PORT}:9000" \
