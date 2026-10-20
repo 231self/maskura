@@ -158,6 +158,13 @@ done
 if [ -z "$READBACK" ]; then
   s3_aws s3 cp --endpoint-url "http://127.0.0.1:${S3_PORT}" \
     's3://maskura-release-smoke/object.txt' - || true
+  # Self-diagnosing evidence: the pinned appliance's own view of the failing
+  # HeadObject (the only place a bare 400's cause can appear), plus the
+  # gateway's tail, without leaking object bodies.
+  echo "--- appliance logs ($S3_NAME) ---" >&2
+  docker logs --tail 60 "$S3_NAME" >&2 || true
+  echo "--- gateway logs ($GATEWAY_NAME) ---" >&2
+  docker logs --tail 40 "$GATEWAY_NAME" >&2 || true
   echo "ERROR: release-smoke backend readback failed" >&2
   exit 1
 fi

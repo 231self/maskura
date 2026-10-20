@@ -11,15 +11,30 @@ echo "--- Running maskura test upload ---"
 MASKURA_GATEWAY_URL="$E2E_GW_URL" "$E2E_MASKURA_BIN" test upload
 
 # Read the stored object straight out of the S3 backend (bypassing the
-# gateway), signed with the appliance's fixed dev root credential.
+# gateway), signed with the appliance's fixed dev root credential. The
+# readback races a transient appliance state on loaded runners (the aws
+# CLI's HeadObject intermittently receives a bare 400 from the pinned
+# appliance), so retry briefly; the content assertions below stay strict.
 echo "--- Reading stored object from the local S3 backend ---"
-AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-    AWS_DEFAULT_REGION=us-east-1 \
-    aws s3 cp --endpoint-url http://127.0.0.1:9000 \
-    "s3://$E2E_BUCKET/test-upload.txt" - > "$E2E_TMP/20-readback.txt" 2>"$E2E_TMP/20-readback.err" || {
+readback_ok=0
+for _ in $(seq 1 5); do
+    if AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+        AWS_DEFAULT_REGION=us-east-1 \
+        aws s3 cp --endpoint-url http://127.0.0.1:9000 \
+        "s3://$E2E_BUCKET/test-upload.txt" - > "$E2E_TMP/20-readback.txt" 2>"$E2E_TMP/20-readback.err"; then
+        readback_ok=1
+        break
+    fi
+    sleep 1
+done
+if [ "$readback_ok" -ne 1 ]; then
     cat "$E2E_TMP/20-readback.err" >&2
+    # Self-diagnosing evidence: the appliance's own view of the failing
+    # HeadObject (the only place a bare 400's cause can appear).
+    echo "--- appliance logs (local S3) ---" >&2
+    "${E2E_COMPOSE[@]}" logs --tail 60 s3 >&2 || true
     fail "aws s3 cp could not read s3://$E2E_BUCKET/test-upload.txt from the local S3 backend"
-}
+fi
 
 for marker in "REDACTED_EMAIL" "REDACTED_SSN" "REDACTED_CARD"; do
     if grep -q "\[$marker\]" "$E2E_TMP/20-readback.txt"; then
