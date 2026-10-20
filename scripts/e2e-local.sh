@@ -49,6 +49,7 @@ trap cleanup EXIT
 
 e2e_boot() {
     echo "=== Maskura E2E: boot local S3 + gateway ==="
+    aws --version 2>&1 || true
 
     # 1. Local S3 appliance (maskura gateway in auto-local mode) on :9000:
     # reuse a healthy instance (common when the local dev appliance is already
