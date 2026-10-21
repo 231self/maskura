@@ -143,21 +143,26 @@ curl --fail --silent --show-error \
 
 # Read back straight from the backend (bypassing the gateway) to prove the
 # transformed bytes were persisted, signed with the appliance root credential.
-# The readback races transient appliance states on loaded runners (the aws
-# CLI's HeadObject intermittently receives a bare 400 from the pinned
-# appliance), so retry briefly; the content assertions below stay strict.
+# s3api (botocore) rather than `s3 cp`: CLI >= 2.38's s3 transfer path signs
+# bodyless HEAD with UNSIGNED-PAYLOAD, which the pinned pre-fix appliance
+# rejects with a bare 400. Drop this workaround when the appliance pin moves
+# past the fix. The readback also races transient appliance states on loaded
+# runners, so retry briefly; the content assertions below stay strict.
 READBACK=""
+READBACK_FILE="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/release-smoke-readback.txt"
 for _ in $(seq 1 15); do
-  if READBACK="$(s3_aws s3 cp --endpoint-url "http://127.0.0.1:${S3_PORT}" \
-      's3://maskura-release-smoke/object.txt' - 2>/dev/null)"; then
+  if s3_aws s3api get-object --endpoint-url "http://127.0.0.1:${S3_PORT}" \
+      --bucket maskura-release-smoke --key object.txt \
+      "$READBACK_FILE" >/dev/null 2>/dev/null; then
+    READBACK="$(cat "$READBACK_FILE")"
     break
   fi
   READBACK=""
   sleep 2
 done
 if [ -z "$READBACK" ]; then
-  s3_aws s3 cp --endpoint-url "http://127.0.0.1:${S3_PORT}" \
-    's3://maskura-release-smoke/object.txt' - || true
+  s3_aws s3api get-object --endpoint-url "http://127.0.0.1:${S3_PORT}" \
+    --bucket maskura-release-smoke --key object.txt "$READBACK_FILE" || true
   # Self-diagnosing evidence: the pinned appliance's own view of the failing
   # HeadObject (the only place a bare 400's cause can appear), plus the
   # gateway's tail, without leaking object bodies.

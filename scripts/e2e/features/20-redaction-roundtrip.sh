@@ -18,10 +18,15 @@ MASKURA_GATEWAY_URL="$E2E_GW_URL" "$E2E_MASKURA_BIN" test upload
 echo "--- Reading stored object from the local S3 backend ---"
 readback_ok=0
 for _ in $(seq 1 5); do
+    # s3api (botocore) rather than `s3 cp`: CLI >= 2.38's s3 transfer path
+    # signs bodyless HEAD with UNSIGNED-PAYLOAD, which the pinned pre-fix
+    # appliance rejects with a bare 400. Drop this workaround when the
+    # appliance pin moves past the fix.
     if AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
         AWS_DEFAULT_REGION=us-east-1 \
-        aws s3 cp --endpoint-url http://127.0.0.1:9000 \
-        "s3://$E2E_BUCKET/test-upload.txt" - > "$E2E_TMP/20-readback.txt" 2>"$E2E_TMP/20-readback.err"; then
+        aws s3api get-object --endpoint-url http://127.0.0.1:9000 \
+        --bucket "$E2E_BUCKET" --key test-upload.txt \
+        "$E2E_TMP/20-readback.txt" >/dev/null 2>"$E2E_TMP/20-readback.err"; then
         readback_ok=1
         break
     fi
