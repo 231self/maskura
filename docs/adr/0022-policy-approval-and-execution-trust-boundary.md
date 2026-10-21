@@ -195,7 +195,29 @@ by enrollment or recovery.
 
 ### Atomic filter-state publication refinement (2026-10-16)
 
-**Decision accepted; implementation not shipped or deployed.** This section
+**Status (updated 2026-10-21): shipped, deployed, and gate-observed.** The
+2026-10-16 snapshot below said "implementation not shipped or deployed"; that is
+no longer accurate. The contract was implemented by the closed deliverable
+(maskura-private issue #284, owner-approved 2026-10-16 with the boundary quoted
+there): `feat(policy): atomically publish staged signed filter-state` and the
+follow-on staged-assignment-contract, staged-retirement-refusal,
+staged-multipart-cleanup, and live-acceptance-supplements series, released
+through hosted control 0.5.50. The deployment-verification observations this
+section requires run live in the hosted filter/multipart promotion gate —
+held-review begin/cancel/status, exact replay against the retained frozen
+result, and the pending/cancel/expiry journey proving serving state stays
+byte-identical while approved traffic continues — and were green on the
+2026-10-20 promotion trains; atomic-failure and stale/replay additionally run
+in the local fault-injection suites (`policy_staged_publication`,
+`policy_changes::tests::`, `enforced_path_matrix`). The exclusions at the end of
+this section stand unchanged and are **not scheduled**: no witness, no execution
+assurance, no multi-owner recovery, no storage/probe rebinding, no new prefix
+routing or cryptographic algorithm. Fleet-wide enrollment and per-workspace
+cutover remain separate deliverables. The specification below is retained
+verbatim as the shipped contract.
+
+**Original snapshot (2026-10-16): decision accepted; implementation not shipped
+or deployed.** This section
 specifies the target contract, not behavior available in hosted control 0.5.44.
 The existing mutation-first limitation remains until implementation and exact-release
 deployment acceptance establish otherwise.
