@@ -14,7 +14,7 @@ POSTGRES_NAME="maskura-postgres-${RUN_ID}"
 GATEWAY_NAME="maskura-gateway-${RUN_ID}"
 # Stable local S3 backend: the last released zero-config appliance (ADR 0019),
 # pinned by digest. MinIO's free images are gone; maskura backs itself here.
-S3_IMAGE="ghcr.io/231self/maskura/maskura:v0.7.14@sha256:4600673d46dd309f03f16a77661f1d412f55c2696045248e5dde1b7bd2c449b1"
+S3_IMAGE="ghcr.io/231self/maskura/maskura:v0.7.29@sha256:9f76700963a70967ee8dea94fe2714a23da6edc0119f841b24fbbf6ac451ef61"
 POSTGRES_IMAGE="postgres:17-trixie@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449"
 LOCAL_VOLUME="maskura-release-smoke-local-${RUN_ID}"
 GATEWAY_PORT="${MASKURA_RELEASE_SMOKE_PORT:-18080}"
@@ -143,26 +143,20 @@ curl --fail --silent --show-error \
 
 # Read back straight from the backend (bypassing the gateway) to prove the
 # transformed bytes were persisted, signed with the appliance root credential.
-# s3api (botocore) rather than `s3 cp`: CLI >= 2.38's s3 transfer path signs
-# bodyless HEAD with UNSIGNED-PAYLOAD, which the pinned pre-fix appliance
-# rejects with a bare 400. Drop this workaround when the appliance pin moves
-# past the fix. The readback also races transient appliance states on loaded
-# runners, so retry briefly; the content assertions below stay strict.
+# The readback races transient appliance states on loaded runners, so retry
+# briefly; the content assertions below stay strict.
 READBACK=""
-READBACK_FILE="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/release-smoke-readback.txt"
 for _ in $(seq 1 15); do
-  if s3_aws s3api get-object --endpoint-url "http://127.0.0.1:${S3_PORT}" \
-      --bucket maskura-release-smoke --key object.txt \
-      "$READBACK_FILE" >/dev/null 2>/dev/null; then
-    READBACK="$(cat "$READBACK_FILE")"
+  if READBACK="$(s3_aws s3 cp --endpoint-url "http://127.0.0.1:${S3_PORT}" \
+      's3://maskura-release-smoke/object.txt' - 2>/dev/null)"; then
     break
   fi
   READBACK=""
   sleep 2
 done
 if [ -z "$READBACK" ]; then
-  s3_aws s3api get-object --endpoint-url "http://127.0.0.1:${S3_PORT}" \
-    --bucket maskura-release-smoke --key object.txt "$READBACK_FILE" || true
+  s3_aws s3 cp --endpoint-url "http://127.0.0.1:${S3_PORT}" \
+    's3://maskura-release-smoke/object.txt' - || true
   # Self-diagnosing evidence: the pinned appliance's own view of the failing
   # HeadObject (the only place a bare 400's cause can appear), plus the
   # gateway's tail, without leaking object bodies.
