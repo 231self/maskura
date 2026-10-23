@@ -9,6 +9,16 @@ typed transform, then reconstructed for output.
 The `binary-reductor` world is part of `maskura:plugin@0.1.0` in
 [`crates/plugin-sdk/wit/world.wit`](https://github.com/231self/maskura/blob/main/crates/plugin-sdk/wit/world.wit).
 
+## Format status
+
+- **Avro** — shipped (see the [Avro gate](avro.md)).
+- **Lance** — in development ahead of Parquet (owner decision 2026-10-22,
+  [ADR 0026](adr/0026-lance-format-adapter.md), [status page](lance.md)):
+  conservative head/tail magic and manifest detection, `MASKURA_ENABLE_LANCE`
+  default-off gate, policy-`EffectiveState` coverage with the codec. Lance
+  dataset versions are opaque within object versions (no v1 time travel).
+- **Parquet** — approved scope, following Lance.
+
 ## Lifecycle
 
 For one object, the host calls the component in this order:
