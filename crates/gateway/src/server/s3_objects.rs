@@ -1209,6 +1209,70 @@ pub(crate) async fn avro_transformed_read_response(
     (response.body(body).unwrap(), Some(object.counters.bytes()))
 }
 
+pub(crate) async fn lance_transformed_read_response(
+    state: &AppState,
+    auth: &Auth,
+    headers: &HeaderMap,
+    response_metadata: ObjectMetadata,
+    mut object: OpenedObject,
+    key: &str,
+) -> (axum::response::Response, Option<u64>) {
+    if !state.transformed_read_spool_enabled {
+        object.cancellation.cancel();
+        return (
+            transformed_read_error_response(
+                key,
+                TransformedReadError::Capacity(
+                    "unsafe transformed reads require MASKURA_TRANSFORMED_READ_SPOOL=encrypted"
+                        .to_string(),
+                ),
+            ),
+            None,
+        );
+    }
+    let max_source_bytes = state.source_body_limits.max_bytes.min(64 * 1024 * 1024) as usize;
+    let source = match collect_opened_object(&mut object, max_source_bytes).await {
+        Ok(source) => source,
+        Err(error) => return (transformed_read_error_response(key, error), None),
+    };
+    let limits = crate::lance::LanceLimits {
+        max_source_bytes,
+        ..crate::lance::LanceLimits::default()
+    };
+    let mut pump = match lance_pump(auth, headers, limits) {
+        Ok(pump) => pump,
+        Err(error) => {
+            return (
+                transformed_read_error_response(key, TransformedReadError::Pipeline(error)),
+                None,
+            );
+        }
+    };
+    let output = match crate::lance::process_lance(source.as_slice(), limits, &mut pump) {
+        Ok(output) => output,
+        Err(error) => {
+            return (
+                transformed_read_error_response(key, TransformedReadError::Pipeline(error)),
+                None,
+            );
+        }
+    };
+    let (body, content_length) =
+        match serve_spooled_bytes(state, output, object.cancellation.clone()).await {
+            Ok(result) => result,
+            Err(error) => return (transformed_read_error_response(key, error), None),
+        };
+    let mut response = axum::response::Response::builder().status(StatusCode::OK);
+    response
+        .headers_mut()
+        .unwrap()
+        .extend(transformed_response_headers(
+            &response_metadata,
+            Some(content_length),
+        ));
+    (response.body(body).unwrap(), Some(object.counters.bytes()))
+}
+
 pub(crate) async fn process_transformed_source<F, Fut>(
     mut object: OpenedObject,
     mut pipeline: StreamingPipelineSession,
@@ -2066,6 +2130,54 @@ pub(crate) async fn s3_get(
                 .await;
             }
         };
+        if is_lance_content_type(&metadata.headers) {
+            if let Some(error) = avro_read_preflight(&headers, &params, &metadata) {
+                return transformed_read_error_response(&key, error);
+            }
+            if !state.binary_lance_enabled {
+                return transformed_read_error_response(
+                    &key,
+                    TransformedReadError::InvalidRequest(
+                        "Lance processing is disabled; set MASKURA_ENABLE_LANCE=true".to_string(),
+                    ),
+                );
+            }
+            let object = match open_backend_object(
+                &state,
+                backend.clone(),
+                &auth,
+                &bucket,
+                &key,
+                &headers,
+                false,
+            )
+            .await
+            {
+                Ok(object) => object,
+                Err(error) => return open_error_response(&bucket, &key, error),
+            };
+            let source_bytes = content_length(&object.metadata.headers);
+            let response_metadata = object.metadata.clone();
+            let (response, completed_source_bytes) = lance_transformed_read_response(
+                &state,
+                &auth,
+                &headers,
+                response_metadata,
+                object,
+                &key,
+            )
+            .await;
+            return metered_read_response(
+                state.control.clone(),
+                &auth,
+                &grant,
+                &key,
+                source_bytes.or(completed_source_bytes),
+                response,
+                None,
+            )
+            .await;
+        }
         if is_avro_content_type(&metadata.headers) {
             if let Some(error) = avro_read_preflight(&headers, &params, &metadata) {
                 return transformed_read_error_response(&key, error);

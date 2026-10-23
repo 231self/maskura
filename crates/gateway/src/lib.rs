@@ -16,6 +16,8 @@ pub mod format;
 pub mod hybrid;
 pub mod integrity;
 pub mod key_cipher;
+pub mod lance;
+pub mod lance_wire;
 pub(crate) mod local_storage;
 pub mod managed;
 pub use maskura_mcp_protocol as mcp;

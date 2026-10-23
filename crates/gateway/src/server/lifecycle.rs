@@ -857,6 +857,7 @@ pub async fn build_state_with_pipeline_template(
         spool_quota,
         transformed_read_spool_enabled: config.features.transformed_read_spool,
         binary_avro_enabled: config.features.enable_avro,
+        binary_lance_enabled: config.features.enable_lance,
         dev_memory_max_object_bytes,
         dev_memory_streaming_enabled,
         demo_pipelines,

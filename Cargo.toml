@@ -102,3 +102,15 @@ lto = true
 strip = true
 opt-level = "s"
 codegen-units = 1
+
+# Cap build-cache growth. Full DWARF (debug = true) plus incremental compile
+# state multiplied artifacts 3-5x and the shared debug tree grew past 40G.
+# line-tables-only keeps source-mapped backtraces for panics and test failures
+# while dropping the bulk; incremental = false trades rebuild speed for disk.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
