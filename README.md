@@ -199,6 +199,7 @@ Rust, Python, JavaScript/TypeScript, and workflow code.
 - [Runnable examples](examples/README.md)
 - [MCP server](docs/mcp.md)
 - [Avro support](docs/avro.md)
+- [Lance format track](docs/lance.md) — columnar ML tables, in development (ADR 0026)
 - [Benchmarks](docs/benchmarks.md)
 - [Open-source and hosted Maskura](https://maskura.dev/open-source/)
 
