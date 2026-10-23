@@ -191,6 +191,23 @@ pub(crate) async fn streaming_single_put(
             "Content-Encoding is unsupported for transformed streaming".to_string(),
         ));
     }
+    if is_lance_content_type(headers) {
+        if !state.binary_lance_enabled {
+            return Err(StreamingPutError::Unsupported(
+                "Lance processing is disabled; set MASKURA_ENABLE_LANCE=true".to_string(),
+            ));
+        }
+        return streaming_lance_single_put(
+            state,
+            authentication,
+            backend,
+            usage,
+            headers,
+            body,
+            key,
+        )
+        .await;
+    }
     if is_avro_content_type(headers) {
         if !state.binary_avro_enabled {
             return Err(StreamingPutError::Unsupported(
@@ -401,6 +418,62 @@ pub(crate) async fn streaming_single_put(
     }
 }
 
+pub(crate) fn lance_media_type(content_type: &str) -> Option<String> {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        media_type.as_str(),
+        "application/vnd.apache.lance" | "application/x-lance" | "application/vnd.lance"
+    )
+    .then_some(media_type)
+}
+
+pub(crate) fn is_lance_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(lance_media_type)
+        .is_some()
+}
+
+pub(crate) fn lance_pump(
+    auth: &Auth,
+    headers: &HeaderMap,
+    limits: crate::lance::LanceLimits,
+) -> Result<
+    crate::binary_pump::BinaryPump<
+        crate::binary_reductor::CommonTypeBinaryReductor,
+        crate::binary_pump::EnvelopeBinaryTransform,
+    >,
+    maskura_error::MaskuraError,
+> {
+    let targets = customer_headers::validated(headers, customer_headers::ENCRYPT_FIELDS)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| {
+                    maskura_error::MaskuraError::new(
+                        maskura_error::codes::CONFIG_INVALID,
+                        "invalid x-maskura-encrypt-fields",
+                    )
+                })
+                .and_then(crate::binary_pump::parse_envelope_targets)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let transform =
+        crate::binary_pump::EnvelopeBinaryTransform::new(targets, auth.public_key_pem.as_deref())?;
+    Ok(crate::binary_pump::BinaryPump::new(
+        crate::binary_reductor::CommonTypeBinaryReductor::default(),
+        transform,
+        limits.ir,
+    ))
+}
+
 pub(crate) fn avro_media_type(content_type: &str) -> Option<String> {
     let media_type = content_type
         .split(';')
@@ -557,6 +630,153 @@ pub(crate) async fn streaming_avro_single_put(
         };
         let mut pump = avro_pump(&authentication.auth, headers, limits)?;
         let output = crate::avro::process_ocf(input.as_slice(), limits, &mut pump)?;
+        let output_bytes =
+            u64::try_from(output.len()).map_err(|_| StreamingPutError::InputTooLarge)?;
+        let digest = hex::encode(sha2::Sha256::digest(&output));
+        let stored = {
+            let mut sink = sink_guard.sink.lock().await;
+            sink.write(bytes::Bytes::from(output)).await?;
+            sink.verify_output(output_bytes, &digest).await?;
+            let usage_event = UsageEvent::from_grant(grant, input_bytes, output_bytes);
+            persist_transaction_usage_evidence(
+                state.operation_journal.as_ref(),
+                sink.usage_journal_operation_id(),
+                &usage_event,
+            )
+            .await
+            .map_err(TransactionError::from)?;
+            sink.record_usage_evidence(&usage_event).await?;
+            sink.complete(DestinationCommitAuthority::SinglePut).await?
+        };
+        Ok((stored, input_bytes, output_bytes))
+    }
+    .await;
+
+    match processing {
+        Ok((stored, input_bytes, output_bytes)) => {
+            sink_guard.disarm();
+            Ok((authentication.auth, stored, input_bytes, output_bytes, None))
+        }
+        Err(error) => {
+            let preserve_reservation = sink_guard
+                .sink
+                .lock()
+                .await
+                .commit_state()
+                .preserves_reservation();
+            if !preserve_reservation {
+                let _ = sink_guard.sink.lock().await.abort().await;
+            }
+            sink_guard.disarm();
+            if preserve_reservation {
+                Err(StreamingPutError::PreserveReservation(Box::new(error)))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+pub(crate) async fn streaming_lance_single_put(
+    state: &AppState,
+    mut authentication: HeaderAuthentication,
+    backend: ResolvedBackend,
+    usage: AuthorizedUsage<'_>,
+    headers: &HeaderMap,
+    mut body: axum::body::Body,
+    key: &str,
+) -> Result<
+    (
+        Auth,
+        StoredObjectMeta,
+        u64,
+        u64,
+        Option<crate::control::PipelineEvidence>,
+    ),
+    StreamingPutError,
+> {
+    use http_body_util::BodyExt as _;
+    use sha2::Digest as _;
+    let grant = usage.grant;
+
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| StreamingPutError::InvalidRequest("Content-Type is required".to_string()))?
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let mut content_md5 =
+        ContentMd5Verifier::from_headers(headers).map_err(StreamingPutError::Integrity)?;
+    let sink = begin_streaming_sink(
+        state,
+        backend,
+        AuthorizedOperation {
+            auth: &authentication.auth,
+            grant,
+        },
+        grant.operation_id(),
+        grant.bucket(),
+        key,
+        &content_type,
+        None,
+        None,
+    )
+    .await?;
+    let mut sink_guard = SinkAbortGuard::new(sink);
+    let processing = async {
+        let mut input = Vec::new();
+        let mut input_bytes = 0_u64;
+        while let Some(frame) = body
+            .frame()
+            .await
+            .transpose()
+            .map_err(|_| StreamingPutError::Transport)?
+        {
+            let data = frame
+                .into_data()
+                .map_err(|_| StreamingPutError::Transport)?;
+            if data.len() > state.source_body_limits.max_frame_bytes {
+                return Err(StreamingPutError::SourceFrameTooLarge);
+            }
+            let decoded = if let Some(verifier) = &mut authentication.body_verifier {
+                verifier.push(&data).map_err(StreamingPutError::Integrity)?
+            } else {
+                vec![data]
+            };
+            for chunk in decoded {
+                if let Some(verifier) = &mut content_md5 {
+                    verifier.update(&chunk);
+                }
+                input_bytes = input_bytes
+                    .checked_add(chunk.len() as u64)
+                    .ok_or(StreamingPutError::InputTooLarge)?;
+                if input_bytes > state.source_body_limits.max_bytes {
+                    return Err(StreamingPutError::InputTooLarge);
+                }
+                input.extend_from_slice(&chunk);
+            }
+        }
+        if let Some(verifier) = authentication.body_verifier.take() {
+            let verified = verifier.finish().map_err(StreamingPutError::Integrity)?;
+            if verified != input_bytes {
+                return Err(StreamingPutError::Integrity(
+                    IntegrityError::DecodedLengthMismatch,
+                ));
+            }
+        }
+        if let Some(verifier) = content_md5.take() {
+            verifier.finish().map_err(StreamingPutError::Integrity)?;
+        }
+
+        let limits = crate::lance::LanceLimits {
+            max_source_bytes: state.source_body_limits.max_bytes.min(64 * 1024 * 1024) as usize,
+            ..crate::lance::LanceLimits::default()
+        };
+        let mut pump = lance_pump(&authentication.auth, headers, limits)?;
+        let output = crate::lance::process_lance(input.as_slice(), limits, &mut pump)?;
         let output_bytes =
             u64::try_from(output.len()).map_err(|_| StreamingPutError::InputTooLarge)?;
         let digest = hex::encode(sha2::Sha256::digest(&output));

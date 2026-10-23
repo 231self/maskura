@@ -9,6 +9,7 @@ async fn resolved_feature_limit_and_wasm_config_populates_state_without_late_env
     config.features.streaming_read_mode = ConfigStreamingReadMode::Transformed;
     config.features.transformed_read_spool = true;
     config.features.enable_avro = true;
+    config.features.enable_lance = true;
     config.features.streaming_s3_provider = Some(StreamingS3Provider::Aws);
     config.limits.source_max_frame_bytes = Some(4096);
     config.limits.max_object_bytes = Some(2 * 1024 * 1024);
@@ -53,6 +54,7 @@ async fn resolved_feature_limit_and_wasm_config_populates_state_without_late_env
     assert_eq!(state.streaming_read_mode, StreamingReadMode::Transformed);
     assert!(state.transformed_read_spool_enabled);
     assert!(state.binary_avro_enabled);
+    assert!(state.binary_lance_enabled);
     assert!(state.s3_streaming_capabilities.is_some());
     assert_eq!(state.source_body_limits.max_frame_bytes, 4096);
     assert_eq!(state.source_body_limits.max_bytes, 2 * 1024 * 1024);
