@@ -21,7 +21,7 @@ env:
 
 jobs:
   soak:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,7 +38,7 @@ jobs:
         run: MASKURA_SOAK_ITERATIONS=500 cargo test --locked -p maskura-gateway --test s3_frontdoor_test soak_streaming_roundtrip_holds_under_repetition -- --ignored --nocapture
 
   property:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -6,6 +6,7 @@ use super::*;
 use maskura_pipeline_config::PolicyOperation;
 
 use crate::policy_gate::{PolicyRequest, enforce_policy, policy_error_response};
+use crate::s3_safety::{S3Missing, record_s3_client_failure};
 
 /// Escape a value for inclusion in an S3 XML document.
 pub(crate) fn xml_escape(s: &str) -> String {
@@ -124,7 +125,26 @@ impl PresignedTransportFailure {
     }
 }
 
-pub(crate) fn open_error_response(key: &str, error: OpenObjectError) -> axum::response::Response {
+/// S3-faithful error document for a failed S3-backend request: documented
+/// missing conditions mirror S3's own typed 404 responses instead of surfacing
+/// as opaque `InternalError` failures.
+pub(crate) fn s3_failure_response(
+    bucket: &str,
+    key: &str,
+    failure: S3Failure,
+) -> axum::response::Response {
+    match failure.missing() {
+        Some(S3Missing::Bucket) => s3_error::no_such_bucket(bucket),
+        Some(S3Missing::Object) => s3_error::no_such_key(key),
+        None => s3_error::internal_error(key, failure.client_message()),
+    }
+}
+
+pub(crate) fn open_error_response(
+    bucket: &str,
+    key: &str,
+    error: OpenObjectError,
+) -> axum::response::Response {
     match error {
         OpenObjectError::NotFound => s3_error::no_such_key(key),
         OpenObjectError::InvalidRange { object_length } => {
@@ -140,7 +160,7 @@ pub(crate) fn open_error_response(key: &str, error: OpenObjectError) -> axum::re
             warn!(error_category = "backend", "backend read failed");
             s3_error::internal_error(key, "backend read failed")
         }
-        OpenObjectError::S3(failure) => s3_error::internal_error(key, failure.client_message()),
+        OpenObjectError::S3(failure) => s3_failure_response(bucket, key, failure),
         OpenObjectError::PresignedTransport(failure) => {
             warn!(
                 category = failure.as_str(),
@@ -573,7 +593,7 @@ pub(crate) async fn open_backend_object(
                     {
                         OpenObjectError::NotFound
                     } else {
-                        OpenObjectError::S3(record_s3_failure("head_object", &error))
+                        OpenObjectError::S3(record_s3_client_failure("head_object", &error))
                     }
                 })?;
                 return Ok(OpenedObject::new(
@@ -597,7 +617,7 @@ pub(crate) async fn open_backend_object(
                 {
                     OpenObjectError::NotFound
                 } else {
-                    OpenObjectError::S3(record_s3_failure("get_object", &error))
+                    OpenObjectError::S3(record_s3_client_failure("get_object", &error))
                 }
             })?;
             let status = if output.content_range.is_some() {
@@ -2041,7 +2061,7 @@ pub(crate) async fn s3_get(
                     &auth.context,
                     &grant,
                     &key,
-                    open_error_response(&key, error),
+                    open_error_response(&bucket, &key, error),
                 )
                 .await;
             }
@@ -2070,7 +2090,7 @@ pub(crate) async fn s3_get(
             .await
             {
                 Ok(object) => object,
-                Err(error) => return open_error_response(&key, error),
+                Err(error) => return open_error_response(&bucket, &key, error),
             };
             let source_bytes = content_length(&object.metadata.headers);
             let response_metadata = object.metadata.clone();
@@ -2125,7 +2145,7 @@ pub(crate) async fn s3_get(
                     &auth.context,
                     &grant,
                     &key,
-                    open_error_response(&key, error),
+                    open_error_response(&bucket, &key, error),
                 )
                 .await;
             }
@@ -2240,7 +2260,7 @@ pub(crate) async fn s3_get(
                 &auth.context,
                 &grant,
                 &key,
-                open_error_response(&key, error),
+                open_error_response(&bucket, &key, error),
             )
             .await;
         }
@@ -2278,7 +2298,7 @@ pub(crate) async fn s3_get(
         &auth.context,
         &grant,
         &key,
-        s3_error::not_implemented(&key),
+        s3_error::read_disabled(&key),
     )
     .await
 }
@@ -2454,7 +2474,7 @@ pub(crate) async fn s3_head(
                 &auth.context,
                 &grant,
                 &key,
-                open_error_response(&key, error),
+                open_error_response(&bucket, &key, error),
             )
             .await
         }
@@ -2775,7 +2795,7 @@ pub(crate) async fn s3_delete(
                         &auth.context,
                         &grant,
                         &key,
-                        open_error_response(&key, OpenObjectError::Rejected(error)),
+                        open_error_response(&bucket, &key, OpenObjectError::Rejected(error)),
                     )
                     .await;
                 }
@@ -2837,8 +2857,8 @@ pub(crate) async fn s3_delete(
                 StatusCode::NO_CONTENT.into_response()
             }
             Err(error) => {
-                let failure = record_s3_failure("delete_object", &error);
-                s3_error::internal_error(&key, failure.client_message())
+                let failure = record_s3_client_failure("delete_object", &error);
+                s3_failure_response(&bucket, &key, failure)
             }
         },
         ResolvedBackend::Managed(storage) => {
@@ -3714,7 +3734,7 @@ pub(crate) async fn s3_list_objects(
     let response = match backend {
         ResolvedBackend::S3 { client, .. } => match list_from_s3(client, &bucket, &params).await {
             Ok(xml) => s3_xml_ok(xml),
-            Err(failure) => s3_error::internal_error(&bucket, failure.client_message()),
+            Err(failure) => s3_failure_response(&bucket, &bucket, failure),
         },
         ResolvedBackend::Memory(store) => {
             match list_from_memory(store, &bucket, &params, &state.continuation_token_key) {
@@ -3748,7 +3768,7 @@ pub(crate) async fn s3_list_objects(
         ResolvedBackend::PresignedHttp(url) => {
             match open_http_object(&state, url.clone(), &headers, false).await {
                 Ok(object) => object.into_response(),
-                Err(error) => open_error_response(&bucket, error),
+                Err(error) => open_error_response(&bucket, &bucket, error),
             }
         }
     };
@@ -3807,7 +3827,7 @@ pub(crate) async fn list_from_s3(
     let out = req
         .send()
         .await
-        .map_err(|error| record_s3_failure("list_objects_v2", &error))?;
+        .map_err(|error| record_s3_client_failure("list_objects_v2", &error))?;
 
     let encoding = params.encoding_type.as_deref() == Some("url");
     let mut xml = String::from(
@@ -3902,7 +3922,7 @@ pub(crate) async fn list_from_s3_v1(
     let output = request
         .send()
         .await
-        .map_err(|error| record_s3_failure("list_objects_v1", &error))?;
+        .map_err(|error| record_s3_client_failure("list_objects_v1", &error))?;
     let encoding = params.encoding_type.as_deref() == Some("url");
     let display = |value: &str| {
         if encoding {
@@ -4383,4 +4403,100 @@ pub(crate) fn list_from_local_objects(
     }
     xml.push_str("</ListBucketResult>");
     Ok(xml)
+}
+
+#[cfg(test)]
+mod error_document_tests {
+    use super::{OpenObjectError, open_error_response, s3_failure_response};
+    use crate::s3_safety::{S3Failure, record_s3_client_failure};
+    use aws_smithy_runtime_api::client::result::SdkError;
+    use aws_smithy_types::error::metadata::{ErrorMetadata, ProvideErrorMetadata};
+    use http_body_util::BodyExt as _;
+
+    struct ProviderError {
+        meta: ErrorMetadata,
+    }
+
+    impl ProvideErrorMetadata for ProviderError {
+        fn code(&self) -> Option<&str> {
+            self.meta.code()
+        }
+
+        fn meta(&self) -> &ErrorMetadata {
+            &self.meta
+        }
+    }
+
+    fn provider_failure(code: &'static str) -> S3Failure {
+        record_s3_client_failure(
+            "get_object",
+            &SdkError::service_error(
+                ProviderError {
+                    meta: ErrorMetadata::builder().code(code).build(),
+                },
+                String::new(),
+            ),
+        )
+    }
+
+    async fn document(response: axum::response::Response) -> (axum::http::StatusCode, String) {
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn missing_bucket_is_a_no_such_bucket_document() {
+        for response in [
+            s3_failure_response(
+                "guessed-bucket",
+                "probe.txt",
+                provider_failure("NoSuchBucket"),
+            ),
+            open_error_response(
+                "guessed-bucket",
+                "probe.txt",
+                OpenObjectError::S3(provider_failure("NoSuchBucket")),
+            ),
+        ] {
+            let (status, body) = document(response).await;
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{body}");
+            assert!(body.contains("<Code>NoSuchBucket</Code>"), "{body}");
+            assert!(body.contains("<Key>guessed-bucket</Key>"), "{body}");
+            assert!(!body.contains("InternalError"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_object_is_a_no_such_key_document() {
+        for response in [
+            s3_failure_response("bucket", "missing.txt", provider_failure("NoSuchKey")),
+            s3_failure_response("bucket", "missing.txt", provider_failure("NotFound")),
+            open_error_response(
+                "bucket",
+                "missing.txt",
+                OpenObjectError::S3(provider_failure("NoSuchKey")),
+            ),
+        ] {
+            let (status, body) = document(response).await;
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{body}");
+            assert!(body.contains("<Code>NoSuchKey</Code>"), "{body}");
+            assert!(body.contains("<Key>missing.txt</Key>"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn other_provider_failures_remain_opaque_internal_errors() {
+        for code in ["AccessDenied", "SlowDown", "ThrottlingException"] {
+            let response = s3_failure_response("bucket", "probe.txt", provider_failure(code));
+            let (status, body) = document(response).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{body}"
+            );
+            assert!(body.contains("<Code>InternalError</Code>"), "{body}");
+            assert!(!body.contains(code), "{body}");
+        }
+    }
 }

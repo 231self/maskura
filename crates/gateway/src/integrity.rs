@@ -264,6 +264,7 @@ impl BodyVerifier {
         payload_hash: &str,
         signing: Option<StreamingSigning>,
         trusted_tls: bool,
+        bodyless: bool,
     ) -> Result<Self, IntegrityError> {
         let content_encoding = one_header(headers, "content-encoding")?;
         let decoded_length = one_header(headers, "x-amz-decoded-content-length")?;
@@ -272,7 +273,16 @@ impl BodyVerifier {
 
         let state = match payload_hash {
             "UNSIGNED-PAYLOAD" => {
-                if !trusted_tls || content_encoding.is_some() || trailer_declaration.is_some() {
+                // A request without a body has no payload integrity left to
+                // bind, so the unsigned token is acceptable on any channel
+                // (AWS CLI >= 2.38 signs bodyless HEAD/GET this way). For
+                // body-carrying requests the token stays trusted-TLS only,
+                // and content-encoding/trailer shapes always require the
+                // streaming modes below.
+                if !(trusted_tls || bodyless)
+                    || content_encoding.is_some()
+                    || trailer_declaration.is_some()
+                {
                     return Err(IntegrityError::UnsupportedPayloadMode);
                 }
                 PayloadState::Fixed {
@@ -884,7 +894,7 @@ mod tests {
 
     fn fixed(body: &[u8], extra: &[(&str, &str)]) -> BodyVerifier {
         let hash = hex::encode(Sha256::digest(body));
-        BodyVerifier::from_headers(&headers(extra), &hash, None, false).unwrap()
+        BodyVerifier::from_headers(&headers(extra), &hash, None, false, false).unwrap()
     }
 
     #[test]
@@ -940,6 +950,7 @@ mod tests {
                 ]),
                 &hash,
                 None,
+                false,
                 false
             ),
             Err(IntegrityError::ConflictingChecksum)
@@ -949,6 +960,7 @@ mod tests {
                 &headers(&[("x-amz-checksum-crc32", "not-base64")]),
                 &hash,
                 None,
+                false,
                 false
             )
             .is_err()
@@ -1038,6 +1050,7 @@ mod tests {
             ]),
             "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
             Some(signing()),
+            false,
             false,
         )
         .unwrap()
@@ -1138,6 +1151,7 @@ mod tests {
             "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
             Some(signing.clone()),
             false,
+            false,
         )
         .unwrap();
         let decoded = verifier.push(signed.as_bytes()).unwrap();
@@ -1154,6 +1168,7 @@ mod tests {
             "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
             None,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(verifier.push(unsigned.as_bytes()).unwrap().concat(), data);
@@ -1164,6 +1179,7 @@ mod tests {
             &signed_headers,
             "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
             Some(signing),
+            false,
             false,
         )
         .unwrap();
@@ -1194,11 +1210,44 @@ mod tests {
     fn verifier_state_is_constant_for_one_gibibyte() {
         let chunk = [0_u8; 64 * 1024];
         let mut verifier =
-            BodyVerifier::from_headers(&HeaderMap::new(), "UNSIGNED-PAYLOAD", None, true).unwrap();
+            BodyVerifier::from_headers(&HeaderMap::new(), "UNSIGNED-PAYLOAD", None, true, false)
+                .unwrap();
         for _ in 0..(1024 * 1024 * 1024 / chunk.len()) {
             assert_eq!(verifier.push(&chunk).unwrap().len(), 1);
         }
         assert_eq!(verifier.finish().unwrap(), 1024 * 1024 * 1024);
         assert!(std::mem::size_of::<BodyVerifier>() < 1024);
+    }
+
+    #[test]
+    fn unsigned_payload_is_accepted_for_bodyless_requests_on_untrusted_channels() {
+        // AWS CLI >= 2.38 (CRT S3 client) signs bodyless HEAD/GET with
+        // UNSIGNED-PAYLOAD. A request without a body has no payload integrity
+        // left to bind, so the token must be accepted on any channel — the
+        // seed signature still covers the request itself.
+        assert!(
+            BodyVerifier::from_headers(
+                &headers(&[("content-length", "0"), ("x-amz-checksum-mode", "enabled")]),
+                "UNSIGNED-PAYLOAD",
+                None,
+                false,
+                true
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn unsigned_payload_stays_rejected_for_body_carrying_requests_on_untrusted_channels() {
+        assert!(matches!(
+            BodyVerifier::from_headers(
+                &headers(&[("content-length", "17")]),
+                "UNSIGNED-PAYLOAD",
+                None,
+                false,
+                false
+            ),
+            Err(IntegrityError::UnsupportedPayloadMode)
+        ));
     }
 }

@@ -120,7 +120,16 @@ pub fn internal_error(key: &str, detail: &str) -> axum::response::Response {
 pub fn transformed_read_not_supported(key: &str) -> axum::response::Response {
     s3_error_xml(
         "NotImplemented",
-        "Transformed reads are disabled until the streaming disclosure model is available.",
+        "Transformed reads are disabled on this gateway. Set MASKURA_STREAMING_READ_MODE=transformed (config: [features] streaming_read_mode = \"transformed\") to enable processed reads.",
+        key,
+        StatusCode::NOT_IMPLEMENTED,
+    )
+}
+
+pub fn read_disabled(key: &str) -> axum::response::Response {
+    s3_error_xml(
+        "NotImplemented",
+        "Reads are administratively disabled on this gateway. Set MASKURA_STREAMING_READ_MODE=passthrough (or transformed for processed reads; config: [features] streaming_read_mode) to enable them.",
         key,
         StatusCode::NOT_IMPLEMENTED,
     )
