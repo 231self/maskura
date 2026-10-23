@@ -1,3 +1,11 @@
+[advisories]
+# RUSTSEC-2026-0381: webpki-roots 0.26.x has no fix (advisory fixes >=1.0.10)
+# and is held by sqlx-core's TLS root bundle; the 1.x line is fixed at 1.0.10
+# and rustls-webpki at 0.103.16. scripts/audit-rust.sh fails closed if any
+# holder other than sqlx-core appears on the 0.26 line. Re-review on any
+# sqlx/sea-orm bump.
+ignore = ["RUSTSEC-2026-0381"]
+
 [graph]
 targets = []
 

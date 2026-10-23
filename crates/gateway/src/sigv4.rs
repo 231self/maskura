@@ -284,6 +284,7 @@ impl RequestAuthorization {
             &payload_hash,
             Some(streaming),
             policy.trusted_tls(uri),
+            matches!(method, "GET" | "HEAD" | "DELETE"),
         )
         .map_err(Into::into)
     }

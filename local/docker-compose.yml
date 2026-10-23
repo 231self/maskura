@@ -3,7 +3,7 @@ services:
   # auto-local mode, with the fixed dev root credential so SigV4 clients and
   # the gateway's S3 sink share one well-known principal.
   s3:
-    image: ghcr.io/231self/maskura/maskura:v0.7.14@sha256:4600673d46dd309f03f16a77661f1d412f55c2696045248e5dde1b7bd2c449b1
+    image: ghcr.io/231self/maskura/maskura:v0.7.29@sha256:9f76700963a70967ee8dea94fe2714a23da6edc0119f841b24fbbf6ac451ef61
     ports:
       - "9000:9000"
     environment:

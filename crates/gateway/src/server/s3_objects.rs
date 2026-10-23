@@ -2298,7 +2298,7 @@ pub(crate) async fn s3_get(
         &auth.context,
         &grant,
         &key,
-        s3_error::not_implemented(&key),
+        s3_error::read_disabled(&key),
     )
     .await
 }
