@@ -113,7 +113,14 @@ pub struct ResolvedRoute {
     pub revision_id: String,
     pub resolution_fingerprint: String,
     pub explicit_passthrough: bool,
+    /// Processing format for this route: `"bytes"` or a format-adapter name
+    /// (`"avro"`, `"lance"`, ...). Adapter names are the same keys as the
+    /// adapter feature gates (`MASKURA_ENABLE_AVRO` / `MASKURA_ENABLE_LANCE`,
+    /// surfaced as `features.enable_avro` / `features.enable_lance` and the
+    /// runtime `binary_avro_enabled` / `binary_lance_enabled` state).
     pub format: String,
+    /// SHA-256 of the pinned adapter implementation. Required (and only
+    /// meaningful) for non-`"bytes"` routes.
     pub adapter_sha256: Option<String>,
     pub limits: ResolvedLimits,
     pub steps: Vec<ResolvedStep>,
@@ -453,12 +460,63 @@ mod tests {
                 s.routes[0].format = "avro".into();
                 s.routes[0].adapter_sha256 = Some("a".repeat(64));
             },
+            |s| {
+                s.routes[0].format = "lance".into();
+                s.routes[0].adapter_sha256 = Some("a".repeat(64));
+            },
         ];
         for mutate in mutations {
             let mut state = original.clone();
             mutate(&mut state);
             assert_ne!(state.digest().unwrap(), original.digest().unwrap());
         }
+    }
+
+    /// The `lance` format-adapter entry (policy-approval Slice 3 / ADR 0022
+    /// pair for the Lance codec): a route whose `format` names the `lance`
+    /// adapter — the same key as the `MASKURA_ENABLE_LANCE` feature gate
+    /// (`features.enable_lance` / `binary_lance_enabled` at runtime) — must
+    /// pin its adapter implementation with `adapter_sha256`, and the pin is
+    /// part of the signed commitment. Unpinned adapter routes fail closed.
+    #[test]
+    fn lance_adapter_entry_pins_the_adapter_and_fails_closed_unpinned() {
+        let mut state = fixture();
+        state.routes[0].format = "lance".into();
+        state.routes[0].adapter_sha256 = Some("a".repeat(64));
+        state.validate().expect("pinned lance adapter entry");
+        let lance_digest = state.digest().unwrap();
+
+        // The entry round-trips verbatim: the signed state carries the
+        // adapter name and its pinned implementation to the verifier.
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert_eq!(encoded["routes"][0]["format"], "lance");
+        assert_eq!(encoded["routes"][0]["adapter_sha256"], "a".repeat(64));
+        assert_eq!(
+            serde_json::from_value::<EffectiveState>(encoded).unwrap(),
+            state
+        );
+
+        // The commitment is keyed to the pinned adapter implementation:
+        // a different pin digests differently, and dropping the pin fails
+        // closed rather than degrading to an unpinned byte route.
+        let mut repinned = state.clone();
+        repinned.routes[0].adapter_sha256 = Some("b".repeat(64));
+        assert_ne!(repinned.digest().unwrap(), lance_digest);
+        let mut unpinned = state.clone();
+        unpinned.routes[0].adapter_sha256 = None;
+        let error = unpinned.validate().expect_err("unpinned lance route");
+        assert!(
+            error
+                .to_string()
+                .contains("non-byte routes must pin their adapter implementation"),
+            "unpinned adapter route must fail closed with the pin error: {error}"
+        );
+        assert!(unpinned.digest().is_err());
+
+        // A non-hex pin is not an adapter identity.
+        let mut malformed = state;
+        malformed.routes[0].adapter_sha256 = Some("short".into());
+        assert!(malformed.validate().is_err());
     }
 
     #[test]

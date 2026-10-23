@@ -11,6 +11,33 @@
 //! `PolicyOperation::List` with the requested prefix: in-progress upload
 //! listings disclose key names, the same disclosure surface ListObjects
 //! scopes to approved prefixes.
+//!
+//! # Format-adapter rows (Lance)
+//!
+//! Format adapters ride the same gate seam (the gate call sites are
+//! format-blind) but add format-specific dispatch and fail-closed behavior
+//! behind their feature gates. The Lance rows below (the ADR 0022 policy
+//! pair for the Lance codec) pin that surface. Row names name the adapter
+//! seam each path invokes.
+//!
+//! | Row (path × scenario) | Expected | Seam | Pinned by |
+//! |---|---|---|---|
+//! | EffectiveState entry × `lance` adapter | `format: "lance"` + pinned `adapter_sha256`, keyed to the `MASKURA_ENABLE_LANCE` gate | `effective_state::ResolvedRoute` | `lance_effective_state_entry_is_keyed_to_the_lance_feature_gate` |
+//! | Single PUT × Lance content types × gate closed | 501 before body read, nothing stored (`Put` still presented to the gate) | `s3_upload.rs::streaming_lance_single_put` | `streaming_lance_single_put_gate_closed_rejects_501_before_the_body` |
+//! | Single PUT × Lance content types × gate open | 200, `Put` presented to the gate | `s3_upload.rs::streaming_lance_single_put` | `streaming_lance_single_put_presents_put_to_the_policy_gate` |
+//! | Staged multipart completion × Lance × frozen admission | 200 through the Lance completion path; `MultipartComplete` presented with the frozen create-time verdict | `multipart.rs::complete_staged_lance_multipart` | `complete_staged_lance_multipart_serves_under_the_frozen_verdict` |
+//! | Processed GET × Lance × `Range` / `partNumber` | `InvalidRequest` before decode | `s3_objects.rs::lance_transformed_read_response` | `lance_transformed_read_response_rejects_range_and_part_number` |
+//! | Processed GET × Lance × gate open | complete-output staging (200 served from the spool); staging disabled or undecodable input fails closed — never a raw fallback | `s3_objects.rs::lance_transformed_read_response` | `lance_transformed_read_response_stages_complete_output_without_raw_fallback` |
+//! | Processed GET × Lance × gate closed | rejected (`InvalidRequest`), no raw bytes disclosed | `s3_objects.rs::lance_transformed_read_response` | `lance_processed_read_gate_closed_is_rejected` |
+//! | Raw GET / HEAD / byte-range × stored Lance object | **unprocessed** passthrough over the stored representation (`RawGet`/`Head`, never `ProcessedGet`) | (no adapter seam — the raw path is format-blind) | `lance_raw_get_head_and_byte_range_stay_unprocessed_passthrough` |
+//! | Metering / pipeline evidence × Lance | the existing binary-adapter rows (`UsageRoute::PutObject`/`GetObject`; `CommonTypeBinaryReductor` + envelope per `lance/tests.rs::process_lance_emits_the_typed_envelope_schema`); no new metering route | `control::UsageEvent` | `lance_metering_reuses_the_binary_adapter_rows` |
+//!
+//! Avro-gap note: the earlier binary adapter has **no** rows here — the Avro
+//! seams (`streaming_avro_single_put`, `complete_staged_avro_multipart`,
+//! `avro_transformed_read_response`) and their gate-closed 501 /
+//! `InvalidRequest` behavior were never matrix-tested. The Lance rows above
+//! establish the format-adapter row pattern; Avro rows mirroring them are a
+//! noted coverage gap, not a behavior change.
 
 use super::*;
 
@@ -114,6 +141,17 @@ fn coverage_config() -> (Config, std::path::PathBuf) {
 }
 
 async fn coverage_router() -> (Router, Arc<AppState>, Arc<RecordingPolicyGate>) {
+    coverage_router_with(Arc::new(RecordingPolicyGate::default()), |_| {}).await
+}
+
+/// The coverage router with a caller-chosen gate and state tuning applied
+/// before the router is built: the router holds `Arc<AppState>` clones, so
+/// state must be final at build time. This is how the format-adapter rows
+/// key the `lance` gate (`binary_lance_enabled`) on and off per scenario.
+async fn coverage_router_with(
+    gate: Arc<RecordingPolicyGate>,
+    tune: impl FnOnce(&mut AppState),
+) -> (Router, Arc<AppState>, Arc<RecordingPolicyGate>) {
     let (config, _scratch) = coverage_config();
     let mut state = build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
@@ -124,10 +162,11 @@ async fn coverage_router() -> (Router, Arc<AppState>, Arc<RecordingPolicyGate>) 
     )
     .await
     .expect("build_state");
-    let gate = Arc::new(RecordingPolicyGate::default());
-    Arc::get_mut(&mut state)
-        .expect("test state is uniquely owned")
-        .policy_gate = Some(gate.clone());
+    {
+        let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+        state_mut.policy_gate = Some(gate.clone());
+        tune(state_mut);
+    }
     (build_router(state.clone()), state, gate)
 }
 
@@ -1253,5 +1292,833 @@ async fn list_multipart_uploads_is_gated() {
         response.status(),
         StatusCode::OK,
         "an approved List verdict must list uploads"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Format-adapter rows (Lance) — see the "Format-adapter rows (Lance)" table
+// in the module docs. Each fn pins one row.
+// ---------------------------------------------------------------------------
+
+/// Canonical Lance media type (the adapter also accepts `application/x-lance`
+/// and `application/vnd.lance` — see `s3_upload.rs::lance_media_type`).
+const LANCE_MEDIA_TYPE: &str = "application/vnd.apache.lance";
+
+/// Reference-written structural v2.2 fixture (`lance/tests.rs` decodes it).
+const LANCE_INT_V2_2: &[u8] = include_bytes!("../fixtures/lance/int_v2_2.lance");
+
+/// Reference-written v2.0 fixture with an `email` string column (the fixture
+/// the codec's envelope test encrypts).
+const LANCE_MIXED_V2_0: &[u8] = include_bytes!("../fixtures/lance/mixed_v2_0.lance");
+
+/// The `lance` gate on: `MASKURA_ENABLE_LANCE` / `features.enable_lance`
+/// resolved into the runtime `binary_lance_enabled` state the adapter seams
+/// check.
+fn with_lance_enabled(state: &mut AppState) {
+    state.binary_lance_enabled = true;
+}
+
+async fn create_upload_with_content_type(
+    app: &Router,
+    hdrs: &[(&'static str, String)],
+    key: &str,
+    content_type: &str,
+) -> String {
+    let create = add_headers(
+        Request::builder()
+            .method("POST")
+            .uri(format!("/bucket/{key}?uploads"))
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .unwrap(),
+        hdrs,
+    );
+    let response = app.clone().oneshot(create).await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "staged multipart create must succeed: {}",
+        String::from_utf8_lossy(&body)
+    );
+    upload_id_from(&String::from_utf8_lossy(&body))
+}
+
+async fn upload_part_bytes(
+    app: &Router,
+    hdrs: &[(&'static str, String)],
+    key: &str,
+    upload_id: &str,
+    body: &[u8],
+) -> String {
+    let part = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/bucket/{key}?partNumber=1&uploadId={upload_id}"))
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, body.len().to_string())
+            .body(Body::from(body.to_vec()))
+            .unwrap(),
+        hdrs,
+    );
+    let response = app.clone().oneshot(part).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "staged part upload");
+    response
+        .headers()
+        .get(header::ETAG)
+        .expect("UploadPart ETag")
+        .to_str()
+        .expect("UploadPart ETag text")
+        .to_string()
+}
+
+fn lance_object_get(key: &str, process: bool) -> axum::http::request::Builder {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(format!("/bucket/{key}"));
+    if process {
+        builder = builder.header("x-maskura-process", "read");
+    }
+    builder
+}
+
+/// Plant a stored object directly in the coverage router's local file store:
+/// the read rows need a stored Lance representation to read, and a
+/// gate-closed (or pre-codec) gateway refuses to write one through the
+/// adapter.
+async fn plant_object(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    data: &[u8],
+    content_type: &str,
+) {
+    state
+        .file_store
+        .as_ref()
+        .expect("coverage config uses local file storage")
+        .put(
+            bucket,
+            key,
+            bytes::Bytes::copy_from_slice(data),
+            content_type,
+        )
+        .await
+        .expect("plant stored object");
+}
+
+/// The stored representation of `key` as raw passthrough serves it.
+async fn raw_get_body(app: &Router, hdrs: &[(&'static str, String)], key: &str) -> Vec<u8> {
+    let raw_get = add_headers(
+        lance_object_get(key, false).body(Body::empty()).unwrap(),
+        hdrs,
+    );
+    let response = app.clone().oneshot(raw_get).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "raw passthrough must serve the stored object"
+    );
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+/// The `EffectiveState` entry for the `lance` adapter is keyed to the
+/// `MASKURA_ENABLE_LANCE` gate: the route's `format` name is the feature-gate
+/// key (`features.enable_lance` → `binary_lance_enabled`), and non-byte
+/// entries pin their adapter implementation (`adapter_sha256`; entry
+/// validation is unit-pinned in
+/// `pipeline-config/src/effective_state.rs::lance_adapter_entry_pins_the_adapter_and_fails_closed_unpinned`).
+#[tokio::test]
+async fn lance_effective_state_entry_is_keyed_to_the_lance_feature_gate() {
+    use maskura_pipeline_config::{
+        EFFECTIVE_STATE_SCHEMA_VERSION, EffectiveState, ResolvedLimits, ResolvedRoute, ResolvedStep,
+    };
+
+    let entry = ResolvedRoute {
+        bucket: "tenant".into(),
+        prefix: "data/".into(),
+        operation: PolicyOperation::Put,
+        destination_id: "dest".into(),
+        assignment_id: "assignment".into(),
+        revision_id: "revision".into(),
+        resolution_fingerprint: "f".repeat(64),
+        explicit_passthrough: false,
+        format: "lance".into(),
+        adapter_sha256: Some("a".repeat(64)),
+        limits: ResolvedLimits {
+            processing: PolicyLimits {
+                record_max_bytes: 1024,
+                object_max_bytes: 4096,
+                memory_bytes: 67_108_864,
+                fuel: 10_000_000,
+                deadline_ms: 30_000,
+            },
+            output_max_bytes: 8192,
+            table_entries: 10_000,
+            stack_bytes: 524_288,
+            max_plugins: 10,
+        },
+        steps: vec![ResolvedStep {
+            component_sha256: "a".repeat(64),
+            plugin_version_id: "plugin-version".into(),
+            world: "maskura:plugin/transformer@0.1.0".into(),
+            enabled: true,
+            config_json: None,
+            grants: BTreeSet::new(),
+            prefix_safe_for_read: false,
+        }],
+    };
+    let state = EffectiveState {
+        schema_version: EFFECTIVE_STATE_SCHEMA_VERSION,
+        audience: "https://maskura.dev".into(),
+        workspace_id: "ws-1".into(),
+        destinations: [(
+            "dest".into(),
+            DestinationBinding::Concrete {
+                destination: ResolvedDestination {
+                    mode: StorageMode::S3Compatible,
+                    endpoint: "https://s3.example.com/".into(),
+                    bucket: "objects".into(),
+                    region: "region".into(),
+                    role_arn: None,
+                    configuration_version_id: Some("config-version-1".into()),
+                    configuration_sha256: "d".repeat(64),
+                },
+            },
+        )]
+        .into(),
+        routes: vec![entry.clone()],
+    };
+    state
+        .validate()
+        .expect("the pinned lance adapter entry validates");
+
+    // The entry's format name is exactly the feature-gate key: the same name
+    // selects the adapter spec whose `FeatureGate` the runtime consults, and
+    // the gate env alias is `MASKURA_ENABLE_LANCE`.
+    let spec = maskura_gateway::format::FormatSpec::for_name(&entry.format)
+        .expect("the lance entry names a known adapter");
+    assert_eq!(spec, &maskura_gateway::format::LANCE_SPEC);
+    assert_eq!(
+        spec.feature_gate,
+        Some(maskura_gateway::format::FeatureGate {
+            name: "lance",
+            enabled_by_default: false,
+        })
+    );
+    assert!(!maskura_gateway::format::EnabledBinaryFormats::NONE.is_enabled(spec));
+    assert!(maskura_gateway::format::EnabledBinaryFormats::ALL.is_enabled(spec));
+    assert_eq!(
+        maskura_customer_config::aliases::ENABLE_LANCE.name(),
+        "MASKURA_ENABLE_LANCE"
+    );
+
+    // The gate key chain end to end: `features.enable_lance` populates the
+    // runtime `binary_lance_enabled` state the adapter's data-plane seams
+    // check, and the adapter is default-off.
+    let mut config = test_config();
+    config.features.enable_lance = true;
+    let enabled = build_state_with_pipeline_template(
+        Arc::new(NoopControlPlane),
+        default_wrapping().expect("wrapping"),
+        Arc::new(InMemoryWorkspaceStorageRepository::new()),
+        test_pipeline_template(),
+        &config,
+    )
+    .await
+    .expect("build_state");
+    assert!(enabled.binary_lance_enabled);
+    let (_app, closed, _gate) = coverage_router().await;
+    assert!(
+        !closed.binary_lance_enabled,
+        "the lance adapter gate is closed by default"
+    );
+}
+
+/// Row (a), gate closed: a single PUT with Lance content types is rejected
+/// 501 before the body is read and nothing is stored. The policy gate still
+/// covers the path (`Put` is presented before the adapter dispatch), so a
+/// gate-closed Lance write can never widen the unenforced surface.
+#[tokio::test]
+async fn streaming_lance_single_put_gate_closed_rejects_501_before_the_body() {
+    let (app, state, gate) = coverage_router().await;
+    let (ak, sk) = make_key(&state).await;
+    let hdrs = auth_headers(&ak, &sk);
+    create_bucket(&app, &hdrs).await;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let put = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/bucket/gate-closed.lance")
+            .header(header::CONTENT_TYPE, LANCE_MEDIA_TYPE)
+            .body(Body::new(PollTrackingBody {
+                polls: polls.clone(),
+                data: Some(Bytes::copy_from_slice(LANCE_INT_V2_2)),
+            }))
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(put).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_IMPLEMENTED,
+        "gate-closed Lance writes are rejected 501 (MASKURA_ENABLE_LANCE unset)"
+    );
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        0,
+        "the gate-closed rejection must happen before the body is read"
+    );
+    assert!(
+        state
+            .file_store
+            .as_ref()
+            .expect("coverage config uses local file storage")
+            .head("bucket", "gate-closed.lance")
+            .await
+            .expect("file store head")
+            .is_none(),
+        "a gate-closed Lance write stores nothing"
+    );
+    assert_eq!(
+        gate.count(PolicyOperation::Put),
+        1,
+        "the policy gate covers the Lance write path even when the adapter gate is closed"
+    );
+}
+
+/// Row (a), gate open: the single PUT runs through
+/// `s3_upload.rs::streaming_lance_single_put` and presents `Put` to the
+/// policy gate; the stored output is the codec's processed Lance file.
+#[tokio::test]
+async fn streaming_lance_single_put_presents_put_to_the_policy_gate() {
+    let (app, state, gate) =
+        coverage_router_with(Arc::new(RecordingPolicyGate::default()), with_lance_enabled).await;
+    let (ak, sk) = make_key(&state).await;
+    let hdrs = auth_headers(&ak, &sk);
+    create_bucket(&app, &hdrs).await;
+    let put = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/bucket/object.lance")
+            .header(header::CONTENT_TYPE, LANCE_MEDIA_TYPE)
+            .body(Body::from(LANCE_INT_V2_2.to_vec()))
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(put).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "gate-open Lance single PUT serves through streaming_lance_single_put"
+    );
+    let stored = raw_get_body(&app, &hdrs, "object.lance").await;
+    assert!(
+        stored.ends_with(b"LANC"),
+        "the stored representation is a processed Lance file"
+    );
+    assert!(
+        gate.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(
+                |(operation, bucket, key, frozen)| *operation == PolicyOperation::Put
+                    && bucket == "bucket"
+                    && key == "object.lance"
+                    && !*frozen
+            ),
+        "streaming_lance_single_put must present Put to the policy gate; calls: {:?}",
+        gate.calls.lock().unwrap()
+    );
+}
+
+/// Row (b): staged multipart completion with Lance content types runs through
+/// `multipart.rs::complete_staged_lance_multipart` under the frozen
+/// create-time admission — the `MultipartComplete` verdict the completion
+/// path presents carries the frozen verdict persisted at create time.
+#[tokio::test]
+async fn complete_staged_lance_multipart_serves_under_the_frozen_verdict() {
+    let (app, state, gate) =
+        coverage_router_with(Arc::new(RecordingPolicyGate::bound()), with_lance_enabled).await;
+    let (ak, sk) = make_key(&state).await;
+    let hdrs = auth_headers(&ak, &sk);
+    create_bucket(&app, &hdrs).await;
+    let upload_id =
+        create_upload_with_content_type(&app, &hdrs, "multipart-object.lance", LANCE_MEDIA_TYPE)
+            .await;
+    let etag = upload_part_bytes(
+        &app,
+        &hdrs,
+        "multipart-object.lance",
+        &upload_id,
+        LANCE_INT_V2_2,
+    )
+    .await;
+    let complete = add_headers(
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/bucket/multipart-object.lance?uploadId={upload_id}"
+            ))
+            .body(Body::from(complete_xml(&etag)))
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(complete).await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "Lance multipart completion serves under the frozen admission: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let stored = raw_get_body(&app, &hdrs, "multipart-object.lance").await;
+    assert!(
+        stored.ends_with(b"LANC"),
+        "the completed object is a processed Lance file"
+    );
+    // Frozen policy verdicts cover the completion path: the completion's gate
+    // verdict is checked against the admission frozen at create time.
+    let calls = gate.calls.lock().unwrap();
+    assert!(
+        calls.iter().any(|(operation, _, _, frozen)| *operation
+            == PolicyOperation::MultipartCreate
+            && !*frozen),
+        "the create request freezes the admission; calls: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(operation, _bucket, key, frozen)| *operation
+                == PolicyOperation::MultipartComplete
+                && key == "multipart-object.lance"
+                && *frozen),
+        "complete_staged_lance_multipart must run under the frozen create-time verdict; calls: {calls:?}"
+    );
+}
+
+/// Row (c), preflight: processed reads reject `Range` and `partNumber`
+/// before any Lance decode, with the typed `InvalidRequest` code.
+#[tokio::test]
+async fn lance_transformed_read_response_rejects_range_and_part_number() {
+    let (app, state, _gate) =
+        coverage_router_with(Arc::new(RecordingPolicyGate::default()), with_lance_enabled).await;
+    let (ak, sk) = make_key(&state).await;
+    let hdrs = auth_headers(&ak, &sk);
+    plant_object(
+        &state,
+        "bucket",
+        "ranged.lance",
+        LANCE_INT_V2_2,
+        LANCE_MEDIA_TYPE,
+    )
+    .await;
+
+    let ranged = add_headers(
+        lance_object_get("ranged.lance", true)
+            .header(header::RANGE, "bytes=0-3")
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(ranged).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("<Code>InvalidRequest</Code>")
+            && body.contains("Range is not supported for transformed reads"),
+        "Range must be rejected before any Lance decode: {body}"
+    );
+
+    let part_number = add_headers(
+        lance_object_get("ranged.lance", true)
+            .uri("/bucket/ranged.lance?partNumber=1")
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(part_number).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("<Code>InvalidRequest</Code>")
+            && body.contains("part-number reads are not supported for transformed reads"),
+        "partNumber must be rejected before any Lance decode: {body}"
+    );
+}
+
+/// Row (c): processed reads stage the complete filtered output before any
+/// body is disclosed — staging is mandatory (`transformed_read_spool`), and
+/// failures never fall back to raw bytes.
+#[tokio::test]
+async fn lance_transformed_read_response_stages_complete_output_without_raw_fallback() {
+    // Complete-output staging serves: the response is the fully processed
+    // Lance file, not a byte copy of the stored representation.
+    let (app, state, _gate) =
+        coverage_router_with(Arc::new(RecordingPolicyGate::default()), with_lance_enabled).await;
+    let (ak, sk) = make_key(&state).await;
+    let hdrs = auth_headers(&ak, &sk);
+    plant_object(
+        &state,
+        "bucket",
+        "object.lance",
+        LANCE_MIXED_V2_0,
+        LANCE_MEDIA_TYPE,
+    )
+    .await;
+    let processed = add_headers(
+        lance_object_get("object.lance", true)
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(processed).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the processed read stages the complete output and serves it"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        body.ends_with(b"LANC"),
+        "the response is a complete Lance file"
+    );
+    assert!(
+        body.len() != LANCE_MIXED_V2_0.len() || body[..] != LANCE_MIXED_V2_0[..],
+        "the processed output is the staged re-encoded file, not raw bytes"
+    );
+
+    // Staging is enforced, not advisory: without the encrypted read spool the
+    // complete-output read fails closed — never a raw fallback.
+    let (app, state, _gate) =
+        coverage_router_with(Arc::new(RecordingPolicyGate::default()), |state| {
+            with_lance_enabled(state);
+            state.transformed_read_spool_enabled = false;
+        })
+        .await;
+    let (ak, sk) = make_key(&state).await;
+    let hdrs = auth_headers(&ak, &sk);
+    plant_object(
+        &state,
+        "bucket",
+        "object.lance",
+        LANCE_MIXED_V2_0,
+        LANCE_MEDIA_TYPE,
+    )
+    .await;
+    let processed = add_headers(
+        lance_object_get("object.lance", true)
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(processed).await.unwrap();
+    assert_ne!(
+        response.status(),
+        StatusCode::OK,
+        "an unstaged Lance processed read must fail closed"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        !body
+            .windows(LANCE_MIXED_V2_0.len())
+            .any(|w| w == LANCE_MIXED_V2_0),
+        "a failed processed read must never disclose raw bytes"
+    );
+
+    // Undecodable input fails closed through the pipeline error mapping —
+    // still no raw fallback.
+    plant_object(
+        &state,
+        "bucket",
+        "invalid.lance",
+        b"not a lance file",
+        LANCE_MEDIA_TYPE,
+    )
+    .await;
+    let processed = add_headers(
+        lance_object_get("invalid.lance", true)
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(processed).await.unwrap();
+    assert!(
+        !response.status().is_success(),
+        "an undecodable Lance object must fail its processed read"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        !body
+            .windows(b"not a lance file".len())
+            .any(|w| w == b"not a lance file"),
+        "a failed processed read must never disclose raw bytes"
+    );
+}
+
+/// Row (c) / requirement 3, read side: with the `lance` gate closed
+/// (`MASKURA_ENABLE_LANCE` unset), processed reads over stored Lance objects
+/// are rejected — and never fall back to the raw stored bytes.
+#[tokio::test]
+async fn lance_processed_read_gate_closed_is_rejected() {
+    let (app, state, _gate) = coverage_router().await;
+    let (ak, sk) = make_key(&state).await;
+    let hdrs = auth_headers(&ak, &sk);
+    plant_object(
+        &state,
+        "bucket",
+        "object.lance",
+        LANCE_INT_V2_2,
+        LANCE_MEDIA_TYPE,
+    )
+    .await;
+    let processed = add_headers(
+        lance_object_get("object.lance", true)
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(processed).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "gate-closed processed reads over Lance objects are rejected"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("<Code>InvalidRequest</Code>"),
+        "the gate-closed rejection keeps the typed S3 code: {text}"
+    );
+    assert!(
+        !body
+            .windows(LANCE_INT_V2_2.len())
+            .any(|window| window == LANCE_INT_V2_2),
+        "a gate-closed processed read must never disclose raw bytes"
+    );
+}
+
+/// Row (d): raw GET, HEAD, and byte-range reads over stored Lance objects are
+/// **unprocessed** passthrough over the stored representation — the policy
+/// gate sees `RawGet`/`Head` (never `ProcessedGet`), the adapter is not
+/// invoked, and the bytes are returned unchanged.
+#[tokio::test]
+async fn lance_raw_get_head_and_byte_range_stay_unprocessed_passthrough() {
+    // Deliberately gate CLOSED: raw passthrough must not depend on the
+    // adapter feature gate at all.
+    let (app, state, gate) = coverage_router().await;
+    let (ak, sk) = make_key(&state).await;
+    let hdrs = auth_headers(&ak, &sk);
+    plant_object(
+        &state,
+        "bucket",
+        "object.lance",
+        LANCE_INT_V2_2,
+        LANCE_MEDIA_TYPE,
+    )
+    .await;
+
+    let raw_get = add_headers(
+        lance_object_get("object.lance", false)
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(raw_get).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        body.as_ref(),
+        LANCE_INT_V2_2,
+        "raw GET returns the stored representation unchanged"
+    );
+
+    let ranged = add_headers(
+        lance_object_get("object.lance", false)
+            .header(header::RANGE, "bytes=0-3")
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(ranged).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        body.as_ref(),
+        &LANCE_INT_V2_2[..4],
+        "byte-range reads slice the stored representation verbatim"
+    );
+
+    let head = add_headers(
+        Request::builder()
+            .method("HEAD")
+            .uri("/bucket/object.lance")
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(head).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some(LANCE_MEDIA_TYPE),
+        "HEAD reports the stored representation's metadata"
+    );
+
+    // Explicitly *unprocessed*: the gate saw RawGet/Head and no ProcessedGet.
+    let calls = gate.calls.lock().unwrap();
+    assert!(
+        calls
+            .iter()
+            .any(|(operation, _, _, _)| *operation == PolicyOperation::RawGet),
+        "raw GET must present RawGet; calls: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(operation, _, _, _)| *operation == PolicyOperation::Head),
+        "HEAD must present Head; calls: {calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(operation, _, _, _)| *operation == PolicyOperation::ProcessedGet)
+            .count(),
+        0,
+        "raw passthrough paths must never claim processed reads; calls: {calls:?}"
+    );
+}
+
+/// Requirement 4: pipeline evidence and receipt metering for Lance reuse the
+/// existing binary-adapter rows — the same `UsageRoute` rows every object
+/// meters on (there is no, and must be no, format-specific metering route),
+/// with the binary-adapter evidence treatment. The Lance pipeline identity
+/// (`CommonTypeBinaryReductor` + `EnvelopeBinaryTransform`) is asserted
+/// through the envelope effect below and at unit level by
+/// `lance/tests.rs::process_lance_emits_the_typed_envelope_schema`.
+#[tokio::test]
+async fn lance_metering_reuses_the_binary_adapter_rows() {
+    let control = Arc::new(RecordingMeteringControl::default());
+    let metering = control.clone();
+    let (app, state, _gate) =
+        coverage_router_with(Arc::new(RecordingPolicyGate::default()), move |state| {
+            with_lance_enabled(state);
+            state.control = metering.clone();
+            state.source_body_limits.max_bytes = 64 * 1024 * 1024;
+            state.max_pipeline_output_bytes = 64 * 1024 * 1024;
+        })
+        .await;
+    // A key with the hybrid public key attached so the envelope transform
+    // runs on its declared target.
+    let (secret, created) = state
+        .keys
+        .create_key(
+            "test-user",
+            &WorkspaceId::new("test-user").unwrap(),
+            "lance-metering",
+            0,
+            Some(TEST_PUBLIC_KEY_PEM.to_string()),
+        )
+        .await
+        .expect("create test API key");
+    let hdrs = auth_headers(&created.key_id, &secret);
+    create_bucket(&app, &hdrs).await;
+
+    let put = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/bucket/metered.lance")
+            .header(header::CONTENT_TYPE, LANCE_MEDIA_TYPE)
+            .header("x-maskura-encrypt-fields", "email")
+            .body(Body::from(LANCE_MIXED_V2_0.to_vec()))
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(put).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let raw_get = add_headers(
+        lance_object_get("metered.lance", false)
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(raw_get).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        !stored
+            .windows(b"ada@example.com".len())
+            .any(|window| window == b"ada@example.com"),
+        "the Lance pipeline runs the binary-adapter envelope transform"
+    );
+
+    let processed = add_headers(
+        lance_object_get("metered.lance", true)
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(processed).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let events = control.events.lock().unwrap().clone();
+    assert_eq!(
+        events
+            .iter()
+            .map(|call| {
+                (
+                    call.event.kind(),
+                    call.event.route(),
+                    call.event.pipeline_evidence().is_some(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            // The existing binary-adapter rows: standard object routes, the
+            // binary-adapter evidence treatment, and no format-specific
+            // metering route anywhere.
+            (RequestKind::Write, UsageRoute::PutObject, false),
+            (RequestKind::Read, UsageRoute::GetObject, false),
+            (RequestKind::Read, UsageRoute::GetObject, false),
+        ],
+        "Lance must reuse the existing binary-adapter metering rows"
     );
 }
