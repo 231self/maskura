@@ -18,6 +18,8 @@ deeper documentation:
 - **[Run the claims](proofs.md)** — black-box S3, plugin, and Python encryption
   proofs with explicit assertions and limits.
 - **[Avro gate](avro.md)** — the typed Avro OCF processing path.
+- **[Lance format](lance.md)** — the columnar ML table adapter, in development
+  (ADR 0026, ahead of Parquet).
 - **[Binary adapters](binary-adapters.md)** — schema-aware binary reductors for
   typed formats.
 - **[MCP](mcp.md)** — the local stdio MCP server for agent clients.
