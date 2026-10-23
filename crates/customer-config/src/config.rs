@@ -73,6 +73,7 @@ pub struct FeaturesConfig {
     pub streaming_read_mode: StreamingReadMode,
     pub transformed_read_spool: bool,
     pub enable_avro: bool,
+    pub enable_lance: bool,
     pub streaming_s3_provider: Option<StreamingS3Provider>,
     pub dev_memory_streaming: bool,
     pub managed_streaming_mode: ManagedStreamingMode,
@@ -201,6 +202,7 @@ struct FeaturesWire {
     streaming_read_mode: Option<StreamingReadMode>,
     transformed_read_spool: bool,
     enable_avro: bool,
+    enable_lance: bool,
     streaming_s3_provider: Option<StreamingS3Provider>,
     dev_memory_streaming: bool,
     managed_streaming_mode: ManagedStreamingMode,
@@ -228,6 +230,7 @@ impl<'de> Deserialize<'de> for Config {
                 streaming_read_mode: wire.features.streaming_read_mode.unwrap_or_default(),
                 transformed_read_spool: wire.features.transformed_read_spool,
                 enable_avro: wire.features.enable_avro,
+                enable_lance: wire.features.enable_lance,
                 streaming_s3_provider: wire.features.streaming_s3_provider,
                 dev_memory_streaming: wire.features.dev_memory_streaming,
                 managed_streaming_mode: wire.features.managed_streaming_mode,
@@ -353,6 +356,9 @@ impl Config {
         }
         if let Some(value) = resolve(aliases::ENABLE_AVRO)? {
             self.features.enable_avro = parse_bool("features.enable_avro", &value)?;
+        }
+        if let Some(value) = resolve(aliases::ENABLE_LANCE)? {
+            self.features.enable_lance = parse_bool("features.enable_lance", &value)?;
         }
         if let Some(value) = resolve(aliases::STREAMING_S3_PROVIDER)? {
             self.features.streaming_s3_provider = Some(parse_streaming_provider(&value)?);

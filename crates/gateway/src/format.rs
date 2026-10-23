@@ -75,17 +75,20 @@ pub struct FeatureGate {
 pub struct EnabledBinaryFormats {
     pub avro: bool,
     pub parquet: bool,
+    pub lance: bool,
 }
 
 impl EnabledBinaryFormats {
     pub const NONE: Self = Self {
         avro: false,
         parquet: false,
+        lance: false,
     };
 
     pub const ALL: Self = Self {
         avro: true,
         parquet: true,
+        lance: true,
     };
 
     pub fn is_enabled(self, spec: &FormatSpec) -> bool {
@@ -94,6 +97,7 @@ impl EnabledBinaryFormats {
                 || match feature_gate.name {
                     "avro" => self.avro,
                     "parquet" => self.parquet,
+                    "lance" => self.lance,
                     _ => false,
                 }
         })
@@ -292,7 +296,28 @@ pub static PARQUET_SPEC: FormatSpec = FormatSpec {
     record_format: None,
 };
 
-pub static FORMAT_SPECS: [&FormatSpec; 8] = [
+pub static LANCE_SPEC: FormatSpec = FormatSpec {
+    name: "lance",
+    codec_kind: CodecKind::SeekableBinary,
+    canonical_media_type: "application/vnd.apache.lance",
+    media_type_aliases: &["application/x-lance", "application/vnd.lance"],
+    extensions: &["lance"],
+    magic: MagicRequirements {
+        // Lance files have no head magic: real files begin with page data.
+        // Detection validates the trailing `LANC` magic plus the version pair
+        // in the file footer (see `crate::lance::validate_magic_footer`).
+        prefix: None,
+        required_footer: Some(b"LANC"),
+    },
+    processed_read_safety: ProcessedReadSafety::CompleteOutputRequired,
+    feature_gate: Some(FeatureGate {
+        name: "lance",
+        enabled_by_default: false,
+    }),
+    record_format: None,
+};
+
+pub static FORMAT_SPECS: [&FormatSpec; 9] = [
     &JSONL_SPEC,
     &JSON_SPEC,
     &CSV_SPEC,
@@ -301,6 +326,7 @@ pub static FORMAT_SPECS: [&FormatSpec; 8] = [
     &BINARY_SPEC,
     &AVRO_SPEC,
     &PARQUET_SPEC,
+    &LANCE_SPEC,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -731,7 +757,7 @@ mod tests {
     fn runtime_binary_gates_can_enable_avro_and_parquet() {
         let avro_only = EnabledBinaryFormats {
             avro: true,
-            parquet: false,
+            ..EnabledBinaryFormats::NONE
         };
         let avro = resolve_format_with_policy(
             None,
@@ -863,13 +889,64 @@ mod tests {
                 deferred_magic,
                 EnabledBinaryFormats {
                     avro: true,
-                    parquet: false,
+                    ..EnabledBinaryFormats::NONE
                 },
             )
             .unwrap()
             .spec,
             &AVRO_SPEC
         );
+    }
+
+    #[test]
+    fn lance_has_tail_magic_and_is_disabled() {
+        assert_eq!(LANCE_SPEC.codec_kind, CodecKind::SeekableBinary);
+        assert_eq!(LANCE_SPEC.magic.prefix, None);
+        assert_eq!(LANCE_SPEC.magic.required_footer, Some(b"LANC".as_slice()));
+        assert_eq!(
+            LANCE_SPEC.processed_read_safety,
+            ProcessedReadSafety::CompleteOutputRequired
+        );
+        assert!(!LANCE_SPEC.enabled_by_default());
+        assert_eq!(
+            resolve_format_with_policy(
+                None,
+                Some("application/vnd.apache.lance"),
+                None,
+                None,
+                FormatResolutionPolicy::STRICT_CONTENT_TYPE,
+                EnabledBinaryFormats::NONE,
+            ),
+            Err(FormatResolveError::Disabled {
+                format: "lance",
+                feature_gate: "lance",
+            })
+        );
+        let enabled = resolve_format_with_policy(
+            None,
+            Some("application/x-lance"),
+            None,
+            None,
+            FormatResolutionPolicy::STRICT_CONTENT_TYPE,
+            EnabledBinaryFormats {
+                lance: true,
+                ..EnabledBinaryFormats::NONE
+            },
+        )
+        .unwrap();
+        assert_eq!(enabled.spec, &LANCE_SPEC);
+        // Conflicting signals are still rejected rather than guessed.
+        assert!(matches!(
+            resolve_format_with_policy(
+                Some("json"),
+                Some("application/vnd.apache.lance"),
+                None,
+                None,
+                FormatResolutionPolicy::STRICT_CONTENT_TYPE,
+                EnabledBinaryFormats::ALL,
+            ),
+            Err(FormatResolveError::Conflict { .. })
+        ));
     }
 
     #[test]

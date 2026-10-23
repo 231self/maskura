@@ -931,6 +931,26 @@ pub(crate) async fn complete_staged_multipart(
         .ok_or_else(|| {
             MultipartCompletionError::Invalid("multipart Content-Type is missing".to_string())
         })?;
+    if let Some(lance_media) = lance_media_type(content_type) {
+        if !state.binary_lance_enabled {
+            return Err(MultipartCompletionError::Streaming(
+                StreamingPutError::Unsupported(
+                    "Lance processing is disabled; set MASKURA_ENABLE_LANCE=true".to_string(),
+                ),
+            ));
+        }
+        return complete_staged_lance_multipart(
+            state,
+            staging,
+            identity,
+            upload,
+            lease,
+            operation,
+            backend,
+            &lance_media,
+        )
+        .await;
+    }
     if let Some(avro_media) = avro_media_type(content_type) {
         if !state.binary_avro_enabled {
             return Err(MultipartCompletionError::Streaming(
@@ -1751,6 +1771,171 @@ pub(crate) async fn complete_staged_avro_multipart(
     };
     let output_bytes = u64::try_from(output.len())
         .map_err(|_| MultipartCompletionError::Invalid("Avro output is too large".to_string()))?;
+    let output_digest = hex::encode(sha2::Sha256::digest(&output));
+    let result = async {
+        renew_and_fence_completion(staging, identity, lease).await?;
+        sink.write(bytes::Bytes::from(output)).await?;
+        sink.verify_output(output_bytes, &output_digest).await?;
+        renew_and_fence_completion(staging, identity, lease).await?;
+        let precommit_result = MultipartCompletionResult {
+            etag: None,
+            checksum_sha256: output_digest.clone(),
+            version_id: None,
+            source_bytes: input_bytes,
+            size_bytes: output_bytes,
+            pipeline_evidence: None,
+        };
+        let mut usage_event = multipart_completion_event(operation.grant, &precommit_result);
+        usage_event = usage_event.with_operation_id(destination_operation_id);
+        renew_and_fence_completion(staging, identity, lease).await?;
+        coordinator
+            .publish(
+                identity,
+                fingerprint,
+                lease.fencing_token,
+                precommit_result,
+                &usage_event,
+                &mut sink,
+            )
+            .await
+            .map_err(MultipartCompletionError::from)
+    }
+    .await;
+
+    if result.is_err()
+        && renew_and_fence_completion(staging, identity, lease)
+            .await
+            .is_ok()
+    {
+        let _ = sink.abort().await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn complete_staged_lance_multipart(
+    state: &AppState,
+    staging: &MultipartStaging,
+    identity: &MultipartIdentity,
+    upload: &MultipartUpload,
+    lease: &CompletionLease,
+    operation: AuthorizedOperation<'_>,
+    backend: ResolvedBackend,
+    content_type: &str,
+) -> Result<MultipartCompletionResult, MultipartCompletionError> {
+    use sha2::Digest as _;
+
+    let fingerprint = upload
+        .complete_request_fingerprint
+        .as_deref()
+        .ok_or_else(|| {
+            MultipartCompletionError::Invalid(
+                "multipart completion fingerprint is missing".to_string(),
+            )
+        })?;
+    let destination_operation_id =
+        crate::multipart_staging::DestinationCommitPermit::deterministic_operation_id(
+            identity,
+            fingerprint,
+        );
+    let coordinator = multipart_completion_coordinator(state, staging)?;
+    renew_and_fence_completion(staging, identity, lease).await?;
+    let stored_metadata = multipart_stored_metadata(&upload.snapshot);
+    validate_multipart_checksum_mode(&upload.snapshot)
+        .map_err(|detail| MultipartCompletionError::Invalid(detail.to_string()))?;
+    let mut sink = begin_streaming_sink(
+        state,
+        backend,
+        operation,
+        destination_operation_id,
+        &identity.bucket,
+        &identity.key,
+        content_type,
+        Some((&coordinator, identity, fingerprint)),
+        Some(stored_metadata),
+    )
+    .await?;
+    coordinator
+        .bind_existing_operation(destination_operation_id, identity)
+        .await?;
+    // Route admission can block; a stale completion worker must stop before it
+    // polls any selected artifact.
+    renew_and_fence_completion(staging, identity, lease).await?;
+
+    let max_source_bytes = state.source_body_limits.max_bytes.min(64 * 1024 * 1024) as usize;
+    let mut input = Vec::new();
+    let mut input_bytes = 0_u64;
+    for part in &lease.selected_parts {
+        renew_and_fence_completion(staging, identity, lease).await?;
+        let body = staging.artifacts.get(&part.artifact_key).await?;
+        renew_and_fence_completion(staging, identity, lease).await?;
+        let mut reader = EncryptedPartReader::open(
+            body,
+            identity,
+            part,
+            &upload.snapshot,
+            staging.wrapping.clone(),
+        )
+        .await?;
+        let mut part_bytes = 0_u64;
+        let mut part_sha256 = sha2::Sha256::new();
+        let mut part_md5 = Md5::new();
+        loop {
+            renew_and_fence_completion(staging, identity, lease).await?;
+            let Some(chunk) = reader.next_chunk().await? else {
+                break;
+            };
+            part_bytes = part_bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
+                MultipartCompletionError::Invalid("multipart part is too large".to_string())
+            })?;
+            input_bytes = input_bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
+                MultipartCompletionError::Invalid("multipart input is too large".to_string())
+            })?;
+            if part_bytes > part.size_bytes || input_bytes as usize > max_source_bytes {
+                return Err(MultipartCompletionError::Invalid(
+                    "multipart input exceeds its limit".to_string(),
+                ));
+            }
+            part_sha256.update(&chunk);
+            part_md5.update(&chunk);
+            input.extend_from_slice(&chunk);
+        }
+        if part_bytes != part.size_bytes
+            || hex::encode(part_sha256.finalize()) != part.checksum_sha256
+            || format!("\"{}\"", hex::encode(part_md5.finalize())) != part.etag
+        {
+            return Err(MultipartCompletionError::Invalid(
+                "staged multipart artifact does not match its committed part".to_string(),
+            ));
+        }
+    }
+    let limits = crate::lance::LanceLimits {
+        max_source_bytes,
+        ..crate::lance::LanceLimits::default()
+    };
+    let headers = HeaderMap::new();
+    let mut pump = lance_pump(operation.auth, &headers, limits)?;
+    let mut decoding = tokio::task::spawn_blocking(move || {
+        crate::lance::process_lance(input.as_slice(), limits, &mut pump)
+    });
+    let output = loop {
+        tokio::select! {
+            result = &mut decoding => {
+                break result
+                    .map_err(|_| MultipartCompletionError::Invalid(
+                        "Lance decoding worker failed".to_string(),
+                    ))??;
+            }
+            () = tokio::time::sleep((COMPLETION_LEASE / 3).max(Duration::from_millis(1))) => {
+                if let Err(error) = renew_and_fence_completion(staging, identity, lease).await {
+                    decoding.abort();
+                    return Err(error.into());
+                }
+            }
+        }
+    };
+    let output_bytes = u64::try_from(output.len())
+        .map_err(|_| MultipartCompletionError::Invalid("Lance output is too large".to_string()))?;
     let output_digest = hex::encode(sha2::Sha256::digest(&output));
     let result = async {
         renew_and_fence_completion(staging, identity, lease).await?;

@@ -45,6 +45,7 @@ pub struct AppState {
     pub transformed_read_spool_enabled: bool,
     /// Enables the opt-in Avro OCF processing path. Disabled by default.
     pub binary_avro_enabled: bool,
+    pub binary_lance_enabled: bool,
     pub dev_memory_max_object_bytes: usize,
     pub dev_memory_streaming_enabled: bool,
     pub(crate) demo_pipelines: DemoPipelines,
