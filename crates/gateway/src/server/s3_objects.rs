@@ -2130,6 +2130,34 @@ pub(crate) async fn s3_get(
                 .await;
             }
         };
+        // Table-unit dispatch runs before any per-object format dispatch: a
+        // processed read inside a table root is a table operation or a named
+        // fail-closed rejection (ADR 0028), never an ordinary object read.
+        if let Some((response, completed_source_bytes)) =
+            crate::server::iceberg::iceberg_transformed_read_response(
+                &state,
+                &auth,
+                &headers,
+                &params,
+                &metadata.headers,
+                backend,
+                &bucket,
+                &key,
+            )
+            .await
+        {
+            let source_bytes = content_length(&metadata.headers);
+            return metered_read_response(
+                state.control.clone(),
+                &auth,
+                &grant,
+                &key,
+                source_bytes.or(completed_source_bytes),
+                response,
+                None,
+            )
+            .await;
+        }
         if is_lance_content_type(&metadata.headers) {
             if let Some(error) = avro_read_preflight(&headers, &params, &metadata) {
                 return transformed_read_error_response(&key, error);
@@ -3600,6 +3628,20 @@ pub(crate) async fn s3_post(
         };
         if let Err(error) = crate::policy_gate::consume_policy(&policy, &selection.snapshot) {
             return policy_error_response(&key, &error);
+        }
+        // Table units are single-object operations (ADR 0028): a multipart
+        // create of a table-root document or sub-unit fails closed after the
+        // policy gate has covered the request.
+        if let Some(error) = crate::server::iceberg::multipart_table_rejection(
+            &state,
+            backend,
+            &bucket,
+            &key,
+            crate::server::iceberg::content_type_of(&parts.headers),
+        )
+        .await
+        {
+            return pipeline_error_response(&key, &error);
         }
         if let Err(error) = validate_streaming_backend(&state, backend) {
             return streaming_put_error_response(&key, error);
