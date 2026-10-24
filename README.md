@@ -199,7 +199,9 @@ Rust, Python, JavaScript/TypeScript, and workflow code.
 - [Runnable examples](examples/README.md)
 - [MCP server](docs/mcp.md)
 - [Avro support](docs/avro.md)
-- [Lance format track](docs/lance.md) — columnar ML tables, in development (ADR 0026)
+- [Lance format](docs/lance.md) — **New!** columnar ML tables (ADR 0026)
+- [Apache Parquet](docs/parquet.md) — **New!** typed columnar processing (ADR 0027)
+- [Iceberg table format](docs/iceberg.md) — **New!** table-aware policy layer (ADR 0028)
 - [Benchmarks](docs/benchmarks.md)
 - [Open-source and hosted Maskura](https://maskura.dev/open-source/)
 
