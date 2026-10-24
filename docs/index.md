@@ -20,6 +20,8 @@ deeper documentation:
 - **[Avro gate](avro.md)** — the typed Avro OCF processing path.
 - **[Lance format](lance.md)** — the columnar ML table adapter, in development
   (ADR 0026, ahead of Parquet).
+- **[Iceberg table format](iceberg.md)** — the table-aware adapter over the
+  file codecs (ADR 0028, default-off).
 - **[Binary adapters](binary-adapters.md)** — schema-aware binary reductors for
   typed formats.
 - **[MCP](mcp.md)** — the local stdio MCP server for agent clients.

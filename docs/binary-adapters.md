@@ -18,6 +18,14 @@ The `binary-reductor` world is part of `maskura:plugin@0.1.0` in
   default-off gate, policy-`EffectiveState` coverage with the codec. Lance
   dataset versions are opaque within object versions (no v1 time travel).
 - **Parquet** — approved scope, following Lance.
+- **Iceberg** (table layer, not an object codec) — the table-aware layer over
+  these codecs ([ADR 0028](adr/0028-iceberg-table-format-adapter.md),
+  [status page](iceberg.md)): the unit of work is the table root, manifests are
+  read with the Avro stack but rewritten by the table layer, and the commit is
+  one atomic `version-hint` pointer swap. `MASKURA_ENABLE_ICEBERG` default-off
+  gate and policy-`EffectiveState` coverage land with the adapter. Data files
+  transform through the Parquet codec seam, which fails closed until the
+  Parquet adapter is wired.
 
 ## Lifecycle
 

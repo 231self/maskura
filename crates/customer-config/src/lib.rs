@@ -49,6 +49,7 @@ pub mod aliases {
     pub const STREAMING_S3_PROVIDER: EnvAlias = EnvAlias::new("MASKURA_STREAMING_S3_PROVIDER");
     pub const ENABLE_AVRO: EnvAlias = EnvAlias::new("MASKURA_ENABLE_AVRO");
     pub const ENABLE_LANCE: EnvAlias = EnvAlias::new("MASKURA_ENABLE_LANCE");
+    pub const ENABLE_ICEBERG: EnvAlias = EnvAlias::new("MASKURA_ENABLE_ICEBERG");
     pub const LEGACY_MAX_OBJECT_BYTES: EnvAlias = EnvAlias::new("MASKURA_LEGACY_MAX_OBJECT_BYTES");
     pub const SINGLE_TENANT: EnvAlias = EnvAlias::new("MASKURA_SINGLE_TENANT");
     pub const LOCAL_STORAGE_DIR: EnvAlias = EnvAlias::new("MASKURA_LOCAL_STORAGE_DIR");
@@ -80,6 +81,7 @@ pub mod aliases {
         STREAMING_S3_PROVIDER,
         ENABLE_AVRO,
         ENABLE_LANCE,
+        ENABLE_ICEBERG,
         LEGACY_MAX_OBJECT_BYTES,
         SINGLE_TENANT,
         LOCAL_STORAGE_DIR,

@@ -93,6 +93,9 @@ pub(crate) fn pipeline_error_response(
         | maskura_error::codes::LIMIT_INTERMEDIATE_BYTES
         | maskura_error::codes::LIMIT_FINISH_BYTES
         | maskura_error::codes::RECORD_TOO_LARGE => s3_error::entity_too_large(key),
+        maskura_error::codes::UNSUPPORTED_TABLE_OPERATION => {
+            s3_error::unsupported_table_operation(key, error.message())
+        }
         maskura_error::codes::DECODE_JSON
         | maskura_error::codes::DECODE_JSONL
         | maskura_error::codes::DECODE_CSV
@@ -165,7 +168,7 @@ pub(crate) fn streaming_format_content_type(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn streaming_single_put(
     state: &AppState,
-    mut authentication: HeaderAuthentication,
+    authentication: HeaderAuthentication,
     backend: ResolvedBackend,
     usage: AuthorizedUsage<'_>,
     snapshot: PipelineSnapshot,
@@ -191,6 +194,24 @@ pub(crate) async fn streaming_single_put(
             "Content-Encoding is unsupported for transformed streaming".to_string(),
         ));
     }
+    // Table-unit dispatch runs before any per-object format dispatch: a
+    // processed write inside a table root is a table operation or a named
+    // fail-closed rejection (ADR 0028), never an ordinary object write.
+    let mut authentication = Some(authentication);
+    if let Some(result) = crate::server::iceberg::streaming_iceberg_single_put(
+        state,
+        &mut authentication,
+        &backend,
+        usage,
+        headers,
+        &mut body,
+        key,
+    )
+    .await
+    {
+        return result;
+    }
+    let mut authentication = authentication.expect("untouched when the table dispatch declines");
     if is_lance_content_type(headers) {
         if !state.binary_lance_enabled {
             return Err(StreamingPutError::Unsupported(
