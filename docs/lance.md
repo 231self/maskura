@@ -14,10 +14,10 @@ set `MASKURA_ENABLE_LANCE=true` (or `features.enable_lance = true`) to opt in.
 Requests carrying Lance content while the gate is closed are rejected before
 the body is read and nothing is stored.
 
-Status: the codec and its policy coverage land together — the format
-adapter's `EffectiveState` entry and enforced-path matrix rows ship in the
-same change, per the policy-approval contract (ADR 0022): uncovered
-format-adapter paths fail closed.
+Status: **shipped** (2026-10-24). The codec and its policy coverage landed
+together per the policy-approval contract (ADR 0022): the format adapter's
+`EffectiveState` entry and enforced-path matrix rows shipped in the same
+change, so uncovered format-adapter paths fail closed.
 
 ## Why Lance first
 
