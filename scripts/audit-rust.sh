@@ -25,4 +25,21 @@ if [ -n "$holders" ] && [ "$holders" != "sqlx-core" ]; then
   exit 1
 fi
 
-cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0381
+# RUSTSEC-2026-0387 (crypto-bigint 0.5.5 timing variability in operations
+# intended to be constant-time; fixes >=0.7.6): held by aws-sigv4 1.6.0 (AWS
+# SigV4 signing path — no newer release exists, checked 2026-10-24) and
+# elliptic-curve 0.13.8 via p256 0.13.2 in maskura-pipeline-config (the ES256
+# verification ADR 0023 pins; a fixed crypto-bigint needs an
+# elliptic-curve/p256 0.14 major crypto-stack upgrade = architectural change,
+# not a patch). Exposure: timing side channels in bigint operations used by
+# SigV4 signing and P-256 verification. Keep the exception only while these
+# two are the sole holders; re-review on any aws-sigv4/elliptic-curve/p256 bump.
+holders="$(cargo tree --workspace --target all --color never -i crypto-bigint@0.5.5 --depth 1 \
+  2>/dev/null | tail -n +2 | sed 's/^[^A-Za-z0-9_-]*//' | awk '{print $1}' | sort -u)"
+expected_holders="$(printf 'aws-sigv4\nelliptic-curve')"
+if [ -n "$holders" ] && [ "$holders" != "$expected_holders" ]; then
+  echo "ERROR: crypto-bigint 0.5.5 holders changed ($holders); re-review RUSTSEC-2026-0387" >&2
+  exit 1
+fi
+
+cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0381 --ignore RUSTSEC-2026-0387
