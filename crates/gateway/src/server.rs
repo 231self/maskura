@@ -111,6 +111,7 @@ use crate::{Format, Gateway};
 mod admin;
 mod auth;
 mod demo;
+pub(crate) mod iceberg;
 mod lifecycle;
 mod multipart;
 mod openapi;

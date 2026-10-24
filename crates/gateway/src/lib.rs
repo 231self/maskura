@@ -14,6 +14,7 @@ pub mod file_store;
 pub(crate) mod filesystem_persistence;
 pub mod format;
 pub mod hybrid;
+pub mod iceberg;
 pub mod integrity;
 pub mod key_cipher;
 pub mod lance;

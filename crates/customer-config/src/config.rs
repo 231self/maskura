@@ -74,6 +74,10 @@ pub struct FeaturesConfig {
     pub transformed_read_spool: bool,
     pub enable_avro: bool,
     pub enable_lance: bool,
+    /// Enables the table-aware Iceberg adapter surface (ADR 0028). Disabled by
+    /// default: table-root writes and processed reads are rejected until an
+    /// operator opts in with `MASKURA_ENABLE_ICEBERG`.
+    pub enable_iceberg: bool,
     pub streaming_s3_provider: Option<StreamingS3Provider>,
     pub dev_memory_streaming: bool,
     pub managed_streaming_mode: ManagedStreamingMode,
@@ -203,6 +207,7 @@ struct FeaturesWire {
     transformed_read_spool: bool,
     enable_avro: bool,
     enable_lance: bool,
+    enable_iceberg: bool,
     streaming_s3_provider: Option<StreamingS3Provider>,
     dev_memory_streaming: bool,
     managed_streaming_mode: ManagedStreamingMode,
@@ -231,6 +236,7 @@ impl<'de> Deserialize<'de> for Config {
                 transformed_read_spool: wire.features.transformed_read_spool,
                 enable_avro: wire.features.enable_avro,
                 enable_lance: wire.features.enable_lance,
+                enable_iceberg: wire.features.enable_iceberg,
                 streaming_s3_provider: wire.features.streaming_s3_provider,
                 dev_memory_streaming: wire.features.dev_memory_streaming,
                 managed_streaming_mode: wire.features.managed_streaming_mode,
@@ -359,6 +365,9 @@ impl Config {
         }
         if let Some(value) = resolve(aliases::ENABLE_LANCE)? {
             self.features.enable_lance = parse_bool("features.enable_lance", &value)?;
+        }
+        if let Some(value) = resolve(aliases::ENABLE_ICEBERG)? {
+            self.features.enable_iceberg = parse_bool("features.enable_iceberg", &value)?;
         }
         if let Some(value) = resolve(aliases::STREAMING_S3_PROVIDER)? {
             self.features.streaming_s3_provider = Some(parse_streaming_provider(&value)?);
@@ -919,6 +928,7 @@ multipart_mode = "reject"
 streaming_read_mode = "transformed"
 transformed_read_spool = true
 enable_avro = true
+enable_iceberg = true
 streaming_s3_provider = "minio"
 dev_memory_streaming = true
 managed_streaming_mode = "observe"
@@ -981,6 +991,8 @@ presigned_http_min_validity_secs = 30
             config.features.streaming_read_mode,
             StreamingReadMode::Transformed
         );
+        assert!(config.features.enable_avro);
+        assert!(config.features.enable_iceberg);
         assert_eq!(
             config.supabase.url.as_deref(),
             Some("https://example.supabase.co")
@@ -1230,6 +1242,8 @@ dir = "/var/lib/maskura/staging"
         let config = Config::resolve(None).unwrap();
         assert_eq!(config.server.listen_addr, None);
         assert!(!config.auth.disabled);
+        // The Iceberg table surface is default-off (ADR 0028).
+        assert!(!config.features.enable_iceberg);
     }
 
     #[test]
@@ -1262,6 +1276,18 @@ dir = "/var/lib/maskura/staging"
             StreamingReadMode::Transformed
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_iceberg_gate_is_default_off_and_env_overridable() {
+        assert!(!parse("[features]\n").unwrap().features.enable_iceberg);
+        // SAFETY: this test owns this uncommon process variable for its brief
+        // lifetime, and setting it cannot invalidate other configurations
+        // resolved concurrently.
+        unsafe { std::env::set_var("MASKURA_ENABLE_ICEBERG", "true") };
+        let config = Config::resolve(None).unwrap();
+        unsafe { std::env::remove_var("MASKURA_ENABLE_ICEBERG") };
+        assert!(config.features.enable_iceberg);
     }
 
     #[test]

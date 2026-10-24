@@ -79,6 +79,7 @@ and filter components replace these defaults when provided.
 | `features.transformed_read_spool` | `MASKURA_TRANSFORMED_READ_SPOOL` | `false`. The environment value enables it only when equal to `encrypted` (case-insensitive). Required for transformed reads with any component not declared prefix-safe. |
 | `features.enable_avro` | `MASKURA_ENABLE_AVRO` | `false`. Enables Avro processing. |
 | `features.enable_lance` | `MASKURA_ENABLE_LANCE` | `false`. Enables Apache Lance processing. |
+| `features.enable_iceberg` | `MASKURA_ENABLE_ICEBERG` | `false`. Enables the table-aware Iceberg adapter surface (ADR 0028): table-root processed writes and reads. Partial processed operations inside a table root fail closed with `unsupported.table_operation` regardless of this gate. |
 | `features.streaming_s3_provider` | `MASKURA_STREAMING_S3_PROVIDER` | Unset; accepted values are `aws`, `minio`, `r2`, and `b2`. Required so Maskura can verify support for direct streaming to global S3. |
 | `features.dev_memory_streaming` | `MASKURA_DEV_MEMORY_STREAMING` | `false`. Enables the development in-memory streaming path outside explicit single-tenant mode. |
 | `features.managed_streaming_mode` | `MASKURA_MANAGED_STREAMING_MODE` | `off`; accepted values are `off`, `observe`, and `enforce`. `observe`/`enforce` require transactional mode and durable hosted dependencies. |

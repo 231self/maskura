@@ -323,7 +323,13 @@ fn schema_node_to_json(node: &SchemaNode, records: &mut u32) -> Result<JsonValue
     })
 }
 
-fn avro_value_to_ir(value: AvroValue, schema: &SchemaNode) -> Result<Value, MaskuraError> {
+/// Converts one decoded Avro value into the bounded Maskura IR.
+///
+/// The Iceberg manifest layer ([`crate::iceberg::manifest`]) routes manifest
+/// `partition` values — plain scalar records — through the typed value
+/// transform with these converters; manifest statistics columns stay at the
+/// raw Avro level because the bounded IR cannot represent `map<int, …>`.
+pub fn avro_value_to_ir(value: AvroValue, schema: &SchemaNode) -> Result<Value, MaskuraError> {
     let value = match value {
         AvroValue::Union(_, value) => *value,
         value => value,
@@ -410,7 +416,10 @@ fn avro_value_to_ir(value: AvroValue, schema: &SchemaNode) -> Result<Value, Mask
     }
 }
 
-fn ir_value_to_avro(value: &Value, schema: &SchemaNode) -> Result<AvroValue, MaskuraError> {
+/// Converts one IR value back to its Avro representation.
+///
+/// See [`avro_value_to_ir`] for the manifest-layer contract.
+pub fn ir_value_to_avro(value: &Value, schema: &SchemaNode) -> Result<AvroValue, MaskuraError> {
     if schema.nullable {
         if matches!(value, Value::Null) {
             return Ok(AvroValue::Union(0, Box::new(AvroValue::Null)));
