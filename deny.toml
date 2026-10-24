@@ -4,7 +4,14 @@
 # and rustls-webpki at 0.103.16. scripts/audit-rust.sh fails closed if any
 # holder other than sqlx-core appears on the 0.26 line. Re-review on any
 # sqlx/sea-orm bump.
-ignore = ["RUSTSEC-2026-0381"]
+# RUSTSEC-2026-0387: crypto-bigint 0.5.5 timing variability in "constant-time"
+# operations (fixes >=0.7.6); held by aws-sigv4 1.6.0 (no newer release,
+# checked 2026-10-24) and elliptic-curve 0.13.8 via p256 0.13.2 in
+# maskura-pipeline-config (ES256 verification, ADR 0023 — a fix needs the
+# elliptic-curve/p256 0.14 major crypto-stack upgrade). scripts/audit-rust.sh
+# fails closed if the holder set changes. Re-review on any
+# aws-sigv4/elliptic-curve/p256 bump.
+ignore = ["RUSTSEC-2026-0381", "RUSTSEC-2026-0387"]
 
 [graph]
 targets = []
