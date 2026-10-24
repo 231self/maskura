@@ -931,6 +931,22 @@ pub(crate) async fn complete_staged_multipart(
         .ok_or_else(|| {
             MultipartCompletionError::Invalid("multipart Content-Type is missing".to_string())
         })?;
+    // Table units are single-object operations (ADR 0028): a staged
+    // multipart completion targeting a table root document or sub-unit fails
+    // closed rather than publishing a per-object processed write.
+    if let Some(error) = crate::server::iceberg::multipart_table_rejection(
+        state,
+        &backend,
+        &identity.bucket,
+        &identity.key,
+        Some(content_type),
+    )
+    .await
+    {
+        return Err(MultipartCompletionError::Streaming(
+            StreamingPutError::Pipeline(error),
+        ));
+    }
     if let Some(lance_media) = lance_media_type(content_type) {
         if !state.binary_lance_enabled {
             return Err(MultipartCompletionError::Streaming(

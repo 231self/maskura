@@ -80,6 +80,18 @@ pub fn policy_error(key: &str, code: &str, message: &str) -> axum::response::Res
     s3_error_xml(code, message, key, StatusCode::FORBIDDEN)
 }
 
+/// Named table-layer rejection (ADR 0028): `unsupported.table_operation` is
+/// the machine-readable S3 `<Code>` element so callers can distinguish a
+/// partial table operation from an ordinary object failure.
+pub fn unsupported_table_operation(key: &str, message: &str) -> axum::response::Response {
+    s3_error_xml(
+        "unsupported.table_operation",
+        message,
+        key,
+        StatusCode::BAD_REQUEST,
+    )
+}
+
 pub fn no_such_key(key: &str) -> axum::response::Response {
     s3_error_xml(
         "NoSuchKey",

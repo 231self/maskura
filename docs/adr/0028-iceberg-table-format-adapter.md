@@ -107,3 +107,50 @@ Three approaches were considered:
 - The formats roadmap now covers the object formats (Avro, Lance, Parquet)
   and the table layer (Iceberg) under one policy-approval contract. Delta
   Lake remains unapproved scope.
+
+## Implementation notes (2026-10-23)
+
+The table layer landed as `crates/gateway/src/iceberg/` (detection, metadata,
+manifest rewrite, walker, commit) with the HTTP surface in
+`crates/gateway/src/server/iceberg.rs`, the default-off
+`MASKURA_ENABLE_ICEBERG` gate (`features.enable_iceberg` → the runtime
+`binary_iceberg_enabled` state), the `EffectiveState` route entry for the
+table-walk/commit path, and the enforced-path matrix rows. Mechanics this
+implementation fixed, for the record:
+
+- **The data-file transform is a named fail-closed seam**
+  (`DataFileTransform`), implemented by the Parquet codec ([ADR
+  0027](0027-parquet-format-adapter.md)) when it lands; until then
+  `UnsupportedDataFileTransform` fails every data file closed with
+  `unsupported.format`, so only zero-data-file tables can be processed end to
+  end. Wiring note: replace the stub at the two `walk_and_prepare` call sites
+  in `server/iceberg.rs` with the Parquet-backed transform. Pyiceberg interop
+  reading a transformed table end to end (§8) stays an acceptance item for
+  that follow-on.
+- **Processed write contract**: `PutObject` of the *current* table metadata
+  document to the next zero-padded version key (`0000N-token.metadata.json`).
+  The request body is the state the walk transforms (compare-and-swap against
+  the committed document); creating a table root through this path fails
+  closed because there is no committed state to transform.
+- **Processed read contract**: a complete-output staging of the document a
+  commit would produce — a preview, marked `x-maskura-iceberg-preview`, with
+  nothing stored and no raw fallback. `Range`/`partNumber` are rejected
+  before any walk.
+- **Partial-operation rejection is gate-independent.** The named
+  `unsupported.table_operation` failure applies to processed operations on
+  strict sub-units (and multipart of any table unit) whether or not
+  `MASKURA_ENABLE_ICEBERG` is open; the gate governs only table-root
+  processing. This ordering is pinned by the matrix rows.
+- **Hive-layout rejection uses two signals**: a `field=value` path shape plus
+  a table-claiming content type. A `_delta_log` marker alone always fails
+  closed for processed operations; a Hive-looking path alone is an ordinary
+  object (never guessed as a table, and never rejected on shape alone).
+- **Backends**: table operations require direct object IO (file, memory,
+  S3-compatible). Managed service storage and presigned proxies fail closed
+  with `unsupported.table_operation` — their placement/authority machinery has
+  no multi-object transactional shape for a commit yet.
+- **Commit fencing** is the `version-hint` compare-and-swap plus
+  write-new-objects-only ordering; the streaming workspace lease and write
+  intents are not yet integrated for the table path (v1, direct-IO backends
+  only). Post-swap cleanup of replaced plaintext objects is best-effort and
+  audited (`cleanup_failures`), matching the "no plaintext survives" intent.

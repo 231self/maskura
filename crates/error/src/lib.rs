@@ -37,6 +37,7 @@ pub mod codes {
     pub const RECEIPT_STALE: &str = "receipt.stale";
     pub const INTERNAL: &str = "internal";
     pub const UNSUPPORTED_FORMAT: &str = "unsupported.format";
+    pub const UNSUPPORTED_TABLE_OPERATION: &str = "unsupported.table_operation";
     pub const WIT_INVALID: &str = "wit.invalid";
     pub const COMPONENT_LOAD: &str = "component.load";
 }

@@ -46,6 +46,10 @@ pub struct AppState {
     /// Enables the opt-in Avro OCF processing path. Disabled by default.
     pub binary_avro_enabled: bool,
     pub binary_lance_enabled: bool,
+    /// Enables the table-aware Iceberg adapter surface (ADR 0028). Disabled by
+    /// default: table-root writes and processed reads are rejected until an
+    /// operator opts in with `MASKURA_ENABLE_ICEBERG`.
+    pub binary_iceberg_enabled: bool,
     pub dev_memory_max_object_bytes: usize,
     pub dev_memory_streaming_enabled: bool,
     pub(crate) demo_pipelines: DemoPipelines,

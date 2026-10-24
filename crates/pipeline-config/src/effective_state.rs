@@ -114,13 +114,19 @@ pub struct ResolvedRoute {
     pub resolution_fingerprint: String,
     pub explicit_passthrough: bool,
     /// Processing format for this route: `"bytes"` or a format-adapter name
-    /// (`"avro"`, `"lance"`, ...). Adapter names are the same keys as the
-    /// adapter feature gates (`MASKURA_ENABLE_AVRO` / `MASKURA_ENABLE_LANCE`,
-    /// surfaced as `features.enable_avro` / `features.enable_lance` and the
-    /// runtime `binary_avro_enabled` / `binary_lance_enabled` state).
+    /// (`"avro"`, `"lance"`, `"parquet"`, or `"iceberg"` for the
+    /// table-walk/commit path of the Iceberg table-format adapter, ADR 0028).
+    /// Adapter names are the same keys as the adapter feature gates
+    /// (`MASKURA_ENABLE_AVRO` / `MASKURA_ENABLE_LANCE` /
+    /// `MASKURA_ENABLE_ICEBERG`, surfaced as `features.enable_avro` /
+    /// `features.enable_lance` / `features.enable_iceberg` and the runtime
+    /// `binary_avro_enabled` / `binary_lance_enabled` /
+    /// `binary_iceberg_enabled` state). Every non-`"bytes"` route must pin
+    /// its adapter implementation in `adapter_sha256`.
     pub format: String,
     /// SHA-256 of the pinned adapter implementation. Required (and only
-    /// meaningful) for non-`"bytes"` routes.
+    /// meaningful) for non-`"bytes"` routes, so an approved route cannot
+    /// silently change meaning when the adapter changes.
     pub adapter_sha256: Option<String>,
     pub limits: ResolvedLimits,
     pub steps: Vec<ResolvedStep>,
@@ -519,6 +525,34 @@ mod tests {
         assert!(malformed.validate().is_err());
     }
 
+    /// The ADR 0028 entry: the Iceberg table-walk/commit path is a first-class
+    /// `EffectiveState` route — `format: "iceberg"` keyed to the default-off
+    /// `MASKURA_ENABLE_ICEBERG` gate — and, like every non-`bytes` adapter
+    /// route, it pins the adapter implementation that owns it.
+    #[test]
+    fn the_iceberg_table_walk_route_is_a_pinned_effective_state_entry() {
+        let mut state = fixture();
+        state.routes[0].format = "iceberg".into();
+        state.routes[0].adapter_sha256 = Some("a".repeat(64));
+        state
+            .validate()
+            .expect("the pinned iceberg table-walk/commit route validates");
+        let pinned = state.digest().unwrap();
+
+        // The pin is load-bearing: an unpinned iceberg route is not a valid
+        // commitment, and swapping the pin changes what is committed.
+        let mut unpinned = state.clone();
+        unpinned.routes[0].adapter_sha256 = None;
+        assert!(
+            unpinned.validate().is_err(),
+            "an unpinned iceberg table route must fail closed"
+        );
+
+        let mut repinned = state.clone();
+        repinned.routes[0].adapter_sha256 = Some("b".repeat(64));
+        repinned.validate().expect("still pinned");
+        assert_ne!(repinned.digest().unwrap(), pinned);
+    }
     #[test]
     fn step_order_is_signed_and_invalid_routes_fail_closed() {
         let mut state = fixture();
