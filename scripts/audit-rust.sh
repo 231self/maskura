@@ -42,4 +42,29 @@ if [ -n "$holders" ] && [ "$holders" != "$expected_holders" ]; then
   exit 1
 fi
 
-cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0381 --ignore RUSTSEC-2026-0387
+# RUSTSEC-2026-0391/0395-0406/0410 (the zstd family: abandoned-stream data
+# leaks into the next stream on a reused context, uninitialized memory on
+# legacy-frame decode failures, and the zstd-sys companion; fixes at
+# zstd >=0.14.3 / zstd-safe >=8.2.0): held by apache-avro 0.22 (its
+# zstandard feature pins zstd ^0.13; 0.22.0 is the latest release,
+# checked 2026-10-26) and wasmtime-internal-cache 48 (needs the wasmtime
+# 50 runtime major). Exposure: zstd decompression of untrusted Avro
+# blocks and plugin cache reads. Keep the exception only while these two
+# are the sole holders. Named follow-ups: evaluate wasmtime 50 (drops
+# one holder) and evaluate dropping apache-avro's zstandard feature
+# (fail-closed on zstd-compressed Avro, drops the untrusted-input path);
+# re-review on any apache-avro/wasmtime bump.
+holders="$(cargo tree --workspace --target all --color never -i zstd@0.13.3 --depth 1 \
+  2>/dev/null | tail -n +2 | sed 's/^[^A-Za-z0-9_-]*//' | awk '{print $1}' | sort -u)"
+expected_holders="$(printf 'apache-avro\nwasmtime-internal-cache')"
+if [ -n "$holders" ] && [ "$holders" != "$expected_holders" ]; then
+  echo "ERROR: zstd 0.13.3 holders changed ($holders); re-review the zstd family exceptions" >&2
+  exit 1
+fi
+
+cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0381 --ignore RUSTSEC-2026-0387 \
+  --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0395 --ignore RUSTSEC-2026-0396 \
+  --ignore RUSTSEC-2026-0397 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0399 \
+  --ignore RUSTSEC-2026-0400 --ignore RUSTSEC-2026-0401 --ignore RUSTSEC-2026-0402 \
+  --ignore RUSTSEC-2026-0403 --ignore RUSTSEC-2026-0404 --ignore RUSTSEC-2026-0405 \
+  --ignore RUSTSEC-2026-0406 --ignore RUSTSEC-2026-0410
