@@ -11,7 +11,30 @@
 # elliptic-curve/p256 0.14 major crypto-stack upgrade). scripts/audit-rust.sh
 # fails closed if the holder set changes. Re-review on any
 # aws-sigv4/elliptic-curve/p256 bump.
-ignore = ["RUSTSEC-2026-0381", "RUSTSEC-2026-0387"]
+# RUSTSEC-2026-0391/0395-0406/0410 (the zstd family; fixes zstd >=0.14.3 /
+# zstd-safe >=8.2.0): held by apache-avro 0.22 (latest, pins zstd ^0.13) and
+# wasmtime-internal-cache 48 (needs the wasmtime 50 major).
+# scripts/audit-rust.sh fails closed if the holder set changes. Named
+# follow-ups: evaluate wasmtime 50 and dropping apache-avro's zstandard
+# feature. Re-review on any apache-avro/wasmtime bump.
+ignore = [
+  "RUSTSEC-2026-0381",
+  "RUSTSEC-2026-0387",
+  "RUSTSEC-2026-0391",
+  "RUSTSEC-2026-0395",
+  "RUSTSEC-2026-0396",
+  "RUSTSEC-2026-0397",
+  "RUSTSEC-2026-0398",
+  "RUSTSEC-2026-0399",
+  "RUSTSEC-2026-0400",
+  "RUSTSEC-2026-0401",
+  "RUSTSEC-2026-0402",
+  "RUSTSEC-2026-0403",
+  "RUSTSEC-2026-0404",
+  "RUSTSEC-2026-0405",
+  "RUSTSEC-2026-0406",
+  "RUSTSEC-2026-0410",
+]
 
 [graph]
 targets = []
