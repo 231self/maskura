@@ -292,7 +292,6 @@ fn configure_local_staged_env(env: &mut EnvRestore, root: &Path) {
     env.set("MASKURA_STORAGE_MODE", "local");
     env.set("MASKURA_LOCAL_STORAGE_DIR", &root.to_string_lossy());
     env.set("MASKURA_MULTIPART_MODE", "staged");
-    env.set("MASKURA_STREAMING_READ_MODE", "passthrough");
     env.set("MASKURA_SIGV4_TRUSTED_TLS", "1");
     let components = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/components");
     assert!(

@@ -112,9 +112,8 @@ impl PolicyGate for RecordingPolicyGate {
 /// Staged multipart and transformed reads are config-explicit features; a
 /// TOML file sets the explicit flags the same way operator deployment does.
 /// The feature fields are pinned after resolve because the process-wide
-/// `test_pipeline_template` fixture force-sets env overrides (including
-/// `MASKURA_STREAMING_READ_MODE=passthrough`) that would otherwise stomp the
-/// file depending on test order.
+/// `test_pipeline_template` fixture force-sets env overrides that would
+/// otherwise stomp the file depending on test order.
 fn coverage_config() -> (Config, std::path::PathBuf) {
     let scratch = std::env::temp_dir().join(format!(
         "maskura-policy-gate-coverage-{}",

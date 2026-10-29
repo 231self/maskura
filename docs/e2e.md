@@ -54,7 +54,9 @@ The orchestrator starts (or reuses) one shared environment for every feature:
 - **Bucket `maskura-local`** is created if missing.
 - **Gateway (AUTH_DISABLED)** on `$MASKURA_E2E_GW_PORT` (default `9010`),
   single-tenant streaming against that MinIO, an isolated `keys.json`, the
-  built `pii-default` component, and `MASKURA_STREAMING_READ_MODE=passthrough`.
+  built `pii-default` component. Reads are protected by the resolved read
+  pipeline (ADR 0029); the `30-keys` feature asserts the mandated `HEAD`
+  denial under a protected scope.
 - Gateway, MinIO, and the filter/binaries are **built from the working tree**
   each run, so the suite validates the code you have checked out.
 

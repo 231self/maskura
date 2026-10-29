@@ -64,11 +64,11 @@ field limits follow the shared IR contract.
 
 ## Read semantics
 
-Lance is not prefix-safe in the first release: a processed
-`x-maskura-process: read` GET stages the complete filtered output in the
-encrypted read spool before any response body is disclosed, exactly like Avro
-and Parquet. Raw GET, HEAD, and byte-range semantics over the stored
-representation are unchanged — those paths are unprocessed passthrough.
+Lance is not prefix-safe in the first release: a protected GET (the resolved
+read pipeline, ADR 0029) stages the complete filtered output in the encrypted
+read spool before any response body is disclosed, exactly like Avro and
+Parquet. Under an `explicit_passthrough` read scope, GET, HEAD, and byte-range
+semantics over the stored representation are unprocessed passthrough.
 Processed reads never fall back to raw bytes; `Range` and `partNumber` are
 rejected for processed reads.
 

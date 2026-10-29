@@ -5,6 +5,11 @@
 
 ## Context
 
+> **Note (ADR 0029):** the `MASKURA_STREAMING_READ_MODE` surface described in
+> this record was retired; reads are governed by the resolved read pipeline.
+> The zero-config default stands — local reads resolve the enabled default
+> component as their pipeline.
+
 MinIO retired its free Docker distribution, leaving self-hosters who used
 `docker run minio/minio` without an obvious drop-in replacement. Maskura already
 shipped the durable local `FileStore` (ADR 0012) and local staged multipart

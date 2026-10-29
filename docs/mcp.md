@@ -224,9 +224,10 @@ Delete agent-data/examples/mcp.txt.
 `text/plain; charset=utf-8`). Maskura uses that Content-Type to select the processing
 format before writing to the configured backend.
 
-`maskura_get_object` returns the stored representation by default. Set `process` to
-`true` to send `x-maskura-process: read` and run the configured read pipeline before
-the MCP client receives the object.
+`maskura_get_object` applies the resolved read pipeline to every read (ADR 0029):
+the MCP client receives the protected projection, or the stored bytes when the
+scope's pipeline is an explicit passthrough assignment. The `process` parameter
+is retained for wire compatibility and is inert.
 
 `maskura_list_objects` performs S3 ListObjectsV2 with an optional prefix and returns
 decoded object keys. `maskura_delete_object` deletes one bucket/key pair.

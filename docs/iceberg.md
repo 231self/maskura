@@ -50,12 +50,15 @@ cannot be processed end to end until then.
 - **Table-root processed write** — `PutObject` of the *current* table metadata
   document to the next version's key. With the gate closed the request is
   rejected 501 before the body is read and nothing is stored.
-- **Table-root processed read** — `x-maskura-process: read` `GetObject` of the
-  current metadata document stages the complete transformed output (the
-  document a commit would produce; a preview — nothing is stored). `Range` and
-  `partNumber` are rejected; failures never fall back to the raw bytes.
-- **Raw per-object GET/HEAD/byte-range** over any table file is *unprocessed*
-  passthrough over the stored representation, regardless of the gate.
+- **Table-root protected read** — a protected `GetObject` of the current
+  metadata document (the resolved read pipeline, ADR 0029) stages the complete
+  transformed output (the document a commit would produce; a preview — nothing
+  is stored). `Range` and `partNumber` are rejected; failures never fall back
+  to the raw bytes.
+- **Per-object GET/HEAD/byte-range** over any table file is unprocessed
+  passthrough over the stored representation only under an
+  `explicit_passthrough` read scope, regardless of the gate (ADR 0029);
+  protected scopes deny those shapes.
 - **Multipart** is single-object-only for table units: multipart
   create/completion of a table-root document or sub-unit fails closed.
 
