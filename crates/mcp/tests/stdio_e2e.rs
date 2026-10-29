@@ -79,6 +79,7 @@ async fn stdio_client_round_trips_through_the_real_gateway() -> anyhow::Result<(
         component.display()
     );
     let keys_file = temporary.path().join("keys.json");
+    let spool_dir = temporary.path().join("spool");
     let _environment = EnvironmentGuard::apply(&[
         ("AUTH_DISABLED", None),
         ("MASKURA_SINGLE_TENANT", Some("true")),
@@ -91,7 +92,11 @@ async fn stdio_client_round_trips_through_the_real_gateway() -> anyhow::Result<(
             Some(keys_file.to_str().expect("keys path is UTF-8")),
         ),
         ("MASKURA_DEV_MEMORY_STREAMING", Some("true")),
-        ("MASKURA_STREAMING_READ_MODE", Some("passthrough")),
+        ("MASKURA_TRANSFORMED_READ_SPOOL", Some("encrypted")),
+        (
+            "MASKURA_SPOOL_DIR",
+            Some(spool_dir.to_str().expect("spool path is UTF-8")),
+        ),
         ("DATABASE_URL", None),
         ("S3_ENDPOINT", None),
         ("MASKURA_SERVICE_BUCKETS", None),

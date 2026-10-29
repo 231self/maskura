@@ -19,9 +19,7 @@ use http_body_util::BodyExt as _;
 
 use maskura_customer_config::Config;
 
-use maskura_customer_config::config::{
-    StreamingReadMode as ConfigStreamingReadMode, StreamingS3Provider,
-};
+use maskura_customer_config::config::StreamingS3Provider;
 
 use maskura_gateway::Gateway;
 
@@ -47,15 +45,15 @@ use maskura_gateway::mcp::{
 use maskura_gateway::object::BodyLimits;
 
 use maskura_gateway::pipeline::{
-    ComponentSource, PipelineDirection, PipelineResolution, PipelineResolver,
+    ComponentSource, PipelineDirection, PipelineLocator, PipelineResolution, PipelineResolver,
     StaticPipelineResolver,
 };
 
 use maskura_gateway::plugin_registry::{PipelineLimits, PluginRegistry};
 
 use maskura_gateway::server::{
-    AppState, InvocationError, InvocationLimits, StatePipelineTemplate, StreamingReadMode,
-    TrustedInvocationContext, build_router, build_state_with_pipeline_template, invoke_mcp,
+    AppState, InvocationError, InvocationLimits, StatePipelineTemplate, TrustedInvocationContext,
+    build_router, build_state_with_pipeline_template, invoke_mcp,
 };
 
 use maskura_gateway::sigv4::SigV4Policy;
@@ -651,7 +649,15 @@ fn test_pipeline_template() -> &'static StatePipelineTemplate {
             std::env::set_var("MASKURA_PLUGINS_DIR", components);
         }
         let config = Config::resolve(None).expect("resolve pipeline config");
-        StatePipelineTemplate::from_config(&config).expect("compile test pipeline components")
+        StatePipelineTemplate::from_config_with_executor(
+            &config,
+            maskura_wasm_runtime::ExecutorConfig {
+                workers: 16,
+                queue_capacity: 128,
+                guest_memory_budget_bytes: 16 * 1024 * 1024 * 1024,
+            },
+        )
+        .expect("compile test pipeline components")
     })
 }
 
@@ -690,6 +696,77 @@ async fn trusted_context(state: &Arc<AppState>, workspace_id: &str) -> TrustedIn
 async fn router() -> (Router, Arc<AppState>) {
     let state = test_state().await;
     (build_router(state.clone()), state)
+}
+
+/// Swap in an authored `explicit_passthrough` read assignment — under the
+/// mandatory read pipeline the only way stored bytes are served. Raw
+/// mechanics (Range, conditional GET, HEAD, response hardening) remain
+/// product behavior for such scopes. Writes resolve to the same empty
+/// passthrough chain (store as-is).
+fn apply_explicit_passthrough(state: &mut AppState) {
+    let limits = PipelineLimits::default();
+    let resolution = PipelineResolution {
+        locator: PipelineLocator {
+            revision: "static".to_string(),
+            fingerprint: maskura_gateway::pipeline::resolution_fingerprint(
+                PipelineDirection::Read,
+                &[],
+                true,
+                limits,
+            ),
+            assignment_id: None,
+        },
+        steps: Vec::new(),
+        policy_generation: None,
+        explicit_passthrough: true,
+        limits,
+    };
+    let resolver = Arc::new(TestPipelineResolver {
+        resolution,
+        calls: Mutex::default(),
+        resolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        failure_code: None,
+    });
+    let component = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-components/test-transformer.component.wasm"),
+    )
+    .expect("test-transformer.component.wasm; run just build-plugins");
+    let registry = Arc::new(PluginRegistry::new());
+    state.gateway = Arc::new(
+        Gateway::with_registry(
+            maskura_wasm_runtime::FilterEngine::new(&component).unwrap(),
+            registry,
+        )
+        .with_resolver(resolver, Arc::new(FixedComponentSource(component.into()))),
+    );
+}
+
+async fn explicit_passthrough_test_state(control: Option<Arc<dyn ControlPlane>>) -> Arc<AppState> {
+    let mut state = test_state().await;
+    if let Some(control) = control {
+        Arc::get_mut(&mut state)
+            .expect("test state is uniquely owned")
+            .control = control;
+    }
+    apply_explicit_passthrough(Arc::get_mut(&mut state).expect("test state is uniquely owned"));
+    state
+}
+
+async fn explicit_passthrough_router() -> (Router, Arc<AppState>) {
+    let state = explicit_passthrough_test_state(None).await;
+    (build_router(state.clone()), state)
+}
+
+/// Protected-read fixture: the catalog chain runs for reads through the
+/// encrypted spool (its components are prefix-unsafe by default).
+async fn spooled_test_state() -> Arc<AppState> {
+    let mut state = test_state().await;
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.transformed_read_spool_enabled = true;
+    state_mut.spool_config.directory =
+        std::env::temp_dir().join(format!("maskura-protected-read-{}", uuid::Uuid::now_v7()));
+    state
 }
 
 fn unavailable_key_store() -> Arc<dyn KeyRepository> {
@@ -785,7 +862,6 @@ async fn unsafe_transformed_test_state(later_filter: bool) -> Arc<AppState> {
         uuid::Uuid::now_v7()
     ));
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = true;
     state_mut.spool_config.directory = spool_dir;
     state_mut.spool_config.max_object_bytes = 1024;
@@ -835,7 +911,6 @@ async fn direct_identity_pipeline_test_state(control: Arc<dyn ControlPlane>) -> 
     let execution_registry = Arc::new(PluginRegistry::new());
     let mut state = test_state().await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = false;
     state_mut.control = control;
     state_mut.plugins = execution_registry.clone();
@@ -1239,5 +1314,6 @@ mod multipart;
 mod objects;
 mod pipeline;
 mod policy_gate;
+mod read_mandate;
 mod sigv4;
 mod streaming;

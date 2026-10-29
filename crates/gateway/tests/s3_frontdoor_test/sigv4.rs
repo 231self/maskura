@@ -6,10 +6,9 @@ async fn presigned_transport_failure_never_discloses_signed_url_material() {
     let address = listener.local_addr().unwrap();
     drop(listener);
 
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     let control = Arc::new(RecordingMeteringControl::default());
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
     state_mut.control = control.clone();
     state_mut.presigned_http_policy = PresignedHttpPolicy::new(
         Vec::<String>::new(),
@@ -94,9 +93,8 @@ async fn presigned_transport_failure_never_discloses_signed_url_material() {
 #[tokio::test]
 async fn presigned_http_responses_are_hardened_without_losing_object_semantics() {
     let (upstream, task) = spawn_presigned_upstream().await;
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
     state_mut.presigned_http_policy = PresignedHttpPolicy::new(
         Vec::<String>::new(),
         ["127.0.0.1".to_string()],
@@ -397,8 +395,8 @@ async fn sigv4_signed_semantic_headers_accept_and_detect_mutation_or_removal() {
             StatusCode::FORBIDDEN,
         ),
         (
-            "removed legacy semantic header",
-            HeaderChange::Remove("x-maskura-process"),
+            "removed semantic header",
+            HeaderChange::Remove("x-maskura-stable-fields"),
             StatusCode::FORBIDDEN,
         ),
     ]
@@ -414,7 +412,7 @@ async fn sigv4_signed_semantic_headers_accept_and_detect_mutation_or_removal() {
             b"semantic body",
             &[
                 ("content-type", "text/plain"),
-                ("x-maskura-process", "write"),
+                ("x-maskura-stable-fields", "email"),
                 ("x-amz-meta-dynamic-name", "one"),
             ],
         );
@@ -453,7 +451,7 @@ async fn sigv4_signs_the_exact_canonical_semantic_header_names() {
     let (access_key, secret_key) = make_key(&state).await;
 
     for (index, (name, value)) in [
-        ("x-maskura-process", "write"),
+        ("x-maskura-stable-fields", "email"),
         ("x-maskura-encrypt-fields", "email"),
     ]
     .into_iter()
@@ -482,8 +480,8 @@ async fn sigv4_signs_the_exact_canonical_semantic_header_names() {
         b"duplicate semantic header",
         &[
             ("content-type", "text/plain"),
-            ("x-maskura-process", "write"),
-            ("x-maskura-process", "read"),
+            ("x-maskura-stable-fields", "email"),
+            ("x-maskura-stable-fields", "card"),
         ],
     );
     assert_eq!(
@@ -617,7 +615,7 @@ async fn sigv4_rejects_unsigned_integrity_header_injection_before_polling_the_bo
     for (index, (name, value)) in [
         ("x-maskura-storage-mode", "managed"),
         ("x-maskura-backend-url", "https://storage.example/object"),
-        ("x-maskura-process", "read"),
+        ("x-maskura-encrypt-fields", "email"),
         ("x-maskura-stable-fields", "email"),
         ("content-type", "text/plain"),
         ("content-encoding", "gzip"),
@@ -673,7 +671,7 @@ async fn sigv4_rejects_unsigned_integrity_header_injection_before_polling_the_bo
 
 #[tokio::test]
 async fn presigned_host_only_get_accepts_but_appended_protected_headers_are_rejected() {
-    let (app, state) = router().await;
+    let (app, state) = explicit_passthrough_router().await;
     let (access_key, secret_key) = make_key(&state).await;
     state.store.put(
         "presigned",
@@ -729,7 +727,7 @@ async fn presigned_host_only_get_accepts_but_appended_protected_headers_are_reje
     assert_eq!(response.status(), StatusCode::OK);
 
     for (name, value) in [
-        ("x-maskura-process", "read"),
+        ("x-maskura-encrypt-fields", "email"),
         ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
         ("x-amz-meta-dynamic-name", "appended"),
         ("x-amz-tagging", "project=appended"),
@@ -770,8 +768,8 @@ async fn non_sigv4_api_key_auth_rejects_duplicate_semantic_headers() {
             &auth_headers(&access_key, &secret_key),
         ),
         &[
-            ("x-maskura-process", " write ".to_string()),
-            ("x-maskura-process", "read".to_string()),
+            ("x-maskura-stable-fields", " email ".to_string()),
+            ("x-maskura-stable-fields", "email".to_string()),
         ],
     );
 
@@ -839,7 +837,8 @@ async fn streaming_sigv4_hash_is_checked_before_atomic_commit() {
 
 #[tokio::test]
 async fn sigv4_get_object_roundtrip() {
-    let (app, state) = router().await;
+    let state = spooled_test_state().await;
+    let app = build_router(state.clone());
     let (ak, sk) = make_key(&state).await;
 
     // PUT via SigV4.

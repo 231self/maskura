@@ -93,17 +93,6 @@ pub(crate) fn effective_multipart_mode(config: &Config, auto_local: bool) -> Mul
     }
 }
 
-pub(crate) fn effective_streaming_read_mode(
-    config: &Config,
-    auto_local: bool,
-) -> StreamingReadMode {
-    if auto_local && !config.streaming_read_mode_is_explicit() {
-        StreamingReadMode::Passthrough
-    } else {
-        StreamingReadMode::from_config(config)
-    }
-}
-
 pub(crate) fn explicit_single_tenant_mode(config: &Config, auto_local: bool) -> bool {
     config.auth.disabled || auto_local || config.storage.single_tenant
 }
@@ -843,7 +832,6 @@ pub async fn build_state_with_pipeline_template(
         control,
         policy_gate: None,
         legacy_max_object_bytes: legacy_max_object_bytes(config),
-        streaming_read_mode: effective_streaming_read_mode(config, auto_local),
         source_body_limits,
         max_pipeline_output_bytes,
         presigned_http_policy: PresignedHttpPolicy::from_config(&config.allowlists)
@@ -1146,10 +1134,10 @@ pub async fn invoke_mcp(
                 (response, (0_u8, request.bucket, request.key))
             }
             crate::mcp::ToolRequest::GetObject(request) => {
-                let mut headers = HeaderMap::new();
-                if request.process {
-                    headers.insert("x-maskura-process", "read".parse().unwrap());
-                }
+                // The mandatory read pipeline ignores `process`: the resolved
+                // read pipeline applies to every read either way.
+                let _ = request.process;
+                let headers = HeaderMap::new();
                 let response = s3_get(
                     State(state.clone()),
                     Path((request.bucket, request.key)),

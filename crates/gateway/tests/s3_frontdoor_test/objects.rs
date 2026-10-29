@@ -2,7 +2,8 @@ use super::*;
 
 #[tokio::test]
 async fn put_get_roundtrip_filters_pii() {
-    let (app, state) = router().await;
+    let state = spooled_test_state().await;
+    let app = build_router(state.clone());
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
 
@@ -263,7 +264,7 @@ async fn create_bucket_is_rejected() {
 
 #[tokio::test]
 async fn head_and_delete_remain_available() {
-    let (app, state) = router().await;
+    let (app, state) = explicit_passthrough_router().await;
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
 
@@ -322,7 +323,7 @@ async fn head_and_delete_remain_available() {
 
 #[tokio::test]
 async fn conditional_get_and_head_preserve_object_identity_without_a_body() {
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     let (ak, sk) = make_key(&state).await;
     let headers = auth_headers(&ak, &sk);
     state.store.put(
@@ -389,9 +390,8 @@ async fn conditional_get_and_head_preserve_object_identity_without_a_body() {
 
 #[tokio::test]
 async fn object_get_forces_browser_safe_download_headers_for_html() {
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
     state_mut.store.put(
         "download",
         "attacker-name.html",
@@ -523,7 +523,8 @@ async fn content_md5_covers_source_bytes_before_transformation() {
 
 #[tokio::test]
 async fn tsv_roundtrip_filters_and_preserves() {
-    let (app, state) = router().await;
+    let state = spooled_test_state().await;
+    let app = build_router(state.clone());
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
 

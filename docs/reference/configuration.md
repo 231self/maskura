@@ -75,7 +75,6 @@ and filter components replace these defaults when provided.
 | TOML key | Environment override | Default and behavior |
 |---|---|---|
 | `features.multipart_mode` | `MASKURA_MULTIPART_MODE` | `reject`; accepted values are `reject` and `staged`. Local staged mode uses the local root. Hosted staged mode requires the complete staging configuration and env-only dependencies. |
-| `features.streaming_read_mode` | `MASKURA_STREAMING_READ_MODE` | `off`; accepted values are `off`, `passthrough`, and `transformed`. `transformed` also requires `transformed_read_spool = true`. |
 | `features.transformed_read_spool` | `MASKURA_TRANSFORMED_READ_SPOOL` | `false`. The environment value enables it only when equal to `encrypted` (case-insensitive). Required for transformed reads with any component not declared prefix-safe. |
 | `features.enable_avro` | `MASKURA_ENABLE_AVRO` | `false`. Enables Avro processing. |
 | `features.enable_lance` | `MASKURA_ENABLE_LANCE` | `false`. Enables Apache Lance processing. |

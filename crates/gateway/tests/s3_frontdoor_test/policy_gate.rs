@@ -45,9 +45,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use maskura_customer_config::config::{
-    MultipartMode as ConfigMultipartMode, StreamingReadMode as ConfigStreamingReadMode,
-};
+use maskura_customer_config::config::MultipartMode as ConfigMultipartMode;
 use maskura_error::MaskuraError;
 use maskura_gateway::policy_gate::{
     PolicyBinding, PolicyGate, PolicyRequest, VERIFIED_POLICY_SCHEMA_VERSION, VerifiedPolicy,
@@ -127,14 +125,13 @@ fn coverage_config() -> (Config, std::path::PathBuf) {
     std::fs::write(
         &path,
         format!(
-            "[features]\nmultipart_mode = \"staged\"\nstreaming_read_mode = \"transformed\"\ntransformed_read_spool = true\n[storage]\nlocal_dir = \"{}\"\nmode = \"local\"\nsingle_tenant = true\n",
+            "[features]\nmultipart_mode = \"staged\"\ntransformed_read_spool = true\n[storage]\nlocal_dir = \"{}\"\nmode = \"local\"\nsingle_tenant = true\n",
             scratch.display()
         ),
     )
     .expect("write coverage config");
     let mut config = Config::resolve(Some(&path)).expect("resolve coverage config");
     config.features.multipart_mode = ConfigMultipartMode::Staged;
-    config.features.streaming_read_mode = ConfigStreamingReadMode::Transformed;
     config.features.transformed_read_spool = true;
     assert_eq!(config.features.multipart_mode, ConfigMultipartMode::Staged);
     (config, scratch)
@@ -181,7 +178,12 @@ fn upload_id_from(body: &str) -> String {
 
 #[tokio::test]
 async fn policy_gate_covers_every_data_plane_operation() {
-    let (app, state, gate) = coverage_router().await;
+    // One recorded gate shared by two scopes: the kinds presented to the gate
+    // are assignment-driven under the mandatory read pipeline (a protected
+    // scope presents ProcessedGet and denies HEAD before the gate; an explicit
+    // passthrough scope presents RawGet and admits HEAD).
+    let gate = Arc::new(RecordingPolicyGate::default());
+    let (app, state, gate) = coverage_router_with(gate, |_| {}).await;
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
 
@@ -243,6 +245,8 @@ async fn policy_gate_covers_every_data_plane_operation() {
         String::from_utf8_lossy(&processed_body)
     );
 
+    // A protected scope denies HEAD before the gate (transformed metadata is
+    // not available); the passthrough drive below covers the gated Head op.
     let head = add_headers(
         Request::builder()
             .method("HEAD")
@@ -251,7 +255,8 @@ async fn policy_gate_covers_every_data_plane_operation() {
             .unwrap(),
         &hdrs,
     );
-    app.clone().oneshot(head).await.unwrap();
+    let head_response = app.clone().oneshot(head).await.unwrap();
+    assert_eq!(head_response.status(), StatusCode::BAD_REQUEST);
 
     let list = add_headers(
         Request::builder()
@@ -344,6 +349,31 @@ async fn policy_gate_covers_every_data_plane_operation() {
         &hdrs,
     );
     app.clone().oneshot(delete).await.unwrap();
+
+    // The explicit passthrough drive: reads present RawGet and HEAD reaches
+    // the gate (the legacy read-selection header is inert).
+    let (raw_app, raw_state, gate) =
+        coverage_router_with(gate.clone(), apply_explicit_passthrough).await;
+    let (raw_ak, raw_sk) = make_key(&raw_state).await;
+    let raw_hdrs = auth_headers(&raw_ak, &raw_sk);
+    let raw_get = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/bucket/object")
+            .body(Body::empty())
+            .unwrap(),
+        &raw_hdrs,
+    );
+    raw_app.clone().oneshot(raw_get).await.unwrap();
+    let raw_head = add_headers(
+        Request::builder()
+            .method("HEAD")
+            .uri("/bucket/object")
+            .body(Body::empty())
+            .unwrap(),
+        &raw_hdrs,
+    );
+    raw_app.clone().oneshot(raw_head).await.unwrap();
 
     let expected: BTreeSet<PolicyOperation> = [
         PolicyOperation::Put,
@@ -1931,7 +1961,11 @@ async fn lance_processed_read_gate_closed_is_rejected() {
 async fn lance_raw_get_head_and_byte_range_stay_unprocessed_passthrough() {
     // Deliberately gate CLOSED: raw passthrough must not depend on the
     // adapter feature gate at all.
-    let (app, state, gate) = coverage_router().await;
+    let (app, state, gate) = coverage_router_with(
+        Arc::new(RecordingPolicyGate::default()),
+        apply_explicit_passthrough,
+    )
+    .await;
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
     plant_object(

@@ -50,12 +50,13 @@ code="$(curl -sS -o "$E2E_TMP/30-put.out" -w '%{http_code}' \
     "$E2E_GW_URL/$E2E_BUCKET/$OBJECT_KEY")"
 expect_status 200 "$code" "authenticated PUT /$E2E_BUCKET/$OBJECT_KEY"
 
-# 4. HEAD returns the object metadata.
+# 4. HEAD is denied under the protected read pipeline (ADR 0029); only an
+# explicit passthrough scope serves stored metadata.
 code="$(curl -sS -o /dev/null -I -w '%{http_code}' \
     -H "x-maskura-access-key: $KEY_ID" \
     -H "x-maskura-secret-key: $SECRET" \
     "$E2E_GW_URL/$E2E_BUCKET/$OBJECT_KEY")"
-expect_status 200 "$code" "HEAD /$E2E_BUCKET/$OBJECT_KEY"
+expect_status 400 "$code" "HEAD /$E2E_BUCKET/$OBJECT_KEY (denied under protected scope)"
 
 # 5. GET returns the exact stored bytes.
 code="$(curl -sS -o "$E2E_TMP/30-get.out" -w '%{http_code}' \

@@ -102,9 +102,90 @@ use maskura_gateway::control::{
     ControlPlane, MeteringError, RequestKind, UsageAuthorization, UsageEvent, UsageRoute,
 };
 
-use maskura_gateway::server::{build_router, build_state};
+use bytes::Bytes;
+use maskura_error::MaskuraError;
+use maskura_gateway::Gateway;
+use maskura_gateway::pipeline::{
+    ComponentSource, PipelineDirection, PipelineLocator, PipelineResolution, PipelineResolver,
+    StaticPipelineResolver, resolution_fingerprint,
+};
+use maskura_gateway::plugin_registry::{PipelineLimits, PluginRegistry};
+use maskura_gateway::server::{AppState, build_router, build_state};
 
 use tower::ServiceExt;
+
+/// The mandatory read pipeline serves stored bytes only under an authored
+/// explicit passthrough assignment (ADR 0029). These tests assert multipart
+/// assembly mechanics and write-side redaction, so reads resolve to that
+/// assignment while writes keep the enabled pii chain (stored objects stay
+/// redacted).
+struct PassthroughReadResolver {
+    write: StaticPipelineResolver,
+}
+
+#[async_trait::async_trait]
+impl PipelineResolver for PassthroughReadResolver {
+    async fn resolve(
+        &self,
+        workspace_id: &str,
+        bucket: &str,
+        direction: PipelineDirection,
+    ) -> Result<PipelineResolution, MaskuraError> {
+        match direction {
+            PipelineDirection::Read => {
+                let limits = PipelineLimits::default();
+                Ok(PipelineResolution {
+                    locator: PipelineLocator {
+                        revision: "static".to_string(),
+                        fingerprint: resolution_fingerprint(direction, &[], true, limits),
+                        assignment_id: None,
+                    },
+                    steps: Vec::new(),
+                    policy_generation: None,
+                    explicit_passthrough: true,
+                    limits,
+                })
+            }
+            PipelineDirection::Write => self.write.resolve(workspace_id, bucket, direction).await,
+        }
+    }
+}
+
+struct FixedComponentSource(Bytes);
+
+#[async_trait::async_trait]
+impl ComponentSource for FixedComponentSource {
+    async fn load(&self, _component_hash: &str) -> Result<Bytes, MaskuraError> {
+        Ok(self.0.clone())
+    }
+}
+
+fn apply_passthrough_reads(state: &mut Arc<AppState>) {
+    let engine_component = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-components/test-transformer.component.wasm"),
+    )
+    .expect("test-transformer.component.wasm; run just build-plugins");
+    let pii_component = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/components/pii-default.component.wasm"),
+    )
+    .expect("pii-default.component.wasm; run just build-plugins");
+    let registry = Arc::new(PluginRegistry::new());
+    registry.import("pii-default", &pii_component).unwrap();
+    let write = StaticPipelineResolver::new(registry.clone());
+    let state_mut = Arc::get_mut(state).expect("test state is uniquely owned");
+    state_mut.gateway = Arc::new(
+        Gateway::with_registry(
+            maskura_wasm_runtime::FilterEngine::new(&engine_component).unwrap(),
+            registry,
+        )
+        .with_resolver(
+            Arc::new(PassthroughReadResolver { write }),
+            Arc::new(FixedComponentSource(pii_component.into())),
+        ),
+    );
+}
 
 const TEST_KEK: [u8; 32] = [7; 32];
 

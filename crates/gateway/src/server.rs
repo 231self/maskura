@@ -29,7 +29,6 @@ use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use maskura_customer_config::config::{
     ManagedStreamingMode as ConfigManagedStreamingMode, MultipartMode as ConfigMultipartMode,
-    StreamingReadMode as ConfigStreamingReadMode,
 };
 use maskura_customer_config::{Config, aliases as customer_env, resolve as resolve_customer_env};
 use md5::Md5;
@@ -138,7 +137,7 @@ pub use routing::build_router;
 pub(crate) use s3_objects::*;
 pub(crate) use s3_upload::*;
 pub(crate) use state::*;
-pub use state::{AppState, StatePipelineTemplate, StreamingReadMode};
+pub use state::{AppState, StatePipelineTemplate};
 pub(crate) use workspace_lease::*;
 
 #[cfg(test)]

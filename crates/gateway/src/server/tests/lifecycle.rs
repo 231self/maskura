@@ -61,22 +61,13 @@ fn auto_local_defaults_do_not_override_explicit_feature_modes() {
         effective_multipart_mode(&defaults, true),
         MultipartMode::Staged
     );
-    assert_eq!(
-        effective_streaming_read_mode(&defaults, true),
-        StreamingReadMode::Passthrough
-    );
-
     let explicit = Config::from_toml_str(
-            "[features]\nmultipart_mode = \"reject\"\nstreaming_read_mode = \"off\"\n\n[wasm]\nfilter_component = \"/tmp/noop.wasm\"\n",
+            "[features]\nmultipart_mode = \"reject\"\n\n[wasm]\nfilter_component = \"/tmp/noop.wasm\"\n",
         )
         .unwrap();
     assert_eq!(
         effective_multipart_mode(&explicit, true),
         MultipartMode::Reject
-    );
-    assert_eq!(
-        effective_streaming_read_mode(&explicit, true),
-        StreamingReadMode::Off
     );
     assert!(explicit.filter_component_is_explicit());
 }

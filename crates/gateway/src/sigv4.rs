@@ -24,7 +24,6 @@ const MAX_PRESIGN_EXPIRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SEMANTIC_HEADERS: &[&str] = &[
     "x-maskura-storage-mode",
     "x-maskura-backend-url",
-    "x-maskura-process",
     "x-maskura-stable-fields",
     "x-maskura-encrypt-fields",
     "content-type",
@@ -1067,7 +1066,6 @@ mod tests {
         let protected_headers = [
             ("x-maskura-storage-mode", "managed"),
             ("x-maskura-backend-url", "https://storage.example/object"),
-            ("x-maskura-process", "read"),
             ("x-maskura-stable-fields", "email"),
             ("x-maskura-encrypt-fields", "email"),
             ("content-type", "text/plain"),
@@ -1145,7 +1143,6 @@ mod tests {
         let canonical_values = [
             ("x-maskura-storage-mode", "managed"),
             ("x-maskura-backend-url", "https://storage.example/object"),
-            ("x-maskura-process", "read"),
             ("x-maskura-stable-fields", "email, account_id"),
             ("x-maskura-encrypt-fields", "email"),
             ("content-type", "text/plain; charset=utf-8"),
@@ -1513,7 +1510,7 @@ mod tests {
             .unwrap()
             .unwrap();
         for (name, value) in [
-            ("x-maskura-process", "read"),
+            ("x-maskura-stable-fields", "email"),
             ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
             ("x-amz-meta-dynamic-name", "metadata"),
         ] {

@@ -53,7 +53,6 @@ explicit_passthrough = true
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.auth_disabled = true;
     state_mut.dev_memory_streaming_enabled = true;
-    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = true;
     state_mut.gateway = Arc::new(
         state_mut
@@ -191,7 +190,6 @@ async fn resolver_precedes_authorization_and_isolates_workspace_bucket_and_direc
         ..PipelineAttemptControl::default()
     });
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = true;
     state_mut.control = control.clone();
     state_mut.gateway = Arc::new(

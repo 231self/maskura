@@ -14,9 +14,16 @@
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use bytes::Bytes;
 use maskura_customer_config::Config;
+use maskura_gateway::Gateway;
 use maskura_gateway::control::NoopControlPlane;
 use maskura_gateway::key_cipher::default_wrapping;
+use maskura_gateway::pipeline::{
+    ComponentSource, PipelineDirection, PipelineLocator, PipelineResolution, PipelineResolver,
+    StaticPipelineResolver, resolution_fingerprint,
+};
+use maskura_gateway::plugin_registry::{PipelineLimits, PluginRegistry};
 use maskura_gateway::server::{
     AppState, StatePipelineTemplate, build_router, build_state_with_pipeline_template,
 };
@@ -163,7 +170,14 @@ async fn body_bytes(response: axum::response::Response) -> Vec<u8> {
 
 async fn build_isolated_state() -> anyhow::Result<Arc<AppState>> {
     let config = Config::resolve(None)?;
-    let pipeline_template = StatePipelineTemplate::from_config(&config)?;
+    let pipeline_template = StatePipelineTemplate::from_config_with_executor(
+        &config,
+        maskura_wasm_runtime::ExecutorConfig {
+            workers: 16,
+            queue_capacity: 128,
+            guest_memory_budget_bytes: 16 * 1024 * 1024 * 1024,
+        },
+    )?;
     build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
         default_wrapping()?,
@@ -174,10 +188,80 @@ async fn build_isolated_state() -> anyhow::Result<Arc<AppState>> {
     .await
 }
 
+/// The mandatory read pipeline serves stored bytes only under an authored
+/// explicit passthrough assignment. Multipart conformance asserts raw
+/// assembly mechanics, so reads resolve to that assignment while writes keep
+/// the default pii chain (stored objects stay redacted).
+struct PassthroughReadResolver {
+    write: StaticPipelineResolver,
+}
+
+#[async_trait::async_trait]
+impl PipelineResolver for PassthroughReadResolver {
+    async fn resolve(
+        &self,
+        workspace_id: &str,
+        bucket: &str,
+        direction: PipelineDirection,
+    ) -> Result<PipelineResolution, maskura_error::MaskuraError> {
+        match direction {
+            PipelineDirection::Read => {
+                let limits = PipelineLimits::default();
+                Ok(PipelineResolution {
+                    locator: PipelineLocator {
+                        revision: "static".to_string(),
+                        fingerprint: resolution_fingerprint(direction, &[], true, limits),
+                        assignment_id: None,
+                    },
+                    steps: Vec::new(),
+                    policy_generation: None,
+                    explicit_passthrough: true,
+                    limits,
+                })
+            }
+            PipelineDirection::Write => self.write.resolve(workspace_id, bucket, direction).await,
+        }
+    }
+}
+
+struct FixedComponentSource(Bytes);
+
+#[async_trait::async_trait]
+impl ComponentSource for FixedComponentSource {
+    async fn load(&self, _component_hash: &str) -> Result<Bytes, maskura_error::MaskuraError> {
+        Ok(self.0.clone())
+    }
+}
+
 async fn build_test_state() -> Arc<AppState> {
-    build_isolated_state()
+    let mut state = build_isolated_state()
         .await
-        .expect("build local-filesystem multipart state")
+        .expect("build local-filesystem multipart state");
+    let engine_component = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-components/test-transformer.component.wasm"),
+    )
+    .expect("test-transformer.component.wasm; run just build-plugins");
+    let pii_component = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/components/pii-default.component.wasm"),
+    )
+    .expect("pii-default.component.wasm; run just build-plugins");
+    let registry = Arc::new(PluginRegistry::new());
+    registry.import("pii-default", &pii_component).unwrap();
+    let write = StaticPipelineResolver::new(registry.clone());
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.gateway = Arc::new(
+        Gateway::with_registry(
+            maskura_wasm_runtime::FilterEngine::new(&engine_component).unwrap(),
+            registry,
+        )
+        .with_resolver(
+            Arc::new(PassthroughReadResolver { write }),
+            Arc::new(FixedComponentSource(pii_component.into())),
+        ),
+    );
+    state
 }
 
 async fn make_credentials(state: &Arc<AppState>) -> (String, String) {

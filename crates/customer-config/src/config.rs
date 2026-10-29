@@ -5,15 +5,6 @@ use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum StreamingReadMode {
-    #[default]
-    Off,
-    Passthrough,
-    Transformed,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum MultipartMode {
     #[default]
     Reject,
@@ -70,7 +61,6 @@ pub struct SupabaseConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct FeaturesConfig {
     pub multipart_mode: MultipartMode,
-    pub streaming_read_mode: StreamingReadMode,
     pub transformed_read_spool: bool,
     pub enable_avro: bool,
     pub enable_lance: bool,
@@ -177,7 +167,6 @@ pub struct Config {
 #[derive(Debug, Clone, Default)]
 struct ExplicitSettings {
     multipart_mode: bool,
-    streaming_read_mode: bool,
     filter_component: bool,
 }
 
@@ -203,7 +192,6 @@ struct ConfigWire {
 #[serde(default, deny_unknown_fields)]
 struct FeaturesWire {
     multipart_mode: Option<MultipartMode>,
-    streaming_read_mode: Option<StreamingReadMode>,
     transformed_read_spool: bool,
     enable_avro: bool,
     enable_lance: bool,
@@ -222,7 +210,6 @@ impl<'de> Deserialize<'de> for Config {
         let wire = ConfigWire::deserialize(deserializer)?;
         let explicit = ExplicitSettings {
             multipart_mode: wire.features.multipart_mode.is_some(),
-            streaming_read_mode: wire.features.streaming_read_mode.is_some(),
             filter_component: wire.wasm.filter_component.is_some(),
         };
         Ok(Self {
@@ -232,7 +219,6 @@ impl<'de> Deserialize<'de> for Config {
             supabase: wire.supabase,
             features: FeaturesConfig {
                 multipart_mode: wire.features.multipart_mode.unwrap_or_default(),
-                streaming_read_mode: wire.features.streaming_read_mode.unwrap_or_default(),
                 transformed_read_spool: wire.features.transformed_read_spool,
                 enable_avro: wire.features.enable_avro,
                 enable_lance: wire.features.enable_lance,
@@ -352,10 +338,6 @@ impl Config {
         if let Some(value) = resolve(aliases::MULTIPART_MODE)? {
             self.features.multipart_mode = parse_multipart_mode(&value)?;
             self.explicit.multipart_mode = true;
-        }
-        if let Some(value) = resolve(aliases::STREAMING_READ_MODE)? {
-            self.features.streaming_read_mode = parse_streaming_read_mode(&value)?;
-            self.explicit.streaming_read_mode = true;
         }
         if let Some(value) = resolve(aliases::TRANSFORMED_READ_SPOOL)? {
             self.features.transformed_read_spool = value.eq_ignore_ascii_case("encrypted");
@@ -714,24 +696,11 @@ impl Config {
             ));
         }
 
-        if self.features.streaming_read_mode == StreamingReadMode::Transformed
-            && !self.features.transformed_read_spool
-        {
-            return Err(invalid(
-                "features.streaming_read_mode",
-                "transformed reads require transformed_read_spool = true",
-            ));
-        }
-
         Ok(())
     }
 
     pub fn multipart_mode_is_explicit(&self) -> bool {
         self.explicit.multipart_mode
-    }
-
-    pub fn streaming_read_mode_is_explicit(&self) -> bool {
-        self.explicit.streaming_read_mode
     }
 
     pub fn filter_component_is_explicit(&self) -> bool {
@@ -779,18 +748,6 @@ fn parse_multipart_mode(value: &str) -> Result<MultipartMode, ConfigError> {
         other => Err(invalid(
             "features.multipart_mode",
             format!("{other:?} is not one of reject, staged"),
-        )),
-    }
-}
-
-fn parse_streaming_read_mode(value: &str) -> Result<StreamingReadMode, ConfigError> {
-    match value {
-        "off" => Ok(StreamingReadMode::Off),
-        "passthrough" => Ok(StreamingReadMode::Passthrough),
-        "transformed" => Ok(StreamingReadMode::Transformed),
-        other => Err(invalid(
-            "features.streaming_read_mode",
-            format!("{other:?} is not one of off, passthrough, transformed"),
         )),
     }
 }
@@ -925,7 +882,6 @@ url = "https://example.supabase.co"
 
 [features]
 multipart_mode = "reject"
-streaming_read_mode = "transformed"
 transformed_read_spool = true
 enable_avro = true
 enable_iceberg = true
@@ -986,10 +942,6 @@ presigned_http_min_validity_secs = 30
         assert_eq!(
             config.storage.s3_endpoint.as_deref(),
             Some("http://minio:9000")
-        );
-        assert_eq!(
-            config.features.streaming_read_mode,
-            StreamingReadMode::Transformed
         );
         assert!(config.features.enable_avro);
         assert!(config.features.enable_iceberg);
@@ -1092,22 +1044,6 @@ presigned_http_min_validity_secs = 30
     fn rejects_managed_observe_without_transactional() {
         let error = parse("[features]\nmanaged_streaming_mode = \"enforce\"\n").unwrap_err();
         assert!(error.message.contains("managed_streaming_transactional"));
-    }
-
-    #[test]
-    fn rejects_transformed_read_without_spool() {
-        let error = parse("[features]\nstreaming_read_mode = \"transformed\"\n").unwrap_err();
-        assert_eq!(error.path, "features.streaming_read_mode");
-    }
-
-    #[test]
-    fn accepts_transformed_read_with_spool() {
-        assert!(
-            parse(
-                "[features]\nstreaming_read_mode = \"transformed\"\ntransformed_read_spool = true\n"
-            )
-            .is_ok()
-        );
     }
 
     #[test]
@@ -1262,18 +1198,18 @@ dir = "/var/lib/maskura/staging"
     fn resolve_applies_environment_before_cross_field_validation() {
         let path = write_temp_file(
             "env-repairs-combination",
-            "[features]\nstreaming_read_mode = \"transformed\"\n",
+            "[features]\nmanaged_streaming_mode = \"observe\"\n",
         );
         // SAFETY: this test owns this uncommon process variable for its brief
-        // lifetime, and setting it to `encrypted` cannot invalidate other
+        // lifetime, and setting it to `true` cannot invalidate other
         // configurations resolved concurrently.
-        unsafe { std::env::set_var("MASKURA_TRANSFORMED_READ_SPOOL", "encrypted") };
+        unsafe { std::env::set_var("MASKURA_MANAGED_STREAMING_TRANSACTIONAL", "true") };
         let config = Config::resolve(Some(&path)).unwrap();
-        unsafe { std::env::remove_var("MASKURA_TRANSFORMED_READ_SPOOL") };
-        assert!(config.features.transformed_read_spool);
+        unsafe { std::env::remove_var("MASKURA_MANAGED_STREAMING_TRANSACTIONAL") };
+        assert!(config.features.managed_streaming_transactional);
         assert_eq!(
-            config.features.streaming_read_mode,
-            StreamingReadMode::Transformed
+            config.features.managed_streaming_mode,
+            ManagedStreamingMode::Observe
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -1292,10 +1228,9 @@ dir = "/var/lib/maskura/staging"
 
     #[test]
     fn records_explicit_auto_local_feature_and_filter_settings() {
-        const INPUT: &str = "[features]\nmultipart_mode = \"reject\"\nstreaming_read_mode = \"off\"\n\n[wasm]\nfilter_component = \"/tmp/noop.wasm\"\n";
+        const INPUT: &str = "[features]\nmultipart_mode = \"reject\"\n\n[wasm]\nfilter_component = \"/tmp/noop.wasm\"\n";
         let config = parse(INPUT).unwrap();
         assert!(config.multipart_mode_is_explicit());
-        assert!(config.streaming_read_mode_is_explicit());
         assert!(config.filter_component_is_explicit());
 
         #[derive(Deserialize)]
@@ -1305,12 +1240,10 @@ dir = "/var/lib/maskura/staging"
         }
         let embedded: EmbeddedConfig = toml::from_str(INPUT).unwrap();
         assert!(embedded.base.multipart_mode_is_explicit());
-        assert!(embedded.base.streaming_read_mode_is_explicit());
         assert!(embedded.base.filter_component_is_explicit());
 
         let defaults = Config::default();
         assert!(!defaults.multipart_mode_is_explicit());
-        assert!(!defaults.streaming_read_mode_is_explicit());
         assert!(!defaults.filter_component_is_explicit());
     }
 

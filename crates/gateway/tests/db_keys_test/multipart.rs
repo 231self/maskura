@@ -271,7 +271,7 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
 
         let control = Arc::new(MultipartBillingControl::default());
         let config = Config::resolve(None).expect("resolve multipart test config");
-        let state = build_state(
+        let mut state = build_state(
             control.clone(),
             Arc::new(LocalKeyWrapping::with_kek(TEST_KEK)),
             Arc::new(maskura_gateway::workspace_storage::InMemoryWorkspaceStorageRepository::new()),
@@ -279,6 +279,7 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         )
         .await
         .expect("build_state with durable staged multipart");
+        apply_passthrough_reads(&mut state);
         let (sk, created) = state
             .keys
             .create_key(
@@ -351,7 +352,7 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         // Rebuild a fully independent gateway process against the same
         // Postgres and staging backend. Completion must use the persisted
         // immutable resolution rather than process-local plugin identities.
-        let restarted_state = build_state(
+        let mut restarted_state = build_state(
             control.clone(),
             Arc::new(LocalKeyWrapping::with_kek(TEST_KEK)),
             Arc::new(maskura_gateway::workspace_storage::InMemoryWorkspaceStorageRepository::new()),
@@ -359,6 +360,7 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         )
         .await
         .expect("restart gateway with durable staged multipart");
+        apply_passthrough_reads(&mut restarted_state);
         let restarted_app = build_router(restarted_state);
 
         // CompleteMultipartUpload with the strict sorted XML document.
