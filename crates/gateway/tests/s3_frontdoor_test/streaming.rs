@@ -1072,9 +1072,36 @@ async fn nonempty_prefix_safe_reads_stream_and_settle_without_spool() {
             .force_path_style(true)
             .build(),
     ));
-    for plugin in state.plugins.list() {
-        state.plugins.set_enabled(&plugin.id, false);
-    }
+    // Assigned one-step identity chain marked prefix-safe: the mandatory read
+    // pipeline removed empty-chain reads, so direct streaming runs through a
+    // real assigned pipeline.
+    let component = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-components/test-transformer.component.wasm"),
+    )
+    .expect("test-transformer.component.wasm; run just build-plugins");
+    let registry = Arc::new(PluginRegistry::new());
+    registry.import("prefix-safe-test", &component).unwrap();
+    let mut resolution = StaticPipelineResolver::new(registry.clone())
+        .resolve("seed", "seed", PipelineDirection::Read)
+        .await
+        .unwrap();
+    resolution.steps[0].capabilities.prefix_safe_for_read = true;
+    let resolver = Arc::new(TestPipelineResolver {
+        resolution,
+        calls: Mutex::default(),
+        resolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        failure_code: None,
+    });
+    let execution_registry = Arc::new(PluginRegistry::new());
+    state_mut.plugins = execution_registry.clone();
+    state_mut.gateway = Arc::new(
+        Gateway::with_registry(
+            maskura_wasm_runtime::FilterEngine::new(&component).unwrap(),
+            execution_registry,
+        )
+        .with_resolver(resolver, Arc::new(FixedComponentSource(component.into()))),
+    );
     let (ak, sk) = make_key(&state).await;
     let app = build_router(state);
     let response = app
@@ -1151,9 +1178,11 @@ async fn nonempty_prefix_safe_reads_stream_and_settle_without_spool() {
             .pipeline_evidence()
             .expect("completed prefix-safe read must retain measured evidence");
         assert_eq!(evidence.revision, "static");
-        assert_eq!(evidence.fuel_consumed, 0);
         assert_eq!(evidence.spool_mode, "none");
-        assert!(evidence.components.starts_with("v1:0:"));
+        assert!(evidence.components.starts_with("v1:1:"));
+        if event.event.source_bytes() > 0 {
+            assert!(evidence.fuel_consumed > 0, "the assigned pipeline executed");
+        }
     }
     assert_eq!(spool_quota.reserved_bytes(), 0);
     assert!(
@@ -1172,7 +1201,7 @@ async fn direct_read_retries_the_exact_terminal_event_before_eof() {
         calls: Mutex::default(),
         releases: AtomicUsize::new(0),
     });
-    let state = direct_passthrough_test_state(control.clone()).await;
+    let state = direct_identity_pipeline_test_state(control.clone()).await;
     let credentials = make_key(&state).await;
     let response = build_router(state)
         .oneshot(add_headers(
@@ -1213,7 +1242,7 @@ async fn direct_read_settlement_exhaustion_errors_after_disclosure_and_preserves
         calls: Mutex::default(),
         releases: AtomicUsize::new(0),
     });
-    let state = direct_passthrough_test_state(control.clone()).await;
+    let state = direct_identity_pipeline_test_state(control.clone()).await;
     let credentials = make_key(&state).await;
     let response = build_router(state)
         .oneshot(add_headers(
@@ -1254,7 +1283,7 @@ async fn direct_read_settlement_exhaustion_errors_after_disclosure_and_preserves
 #[tokio::test]
 async fn direct_read_client_cancellation_after_disclosure_preserves_recoverable_reservation() {
     let control = Arc::new(RecordingMeteringControl::default());
-    let state = direct_passthrough_test_state(control.clone()).await;
+    let state = direct_identity_pipeline_test_state(control.clone()).await;
     let credentials = make_key(&state).await;
     let app = build_router(state);
     let response = app

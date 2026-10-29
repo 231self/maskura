@@ -199,7 +199,11 @@ pub trait ComponentSource: Send + Sync {
 /// `MASKURA_PLUGINS_DIR` and the bundled default
 /// component remain a *catalog* of available artifacts; this resolver decides
 /// the pipeline from that catalog exactly as the historical global chain did.
-/// An empty enabled set is the operator's explicit pass-through choice.
+/// Read direction: an empty enabled set assigns no read pipeline and resolves
+/// to an error — reads deny until a read pipeline is assigned (an explicit
+/// passthrough is authored via the signed pipeline config's
+/// `explicit_passthrough`, never inferred from silence). Write direction: an
+/// empty enabled set remains the historical store-as-is passthrough.
 pub struct StaticPipelineResolver {
     registry: Arc<PluginRegistry>,
 }
@@ -209,7 +213,7 @@ impl StaticPipelineResolver {
         Self { registry }
     }
 
-    fn resolution(&self, direction: PipelineDirection) -> PipelineResolution {
+    fn resolution(&self, direction: PipelineDirection) -> Result<PipelineResolution, MaskuraError> {
         let catalog = self.registry.enabled_catalog();
         let steps: Vec<PipelineStep> = catalog
             .into_iter()
@@ -225,10 +229,16 @@ impl StaticPipelineResolver {
                 sensitive_grant: maskura_wasm_runtime::SensitiveGrant::ALL,
             })
             .collect();
+        if steps.is_empty() && matches!(direction, PipelineDirection::Read) {
+            return Err(MaskuraError::new(
+                codes::CONFIG_INVALID,
+                "no read pipeline is assigned: the enabled plugin catalog is empty",
+            ));
+        }
         let explicit_passthrough = steps.is_empty();
         let limits = self.registry.pipeline_limits();
         let fingerprint = resolution_fingerprint(direction, &steps, explicit_passthrough, limits);
-        PipelineResolution {
+        Ok(PipelineResolution {
             locator: PipelineLocator {
                 revision: "static".to_string(),
                 fingerprint,
@@ -238,7 +248,7 @@ impl StaticPipelineResolver {
             policy_generation: None,
             explicit_passthrough,
             limits,
-        }
+        })
     }
 }
 
@@ -250,7 +260,7 @@ impl PipelineResolver for StaticPipelineResolver {
         _bucket: &str,
         direction: PipelineDirection,
     ) -> Result<PipelineResolution, MaskuraError> {
-        Ok(self.resolution(direction))
+        self.resolution(direction)
     }
 }
 
@@ -435,7 +445,7 @@ mod tests {
     #[test]
     fn canonical_fingerprint_round_trips_and_rejects_persisted_tampering() {
         let resolver = StaticPipelineResolver::new(Arc::new(PluginRegistry::new()));
-        let resolution = resolver.resolution(PipelineDirection::Write);
+        let resolution = resolver.resolution(PipelineDirection::Write).unwrap();
         resolution
             .verify_fingerprint(PipelineDirection::Write)
             .unwrap();
@@ -530,7 +540,7 @@ mod tests {
     #[test]
     fn absent_hosted_identity_fields_preserve_static_serialization_and_fingerprint() {
         let resolver = StaticPipelineResolver::new(Arc::new(PluginRegistry::new()));
-        let resolution = resolver.resolution(PipelineDirection::Write);
+        let resolution = resolver.resolution(PipelineDirection::Write).unwrap();
         let serialized = serde_json::to_value(&resolution).unwrap();
         assert!(serialized.get("policy_generation").is_none());
         assert!(serialized["locator"].get("assignment_id").is_none());
@@ -567,7 +577,7 @@ mod tests {
     #[test]
     fn frozen_hosted_assignment_distinguishes_identical_revisions_and_survives_restore() {
         let resolver = StaticPipelineResolver::new(Arc::new(PluginRegistry::new()));
-        let mut first = resolver.resolution(PipelineDirection::Write);
+        let mut first = resolver.resolution(PipelineDirection::Write).unwrap();
         first.locator.revision = "same-revision".into();
         first.policy_generation = Some(7);
         first.locator.assignment_id = Some("assignment-a".into());
@@ -607,10 +617,22 @@ mod tests {
 
     #[test]
     fn pre_assignment_hosted_snapshots_keep_their_fingerprint() {
-        let resolver = StaticPipelineResolver::new(Arc::new(PluginRegistry::new()));
-        let mut legacy = resolver.resolution(PipelineDirection::Read);
-        legacy.locator.revision = "hosted-revision".into();
-        legacy.policy_generation = Some(5);
+        // Fabricate the legacy pre-assignment hosted shape directly: an empty
+        // chain recorded as explicit passthrough under the historical
+        // resolution semantics. Reads no longer resolve this way (unassigned
+        // reads deny), but persisted snapshots of this shape must keep
+        // verifying.
+        let mut legacy = PipelineResolution {
+            locator: PipelineLocator {
+                revision: "hosted-revision".into(),
+                fingerprint: String::new(),
+                assignment_id: None,
+            },
+            steps: Vec::new(),
+            policy_generation: Some(5),
+            explicit_passthrough: true,
+            limits: PipelineLimits::default(),
+        };
         legacy.locator.fingerprint = resolution_fingerprint_with_generation(
             PipelineDirection::Read,
             &legacy.steps,
@@ -633,5 +655,47 @@ mod tests {
                 .verify_fingerprint(PipelineDirection::Read)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn static_resolver_read_with_no_enabled_plugins_is_unassigned() {
+        // Mandatory read pipeline: silence is never passthrough. An empty
+        // enabled catalog assigns no read pipeline, so reads must deny.
+        let resolver = StaticPipelineResolver::new(Arc::new(PluginRegistry::new()));
+        assert_eq!(
+            resolver
+                .resolution(PipelineDirection::Read)
+                .unwrap_err()
+                .code(),
+            codes::CONFIG_INVALID
+        );
+    }
+
+    #[test]
+    fn static_resolver_write_with_no_enabled_plugins_remains_passthrough() {
+        // Writes are unchanged: the empty enabled set stays the historical
+        // store-as-is passthrough.
+        let resolver = StaticPipelineResolver::new(Arc::new(PluginRegistry::new()));
+        let resolution = resolver.resolution(PipelineDirection::Write).unwrap();
+        assert!(resolution.explicit_passthrough);
+        assert!(resolution.steps.is_empty());
+    }
+
+    #[test]
+    fn static_resolver_read_with_enabled_plugins_resolves_the_chain() {
+        let registry = PluginRegistry::new();
+        let test_component = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("target/test-components/test-transformer.component.wasm"),
+        )
+        .expect("test-transformer.component.wasm; run just build-plugins");
+        registry
+            .import("test-transformer", &test_component)
+            .unwrap();
+        let resolver = StaticPipelineResolver::new(Arc::new(registry));
+        let resolution = resolver.resolution(PipelineDirection::Read).unwrap();
+        assert_eq!(resolution.steps.len(), 1);
+        assert!(!resolution.explicit_passthrough);
     }
 }
