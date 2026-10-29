@@ -626,7 +626,6 @@ fn test_pipeline_template() -> &'static StatePipelineTemplate {
             std::env::remove_var("MASKURA_LEGACY_MAX_OBJECT_BYTES");
             std::env::remove_var("MASKURA_MAX_OBJECT_BYTES");
             std::env::remove_var("MASKURA_MAX_PIPELINE_OUTPUT_BYTES");
-            std::env::remove_var("MASKURA_STREAMING_READ_MODE");
             std::env::remove_var("MASKURA_TRANSFORMED_READ_SPOOL");
             std::env::remove_var("MASKURA_PREFIX_SAFE_COMPONENT_HASHES");
             std::env::remove_var("MASKURA_SPOOL_DIR");
@@ -640,7 +639,6 @@ fn test_pipeline_template() -> &'static StatePipelineTemplate {
             std::env::remove_var("MASKURA_MULTIPART_MODE");
             // Phase 12 removed the legacy buffered PUT/GET path entirely; the
             // streaming in-memory dev backend is the only write/read path left.
-            std::env::set_var("MASKURA_STREAMING_READ_MODE", "passthrough");
             std::env::set_var("MASKURA_DEV_MEMORY_STREAMING", "1");
             // Load the built filter components so the full pipeline (including
             // stable-encrypt) is available for joinable-read tests.

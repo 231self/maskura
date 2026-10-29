@@ -253,7 +253,6 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
             std::env::remove_var("MASKURA_DEFAULT_PLUGIN");
             std::env::remove_var("MASKURA_MANAGED_STREAMING_MODE");
             std::env::remove_var("MASKURA_MANAGED_STREAMING_TRANSACTIONAL");
-            std::env::set_var("MASKURA_STREAMING_READ_MODE", "passthrough");
             std::env::set_var("MASKURA_DEV_MEMORY_STREAMING", "1");
             std::env::set_var("MASKURA_MULTIPART_MODE", "staged");
             std::env::set_var(

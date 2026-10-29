@@ -143,10 +143,12 @@ complete assertion-backed flow, or read [Encryption](docs/encryption.md).
 
 ## Read projections
 
-Maskura can also transform on read. The original remains in storage while a
-caller opting into `x-maskura-process: read` receives the pipeline output. The
-path is fail-closed and deliberately disabled until its spool and reviewed plugin
-policy are configured. See [Security](docs/security.md) for the deployment rules.
+Maskura transforms on read. The original remains in storage while the caller
+receives the resolved read pipeline's output — every read is a pipeline
+application (ADR 0029), and only an explicitly assigned passthrough scope
+serves stored bytes. The path is fail-closed: a read the pipeline cannot fully
+serve is denied, never raw. See [Security](docs/security.md) for the
+deployment rules.
 
 ## Run the proof
 

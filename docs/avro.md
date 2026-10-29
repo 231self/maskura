@@ -58,9 +58,10 @@ applies to single PUT and processed GET.
 
 Staged multipart completion concatenates the encrypted parts into one OCF source
 and runs it through the same processor rather than treating parts as independent
-streams. A processed read (`x-maskura-process: read`) runs the source through the
-typed pump and stages the complete output in the existing encrypted read spool
-before disclosure. Processed read failures never disclose raw source bytes.
+streams. A protected read (the resolved read pipeline, ADR 0029) runs the source
+through the typed pump and stages the complete output in the existing encrypted
+read spool before disclosure. Protected read failures never disclose raw source
+bytes.
 
 ## Verify codec work
 

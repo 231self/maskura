@@ -155,7 +155,7 @@ signature verification all complete before a request body is polled.
   requires signed `x-amz-date` and `x-amz-content-sha256`. In every SigV4 mode,
   every present `x-amz-*` header except `x-amz-user-agent` and
   `x-amz-checksum-mode`, plus each present request-semantic header
-  (`x-maskura-storage-mode`, `x-maskura-backend-url`, `x-maskura-process`,
+  (`x-maskura-storage-mode`, `x-maskura-backend-url`,
   `x-maskura-stable-fields`, `x-maskura-encrypt-fields`, `content-type`,
   `content-encoding`, and `content-md5`, plus their exact legacy aliases),
   must appear in `SignedHeaders`, occur exactly once, contain valid UTF-8, and
@@ -294,20 +294,29 @@ signatures — regenerate them if you need native S3 tools.
   managed placement, multipart identities and quotas, and usage metering.
   Object sessions remain isolated per invocation.
 
-## 5. Transformed reads — fail-closed disclosure rules
+## 5. Protected reads — fail-closed disclosure rules
 
-Read-time processing (`x-maskura-process: read`) runs the pipeline on the way out:
-the object in storage is unchanged, and the caller receives only the
-transformed projection. This is the agent-safe-read path. The guarantees are
-deliberately strict:
+Every object read applies the resolved read pipeline for its workspace/bucket
+scope (ADR 0029). An `explicit_passthrough` assignment is the only route to
+stored bytes; every other read receives the transformed projection, and a read
+the pipeline cannot fully serve is denied. The object in storage is unchanged.
+The guarantees are deliberately strict:
 
-- **Preflight from stored metadata.** A transformed read performs a metadata
+- **Assignment-driven entry.** There is no client-elected mode: no header,
+  query parameter, or request shape selects a representation. Unassigned read
+  scopes deny before object lookup. Unprotected reads exist only as authored
+  `explicit_passthrough` assignments in the pipeline config; the legacy
+  `x-maskura-process` header and the `MASKURA_STREAMING_READ_MODE` gate are
+  retired.
+- **Preflight from stored metadata.** A protected read performs a metadata
   preflight against the stored object *before* any source body is consumed.
   The preflight validates `Content-Type` against a known format
   (JSON/JSONL/CSV/TSV/text), rejects `Range`, `partNumber`, non-identity
-  `Content-Encoding`, and unknown mandatory formats, and requires stored
-  metadata. Presigned-HTTP backends are rejected for transformed reads because
-  they cannot provide a safe metadata preflight.
+  `Content-Encoding`, and unknown mandatory formats (an unsupported binary is
+  denied — never raw passthrough), and requires stored metadata.
+  Presigned-HTTP backends are rejected for protected reads because they cannot
+  provide a safe metadata preflight; they are usable only under
+  `explicit_passthrough` scopes.
 - **Version/ETag binding.** The source GET must match the preflight: either an
   immutable version ID equality or a strong ETag equality (weak ETags are not
   accepted). If the source metadata changed between preflight and GET, the
@@ -335,14 +344,13 @@ deliberately strict:
   body is streamed from the spool only after the full representation is
   written, and a truncated or corrupted spool terminates the response body.
   Dropping the response body cancels the replay and releases the reservation.
-- **No `HEAD` on transformed reads** — `HEAD` is rejected until transformed
-  metadata is available.
-- Transformed reads require stored, version-bound metadata and work with S3,
-  managed storage, and in-memory backends (in local mode). Presigned backend
-  URLs remain raw-only.
-- `MASKURA_STREAMING_READ_MODE` gates the path: `off` (default) rejects transformed
-  reads entirely; `passthrough` enables only raw streaming; `transformed`
-  enables this path.
+- **No `HEAD` on protected reads** — `HEAD` is denied until transformed
+  metadata is available. Under `explicit_passthrough` scopes `HEAD` serves the
+  stored metadata.
+- Protected reads require stored, version-bound metadata and work with S3,
+  managed storage, and in-memory backends (in local mode). Every read's usage
+  authorization binds the resolved policy identity, so the fingerprint covers
+  every read — passthrough assignments included.
 
 ## 6. Storage backends
 
@@ -701,10 +709,10 @@ overrides.
   conditional reads/HEAD. Maskura enables streaming only when the backend can
   discover and abort incomplete uploads, reconcile completed uploads, and clean
   up within five minutes.
-- **Feature defaults** — transformed reads and managed streaming are
+- **Feature defaults** — reads are assignment-driven (ADR 0029): an
+  unassigned read scope denies; managed streaming and multipart are
   **off/reject by default** and must be explicitly enabled:
-  `MASKURA_STREAMING_READ_MODE=off`, `MASKURA_MULTIPART_MODE=reject`,
-  `MASKURA_MANAGED_STREAMING_MODE=off`. Single-part streaming writes are always
+  `MASKURA_MULTIPART_MODE=reject`, `MASKURA_MANAGED_STREAMING_MODE=off`. Single-part streaming writes are always
   enabled; staged multipart additionally requires `MASKURA_MULTIPART_MODE=staged`.
   Local mode supplies its durable file-backed dependencies from the mounted root;
   hosted mode requires its Postgres, wrapping, and staging-backend dependencies.

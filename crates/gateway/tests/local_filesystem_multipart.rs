@@ -566,7 +566,6 @@ async fn run_single_lifecycle() {
     env.set("MASKURA_STORAGE_MODE", "local");
     env.set("MASKURA_LOCAL_STORAGE_DIR", &root.to_string_lossy());
     env.set("MASKURA_MULTIPART_MODE", "staged");
-    env.set("MASKURA_STREAMING_READ_MODE", "passthrough");
     let components = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/components");
     assert!(
         components.is_dir(),
@@ -1181,7 +1180,6 @@ async fn run_restart_matrix() {
     env.set("MASKURA_STORAGE_MODE", "local");
     env.set("MASKURA_LOCAL_STORAGE_DIR", &root.to_string_lossy());
     env.set("MASKURA_MULTIPART_MODE", "staged");
-    env.set("MASKURA_STREAMING_READ_MODE", "passthrough");
     let components = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/components");
     assert!(
         components.is_dir(),
