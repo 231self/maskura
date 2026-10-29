@@ -809,15 +809,43 @@ async fn unsafe_transformed_test_state(later_filter: bool) -> Arc<AppState> {
     state
 }
 
-async fn direct_passthrough_test_state(control: Arc<dyn ControlPlane>) -> Arc<AppState> {
+/// Assigned one-step identity chain (the test transformer passes arbitrary
+/// bytes through) marked prefix-safe. The mandatory read pipeline removed
+/// empty-chain reads, so the direct-streaming settlement mechanics run
+/// through a real assigned pipeline.
+async fn direct_identity_pipeline_test_state(control: Arc<dyn ControlPlane>) -> Arc<AppState> {
+    let component = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-components/test-transformer.component.wasm"),
+    )
+    .expect("test-transformer.component.wasm; run just build-plugins");
+    let registry = Arc::new(PluginRegistry::new());
+    registry.import("prefix-safe-test", &component).unwrap();
+    let mut resolution = StaticPipelineResolver::new(registry.clone())
+        .resolve("seed", "seed", PipelineDirection::Read)
+        .await
+        .unwrap();
+    resolution.steps[0].capabilities.prefix_safe_for_read = true;
+    let resolver = Arc::new(TestPipelineResolver {
+        resolution,
+        calls: Mutex::default(),
+        resolved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        failure_code: None,
+    });
+    let execution_registry = Arc::new(PluginRegistry::new());
     let mut state = test_state().await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = false;
     state_mut.control = control;
-    for plugin in state_mut.plugins.list() {
-        state_mut.plugins.set_enabled(&plugin.id, false);
-    }
+    state_mut.plugins = execution_registry.clone();
+    state_mut.gateway = Arc::new(
+        Gateway::with_registry(
+            maskura_wasm_runtime::FilterEngine::new(&component).unwrap(),
+            execution_registry,
+        )
+        .with_resolver(resolver, Arc::new(FixedComponentSource(component.into()))),
+    );
     state_mut.store.put(
         "direct",
         "records.txt",
