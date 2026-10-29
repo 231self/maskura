@@ -60,14 +60,17 @@ async fn streaming_put_limit_failure_has_no_partial_visibility() {
 }
 
 #[tokio::test]
-async fn streaming_read_off_rejects_get_without_buffering() {
+async fn unassigned_read_scope_rejects_get_without_buffering() {
     let mut state = test_state().await;
     let (access_key, secret_key) = make_key(&state).await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Off;
+    for plugin in state_mut.plugins.list() {
+        state_mut.plugins.set_enabled(&plugin.id, false);
+    }
     let app = build_router(state.clone());
 
-    // Read mode off: GET rejects without buffering or disclosing the object.
+    // Unassigned read scope (mandatory read pipeline): GET denies without
+    // buffering or disclosing the object.
     state.store.put(
         "off",
         "object.txt",
@@ -83,13 +86,13 @@ async fn streaming_read_off_rejects_get_without_buffering() {
         &auth_headers(&access_key, &secret_key),
     );
     let response = app.oneshot(get).await.unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     assert!(
         !String::from_utf8_lossy(&body).contains("payload"),
-        "read-mode-off GET must not buffer the object body"
+        "unassigned-scope GET must not buffer the object body"
     );
 }
 
@@ -244,9 +247,8 @@ async fn soak_streaming_roundtrip_holds_under_repetition() {
 
 #[tokio::test]
 async fn streaming_memory_get_preserves_range_and_head_metadata() {
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
     state_mut.store.put(
         "range",
         "object.txt",
@@ -387,9 +389,8 @@ async fn streaming_file_get_preserves_frames_ranges_and_metadata_only_head() {
         .await
         .unwrap();
 
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
     state_mut.source_body_limits = BodyLimits {
         max_frame_bytes: 4,
         max_bytes: 1024,
@@ -536,9 +537,8 @@ async fn streaming_file_get_enforces_source_limit_during_body_read() {
         )
         .await
         .unwrap();
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
     state_mut.source_body_limits = BodyLimits {
         max_frame_bytes: 4,
         max_bytes: 7,
@@ -572,21 +572,18 @@ async fn streaming_file_get_enforces_source_limit_during_body_read() {
 // LocalStack's Apache-2.0 S3 suite and MinIO Mint's cross-SDK compatibility suite.
 
 #[tokio::test]
-async fn transformed_read_is_rejected_without_exposing_raw_data() {
-    let (app, state) = router().await;
-    let (ak, sk) = make_key(&state).await;
-    let hdrs = auth_headers(&ak, &sk);
-
+async fn denied_reads_never_disclose_raw_data() {
     // Seed RAW data at rest — as if written by the user's own S3 client or a
     // pre-existing bucket (write-time pipeline not involved).
-    state.store.put(
-        "rawbkt",
-        "doc.json",
-        br#"{"email":"alice@example.com","card":"4111111111111111","note":"hi"}"#.to_vec(),
-        "application/json",
-    );
+    let raw = br#"{"email":"alice@example.com","card":"4111111111111111","note":"hi"}"#.to_vec();
 
-    // Plain GET returns raw (PII intact).
+    // An explicit passthrough scope serves the stored bytes unchanged.
+    let (app, state) = explicit_passthrough_router().await;
+    let (ak, sk) = make_key(&state).await;
+    let hdrs = auth_headers(&ak, &sk);
+    state
+        .store
+        .put("rawbkt", "doc.json", raw.clone(), "application/json");
     let get = add_headers(
         Request::builder()
             .method("GET")
@@ -599,29 +596,42 @@ async fn transformed_read_is_rejected_without_exposing_raw_data() {
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let raw = String::from_utf8_lossy(&body);
+    let served = String::from_utf8_lossy(&body);
     assert!(
-        raw.contains("alice@example.com"),
-        "raw read keeps PII: {raw}"
+        served.contains("alice@example.com"),
+        "passthrough scope serves stored bytes: {served}"
     );
 
-    let transformed_get = add_headers(
+    // An unassigned read scope denies without disclosing anything.
+    let mut unassigned = test_state().await;
+    let (ak, sk) = make_key(&unassigned).await;
+    let hdrs = auth_headers(&ak, &sk);
+    {
+        let state_mut = Arc::get_mut(&mut unassigned).expect("test state is uniquely owned");
+        for plugin in state_mut.plugins.list() {
+            state_mut.plugins.set_enabled(&plugin.id, false);
+        }
+    }
+    let app = build_router(unassigned.clone());
+    unassigned
+        .store
+        .put("rawbkt", "doc.json", raw, "application/json");
+    let get = add_headers(
         Request::builder()
             .method("GET")
             .uri("/rawbkt/doc.json")
-            .header("x-maskura-process", "read")
             .body(Body::empty())
             .unwrap(),
         &hdrs,
     );
-    let resp = app.oneshot(transformed_get).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let resp = app.oneshot(get).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
     let rejected = String::from_utf8_lossy(&body);
     assert!(
-        rejected.contains("<Code>NotImplemented</Code>"),
+        rejected.contains("<Code>AccessDenied</Code>"),
         "typed rejection: {rejected}"
     );
     assert!(
@@ -631,33 +641,39 @@ async fn transformed_read_is_rejected_without_exposing_raw_data() {
 }
 
 #[tokio::test]
-async fn transformed_read_is_rejected_before_object_lookup() {
-    let (app, state) = router().await;
+async fn unassigned_read_scope_is_rejected_before_object_lookup() {
+    let mut state = test_state().await;
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
+    {
+        let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+        for plugin in state_mut.plugins.list() {
+            state_mut.plugins.set_enabled(&plugin.id, false);
+        }
+    }
+    let app = build_router(state.clone());
 
     let get = add_headers(
         Request::builder()
             .method("GET")
             .uri("/rawbkt/does-not-exist.json")
-            .header("x-maskura-process", "true")
             .body(Body::empty())
             .unwrap(),
         &hdrs,
     );
     let resp = app.oneshot(get).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
     let xml = String::from_utf8_lossy(&body);
-    assert!(xml.contains("<Code>NotImplemented</Code>"), "{xml}");
+    assert!(xml.contains("<Code>AccessDenied</Code>"), "{xml}");
     assert!(!xml.contains("NoSuchKey"), "lookup must not run: {xml}");
 }
 
 #[tokio::test]
 async fn legacy_body_limit_no_longer_bounds_streaming_put_or_passthrough_get() {
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     Arc::get_mut(&mut state)
         .expect("test state is uniquely owned")
         .legacy_max_object_bytes = 8;
@@ -707,8 +723,9 @@ async fn legacy_body_limit_no_longer_bounds_streaming_put_or_passthrough_get() {
 }
 
 #[tokio::test]
-async fn stable_transformed_reads_are_rejected_without_disclosure() {
-    let (app, state) = router().await;
+async fn stable_transformed_reads_succeed_without_disclosing_pii() {
+    let state = spooled_test_state().await;
+    let app = build_router(state.clone());
 
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
@@ -742,8 +759,8 @@ async fn stable_transformed_reads_are_rejected_without_disclosure() {
 
     let ra = app.clone().oneshot(get("a.json")).await.unwrap();
     let rb = app.clone().oneshot(get("b.json")).await.unwrap();
-    assert_eq!(ra.status(), StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(rb.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(ra.status(), StatusCode::OK);
+    assert_eq!(rb.status(), StatusCode::OK);
     let ta = String::from_utf8_lossy(
         &axum::body::to_bytes(ra.into_body(), usize::MAX)
             .await
@@ -757,10 +774,10 @@ async fn stable_transformed_reads_are_rejected_without_disclosure() {
     )
     .to_string();
 
+    // A stable-fields protected read joins on the protected key; it must
+    // never disclose the raw join value.
     assert!(!ta.contains("alice@example.com"), "a leaks PII: {ta}");
     assert!(!tb.contains("alice@example.com"), "b leaks PII: {tb}");
-    assert!(ta.contains("<Code>NotImplemented</Code>"), "{ta}");
-    assert!(tb.contains("<Code>NotImplemented</Code>"), "{tb}");
 }
 
 #[tokio::test]
@@ -772,7 +789,6 @@ async fn unsafe_transformed_read_stages_then_sanitizes_source_headers() {
     ));
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     let control = Arc::new(RecordingMeteringControl::default());
-    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = true;
     state_mut.spool_config.directory = spool_dir.clone();
     state_mut.spool_config.max_object_bytes = 1024;
@@ -835,7 +851,6 @@ async fn unsafe_transformed_read_stages_then_sanitizes_source_headers() {
 async fn transformed_read_rejects_range_part_head_encoding_and_unknown_format() {
     let mut state = test_state().await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = true;
     state.store.put(
         "read",
@@ -887,7 +902,6 @@ async fn transformed_read_rejects_range_part_head_encoding_and_unknown_format() 
 async fn unsafe_transformed_read_refuses_unavailable_staging_without_disclosure() {
     let mut state = test_state().await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = true;
     state_mut.spool_config.max_object_bytes = 4;
     state_mut.spool_quota = Arc::new(SpoolQuota::new(4));
@@ -1051,7 +1065,6 @@ async fn nonempty_prefix_safe_reads_stream_and_settle_without_spool() {
         uuid::Uuid::now_v7()
     ));
     let spool_quota = Arc::new(SpoolQuota::new(2048));
-    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = false;
     state_mut.spool_config.directory = spool_dir.clone();
     state_mut.spool_config.max_object_bytes = 1024;
@@ -1353,7 +1366,6 @@ async fn direct_read_terminal_plugin_error_never_settles_customer_usage() {
     let mut state = test_state().await;
     let control = Arc::new(RecordingMeteringControl::default());
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Transformed;
     state_mut.transformed_read_spool_enabled = false;
     state_mut.control = control.clone();
     state_mut.plugins = execution_registry.clone();

@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn launch_contract_billable_handlers_generate_distinct_server_usage_event_identities() {
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     let (access_key, secret_key) = make_key(&state).await;
     let control = Arc::new(RecordingMeteringControl::default());
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
@@ -166,11 +166,20 @@ async fn launch_contract_billable_handlers_generate_distinct_server_usage_event_
         authorizations[0].1.pipeline_fingerprint(),
         Some(write_pipeline.fingerprint.as_str())
     );
-    assert!(
-        authorizations[1..]
-            .iter()
-            .all(|(_, authorization)| authorization.pipeline_revision().is_none())
-    );
+    // The mandatory read pipeline binds the resolved policy identity into
+    // every read's authorization (explicit passthrough reads included);
+    // operations that run no read pipeline stay unbound.
+    for (_, authorization) in &authorizations[1..] {
+        let bound = authorization.pipeline_revision() == Some("static");
+        assert_eq!(
+            bound,
+            matches!(
+                authorization.route(),
+                UsageRoute::GetObject | UsageRoute::HeadObject
+            ),
+            "reads carry the pipeline binding, other operations do not"
+        );
+    }
     assert_eq!(
         authorizations
             .iter()
@@ -355,7 +364,7 @@ async fn launch_contract_blocked_authorization_does_not_poll_or_release() {
 
 #[tokio::test]
 async fn launch_contract_mismatched_grant_fails_closed_without_polling_body() {
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     let (access_key, secret_key) = make_key(&state).await;
     let control = Arc::new(StaleGrantControl::default());
     Arc::get_mut(&mut state)
@@ -469,7 +478,7 @@ async fn launch_contract_successful_list_records_receipt_and_failed_list_is_not_
 
 #[tokio::test]
 async fn invalid_range_failed_head_and_failed_delete_release_exact_reservations() {
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     let (access_key, secret_key) = make_key(&state).await;
     state.store.put(
         "failed",
@@ -588,7 +597,7 @@ async fn launch_contract_list_metering_failure_replaces_success_with_service_una
 
 #[tokio::test]
 async fn oversized_get_and_head_release_before_metering() {
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     let (access_key, secret_key) = make_key(&state).await;
     state.store.put(
         "limited",

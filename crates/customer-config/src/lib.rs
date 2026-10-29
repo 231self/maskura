@@ -39,7 +39,6 @@ pub mod aliases {
     pub const MAX_OBJECT_BYTES: EnvAlias = EnvAlias::new("MASKURA_MAX_OBJECT_BYTES");
     pub const MAX_PIPELINE_OUTPUT_BYTES: EnvAlias =
         EnvAlias::new("MASKURA_MAX_PIPELINE_OUTPUT_BYTES");
-    pub const STREAMING_READ_MODE: EnvAlias = EnvAlias::new("MASKURA_STREAMING_READ_MODE");
     pub const TRANSFORMED_READ_SPOOL: EnvAlias = EnvAlias::new("MASKURA_TRANSFORMED_READ_SPOOL");
     pub const PREFIX_SAFE_COMPONENT_HASHES: EnvAlias =
         EnvAlias::new("MASKURA_PREFIX_SAFE_COMPONENT_HASHES");
@@ -74,7 +73,6 @@ pub mod aliases {
         SOURCE_MAX_FRAME_BYTES,
         MAX_OBJECT_BYTES,
         MAX_PIPELINE_OUTPUT_BYTES,
-        STREAMING_READ_MODE,
         TRANSFORMED_READ_SPOOL,
         PREFIX_SAFE_COMPONENT_HASHES,
         PIPELINES_FILE,

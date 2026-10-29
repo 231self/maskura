@@ -30,7 +30,6 @@ pub struct AppState {
     /// historical unenforced behavior (ADR 0021 OSS default).
     pub policy_gate: Option<Arc<dyn crate::policy_gate::PolicyGate>>,
     pub legacy_max_object_bytes: usize,
-    pub streaming_read_mode: StreamingReadMode,
     pub source_body_limits: BodyLimits,
     pub max_pipeline_output_bytes: u64,
     pub presigned_http_policy: PresignedHttpPolicy,
@@ -87,6 +86,18 @@ pub(crate) struct ConfiguredPipelineFile {
 impl StatePipelineTemplate {
     #[doc(hidden)]
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
+        Self::from_config_with_executor(config, maskura_wasm_runtime::ExecutorConfig::default())
+    }
+
+    /// Test seam: identical to [`Self::from_config`] with caller-chosen
+    /// executor sizing. The shared guest-memory budget saturates when many
+    /// pipelines execute concurrently (mandatory reads make every read a
+    /// pipeline execution).
+    #[doc(hidden)]
+    pub fn from_config_with_executor(
+        config: &Config,
+        executor_config: maskura_wasm_runtime::ExecutorConfig,
+    ) -> anyhow::Result<Self> {
         let source_body_limits = source_body_limits(config)?;
         let explicit_component_path = component_path(config);
         let component_bytes = std::fs::read(&explicit_component_path)?;
@@ -105,11 +116,8 @@ impl StatePipelineTemplate {
             max_cumulative_fuel: pipeline_fuel,
             ..default_pipeline_limits
         };
-        let plugins = PluginRegistry::with_options(
-            pipeline_fuel,
-            pipeline_limits,
-            maskura_wasm_runtime::ExecutorConfig::default(),
-        )?;
+        let plugins =
+            PluginRegistry::with_options(pipeline_fuel, pipeline_limits, executor_config)?;
         let prefix_safe_hashes = prefix_safe_component_hashes(config);
 
         use sha2::Digest as _;
@@ -234,28 +242,6 @@ fn pipeline_trust_roots(config: &Config) -> anyhow::Result<maskura_pipeline_conf
     };
     maskura_pipeline_config::parse_trust_roots(raw)
         .map_err(|error| anyhow::anyhow!("MASKURA_PIPELINE_TRUST_ROOTS is invalid: {error}"))
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum StreamingReadMode {
-    #[default]
-    Off,
-    Passthrough,
-    Transformed,
-}
-
-impl StreamingReadMode {
-    pub(crate) fn from_config(config: &Config) -> Self {
-        match config.features.streaming_read_mode {
-            ConfigStreamingReadMode::Off => Self::Off,
-            ConfigStreamingReadMode::Passthrough => Self::Passthrough,
-            ConfigStreamingReadMode::Transformed => Self::Transformed,
-        }
-    }
-
-    pub(crate) fn streams_passthrough(self) -> bool {
-        matches!(self, Self::Passthrough | Self::Transformed)
-    }
 }
 
 /// Imported plugins are unsafe by default. Operators may opt known component

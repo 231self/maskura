@@ -822,13 +822,6 @@ pub(crate) fn s3_xml_ok(xml: String) -> axum::response::Response {
     response
 }
 
-pub(crate) fn wants_transformed_read(headers: &HeaderMap) -> bool {
-    customer_headers::validated(headers, customer_headers::PROCESS)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("read") || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
 #[derive(Debug)]
 pub(crate) enum TransformedReadError {
     InvalidRequest(String),
@@ -1822,7 +1815,6 @@ pub(crate) async fn s3_get(
     if let Some(response) = client_metering_id_rejection(&headers, &key) {
         return response;
     }
-    let transformed_read = wants_transformed_read(&headers);
     // ListParts lists the parts of a caller-owned upload and is deliberately
     // out of the v1 policy claim (part listings are not object-data policy
     // surface); the create-time frozen verdict is still re-checked below.
@@ -1912,58 +1904,58 @@ pub(crate) async fn s3_get(
     }
     let operation = request_operation_identity();
     let resolution_started = Instant::now();
-    let resolution = if transformed_read {
-        match state
-            .gateway
-            .resolve(
-                auth.workspace_id().as_str(),
+    // Mandatory read pipeline: every read resolves the read pipeline for its
+    // scope. An unassigned scope denies (silence is never passthrough); the
+    // resolved `explicit_passthrough` assignment is the only route to stored
+    // bytes, and a non-passthrough resolution is the only route to a
+    // projection. No client input selects a representation.
+    let resolution = match state
+        .gateway
+        .resolve(
+            auth.workspace_id().as_str(),
+            &bucket,
+            crate::pipeline::PipelineDirection::Read,
+        )
+        .await
+    {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            record_failed_pipeline_attempt(
+                state.control.as_ref(),
+                &auth.context,
+                operation.operation_id,
                 &bucket,
                 crate::pipeline::PipelineDirection::Read,
+                None,
+                error.code(),
+                resolution_started.elapsed().as_millis() as u64,
             )
-            .await
-        {
-            Ok(resolution) => Some(resolution),
-            Err(error) => {
-                record_failed_pipeline_attempt(
-                    state.control.as_ref(),
-                    &auth.context,
-                    operation.operation_id,
-                    &bucket,
-                    crate::pipeline::PipelineDirection::Read,
-                    None,
-                    error.code(),
-                    resolution_started.elapsed().as_millis() as u64,
-                )
-                .await;
-                return pipeline_error_response(&key, &error);
-            }
+            .await;
+            // Scope denials are AccessDenied with no detail; transient
+            // resolution failures keep their existing error mapping.
+            return if error.code() == maskura_error::codes::CONFIG_INVALID {
+                s3_error::access_denied(&key)
+            } else {
+                pipeline_error_response(&key, &error)
+            };
         }
-    } else {
-        None
     };
-    let authorization = match &resolution {
-        Some(resolution) => operation.pipeline_authorization(
-            &bucket,
-            UsageRoute::GetObject,
-            RequestKind::Read,
-            object_max_processed_bytes(&state),
-            resolution,
-        ),
-        None => operation.authorization(
-            &bucket,
-            UsageRoute::GetObject,
-            RequestKind::Read,
-            object_max_processed_bytes(&state),
-        ),
-    };
+    let transformed_read = !resolution.explicit_passthrough;
+    let authorization = operation.pipeline_authorization(
+        &bucket,
+        UsageRoute::GetObject,
+        RequestKind::Read,
+        object_max_processed_bytes(&state),
+        &resolution,
+    );
     let grant = match authorize_request(state.control.as_ref(), &auth.context, &authorization, &key)
         .await
     {
         Ok(grant) => grant,
         Err(response) => return response,
     };
-    let mut pipeline_snapshot = if let Some(resolution) = &resolution {
-        match state.gateway.snapshot_for(resolution).await {
+    let mut pipeline_snapshot = if transformed_read {
+        match state.gateway.snapshot_for(&resolution).await {
             Ok(snapshot) => Some(snapshot),
             Err(error) => {
                 record_failed_pipeline_attempt(
@@ -1972,7 +1964,7 @@ pub(crate) async fn s3_get(
                     operation.operation_id,
                     &bucket,
                     crate::pipeline::PipelineDirection::Read,
-                    Some(resolution),
+                    Some(&resolution),
                     error.code(),
                     resolution_started.elapsed().as_millis() as u64,
                 )
@@ -1990,16 +1982,6 @@ pub(crate) async fn s3_get(
     } else {
         None
     };
-    if transformed_read && state.streaming_read_mode != StreamingReadMode::Transformed {
-        return release_failure(
-            state.control.as_ref(),
-            &auth.context,
-            &grant,
-            &key,
-            s3_error::transformed_read_not_supported(&key),
-        )
-        .await;
-    }
     let mut selection = match resolve_backend(&state, &auth, &headers, StorageOperation::Get).await
     {
         Ok(selection) => selection,
@@ -2027,7 +2009,10 @@ pub(crate) async fn s3_get(
             },
             bucket: &bucket,
             key: &key,
-            resolution: resolution.as_ref(),
+            // Gate convention: the frozen resolution is present only on paths
+            // that execute a pipeline. An explicit passthrough read executes
+            // none (its identity is still bound into the usage authorization).
+            resolution: transformed_read.then_some(&resolution),
             destination: backend,
             snapshot: &selection.snapshot,
             direction: crate::pipeline::PipelineDirection::Read,
@@ -2343,9 +2328,7 @@ pub(crate) async fn s3_get(
             &auth,
             operation,
             &grant,
-            resolution
-                .as_ref()
-                .expect("transformed reads resolve an immutable pipeline"),
+            &resolution,
             &headers,
             pipeline_snapshot.expect("transformed reads resolve a pipeline snapshot"),
             preflight,
@@ -2365,7 +2348,7 @@ pub(crate) async fn s3_get(
                 operation.operation_id,
                 &bucket,
                 crate::pipeline::PipelineDirection::Read,
-                resolution.as_ref(),
+                Some(&resolution),
                 maskura_error::codes::INTERNAL,
                 resolution_started.elapsed().as_millis() as u64,
             )
@@ -2417,28 +2400,14 @@ pub(crate) async fn s3_get(
         .await;
     }
 
-    if state.streaming_read_mode.streams_passthrough() {
-        return metered_read_response(
-            state.control.clone(),
-            &auth,
-            &grant,
-            &key,
-            None,
-            object.into_response(),
-            None,
-        )
-        .await;
-    }
-
-    // Legacy whole-object GET buffering was removed in Phase 12. With reads
-    // administratively disabled, reject without collecting the object body;
-    // dropping `object` cancels the source before any byte is buffered.
-    release_failure(
-        state.control.as_ref(),
-        &auth.context,
+    metered_read_response(
+        state.control.clone(),
+        &auth,
         &grant,
         &key,
-        s3_error::read_disabled(&key),
+        None,
+        object.into_response(),
+        None,
     )
     .await
 }
@@ -2458,15 +2427,54 @@ pub(crate) async fn s3_head(
         return response;
     }
     let operation = request_operation_identity();
-    let authorization =
-        operation.authorization(&bucket, UsageRoute::HeadObject, RequestKind::Read, 0);
+    let resolution_started = Instant::now();
+    // Mandatory read pipeline: HEAD follows the read assignment. An explicit
+    // passthrough scope serves stored object metadata; a protected scope
+    // denies until transformed metadata is available; an unassigned scope
+    // denies.
+    let resolution = match state
+        .gateway
+        .resolve(
+            auth.workspace_id().as_str(),
+            &bucket,
+            crate::pipeline::PipelineDirection::Read,
+        )
+        .await
+    {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            record_failed_pipeline_attempt(
+                state.control.as_ref(),
+                &auth.context,
+                operation.operation_id,
+                &bucket,
+                crate::pipeline::PipelineDirection::Read,
+                None,
+                error.code(),
+                resolution_started.elapsed().as_millis() as u64,
+            )
+            .await;
+            return if error.code() == maskura_error::codes::CONFIG_INVALID {
+                s3_error::access_denied(&key)
+            } else {
+                pipeline_error_response(&key, &error)
+            };
+        }
+    };
+    let authorization = operation.pipeline_authorization(
+        &bucket,
+        UsageRoute::HeadObject,
+        RequestKind::Read,
+        0,
+        &resolution,
+    );
     let grant = match authorize_request(state.control.as_ref(), &auth.context, &authorization, &key)
         .await
     {
         Ok(grant) => grant,
         Err(response) => return response,
     };
-    if wants_transformed_read(&headers) {
+    if !resolution.explicit_passthrough {
         let response = s3_error::invalid_request(
             &key,
             "HEAD is not supported for transformed reads until transformed metadata is available",

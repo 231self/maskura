@@ -6,7 +6,6 @@ async fn resolved_feature_limit_and_wasm_config_populates_state_without_late_env
         std::env::temp_dir().join(format!("maskura-resolved-config-{}", uuid::Uuid::new_v4()));
     let mut config = test_config();
     config.supabase.url = Some("https://config-snapshot.supabase.co".to_string());
-    config.features.streaming_read_mode = ConfigStreamingReadMode::Transformed;
     config.features.transformed_read_spool = true;
     config.features.enable_avro = true;
     config.features.enable_lance = true;
@@ -52,7 +51,6 @@ async fn resolved_feature_limit_and_wasm_config_populates_state_without_late_env
     .await
     .expect("build configured state");
 
-    assert_eq!(state.streaming_read_mode, StreamingReadMode::Transformed);
     assert!(state.transformed_read_spool_enabled);
     assert!(state.binary_avro_enabled);
     assert!(state.binary_lance_enabled);

@@ -4,10 +4,9 @@ use super::*;
 async fn filestore_conformance_bucket_object_lifecycle_survives_restart() {
     let root =
         std::env::temp_dir().join(format!("maskura-file-lifecycle-{}", uuid::Uuid::now_v7()));
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     let keys = state.keys.clone();
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
     state_mut.file_store = Some(Arc::new(FileStore::new(root.clone()).await.unwrap()));
     let (ak, sk) = make_key(&state).await;
     let headers = auth_headers(&ak, &sk);
@@ -72,10 +71,9 @@ async fn filestore_conformance_bucket_object_lifecycle_survives_restart() {
 
     drop(app);
     drop(state);
-    let mut restarted = test_state().await;
+    let mut restarted = explicit_passthrough_test_state(None).await;
     let state_mut = Arc::get_mut(&mut restarted).expect("test state is uniquely owned");
     state_mut.keys = keys;
-    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
     state_mut.file_store = Some(Arc::new(FileStore::new(root.clone()).await.unwrap()));
     let app = build_router(restarted);
 
@@ -408,9 +406,8 @@ async fn filestore_conformance_preserves_encoded_key_identity_and_list_encoding(
     let root = std::env::temp_dir().join(format!("maskura-file-keys-{}", uuid::Uuid::now_v7()));
     let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
     store.create_bucket("keys").await.unwrap();
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
     state_mut.file_store = Some(store);
     let (ak, sk) = make_key(&state).await;
     let headers = auth_headers(&ak, &sk);
@@ -509,9 +506,8 @@ async fn filestore_conformance_conditions_and_missing_key_precede_range() {
         )
         .await
         .unwrap();
-    let mut state = test_state().await;
+    let mut state = explicit_passthrough_test_state(None).await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    state_mut.streaming_read_mode = StreamingReadMode::Passthrough;
     state_mut.file_store = Some(store);
     let (ak, sk) = make_key(&state).await;
     let headers = auth_headers(&ak, &sk);

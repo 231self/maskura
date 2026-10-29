@@ -529,8 +529,7 @@ mod multipart_completion_tests {
 #[cfg(test)]
 mod s3_provider_capability_tests {
     use maskura_customer_config::config::{
-        MultipartMode as ConfigMultipartMode, StreamingReadMode as ConfigStreamingReadMode,
-        StreamingS3Provider,
+        MultipartMode as ConfigMultipartMode, StreamingS3Provider,
     };
 
     use super::*;
@@ -559,20 +558,11 @@ mod s3_provider_capability_tests {
         assert!(configured_s3_streaming_capabilities(&config).is_none());
         assert!(configured_managed_streaming_capabilities(&config).is_none());
         assert_eq!(multipart_mode(&config), MultipartMode::Reject);
-        assert_eq!(
-            StreamingReadMode::from_config(&config),
-            StreamingReadMode::Off
-        );
 
         config.features.managed_streaming_transactional = true;
         config.features.multipart_mode = ConfigMultipartMode::Staged;
-        config.features.streaming_read_mode = ConfigStreamingReadMode::Transformed;
         assert!(configured_managed_streaming_capabilities(&config).is_some());
         assert_eq!(multipart_mode(&config), MultipartMode::Staged);
-        assert_eq!(
-            StreamingReadMode::from_config(&config),
-            StreamingReadMode::Transformed
-        );
     }
 
     #[test]

@@ -48,7 +48,8 @@ async fn mcp_tokens_cannot_mutate_public_keys() {
 
 #[tokio::test]
 async fn mcp_token_roundtrip_and_auth() {
-    let (app, state) = router().await;
+    let state = spooled_test_state().await;
+    let app = build_router(state.clone());
 
     // Create an MCP token.
     let token = state
@@ -177,7 +178,7 @@ async fn mcp_token_identity_is_workspace_bound() {
 
 #[tokio::test]
 async fn trusted_mcp_invocation_uses_gateway_pipeline_without_auth_headers() {
-    let state = test_state().await;
+    let state = spooled_test_state().await;
     let context = trusted_context(&state, "hosted-workspace").await;
     let cancellation = tokio_util::sync::CancellationToken::new();
     let put = invoke_mcp(

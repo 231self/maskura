@@ -76,7 +76,6 @@ fn fixture_bytes(name: &str, relative: &str) -> Vec<u8> {
 /// open or closed as requested. Everything else mirrors `test_config`.
 async fn iceberg_state(gate_open: bool) -> Arc<AppState> {
     let mut config = test_config();
-    config.features.streaming_read_mode = ConfigStreamingReadMode::Transformed;
     config.features.transformed_read_spool = true;
     config.features.enable_iceberg = gate_open;
     config.features.dev_memory_streaming = true;
@@ -388,6 +387,7 @@ async fn table_root_processed_read_stages_complete_output_without_raw_fallback()
 async fn raw_reads_of_table_units_are_unprocessed_passthrough() {
     // Gate closed: raw reads never consult the table layer or the gate.
     let mut state = iceberg_state(false).await;
+    apply_explicit_passthrough(Arc::get_mut(&mut state).expect("test state is uniquely owned"));
     load_fixture(&state, "v2_empty");
     load_fixture(&state, "v2_multi_snapshot");
     let (ak, sk) = make_key(&state).await;
