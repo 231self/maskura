@@ -3,7 +3,7 @@
 # Pre-built Wasm components committed to components/. Each invocation builds
 # one native target; the release workflow assembles its multi-arch manifest.
 
-FROM rust:1.99.0-trixie@sha256:81015672d6939b0265f09adf96d5de125482bb1330106076956b0518e74edc90 AS build
+FROM rust:1.99.1-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137 AS build
 WORKDIR /src
 ARG CARGO_BUILD_JOBS=2
 
@@ -15,7 +15,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --locked --release --jobs "$CARGO_BUILD_JOBS" -p maskura-gateway \
     && cp /src/target/release/maskura-gateway /src/gateway-bin
 
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
