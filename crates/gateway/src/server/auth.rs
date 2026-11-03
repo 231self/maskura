@@ -229,22 +229,6 @@ pub(crate) async fn release_failure(
     }
 }
 
-pub(crate) async fn managed_delete_failure_response(
-    control: &dyn ControlPlane,
-    context: &AuthenticatedRequestContext,
-    grant: &AuthorizationGrant,
-    key: &str,
-    error: crate::managed::ManagedDeleteError,
-) -> axum::response::Response {
-    let response = s3_error::internal_error(key, "The managed delete could not be completed.");
-    match error {
-        crate::managed::ManagedDeleteError::PreCommit(_) => {
-            release_failure(control, context, grant, key, response).await
-        }
-        crate::managed::ManagedDeleteError::CommitUnknown(_) => response,
-    }
-}
-
 pub(crate) async fn record_usage(
     control: Arc<dyn ControlPlane>,
     context: &AuthenticatedRequestContext,
