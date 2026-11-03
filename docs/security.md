@@ -79,6 +79,14 @@ Policy approval has three deployment states that must not be conflated:
    workspace to `enforced` is a separate enrollment step that shipping the gate
    does not authorize.
 
+A DeleteObjects batch (`POST /{bucket}?delete`) adds no new authorization mode:
+a batch of N keys is N policy-gated, receipted deletes presented under one S3
+request — one `PolicyOperation::Delete` verdict, one usage receipt, and one
+`<Deleted>`/`<Error>` outcome per key, under the same typed policy codes. There
+is no averaged authorization, no batch verdict, and no silent outcome; the
+policy-claim surface of ADR 0022 extends to batches as N of the existing
+per-operation claims ([ADR 0030](adr/0030-batch-delete-objects.md)).
+
 Approval evidence is versioned canonical-CBOR (a sorted-JSON-keys convention,
 explicitly not RFC 8949 canonical) `ReceiptBody`/`Checkpoint` v2 with SHA-256
 digests, carried by WebAuthn ASN.1 DER ES256 assertions bound to the complete
@@ -594,6 +602,12 @@ Persisted S3-compatible workspace endpoints use a separate
   grammar parser (no general XML resolver): DTDs and entities are rejected
   before tokenization, parts must be sorted and unique, and part ETags/checksums
   are validated against staged parts.
+- `DeleteObjects` XML (`POST /{bucket}?delete`) is capped at 128 KiB and 1000
+  keys and parsed by the same strict-grammar discipline: DTDs, entity
+  declarations, comments, and CDATA are rejected before tokenization (no entity
+  expansion), only XML's predefined and numeric character references are
+  decoded, and any unexpected element (including `VersionId`) fails the whole
+  request before any key is touched.
 - aws-chunked framing is decoded with fixed-size state and explicit limits;
   oversized frames, duplicate trailers, and trailing data are rejected.
 - Wasm guest memory is capped per object (64 MiB aggregate) with a bounded
