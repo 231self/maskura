@@ -32,6 +32,12 @@
 //! | Raw GET / HEAD / byte-range × stored Lance object | **unprocessed** passthrough over the stored representation (`RawGet`/`Head`, never `ProcessedGet`) | (no adapter seam — the raw path is format-blind) | `lance_raw_get_head_and_byte_range_stay_unprocessed_passthrough` |
 //! | Metering / pipeline evidence × Lance | the existing binary-adapter rows (`UsageRoute::PutObject`/`GetObject`; `CommonTypeBinaryReductor` + envelope per `lance/tests.rs::process_lance_emits_the_typed_envelope_schema`); no new metering route | `control::UsageEvent` | `lance_metering_reuses_the_binary_adapter_rows` |
 //!
+//! Batch row: `POST /{bucket}?delete` (S3 Multi-Object Delete) is an envelope
+//! over the single-key gated path — a batch of N keys presents N `Delete`
+//! verdicts and answers each key under its own outcome
+//! (`batch_delete_answers_each_key_under_its_own_verdict`). There is no batch
+//! operation variant and no averaged authorization.
+//!
 //! Avro-gap note: the earlier binary adapter has **no** rows here — the Avro
 //! seams (`streaming_avro_single_put`, `complete_staged_avro_multipart`,
 //! `avro_transformed_read_response`) and their gate-closed 501 /
@@ -349,6 +355,28 @@ async fn policy_gate_covers_every_data_plane_operation() {
     );
     app.clone().oneshot(delete).await.unwrap();
 
+    // A DeleteObjects batch is N gated deletes: the matrix operation set does
+    // not grow, but the count must — one Delete verdict per listed key.
+    let deletes_before_batch = gate.count(PolicyOperation::Delete);
+    let batch = add_headers(
+        Request::builder()
+            .method("POST")
+            .uri("/bucket?delete")
+            .header(header::CONTENT_TYPE, "application/xml")
+            .body(Body::from(
+                "<Delete><Object><Key>object</Key></Object><Object><Key>batch-only</Key></Object></Delete>",
+            ))
+            .unwrap(),
+        &hdrs,
+    );
+    let batch_response = app.clone().oneshot(batch).await.unwrap();
+    assert_eq!(batch_response.status(), StatusCode::OK);
+    assert_eq!(
+        gate.count(PolicyOperation::Delete),
+        deletes_before_batch + 2,
+        "a 2-key DeleteObjects batch must present 2 Delete verdicts"
+    );
+
     // The explicit passthrough drive: reads present RawGet and HEAD reaches
     // the gate (the legacy read-selection header is inert).
     let (raw_app, raw_state, gate) =
@@ -458,6 +486,136 @@ async fn policy_gate_covers_every_data_plane_operation() {
         gate.count(PolicyOperation::Put),
         puts_before + 1,
         "invoke_mcp must present Put to the gate"
+    );
+}
+
+#[tokio::test]
+async fn batch_delete_answers_each_key_under_its_own_verdict() {
+    // A batch is N gated deletes under one request: the gate is consulted per
+    // key, and a denial lands only on its key (`<Error>`) while the rest
+    // proceed to `<Deleted>`.
+    struct DenyOne {
+        denied: String,
+    }
+
+    #[async_trait]
+    impl PolicyGate for DenyOne {
+        async fn enforce(
+            &self,
+            request: &PolicyRequest<'_>,
+        ) -> Result<VerifiedPolicy, MaskuraError> {
+            if request.operation == PolicyOperation::Delete && request.key == self.denied {
+                return Err(MaskuraError::new(
+                    maskura_error::codes::POLICY_DENIED,
+                    "state mismatch",
+                ));
+            }
+            Ok(VerifiedPolicy::unbound())
+        }
+    }
+
+    let gate = Arc::new(DenyOne {
+        denied: "denied.txt".to_string(),
+    });
+    let (config, _scratch) = coverage_config();
+    let mut state = build_state_with_pipeline_template(
+        Arc::new(NoopControlPlane),
+        default_wrapping().expect("wrapping"),
+        Arc::new(InMemoryWorkspaceStorageRepository::new()),
+        test_pipeline_template(),
+        &config,
+    )
+    .await
+    .expect("build_state");
+    {
+        let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+        state_mut.policy_gate = Some(gate);
+    }
+    let app = build_router(state.clone());
+    let (ak, sk) = make_key(&state).await;
+    let hdrs = auth_headers(&ak, &sk);
+
+    let create_bucket = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/bucket")
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    assert_eq!(
+        app.clone().oneshot(create_bucket).await.unwrap().status(),
+        StatusCode::OK
+    );
+    for key in ["kept.txt", "denied.txt"] {
+        let put = add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/bucket/{key}"))
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("payload"))
+                .unwrap(),
+            &hdrs,
+        );
+        assert_eq!(
+            app.clone().oneshot(put).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    let batch = add_headers(
+        Request::builder()
+            .method("POST")
+            .uri("/bucket?delete")
+            .header(header::CONTENT_TYPE, "application/xml")
+            .body(Body::from(
+                "<Delete><Object><Key>kept.txt</Key></Object><Object><Key>denied.txt</Key></Object><Object><Key>missing.txt</Key></Object></Delete>",
+            ))
+            .unwrap(),
+        &hdrs,
+    );
+    let response = app.clone().oneshot(batch).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let xml = String::from_utf8_lossy(&body);
+    assert!(
+        xml.contains("<Deleted><Key>kept.txt</Key></Deleted>"),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<Deleted><Key>missing.txt</Key></Deleted>"),
+        "missing keys answer <Deleted>; the batch is idempotent: {xml}"
+    );
+    assert!(
+        xml.contains("<Error><Key>denied.txt</Key><Code>policy.denied</Code>"),
+        "the denied key lands in Error under its typed code: {xml}"
+    );
+    // The denial is per key: the other keys were deleted.
+    let get = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/bucket/kept.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    assert_eq!(
+        app.clone().oneshot(get).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+    let get = add_headers(
+        Request::builder()
+            .method("GET")
+            .uri("/bucket/denied.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &hdrs,
+    );
+    assert_eq!(
+        app.clone().oneshot(get).await.unwrap().status(),
+        StatusCode::OK
     );
 }
 

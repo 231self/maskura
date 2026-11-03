@@ -45,3 +45,8 @@
 - [ADR 0023: Policy approval verification](adr/0023-policy-approval-verification.md)
 - [ADR 0024: Trust-root lineage and receipt-head retention](adr/0024-trust-root-lineage-and-receipt-head-retention.md)
 - [ADR 0025: Signed backup policy authority](adr/0025-signed-backup-policy-authority.md)
+- [ADR 0026: Apache Lance format adapter](adr/0026-lance-format-adapter.md)
+- [ADR 0027: Parquet format adapter](adr/0027-parquet-format-adapter.md)
+- [ADR 0028: Iceberg table-format adapter](adr/0028-iceberg-table-format-adapter.md)
+- [ADR 0029: Mandatory read pipeline](adr/0029-mandatory-read-pipeline.md)
+- [ADR 0030: Batch delete via S3 DeleteObjects](adr/0030-batch-delete-objects.md)

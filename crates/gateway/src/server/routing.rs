@@ -7,7 +7,10 @@ use super::*;
 /// S3 subresources Maskura does not implement. Before dispatch, any request
 /// carrying one of these is rejected with `NotImplemented` so it can never be
 /// misrouted into a destructive operation (e.g. `PUT ?versioning` creating a
-/// bucket or `PUT ?tagging` overwriting an object).
+/// bucket or `PUT ?tagging` overwriting an object). The `delete` subresource
+/// is not listed: `POST /{bucket}?delete` (S3 Multi-Object Delete) is routed
+/// to `s3_delete_objects`, and the method/path guard below keeps every other
+/// `?delete` request rejected.
 pub(crate) const UNSUPPORTED_S3_SUBRESOURCES: &[&str] = &[
     "acl",
     "tagging",
@@ -18,7 +21,6 @@ pub(crate) const UNSUPPORTED_S3_SUBRESOURCES: &[&str] = &[
     "lifecycle",
     "retention",
     "legal-hold",
-    "delete",
     "cors",
     "encryption",
     "replication",
@@ -40,7 +42,9 @@ pub(crate) const UNSUPPORTED_S3_SUBRESOURCES: &[&str] = &[
 
 /// Reject unsupported S3 operations before method/path dispatch. CopyObject and
 /// UploadPartCopy (via `x-amz-copy-source`) and any unsupported subresource
-/// return `501 NotImplemented` without touching state.
+/// return `501 NotImplemented` without touching state. The `delete` subresource
+/// is only routed for `POST /{bucket}` (Multi-Object Delete); every other
+/// method/path carrying `?delete` is rejected here before dispatch.
 pub(crate) async fn reject_unsupported_s3_operations(
     request: Request,
     next: Next,
@@ -48,13 +52,26 @@ pub(crate) async fn reject_unsupported_s3_operations(
     if request.headers().contains_key("x-amz-copy-source") {
         return s3_error::not_implemented("");
     }
-    if request.uri().query().is_some_and(|query| {
+    let query = request.uri().query();
+    if query.is_some_and(|query| {
         query.split('&').any(|pair| {
             let key = pair.split('=').next().unwrap_or(pair);
             UNSUPPORTED_S3_SUBRESOURCES.contains(&key)
         })
     }) {
         return s3_error::not_implemented("");
+    }
+    if super::s3_batch_delete::has_delete_subresource(query) {
+        let is_bucket_level = request
+            .uri()
+            .path()
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .count()
+            == 1;
+        if request.method() != Method::POST || !is_bucket_level {
+            return s3_error::not_implemented("");
+        }
     }
     next.run(request).await
 }
@@ -66,9 +83,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/{bucket}", get(s3_list_objects))
         .route("/{bucket}", put(s3_bucket_put))
         .route("/{bucket}", delete(s3_bucket_delete))
+        .route("/{bucket}", post(s3_delete_objects))
         .route("/{bucket}/", get(s3_list_objects))
         .route("/{bucket}/", put(s3_bucket_put))
         .route("/{bucket}/", delete(s3_bucket_delete))
+        .route("/{bucket}/", post(s3_delete_objects))
         .route("/{bucket}/{*key}", put(s3_put))
         .route("/{bucket}/{*key}", get(s3_get))
         .route("/{bucket}/{*key}", head(s3_head))

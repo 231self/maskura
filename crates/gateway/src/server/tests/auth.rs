@@ -33,31 +33,39 @@ async fn managed_delete_releases_only_definite_precommit_failures() {
     let grant = test_grant(&authorization);
 
     let definite = RecordingControlPlane::default();
-    let response = managed_delete_failure_response(
+    let failure = release_failed_key(
         &definite,
         &context,
         &grant,
-        "key-a",
-        crate::managed::ManagedDeleteError::PreCommit(crate::managed::ManagedError::Conflict),
+        DeleteKeyFailure::ManagedDelete(crate::managed::ManagedDeleteError::PreCommit(
+            crate::managed::ManagedError::Conflict,
+        )),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
         definite.releases.lock().unwrap().as_slice(),
         &[grant.operation_id()]
     );
+    assert_eq!(
+        failure.response("bucket-a", "key-a").status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
 
     let uncertain = RecordingControlPlane::default();
-    let response = managed_delete_failure_response(
+    let failure = release_failed_key(
         &uncertain,
         &context,
         &grant,
-        "key-a",
-        crate::managed::ManagedDeleteError::CommitUnknown(crate::managed::ManagedError::Conflict),
+        DeleteKeyFailure::ManagedDelete(crate::managed::ManagedDeleteError::CommitUnknown(
+            crate::managed::ManagedError::Conflict,
+        )),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert!(uncertain.releases.lock().unwrap().is_empty());
+    assert_eq!(
+        failure.response("bucket-a", "key-a").status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
 }
 
 #[tokio::test]
