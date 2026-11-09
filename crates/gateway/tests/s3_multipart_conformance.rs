@@ -1065,6 +1065,132 @@ async fn run_sdk_multipart_abort_and_errors() {
 // ===========================================================================
 
 #[test]
+fn http_multipart_content_type_is_frozen_at_initiation() {
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build test tokio runtime");
+    runtime.block_on(async {
+        let root =
+            std::env::temp_dir().join(format!("maskura-http-content-type-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root).expect("create temporary storage root");
+        let mut env = EnvRestore::new();
+        configure_local_staged_env(&mut env, &root);
+        let (state, app, access_key, secret_key) = build_local_state().await;
+        // The gateway's write resolver has its own registry; disable that
+        // registry's plugins so arbitrary binary bytes pass through unchanged.
+        let write_plugins = state.gateway.plugins.as_ref().expect("write registry");
+        for plugin in write_plugins.list() {
+            assert!(write_plugins.set_enabled(&plugin.id, false).is_some());
+        }
+        let headers = auth_headers(&access_key, &secret_key);
+        let bucket = "content-type-cases";
+        create_bucket_raw(&app, &headers, bucket).await;
+        let bytes = b"\x00multipart\xffbinary\x01";
+        let cases = [
+            ("default-no-header", None, None, "application/octet-stream"),
+            (
+                "default-xml",
+                None,
+                Some("application/xml"),
+                "application/octet-stream",
+            ),
+            (
+                "explicit-no-header",
+                Some("binary/octet-stream"),
+                None,
+                "binary/octet-stream",
+            ),
+            (
+                "explicit-xml",
+                Some("binary/octet-stream"),
+                Some("application/xml"),
+                "binary/octet-stream",
+            ),
+        ];
+        for (key, create_type, complete_type, expected_type) in cases {
+            let mut create = Request::builder()
+                .method("POST")
+                .uri(format!("/{bucket}/{key}?uploads"));
+            if let Some(content_type) = create_type {
+                create = create.header(header::CONTENT_TYPE, content_type);
+            }
+            let response = app
+                .clone()
+                .oneshot(add_headers(create.body(Body::empty()).unwrap(), &headers))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "CreateMultipartUpload {key}"
+            );
+            let xml = String::from_utf8(body_bytes(response).await).unwrap();
+            let upload_id = extract_xml(&xml, "UploadId");
+            assert!(!upload_id.is_empty(), "CreateMultipartUpload {key}");
+            // The part transport type is deliberately different from the object type.
+            let etag = upload_part_raw(&app, &headers, bucket, key, &upload_id, 1, bytes).await;
+            let mut complete = Request::builder()
+                .method("POST")
+                .uri(format!("/{bucket}/{key}?uploadId={upload_id}"));
+            if let Some(content_type) = complete_type {
+                complete = complete.header(header::CONTENT_TYPE, content_type);
+            }
+            let response = app
+                .clone()
+                .oneshot(add_headers(
+                    complete
+                        .body(Body::from(complete_xml(&[(1, &etag)])))
+                        .unwrap(),
+                    &headers,
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let completion = String::from_utf8(body_bytes(response).await).unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "CompleteMultipartUpload {key}: {completion}"
+            );
+            let response = app
+                .clone()
+                .oneshot(add_headers(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/{bucket}/{key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                    &headers,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "GetObject {key}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(expected_type),
+                "GetObject {key}"
+            );
+            assert_eq!(
+                body_bytes(response).await.as_slice(),
+                bytes,
+                "GetObject bytes {key}"
+            );
+        }
+        drop(app);
+        drop(state);
+        drop(env);
+        let _ = std::fs::remove_dir_all(&root);
+    });
+}
+
+#[test]
 fn http_conformance_completion_errors_pagination_helpers_and_replay() {
     let _guard = ENV_LOCK
         .lock()

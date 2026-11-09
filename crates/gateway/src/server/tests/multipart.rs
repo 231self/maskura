@@ -1,6 +1,61 @@
 use super::super::*;
 use super::*;
 
+#[test]
+fn multipart_snapshot_defaults_absent_content_type_at_initiation() {
+    let backend = ResolvedBackend::Memory(Arc::new(crate::store::MemoryStore::new()));
+    let mut headers = HeaderMap::new();
+    let snapshot = multipart_snapshot(&headers, &backend, serde_json::json!({}), 1024, None);
+    assert_eq!(
+        snapshot.metadata.get("content-type").map(String::as_str),
+        Some("application/octet-stream")
+    );
+
+    headers.insert("x-amz-meta-content-type", "user-metadata".parse().unwrap());
+    let snapshot = multipart_snapshot(&headers, &backend, serde_json::json!({}), 1024, None);
+    assert_eq!(
+        snapshot.metadata.get("content-type").map(String::as_str),
+        Some("application/octet-stream")
+    );
+}
+
+#[test]
+fn multipart_snapshot_preserves_explicit_content_type() {
+    let backend = ResolvedBackend::Memory(Arc::new(crate::store::MemoryStore::new()));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        "text/plain; charset=utf-8".parse().unwrap(),
+    );
+    headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+    let snapshot = multipart_snapshot(&headers, &backend, serde_json::json!({}), 1024, None);
+
+    assert_eq!(
+        snapshot.metadata.get("content-type").map(String::as_str),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(
+        snapshot
+            .metadata
+            .get("content-encoding")
+            .map(String::as_str),
+        Some("gzip")
+    );
+}
+
+#[test]
+fn multipart_snapshot_does_not_default_invalid_explicit_content_type() {
+    let backend = ResolvedBackend::Memory(Arc::new(crate::store::MemoryStore::new()));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+    );
+    let snapshot = multipart_snapshot(&headers, &backend, serde_json::json!({}), 1024, None);
+
+    assert!(!snapshot.metadata.contains_key("content-type"));
+}
+
 #[tokio::test]
 async fn multipart_crash_recovery_restores_exact_precommit_pipeline_evidence() {
     let journal: Arc<dyn OperationJournal> =

@@ -82,6 +82,12 @@ pub(crate) fn multipart_snapshot(
                 .map(|(name, value)| (name.to_string(), value.to_string()))
         })
         .collect();
+    if !headers.contains_key(header::CONTENT_TYPE) {
+        metadata.insert(
+            header::CONTENT_TYPE.to_string(),
+            "application/octet-stream".to_string(),
+        );
+    }
     for name in [header::CONTENT_TYPE, header::CONTENT_ENCODING] {
         if let Some(value) = headers.get(&name).and_then(|value| value.to_str().ok()) {
             metadata.insert(name.to_string(), value.to_string());
