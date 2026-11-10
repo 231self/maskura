@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This must succeed immediately before the sole time-limited SQLite ignore.
+python3 "$(dirname "$0")/sqlite-guard.py"
+
 # sqlx-macros-core records every database driver's dependencies in Cargo.lock,
 # including the unfixed RSA advisory through its unused MySQL driver. Maskura is
 # Postgres-only. Keep the exception valid only while RSA is absent from every
@@ -62,9 +65,10 @@ if [ -n "$holders" ] && [ "$holders" != "$expected_holders" ]; then
   exit 1
 fi
 
+python3 "$(dirname "$0")/sqlite-guard.py"
 cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0381 --ignore RUSTSEC-2026-0387 \
   --ignore RUSTSEC-2026-0391 --ignore RUSTSEC-2026-0395 --ignore RUSTSEC-2026-0396 \
   --ignore RUSTSEC-2026-0397 --ignore RUSTSEC-2026-0398 --ignore RUSTSEC-2026-0399 \
   --ignore RUSTSEC-2026-0400 --ignore RUSTSEC-2026-0401 --ignore RUSTSEC-2026-0402 \
   --ignore RUSTSEC-2026-0403 --ignore RUSTSEC-2026-0404 --ignore RUSTSEC-2026-0405 \
-  --ignore RUSTSEC-2026-0406 --ignore RUSTSEC-2026-0410
+  --ignore RUSTSEC-2026-0406 --ignore RUSTSEC-2026-0410 --ignore RUSTSEC-2026-0459

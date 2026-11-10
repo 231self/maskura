@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(dirname "$0")/.."
+python3 "$ROOT/scripts/sqlite-guard.py"
 OUT_DIR="$ROOT/target/components"
 # WASI preview 1 target: filters are proper WASI reactors, not bare
 # wasm32-unknown-unknown modules. The wasi_snapshot_preview1.reactor adapter

@@ -29,13 +29,17 @@ The protected CI remains responsible for the long Wasm, SDK, database,
 interoperability, end-to-end, and full test suites. `just push` runs the local
 gate before delegating publication to `jj git push`.
 
-The RustSec audit has one narrowly guarded exception for RUSTSEC-2023-0071.
+The RustSec audit has a narrowly guarded exception for RUSTSEC-2023-0071.
 SQLx's compile-time migration macro records the vulnerable `rsa` crate through
 its MySQL macro support even though Maskura enables only Postgres and the crate
 is absent from every resolved workspace target. The audit script first fails if
 `rsa 0.9.10` becomes reachable in any workspace target, then applies the
 lockfile-only exception. This exception must be removed when SQLx no longer
 records that crate.
+
+ADR 0032 records a separate, time-limited RUSTSEC-2026-0459 exception for
+an inactive SQLite lockfile dependency. Its graph and expiry guard is required
+before use, including for the temporary cargo-deny configuration and artifacts.
 
 Release jobs generate an SPDX JSON SBOM and deterministic SHA-256 checksum
 manifest for downloadable files. GitHub artifact attestations bind those files

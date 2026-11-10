@@ -15,11 +15,14 @@ require_command cargo
 require_command grep
 require_command npm
 
+echo "==> SQLite exception guard tests"
+python3 -m unittest discover -s tests -p 'test_*guard*.py'
+
 echo "==> Rust advisories"
 bash scripts/audit-rust.sh
 
 echo "==> Rust dependency policy"
-cargo deny check --hide-inclusion-graph
+python3 scripts/sqlite-guard.py deny
 
 echo "==> Python advisories"
 if command -v uvx >/dev/null 2>&1; then
