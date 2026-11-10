@@ -87,6 +87,21 @@ is no averaged authorization, no batch verdict, and no silent outcome; the
 policy-claim surface of ADR 0022 extends to batches as N of the existing
 per-operation claims ([ADR 0030](adr/0030-batch-delete-objects.md)).
 
+The source also provides an opt-in native single-PUT final-output validation
+seam for trusted embedders ([ADR 0031](adr/0031-native-final-output-validation.md)).
+It is absent by default, adds no HTTP control, and does not alter signed policy
+evidence. The embedding process must deliberately install and retain the static
+panic reporter before using it. Native validators can access output bytes and
+are trusted cooperative code, not a sandbox or execution attestation. They
+must not detach work beyond the callback/session or retain bytes after abort or
+finalization; the engine cannot join unknown native background tasks. The
+current validated single-PUT path admits only JSON/text and rejects upload-part,
+table, binary and FileStore requests. Multipart creation/completion and other
+routes are not intercepted, so the host must scope the clone to the intended
+single PUT. Journal and reconciliation guarantees remain backend-specific. This
+source capability is not evidence of a deployment or of an embedding service's
+authorization policy.
+
 Approval evidence is versioned canonical-CBOR (a sorted-JSON-keys convention,
 explicitly not RFC 8949 canonical) `ReceiptBody`/`Checkpoint` v2 with SHA-256
 digests, carried by WebAuthn ASN.1 DER ES256 assertions bound to the complete

@@ -29,6 +29,7 @@ pub struct AppState {
     /// Request-path policy gate (policy-approval Slice 3). `None` keeps the
     /// historical unenforced behavior (ADR 0021 OSS default).
     pub policy_gate: Option<Arc<dyn crate::policy_gate::PolicyGate>>,
+    pub(crate) final_output_validation: Option<Arc<dyn super::FinalOutputValidationFactory>>,
     pub legacy_max_object_bytes: usize,
     pub source_body_limits: BodyLimits,
     pub max_pipeline_output_bytes: u64,
@@ -55,6 +56,23 @@ pub struct AppState {
     pub(crate) demo_limiter: Arc<DemoLimiter>,
     pub(crate) multipart: Arc<MultipartPersistenceBundle>,
     pub(crate) continuation_token_key: [u8; 32],
+}
+
+impl AppState {
+    /// Return an isolated state clone with a mandatory final-output validator.
+    /// Only trusted embedding code can install it; HTTP requests cannot.
+    /// The reporter must remain the process panic hook while this state is used.
+    /// Use this clone only for the intended single PUT: multipart creation and
+    /// completion and other routes are not intercepted by this hook.
+    pub fn with_final_output_validation(
+        &self,
+        _reporter: super::StaticPanicReporter,
+        factory: Arc<dyn super::FinalOutputValidationFactory>,
+    ) -> Self {
+        let mut state = self.clone();
+        state.final_output_validation = Some(factory);
+        state
+    }
 }
 
 pub(crate) const LEGACY_MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;

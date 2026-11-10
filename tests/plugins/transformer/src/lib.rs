@@ -19,6 +19,12 @@ mod guest {
             if let Some(value) = context.content_type.strip_prefix("test/finish=") {
                 finish.extend_from_slice(value.as_bytes());
             }
+            if context.config_json.as_deref() == Some(r#""emit-tail""#) {
+                finish.extend_from_slice(b"tail\n");
+            }
+            if context.config_json.as_deref() == Some(r#""finish-trap""#) {
+                finish.extend_from_slice(b"trap");
+            }
             if context.stable_fields.as_deref() == Some("finish-trap") {
                 finish.extend_from_slice(b"trap");
             }

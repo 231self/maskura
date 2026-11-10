@@ -110,6 +110,7 @@ use crate::{Format, Gateway};
 mod admin;
 mod auth;
 mod demo;
+mod final_validation;
 pub(crate) mod iceberg;
 mod lifecycle;
 mod multipart;
@@ -125,6 +126,10 @@ pub(crate) use admin::*;
 pub(crate) use auth::*;
 pub use auth::{Auth, TrustedInvocationContext, require_user_claims, require_user_id};
 pub(crate) use demo::*;
+pub use final_validation::{
+    FinalOutputContext, FinalOutputValidationFactory, FinalOutputValidator, StaticPanicReporter,
+    ValidationFailure, install_static_panic_reporter,
+};
 pub(crate) use lifecycle::*;
 pub use lifecycle::{
     InvocationError, InvocationLimits, MAX_INVOCATION_RESPONSE_BYTES, MAX_INVOCATION_TIMEOUT,

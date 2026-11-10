@@ -68,6 +68,18 @@ jobs:
         run: cargo install --locked wasm-tools --version 1.255.0
       - name: Build Wasm filters
         run: bash scripts/build-plugins.sh
+      - name: Verify final-output validation regressions
+        run: |
+          set -o pipefail
+          test -s target/test-components/test-transformer.component.wasm
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          cargo test --locked -p maskura-gateway --lib server::final_validation::tests | tee "$log"
+          grep -E '^test result: ok\. 4 passed; 0 failed; 0 ignored;' "$log"
+          cargo test --locked -p maskura-gateway --lib server::s3_upload::validation_tests | tee "$log"
+          grep -E '^test result: ok\. 7 passed; 0 failed; 0 ignored;' "$log"
+          cargo test --locked -p maskura-gateway --test final_output_validation | tee "$log"
+          grep -E '^test result: ok\. 23 passed; 0 failed; 0 ignored;' "$log"
       - name: Test
         run: cargo test --locked --workspace
 

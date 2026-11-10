@@ -47,7 +47,7 @@ pub(crate) fn content_type_of(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Cheap, body-free signal check: could this request touch a table unit?
-fn is_candidate(key: &str, content_type: Option<&str>) -> bool {
+pub(crate) fn is_candidate(key: &str, content_type: Option<&str>) -> bool {
     key_shape(key).is_table_candidate() || detect::claims_table_media_type(content_type)
 }
 

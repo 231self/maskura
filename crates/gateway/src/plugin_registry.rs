@@ -165,6 +165,9 @@ pub struct PipelineSnapshot {
 }
 
 impl PipelineSnapshot {
+    pub(crate) fn max_wall_time(&self) -> Duration {
+        self.limits.max_wall_time
+    }
     /// COGS evidence for the executed pipeline, if a revision was resolved.
     pub fn pipeline_evidence(
         &self,
