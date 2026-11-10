@@ -25,6 +25,12 @@ s3_aws() {
     AWS_DEFAULT_REGION=us-east-1 aws "$@"
 }
 
+omit_container_logs() {
+  # Bootstrap output can contain generated credentials. Diagnostics must not
+  # forward raw container logs or response bodies, even on an assertion failure.
+  echo "container output omitted: may contain generated credentials" >&2
+}
+
 cleanup() {
   docker rm -f "$GATEWAY_NAME" "$S3_NAME" "$POSTGRES_NAME" >/dev/null 2>&1 || true
   docker network rm "$NETWORK" >/dev/null 2>&1 || true
@@ -55,7 +61,7 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 if [ "$ready" -ne 1 ]; then
-  docker logs "$S3_NAME" || true
+  omit_container_logs
   echo "ERROR: release-smoke local S3 appliance did not become ready" >&2
   exit 1
 fi
@@ -81,7 +87,7 @@ for _ in $(seq 1 15); do
 done
 if [ "$bucket_ready" -ne 1 ]; then
   s3_aws s3api list-buckets --endpoint-url "http://127.0.0.1:${S3_PORT}" || true
-  docker logs "$S3_NAME" || true
+  omit_container_logs
   echo "ERROR: release-smoke local S3 bucket was not created" >&2
   exit 1
 fi
@@ -100,7 +106,7 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 if [ "$pg_ready" -ne 1 ]; then
-  docker logs "$POSTGRES_NAME" || true
+  omit_container_logs
   echo "ERROR: release-smoke Postgres did not become ready" >&2
   exit 1
 fi
@@ -129,12 +135,13 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 if [ "$ready" -ne 1 ]; then
-  docker logs "$GATEWAY_NAME" || true
+  omit_container_logs
   echo "ERROR: packaged gateway did not become ready" >&2
   exit 1
 fi
 
 INPUT='contact release-smoke@example.com card 4111111111111111'
+echo "smoke phase: protected_put"
 curl --fail --silent --show-error \
   -X PUT \
   -H 'Content-Type: text/plain' \
@@ -155,15 +162,7 @@ for _ in $(seq 1 15); do
   sleep 2
 done
 if [ -z "$READBACK" ]; then
-  s3_aws s3 cp --endpoint-url "http://127.0.0.1:${S3_PORT}" \
-    's3://maskura-release-smoke/object.txt' - || true
-  # Self-diagnosing evidence: the pinned appliance's own view of the failing
-  # HeadObject (the only place a bare 400's cause can appear), plus the
-  # gateway's tail, without leaking object bodies.
-  echo "--- appliance logs ($S3_NAME) ---" >&2
-  docker logs --tail 60 "$S3_NAME" >&2 || true
-  echo "--- gateway logs ($GATEWAY_NAME) ---" >&2
-  docker logs --tail 40 "$GATEWAY_NAME" >&2 || true
+  omit_container_logs
   echo "ERROR: release-smoke backend readback failed" >&2
   exit 1
 fi
@@ -203,7 +202,7 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 if [ "$ready" -ne 1 ]; then
-  docker logs "$GATEWAY_NAME" || true
+  omit_container_logs
   echo "ERROR: zero-config gateway did not become ready" >&2
   exit 1
 fi
@@ -215,13 +214,14 @@ CRED_LINE="$(docker logs "$GATEWAY_NAME" 2>&1 \
 ACCESS_KEY="$(printf '%s\n' "$CRED_LINE" | sed -n 's/.*access_key=\([^ ]*\).*/\1/p')"
 SECRET_KEY="$(printf '%s\n' "$CRED_LINE" | sed -n 's/.*secret_key=\([^ ]*\).*/\1/p')"
 if [ -z "$ACCESS_KEY" ] || [ -z "$SECRET_KEY" ]; then
-  docker logs "$GATEWAY_NAME" || true
+  omit_container_logs
   echo "ERROR: zero-config gateway did not disclose generated root credentials" >&2
   exit 1
 fi
 
 # Byte-preserving round trip into the canonical bucket (no prior `mb`).
 AUTH_HEADERS=(-H "x-maskura-access-key: $ACCESS_KEY" -H "x-maskura-secret-key: $SECRET_KEY")
+echo "smoke phase: local_put"
 curl --fail --silent --show-error \
   -X PUT \
   "${AUTH_HEADERS[@]}" \
@@ -229,11 +229,22 @@ curl --fail --silent --show-error \
   --data-binary "$INPUT" \
   "http://127.0.0.1:${GATEWAY_PORT}/maskura/object.txt" >/dev/null
 
+echo "smoke phase: local_get"
 READBACK="$(curl --fail --silent --show-error \
   "${AUTH_HEADERS[@]}" \
   "http://127.0.0.1:${GATEWAY_PORT}/maskura/object.txt")"
 if [ "$READBACK" != "$INPUT" ]; then
   echo "ERROR: zero-config gateway did not preserve bytes on round trip" >&2
+  exit 1
+fi
+
+# A successful local assignment must not relax credential verification.
+status="$(curl --silent --show-error -o /dev/null -w '%{http_code}' \
+  -H "x-maskura-access-key: $ACCESS_KEY" \
+  -H 'x-maskura-secret-key: invalid-smoke-secret' \
+  "http://127.0.0.1:${GATEWAY_PORT}/maskura/object.txt")"
+if [ "$status" != 403 ]; then
+  echo "ERROR: zero-config gateway accepted invalid credentials" >&2
   exit 1
 fi
 
@@ -253,7 +264,7 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 if [ "$ready" -ne 1 ]; then
-  docker logs "$GATEWAY_NAME" || true
+  omit_container_logs
   echo "ERROR: zero-config gateway did not recover after restart" >&2
   exit 1
 fi
@@ -261,6 +272,7 @@ if docker logs "$GATEWAY_NAME" 2>&1 | grep -q 'generated local root credentials'
   echo "ERROR: zero-config gateway re-disclosed the root secret on restart" >&2
   exit 1
 fi
+echo "smoke phase: local_restart_get"
 READBACK="$(curl --fail --silent --show-error \
   "${AUTH_HEADERS[@]}" \
   "http://127.0.0.1:${GATEWAY_PORT}/maskura/object.txt")"
@@ -288,10 +300,11 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 if [ "$ready" -ne 1 ]; then
-  docker logs "$GATEWAY_NAME" || true
+  omit_container_logs
   echo "ERROR: zero-config gateway with credential override did not become ready" >&2
   exit 1
 fi
+echo "smoke phase: local_override_put"
 curl --fail --silent --show-error \
   -X PUT \
   -H "x-maskura-access-key: smoke-root" \
@@ -299,5 +312,15 @@ curl --fail --silent --show-error \
   -H 'Content-Type: text/plain' \
   --data-binary "$INPUT" \
   "http://127.0.0.1:${GATEWAY_PORT}/maskura/override.txt" >/dev/null
+
+echo "smoke phase: local_override_get"
+READBACK="$(curl --fail --silent --show-error \
+  -H "x-maskura-access-key: smoke-root" \
+  -H "x-maskura-secret-key: smoke-secret" \
+  "http://127.0.0.1:${GATEWAY_PORT}/maskura/override.txt")"
+if [ "$READBACK" != "$INPUT" ]; then
+  echo "ERROR: zero-config gateway with credential override did not preserve bytes" >&2
+  exit 1
+fi
 
 echo "release image zero-config local appliance smoke passed"

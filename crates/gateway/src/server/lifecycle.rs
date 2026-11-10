@@ -97,6 +97,22 @@ pub(crate) fn explicit_single_tenant_mode(config: &Config, auto_local: bool) -> 
     config.auth.disabled || auto_local || config.storage.single_tenant
 }
 
+pub(crate) fn local_appliance_default_pipeline(
+    config: &Config,
+    auto_local: bool,
+    custom_pipeline: bool,
+) -> bool {
+    auto_local
+        && !config.auth.disabled
+        && !custom_pipeline
+        && !config.filter_component_is_explicit()
+        && config
+            .wasm
+            .plugins_dir
+            .as_deref()
+            .is_none_or(|path| path == "/app/components")
+}
+
 pub(crate) fn validate_storage_boundary_startup(
     explicit_single_tenant: bool,
     has_global_s3_endpoint: bool,
@@ -245,7 +261,11 @@ pub async fn build_state(
     config: &Config,
 ) -> anyhow::Result<Arc<AppState>> {
     let pipeline_template = StatePipelineTemplate::from_config(config)?;
-    if auto_local_appliance(config) && !config.filter_component_is_explicit() {
+    if local_appliance_default_pipeline(
+        config,
+        auto_local_appliance(config),
+        pipeline_template.pipeline.is_some(),
+    ) {
         pipeline_template.disable_all_plugins();
     }
     build_state_with_pipeline_template(
@@ -326,7 +346,10 @@ pub async fn build_state_with_pipeline_template(
 
     let source_body_limits = source_body_limits(config)?;
     let max_pipeline_output_bytes = pipeline_template.max_pipeline_output_bytes;
-    let (gateway, plugins, demo_pipelines) = pipeline_template.instantiate()?;
+    let local_appliance_default =
+        local_appliance_default_pipeline(config, auto_local, pipeline_template.pipeline.is_some());
+    let (gateway, plugins, demo_pipelines) =
+        pipeline_template.instantiate(local_appliance_default)?;
 
     let multipart_mode = effective_multipart_mode(config, auto_local);
     let multipart_persistence_mode =

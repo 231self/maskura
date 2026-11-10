@@ -73,6 +73,23 @@ fn auto_local_defaults_do_not_override_explicit_feature_modes() {
 }
 
 #[test]
+fn local_default_assignment_excludes_configured_or_nonlocal_profiles() {
+    use crate::server::lifecycle::local_appliance_default_pipeline;
+    let mut config = Config::default();
+    assert!(local_appliance_default_pipeline(&config, true, false));
+    assert!(!local_appliance_default_pipeline(&config, false, false));
+    assert!(!local_appliance_default_pipeline(&config, true, true));
+    config.auth.disabled = true;
+    assert!(!local_appliance_default_pipeline(&config, true, false));
+    config.auth.disabled = false;
+    config.wasm.plugins_dir = Some("/operator/plugins".to_string());
+    assert!(!local_appliance_default_pipeline(&config, true, false));
+    let explicit =
+        Config::from_toml_str("[wasm]\nfilter_component = '/operator/filter.wasm'\n").unwrap();
+    assert!(!local_appliance_default_pipeline(&explicit, true, false));
+}
+
+#[test]
 fn non_durable_journal_is_global_local_debug_only() {
     let journal: Arc<dyn OperationJournal> =
         Arc::new(crate::transaction::InMemoryOperationJournal::new());

@@ -22,6 +22,7 @@ check-lint:
 # Keep the public evidence entry points executable and parseable without
 # starting Docker or reaching the network.
 check-evidence: check-release check-plugin-contract check-public-copy test-release-notifications
+  python3 -m unittest discover -s tests -p 'test_release_image_smoke.py'
   bash -n examples/prove-maskura.sh examples/local-quickstart.sh examples/maskura-demo.sh scripts/bench-plugins.sh scripts/release-notes.sh scripts/post-release-discord.sh scripts/test-release-notifications.sh
   python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("examples/python-hybrid-roundtrip.py").read_text())'
 

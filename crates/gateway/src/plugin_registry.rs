@@ -90,6 +90,7 @@ struct CacheEntry {
 struct RegistryState {
     plugins: HashMap<String, Plugin>,
     order: Vec<String>,
+    catalog_generation: u64,
     engines: HashMap<String, CacheEntry>,
     cache_order: VecDeque<String>,
     cache_weight: usize,
@@ -517,6 +518,7 @@ impl PluginRegistry {
             },
         );
         state.order.push(id);
+        state.catalog_generation = state.catalog_generation.saturating_add(1);
         evict_unreferenced_engines(&mut state);
         Ok(info)
     }
@@ -580,18 +582,26 @@ impl PluginRegistry {
 
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Option<PluginInfo> {
         let mut state = self.state.write().unwrap();
-        state.plugins.get_mut(id).map(|plugin| {
+        let result = state.plugins.get_mut(id).map(|plugin| {
             plugin.info.enabled = enabled;
             plugin.info.clone()
-        })
+        });
+        if result.is_some() {
+            state.catalog_generation = state.catalog_generation.saturating_add(1);
+        }
+        result
     }
 
     pub fn set_name(&self, id: &str, name: &str) -> Option<PluginInfo> {
         let mut state = self.state.write().unwrap();
-        state.plugins.get_mut(id).map(|plugin| {
+        let result = state.plugins.get_mut(id).map(|plugin| {
             plugin.info.name = name.to_string();
             plugin.info.clone()
-        })
+        });
+        if result.is_some() {
+            state.catalog_generation = state.catalog_generation.saturating_add(1);
+        }
+        result
     }
 
     pub fn remove(&self, id: &str) -> bool {
@@ -599,6 +609,7 @@ impl PluginRegistry {
         state.order.retain(|ordered_id| ordered_id != id);
         let removed = state.plugins.remove(id).is_some();
         if removed {
+            state.catalog_generation = state.catalog_generation.saturating_add(1);
             evict_unreferenced_engines(&mut state);
         }
         removed
@@ -620,6 +631,11 @@ impl PluginRegistry {
             }
         }
         state.order = new_order;
+        state.catalog_generation = state.catalog_generation.saturating_add(1);
+    }
+
+    pub(crate) fn catalog_generation(&self) -> u64 {
+        self.state.read().unwrap().catalog_generation
     }
 
     pub fn get_engine(&self, id: &str) -> Option<Arc<FilterEngine>> {
