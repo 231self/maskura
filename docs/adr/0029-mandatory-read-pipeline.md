@@ -77,12 +77,14 @@ Options considered:
   in the policy document and bound into evidence.
 - Deny-by-default closes the unsupported-format, alternate-surface, and
   presigned-bypass classes as a matter of rule rather than documentation.
-- Fresh workspaces and self-hosted installs must author a read pipeline before
-  the first `GET` (the enabled catalog counts as an assignment; zero enabled
-  plugins is unassigned and denies). The zero-config local appliance keeps
-  working out of the box: its enabled default component resolves a one-step
-  read pipeline, so local reads serve that projection — raw local serving now
-  requires an explicit passthrough assignment.
+- Fresh workspaces and configured self-hosted installs must author a read
+  pipeline before the first `GET` (the enabled catalog counts as an assignment;
+  zero enabled plugins is unassigned and denies). The genuine zero-config local
+  appliance instead receives the server-authored, fingerprinted default
+  passthrough assignment described in ADR 0019. It is scoped to the local root
+  and file backend; a catalog change invalidates it. It does not apply to
+  hosted, external-storage, explicitly configured pipeline or component, or
+  unauthenticated profiles. No general unassigned-read fallback is introduced.
 - Presigned-HTTP backend customers must scope raw buckets apart from protected
   data (explicit passthrough for the former).
 - Supersedes the read-selection parts of the earlier surface: the

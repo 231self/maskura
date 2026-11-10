@@ -14,6 +14,14 @@ origin and dependency inventory of a downloaded release.
 
 ## Decision
 
+Packaged release-image smoke also runs as a required pull-request CI job before
+merge, using the same assembly Dockerfile and smoke script without image
+publication. Closed static phase markers identify failed requests; assertion
+failures must not dump container output that can include generated root
+credentials or print response/object bodies. Synthetic harness controls verify
+phase failures stop the script and redact bootstrap output. They do not replace
+the real packaged-image job or authorize weakening authentication on failure.
+
 Every external GitHub Action is referenced by a full commit SHA, with the
 human-readable release line retained as a comment for update tooling and
 reviewers. The aggregate `check` required on `main` includes `cargo audit`,

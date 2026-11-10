@@ -208,6 +208,68 @@ pub struct StaticPipelineResolver {
     registry: Arc<PluginRegistry>,
 }
 
+/// Server-authored assignment for the genuine zero-config local appliance.
+/// It is never used by configured or hosted deployments. A catalog edit
+/// invalidates the assignment until restart rather than silently falling back
+/// to raw reads after an operator changes a pipeline.
+pub(crate) const LOCAL_APPLIANCE_REVISION: &str = "auto-local-byte-preserving-v1";
+
+pub(crate) struct LocalAppliancePipelineResolver {
+    registry: Arc<PluginRegistry>,
+    generation: u64,
+}
+
+impl LocalAppliancePipelineResolver {
+    pub(crate) fn new(registry: Arc<PluginRegistry>) -> Result<Self, MaskuraError> {
+        let generation = registry.catalog_generation();
+        if generation == u64::MAX || !registry.enabled_catalog().is_empty() {
+            return Err(MaskuraError::new(
+                codes::CONFIG_INVALID,
+                "invalid local appliance catalog",
+            ));
+        }
+        Ok(Self {
+            registry,
+            generation,
+        })
+    }
+}
+
+#[async_trait]
+impl PipelineResolver for LocalAppliancePipelineResolver {
+    async fn resolve(
+        &self,
+        workspace_id: &str,
+        bucket: &str,
+        direction: PipelineDirection,
+    ) -> Result<PipelineResolution, MaskuraError> {
+        if workspace_id != "root" || self.registry.catalog_generation() != self.generation {
+            return Err(MaskuraError::new(
+                codes::CONFIG_INVALID,
+                "local appliance assignment is unavailable",
+            ));
+        }
+        if direction == PipelineDirection::Write {
+            return StaticPipelineResolver::new(self.registry.clone())
+                .resolve(workspace_id, bucket, direction)
+                .await;
+        }
+        let steps = Vec::new();
+        let limits = self.registry.pipeline_limits();
+        Ok(PipelineResolution {
+            locator: PipelineLocator {
+                revision: LOCAL_APPLIANCE_REVISION.to_string(),
+                fingerprint: resolution_fingerprint(direction, &steps, true, limits),
+                assignment_id: None,
+            },
+            steps,
+            policy_generation: None,
+            explicit_passthrough: true,
+            limits,
+        })
+    }
+}
+
 impl StaticPipelineResolver {
     pub fn new(registry: Arc<PluginRegistry>) -> Self {
         Self { registry }
@@ -668,6 +730,40 @@ mod tests {
                 .unwrap_err()
                 .code(),
             codes::CONFIG_INVALID
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_local_read_is_explicit_and_stale_catalog_fails_closed() {
+        let registry = Arc::new(PluginRegistry::new());
+        let resolver = LocalAppliancePipelineResolver::new(registry.clone()).unwrap();
+        let read = resolver
+            .resolve("root", "maskura", PipelineDirection::Read)
+            .await
+            .unwrap();
+        assert_eq!(read.locator.revision, LOCAL_APPLIANCE_REVISION);
+        assert!(read.explicit_passthrough);
+        read.verify_fingerprint(PipelineDirection::Read).unwrap();
+        assert!(
+            resolver
+                .resolve("other", "maskura", PipelineDirection::Read)
+                .await
+                .is_err()
+        );
+        // Even an edit that leaves the catalog empty invalidates the initial
+        // default; changing a protected catalog cannot restore raw by silence.
+        registry.reorder(Vec::new());
+        assert!(
+            resolver
+                .resolve("root", "maskura", PipelineDirection::Read)
+                .await
+                .is_err()
+        );
+        assert!(
+            StaticPipelineResolver::new(registry)
+                .resolve("root", "maskura", PipelineDirection::Read)
+                .await
+                .is_err()
         );
     }
 

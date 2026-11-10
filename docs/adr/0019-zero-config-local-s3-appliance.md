@@ -7,8 +7,13 @@
 
 > **Note (ADR 0029):** the `MASKURA_STREAMING_READ_MODE` surface described in
 > this record was retired; reads are governed by the resolved read pipeline.
-> The zero-config default stands — local reads resolve the enabled default
-> component as their pipeline.
+> The zero-config byte-preserving contract is implemented as a distinct
+> server-authored read assignment, not an unassigned read. This assignment is
+> restricted to the authenticated local root and local file backend. Explicit
+> pipeline or component configuration, custom plugin directories, disabled
+> authentication, and non-local profiles do not receive it. Catalog edits
+> invalidate this default assignment until restart; they never silently turn an
+> unassigned protected read into passthrough. See ADR 0029.
 
 MinIO retired its free Docker distribution, leaving self-hosters who used
 `docker run minio/minio` without an obvious drop-in replacement. Maskura already
@@ -35,6 +40,10 @@ as a zero-config local S3 appliance instead of failing startup.
   pass-through), so uploaded bytes are stored and returned unchanged. PII
   redaction and encryption remain available but opt-in, reversing the previous
   "self-cleaning store" default.
+- **Read identity and isolation.** The server establishes a named, fingerprinted
+  local default read assignment. It is not selected by a request, cannot read a
+  presigned or other external backend, and becomes invalid when the plugin
+  catalog is changed. Configured pipelines retain their own resolution rules.
 - **Root credential.** A SigV4 root principal is bootstrapped on first start:
   `MASKURA_ROOT_USER`/`MASKURA_ROOT_PASSWORD` override it (both must be set
   together), otherwise a strong pair is generated, persisted inside the data

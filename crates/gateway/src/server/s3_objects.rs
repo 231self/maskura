@@ -41,6 +41,43 @@ pub(crate) fn backend_resolver(state: &AppState) -> BackendResolver {
     .with_file_store(state.file_store.clone())
 }
 
+fn local_appliance_read_allows_backend(
+    resolution: &crate::pipeline::PipelineResolution,
+    kind: BackendKind,
+) -> bool {
+    resolution.locator.revision != crate::pipeline::LOCAL_APPLIANCE_REVISION
+        || kind == BackendKind::File
+}
+
+#[cfg(test)]
+mod local_appliance_backend_tests {
+    use super::*;
+    use crate::pipeline::{LocalAppliancePipelineResolver, PipelineDirection, PipelineResolver};
+
+    #[tokio::test]
+    async fn default_appliance_read_denies_external_destinations() {
+        let registry = Arc::new(PluginRegistry::new());
+        let resolver = LocalAppliancePipelineResolver::new(registry).unwrap();
+        let resolution = resolver
+            .resolve("root", "maskura", PipelineDirection::Read)
+            .await
+            .unwrap();
+        assert!(local_appliance_read_allows_backend(
+            &resolution,
+            BackendKind::File
+        ));
+        for kind in [
+            BackendKind::PresignedHttp,
+            BackendKind::PerUserS3,
+            BackendKind::Managed,
+            BackendKind::GlobalS3,
+            BackendKind::Memory,
+        ] {
+            assert!(!local_appliance_read_allows_backend(&resolution, kind));
+        }
+    }
+}
+
 pub(crate) async fn resolve_backend(
     state: &AppState,
     auth: &Auth,
@@ -1996,6 +2033,16 @@ pub(crate) async fn s3_get(
             .await;
         }
     };
+    if !local_appliance_read_allows_backend(&resolution, selection.backend.kind()) {
+        return release_failure(
+            state.control.as_ref(),
+            &auth.context,
+            &grant,
+            &key,
+            s3_error::access_denied(&key),
+        )
+        .await;
+    }
     freeze_read_placement(&mut selection, auth.workspace_id().as_str(), &bucket, &key).await;
     let backend = &selection.backend;
     let policy = match enforce_policy(
@@ -2503,6 +2550,16 @@ pub(crate) async fn s3_head(
             .await;
         }
     };
+    if !local_appliance_read_allows_backend(&resolution, selection.backend.kind()) {
+        return release_failure(
+            state.control.as_ref(),
+            &auth.context,
+            &grant,
+            &key,
+            s3_error::access_denied(&key),
+        )
+        .await;
+    }
     freeze_read_placement(&mut selection, auth.workspace_id().as_str(), &bucket, &key).await;
     let backend = &selection.backend;
     let policy = match enforce_policy(

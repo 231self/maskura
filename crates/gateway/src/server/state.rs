@@ -167,6 +167,7 @@ impl StatePipelineTemplate {
 
     pub(crate) fn instantiate(
         &self,
+        local_appliance_default: bool,
     ) -> anyhow::Result<(Gateway, Arc<PluginRegistry>, DemoPipelines)> {
         let plugins = Arc::new(self.plugins.isolated_clone()?);
         let gateway = match &self.pipeline {
@@ -176,6 +177,12 @@ impl StatePipelineTemplate {
                     &plugins,
                     pipeline.revision.clone(),
                 )?;
+                Gateway::with_shared_registry(Arc::clone(&self.engine), plugins.clone())
+                    .with_resolver(Arc::new(resolver), plugins.clone())
+            }
+            None if local_appliance_default => {
+                let resolver =
+                    crate::pipeline::LocalAppliancePipelineResolver::new(plugins.clone())?;
                 Gateway::with_shared_registry(Arc::clone(&self.engine), plugins.clone())
                     .with_resolver(Arc::new(resolver), plugins.clone())
             }
