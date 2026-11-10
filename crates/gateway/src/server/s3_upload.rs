@@ -5,6 +5,11 @@
 use super::*;
 use maskura_pipeline_config::PolicyOperation;
 
+use super::final_validation::{ValidationSession, callback};
+
+#[cfg(test)]
+#[path = "s3_upload_tests.rs"]
+mod validation_tests;
 use crate::policy_gate::{PolicyRequest, enforce_policy, policy_error_response};
 
 #[derive(Debug)]
@@ -15,6 +20,10 @@ pub(crate) enum StreamingPutError {
     InputTooLarge,
     SourceFrameTooLarge,
     Transport,
+    Validation,
+    SanitizedIntegrity(IntegrityError),
+    SanitizedPipeline(maskura_error::MaskuraError),
+    SanitizedRequest,
     InvalidRequest(String),
     Unsupported(String),
     PreserveReservation(Box<StreamingPutError>),
@@ -23,6 +32,33 @@ pub(crate) enum StreamingPutError {
 impl StreamingPutError {
     pub(crate) fn preserves_reservation(&self) -> bool {
         matches!(self, Self::PreserveReservation(_))
+    }
+
+    fn is_validation(&self) -> bool {
+        match self {
+            Self::Validation
+            | Self::SanitizedIntegrity(_)
+            | Self::SanitizedPipeline(_)
+            | Self::SanitizedRequest => true,
+            Self::PreserveReservation(inner) => inner.is_validation(),
+            _ => false,
+        }
+    }
+
+    fn sanitized_for_validation(self) -> Self {
+        match self {
+            Self::PreserveReservation(error) => {
+                Self::PreserveReservation(Box::new(error.sanitized_for_validation()))
+            }
+            Self::Transaction(
+                TransactionError::CapacityExceeded | TransactionError::TooManyParts,
+            ) => self,
+            Self::Transaction(_) => Self::Validation,
+            Self::Integrity(error) => Self::SanitizedIntegrity(error),
+            Self::Pipeline(error) => Self::SanitizedPipeline(error),
+            Self::InvalidRequest(_) => Self::SanitizedRequest,
+            other => other,
+        }
     }
 }
 
@@ -72,12 +108,78 @@ pub(crate) fn streaming_put_error_response(
         StreamingPutError::Transport => {
             s3_error::invalid_request(key, "request body stream failed")
         }
+        StreamingPutError::Validation => {
+            s3_error::service_unavailable("", "Final output validation did not succeed.")
+        }
+        StreamingPutError::SanitizedIntegrity(error) => validated_integrity_error_response(&error),
+        StreamingPutError::SanitizedPipeline(error) => validated_pipeline_error_response(&error),
+        StreamingPutError::SanitizedRequest => {
+            s3_error::invalid_request("", "The request is invalid.")
+        }
         StreamingPutError::InvalidRequest(detail) => s3_error::invalid_request(key, &detail),
         StreamingPutError::Unsupported(detail) => {
             drop(detail);
             warn!(error_category = "unsupported", "streaming PUT rejected");
             s3_error::not_implemented(key)
         }
+    }
+}
+
+fn validated_integrity_error_response(error: &IntegrityError) -> axum::response::Response {
+    match error {
+        IntegrityError::PayloadHashMismatch | IntegrityError::SignatureMismatch => {
+            s3_error::signature_mismatch("")
+        }
+        IntegrityError::InvalidChecksum(_)
+        | IntegrityError::MissingChecksum
+        | IntegrityError::DecodedLengthMismatch => {
+            s3_error::bad_digest("", "Request checksum validation failed.")
+        }
+        IntegrityError::ConflictingChecksum
+        | IntegrityError::DuplicateHeader(_)
+        | IntegrityError::DuplicateTrailer(_)
+        | IntegrityError::Framing(_)
+        | IntegrityError::InvalidDecodedLength
+        | IntegrityError::InvalidPayloadHash
+        | IntegrityError::MissingDecodedLength
+        | IntegrityError::MissingTrailerDeclaration
+        | IntegrityError::OversizedFraming
+        | IntegrityError::TrailingData
+        | IntegrityError::Truncated
+        | IntegrityError::UnsupportedContentEncoding
+        | IntegrityError::UnsupportedPayloadMode => {
+            s3_error::invalid_request("", "The request integrity checks failed.")
+        }
+    }
+}
+
+fn validated_pipeline_error_response(
+    error: &maskura_error::MaskuraError,
+) -> axum::response::Response {
+    match error.code() {
+        maskura_error::codes::WASM_ADMISSION => s3_error::slow_down(""),
+        maskura_error::codes::LIMIT_INPUT_BYTES
+        | maskura_error::codes::LIMIT_OUTPUT_BYTES
+        | maskura_error::codes::LIMIT_EXPANSION
+        | maskura_error::codes::LIMIT_INTERMEDIATE_BYTES
+        | maskura_error::codes::LIMIT_FINISH_BYTES
+        | maskura_error::codes::RECORD_TOO_LARGE => s3_error::entity_too_large(""),
+        maskura_error::codes::UNSUPPORTED_TABLE_OPERATION => s3_error::unsupported_table_operation(
+            "",
+            "The processing pipeline rejected the request.",
+        ),
+        maskura_error::codes::DECODE_JSON
+        | maskura_error::codes::DECODE_JSONL
+        | maskura_error::codes::DECODE_CSV
+        | maskura_error::codes::DECODE_ENCODING
+        | maskura_error::codes::WASM_REJECT
+        | maskura_error::codes::UNSUPPORTED_FORMAT
+        | maskura_error::codes::CONFIG_INVALID
+        | maskura_error::codes::POLICY_EXPIRED
+        | maskura_error::codes::POLICY_TAMPERED => {
+            s3_error::invalid_request("", "The processing pipeline rejected the request.")
+        }
+        _ => s3_error::service_unavailable("", "The processing pipeline did not succeed."),
     }
 }
 
@@ -119,6 +221,7 @@ pub(crate) async fn streaming_put_failure_response(
     error: StreamingPutError,
 ) -> axum::response::Response {
     let preserve_reservation = error.preserves_reservation();
+    let key = if error.is_validation() { "" } else { key };
     let response = streaming_put_error_response(key, error);
     if preserve_reservation {
         response
@@ -175,6 +278,11 @@ pub(crate) async fn streaming_single_put(
     headers: &HeaderMap,
     mut body: axum::body::Body,
     key: &str,
+    mut validation: Option<(
+        ValidationSession,
+        Instant,
+        tokio_util::sync::CancellationToken,
+    )>,
 ) -> Result<
     (
         Auth,
@@ -249,6 +357,13 @@ pub(crate) async fn streaming_single_put(
     let (format, content_type) = streaming_format(headers)?;
     let mut content_md5 =
         ContentMd5Verifier::from_headers(headers).map_err(StreamingPutError::Integrity)?;
+    let decoder_limits = crate::record::DecoderLimits {
+        max_source_frame_bytes: state.source_body_limits.max_frame_bytes,
+        ..crate::record::DecoderLimits::default()
+    };
+    // Validate decoder configuration before acquiring a sink that would need
+    // asynchronous cleanup if construction fails.
+    let mut decoder = crate::record::RecordDecoder::new(format, decoder_limits)?;
     let sink = begin_streaming_sink(
         state,
         backend,
@@ -281,35 +396,64 @@ pub(crate) async fn streaming_single_put(
         stable_fields,
     };
     let cancellation = trusted_wasm_cancellation();
+    if let Some((_, _, token)) = &validation {
+        let token = token.clone();
+        let wasm = cancellation.clone();
+        tokio::spawn(async move {
+            token.cancelled().await;
+            wasm.cancel();
+        });
+    }
     let pipeline_started = std::time::Instant::now();
-    let mut pipeline = match snapshot
-        .clone()
-        .start_streaming_session(session, cancellation.clone())
-        .await
-    {
+    let startup = match &validation {
+        Some((_, deadline, _)) => {
+            snapshot
+                .clone()
+                .start_streaming_session_with_deadline(session, cancellation.clone(), *deadline)
+                .await
+        }
+        None => {
+            snapshot
+                .clone()
+                .start_streaming_session(session, cancellation.clone())
+                .await
+        }
+    };
+    let mut pipeline = match startup {
         Ok(pipeline) => Some(pipeline),
         Err(error) => {
-            let _ = sink.lock().await.abort().await;
+            let preserve_reservation =
+                abort_uncommitted_sink(&sink, validation.is_some(), grant.operation_id()).await;
             sink_guard.disarm();
+            if preserve_reservation {
+                return Err(StreamingPutError::PreserveReservation(Box::new(
+                    error.into(),
+                )));
+            }
             return Err(error.into());
         }
     };
-    let decoder_limits = crate::record::DecoderLimits {
-        max_source_frame_bytes: state.source_body_limits.max_frame_bytes,
-        ..crate::record::DecoderLimits::default()
-    };
-    let mut decoder = crate::record::RecordDecoder::new(format, decoder_limits)?;
     let mut input_bytes = 0_u64;
     let mut output_bytes = 0_u64;
     let mut output_hasher = sha2::Sha256::new();
 
     let processing = async {
-        while let Some(frame) = body
-            .frame()
-            .await
+        loop {
+            let next = match &validation {
+                Some((_, deadline, token)) => {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return Err(StreamingPutError::Validation),
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(*deadline)) => return Err(StreamingPutError::Validation),
+                        frame = body.frame() => frame,
+                    }
+                }
+                None => body.frame().await,
+            };
+            let Some(frame) = next
             .transpose()
             .map_err(|_| StreamingPutError::Transport)?
-        {
+            else { break };
             let data = frame.into_data().map_err(|frame| {
                 if frame.into_trailers().is_ok() {
                     StreamingPutError::Integrity(IntegrityError::Framing(
@@ -345,8 +489,7 @@ pub(crate) async fn streaming_single_put(
                         .process(record)
                         .await?
                     {
-                        write_stream_record(&sink, record, &mut output_hasher, &mut output_bytes)
-                            .await?;
+                        write_validated_record(&sink, record, &mut output_hasher, &mut output_bytes, &mut validation).await?;
                     }
                 }
             }
@@ -370,7 +513,7 @@ pub(crate) async fn streaming_single_put(
                 .process(record)
                 .await?
             {
-                write_stream_record(&sink, record, &mut output_hasher, &mut output_bytes).await?;
+                write_validated_record(&sink, record, &mut output_hasher, &mut output_bytes, &mut validation).await?;
             }
         }
         let finishing = pipeline
@@ -378,7 +521,7 @@ pub(crate) async fn streaming_single_put(
             .expect("pipeline remains available until finish");
         let (records, pipeline_fuel) = finishing.finish().await?;
         for record in records {
-            write_stream_record(&sink, record, &mut output_hasher, &mut output_bytes).await?;
+            write_validated_record(&sink, record, &mut output_hasher, &mut output_bytes, &mut validation).await?;
         }
         let pipeline_evidence = snapshot.pipeline_evidence(
             pipeline_fuel,
@@ -388,6 +531,10 @@ pub(crate) async fn streaming_single_put(
         let output_digest = hex::encode(output_hasher.finalize());
         let mut sink = sink.lock().await;
         sink.verify_output(output_bytes, &output_digest).await?;
+        if let Some((validator, deadline, token)) = &mut validation {
+            validator.finish(*deadline, token).await.map_err(|_| StreamingPutError::Validation)?;
+        }
+        check_validation_live(&validation)?;
         let mut usage_event = UsageEvent::from_grant(grant, input_bytes, output_bytes);
         if let Some(evidence) = &pipeline_evidence {
             usage_event = usage_event.with_pipeline_evidence(evidence.clone());
@@ -399,7 +546,9 @@ pub(crate) async fn streaming_single_put(
         )
         .await
         .map_err(TransactionError::from)?;
+        check_validation_live(&validation)?;
         sink.record_usage_evidence(&usage_event).await?;
+        check_validation_live(&validation)?;
         let stored = sink.complete(DestinationCommitAuthority::SinglePut).await?;
         Ok((stored, output_bytes, pipeline_evidence))
     }
@@ -421,14 +570,8 @@ pub(crate) async fn streaming_single_put(
             if let Some(pipeline) = pipeline.take() {
                 let _ = pipeline.cancel_and_wait().await;
             }
-            let preserve_reservation = sink.lock().await.commit_state().preserves_reservation();
-            if !preserve_reservation && sink.lock().await.abort().await.is_err() {
-                warn!(
-                    operation_id = %grant.operation_id(),
-                    error_category = "abort",
-                    "streaming sink abort failed"
-                );
-            }
+            let preserve_reservation =
+                abort_uncommitted_sink(&sink, validation.is_some(), grant.operation_id()).await;
             sink_guard.disarm();
             if preserve_reservation {
                 Err(StreamingPutError::PreserveReservation(Box::new(error)))
@@ -437,6 +580,91 @@ pub(crate) async fn streaming_single_put(
             }
         }
     }
+}
+
+fn check_validation_live(
+    validation: &Option<(
+        ValidationSession,
+        Instant,
+        tokio_util::sync::CancellationToken,
+    )>,
+) -> Result<(), StreamingPutError> {
+    if let Some((_, deadline, token)) = validation
+        && (token.is_cancelled() || Instant::now() >= *deadline)
+    {
+        return Err(StreamingPutError::Validation);
+    }
+    Ok(())
+}
+
+fn put_policy_error_response(
+    state: &AppState,
+    key: &str,
+    error: &maskura_error::MaskuraError,
+) -> axum::response::Response {
+    if state.final_output_validation.is_none() {
+        return policy_error_response(key, error);
+    }
+    match error.code() {
+        maskura_error::codes::POLICY_DENIED
+        | maskura_error::codes::POLICY_UNPROVISIONED
+        | maskura_error::codes::POLICY_EXPIRED
+        | maskura_error::codes::POLICY_TAMPERED => {
+            s3_error::policy_error("", error.code(), "The request was denied by policy.")
+        }
+        _ => s3_error::service_unavailable("", "Policy authorization is temporarily unavailable."),
+    }
+}
+
+fn put_pipeline_error_response(
+    state: &AppState,
+    key: &str,
+    error: &maskura_error::MaskuraError,
+) -> axum::response::Response {
+    if state.final_output_validation.is_some() {
+        return validated_pipeline_error_response(error);
+    }
+    pipeline_error_response(key, error)
+}
+
+async fn abort_uncommitted_sink(
+    sink: &Arc<tokio::sync::Mutex<Box<dyn ObjectSinkTransaction>>>,
+    preserve_on_abort_failure: bool,
+    operation_id: Uuid,
+) -> bool {
+    let mut sink = sink.lock().await;
+    if sink.commit_state().preserves_reservation() {
+        return true;
+    }
+    if sink.abort().await.is_err() {
+        warn!(%operation_id, error_category = "abort", "streaming sink abort failed");
+        return preserve_on_abort_failure;
+    }
+    false
+}
+
+async fn write_validated_record(
+    sink: &Arc<tokio::sync::Mutex<Box<dyn ObjectSinkTransaction>>>,
+    record: crate::record::Record,
+    hasher: &mut sha2::Sha256,
+    output_bytes: &mut u64,
+    validation: &mut Option<(
+        ValidationSession,
+        Instant,
+        tokio_util::sync::CancellationToken,
+    )>,
+) -> Result<(), StreamingPutError> {
+    if let Some((session, deadline, cancellation)) = validation {
+        for chunk in [&record.payload, &record.separator] {
+            if !chunk.is_empty() {
+                session
+                    .observe(chunk, *deadline, cancellation)
+                    .await
+                    .map_err(|_| StreamingPutError::Validation)?;
+            }
+        }
+    }
+    write_stream_record(sink, record, hasher, output_bytes).await
 }
 
 pub(crate) fn lance_media_type(content_type: &str) -> Option<String> {
@@ -901,10 +1129,63 @@ pub(crate) async fn s3_put(
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<S3Query>,
     request: Request,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    if state.final_output_validation.is_none() {
+        return s3_put_inner(state, bucket, key, params, request, None).await;
+    }
+    // The worker retains ownership after the HTTP future is dropped. Dropping
+    // its waiter requests cancellation, but never aborts the worker task.
+    struct CancelOnDrop(tokio_util::sync::CancellationToken);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let guard = CancelOnDrop(cancellation.clone());
+    let trusted = TRUSTED_INVOCATION.try_with(Clone::clone).ok();
+    if let Some(invocation) = &trusted {
+        let external = invocation.cancellation.clone();
+        let local = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = external.cancelled() => local.cancel(),
+                _ = local.cancelled() => {},
+            }
+        });
+    }
+    let worker = tokio::spawn(async move {
+        let operation = s3_put_inner(state, bucket, key, params, request, Some(cancellation));
+        match trusted {
+            Some(trusted) => TRUSTED_INVOCATION.scope(trusted, operation).await,
+            None => operation.await,
+        }
+    });
+    let result = worker.await;
+    drop(guard);
+    match result {
+        Ok(response) => response,
+        Err(_) => s3_error::service_unavailable("", "Final output validation did not succeed."),
+    }
+}
+
+async fn s3_put_inner(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    params: S3Query,
+    request: Request,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> axum::response::Response {
     if params.part_number.is_some() || params.upload_id.is_some() {
+        if cancellation.is_some() {
+            return s3_error::not_implemented("");
+        }
         return s3_upload_part(state, bucket, key, params, request).await;
     }
+    // In the opt-in path, do not echo destination keys in error bodies or
+    // internal-error logs. Authorization and storage still use the real key.
+    let response_key = if cancellation.is_some() { "" } else { &key };
     let (parts, request_body) = request.into_parts();
     let header_auth = match authenticate_headers(
         parts.method.as_str(),
@@ -916,11 +1197,14 @@ pub(crate) async fn s3_put(
     .await
     {
         Ok(authentication) => authentication,
-        Err(error) => return authentication_error_response(&key, error),
+        Err(HeaderAuthError::InvalidPayload(error)) if state.final_output_validation.is_some() => {
+            return validated_integrity_error_response(&error);
+        }
+        Err(error) => return authentication_error_response(response_key, error),
     };
     let auth = &header_auth.auth;
     let auth_context = auth.context.clone();
-    if let Some(response) = client_metering_id_rejection(&parts.headers, &key) {
+    if let Some(response) = client_metering_id_rejection(&parts.headers, response_key) {
         return response;
     }
     let operation = request_operation_identity();
@@ -943,11 +1227,15 @@ pub(crate) async fn s3_put(
                 &bucket,
                 crate::pipeline::PipelineDirection::Write,
                 None,
-                error.code(),
+                if state.final_output_validation.is_some() {
+                    maskura_error::codes::INTERNAL
+                } else {
+                    error.code()
+                },
                 resolution_started.elapsed().as_millis() as u64,
             )
             .await;
-            return pipeline_error_response(&key, &error);
+            return put_pipeline_error_response(&state, response_key, &error);
         }
     };
     let authorization = operation.pipeline_authorization(
@@ -957,8 +1245,13 @@ pub(crate) async fn s3_put(
         object_max_processed_bytes(&state),
         &resolution,
     );
-    let grant = match authorize_request(state.control.as_ref(), &auth.context, &authorization, &key)
-        .await
+    let grant = match authorize_request(
+        state.control.as_ref(),
+        &auth.context,
+        &authorization,
+        response_key,
+    )
+    .await
     {
         Ok(grant) => grant,
         Err(response) => return response,
@@ -973,7 +1266,11 @@ pub(crate) async fn s3_put(
                 &bucket,
                 crate::pipeline::PipelineDirection::Write,
                 Some(&resolution),
-                error.code(),
+                if state.final_output_validation.is_some() {
+                    maskura_error::codes::INTERNAL
+                } else {
+                    error.code()
+                },
                 resolution_started.elapsed().as_millis() as u64,
             )
             .await;
@@ -981,8 +1278,8 @@ pub(crate) async fn s3_put(
                 state.control.as_ref(),
                 &auth.context,
                 &grant,
-                &key,
-                pipeline_error_response(&key, &error),
+                response_key,
+                put_pipeline_error_response(&state, response_key, &error),
             )
             .await;
         }
@@ -995,8 +1292,8 @@ pub(crate) async fn s3_put(
                     state.control.as_ref(),
                     &auth_context,
                     &grant,
-                    &key,
-                    backend_resolution_error_response(&key),
+                    response_key,
+                    backend_resolution_error_response(response_key),
                 )
                 .await;
             }
@@ -1025,8 +1322,8 @@ pub(crate) async fn s3_put(
                 state.control.as_ref(),
                 &auth_context,
                 &grant,
-                &key,
-                policy_error_response(&key, &error),
+                response_key,
+                put_policy_error_response(&state, response_key, &error),
             )
             .await;
         }
@@ -1042,8 +1339,8 @@ pub(crate) async fn s3_put(
                 state.control.as_ref(),
                 &auth_context,
                 &grant,
-                &key,
-                policy_error_response(&key, &error),
+                response_key,
+                put_policy_error_response(&state, response_key, &error),
             )
             .await;
         }
@@ -1057,8 +1354,8 @@ pub(crate) async fn s3_put(
                         state.control.as_ref(),
                         &auth_context,
                         &grant,
-                        &key,
-                        policy_error_response(&key, &error),
+                        response_key,
+                        put_policy_error_response(&state, response_key, &error),
                     )
                     .await;
                 }
@@ -1066,23 +1363,35 @@ pub(crate) async fn s3_put(
         }
         None => snapshot,
     };
+    if state.final_output_validation.is_some()
+        && matches!(&selection.backend, ResolvedBackend::File(_))
+    {
+        return release_failure(
+            state.control.as_ref(),
+            &auth_context,
+            &grant,
+            response_key,
+            s3_error::not_implemented(response_key),
+        )
+        .await;
+    }
     if let Some(response) = require_file_bucket(&selection.backend, &bucket).await {
         return release_failure(
             state.control.as_ref(),
             &auth_context,
             &grant,
-            &key,
+            response_key,
             response,
         )
         .await;
     }
     if let Err(error) = validate_streaming_backend(&state, &selection.backend) {
-        let response = streaming_put_error_response(&key, error);
+        let response = streaming_put_error_response(response_key, error);
         return release_failure(
             state.control.as_ref(),
             &auth.context,
             &grant,
-            &key,
+            response_key,
             response,
         )
         .await;
@@ -1091,14 +1400,14 @@ pub(crate) async fn s3_put(
         match storage.managed_mode() {
             ManagedStreamingMode::Observe => {
                 let response = s3_error::service_unavailable(
-                    &key,
+                    response_key,
                     "managed mutations are disabled in observe mode",
                 );
                 return release_failure(
                     state.control.as_ref(),
                     &auth.context,
                     &grant,
-                    &key,
+                    response_key,
                     response,
                 )
                 .await;
@@ -1106,6 +1415,53 @@ pub(crate) async fn s3_put(
             ManagedStreamingMode::Off | ManagedStreamingMode::Enforce => {}
         }
     }
+    let validation = if let Some(factory) = &state.final_output_validation {
+        let token = cancellation.expect("installed validation runs under its supervisor");
+        let unsupported = crate::server::iceberg::is_candidate(
+            &key,
+            crate::server::iceberg::content_type_of(&parts.headers),
+        ) || is_lance_content_type(&parts.headers)
+            || is_avro_content_type(&parts.headers)
+            || !matches!(
+                streaming_format(&parts.headers),
+                Ok((Format::Json | Format::Text, _))
+            );
+        if unsupported {
+            return release_failure(
+                state.control.as_ref(),
+                &auth_context,
+                &grant,
+                "",
+                s3_error::not_implemented(""),
+            )
+            .await;
+        }
+        let deadline = Instant::now() + snapshot.max_wall_time();
+        let context = FinalOutputContext {
+            authenticated: auth_context.clone(),
+            grant: grant.clone(),
+            resolution: resolution.clone(),
+            policy: policy.clone(),
+            destination: selection.snapshot.clone(),
+            key: key.clone(),
+        };
+        let session = callback(deadline, &token, async { factory.begin(&context).await }).await;
+        match session {
+            Ok(session) => Some((ValidationSession::new(session), deadline, token)),
+            Err(_) => {
+                return release_failure(
+                    state.control.as_ref(),
+                    &auth_context,
+                    &grant,
+                    "",
+                    s3_error::service_unavailable("", "Final output validation did not succeed."),
+                )
+                .await;
+            }
+        }
+    } else {
+        None
+    };
     match streaming_single_put(
         &state,
         header_auth,
@@ -1115,6 +1471,7 @@ pub(crate) async fn s3_put(
         &parts.headers,
         request_body,
         &key,
+        validation,
     )
     .await
     {
@@ -1128,8 +1485,13 @@ pub(crate) async fn s3_put(
                 Some(evidence) => usage.event().with_pipeline_evidence(evidence),
                 None => usage.event(),
             };
-            if let Err(response) =
-                record_operation_with_event(state.control.clone(), &auth.context, event, &key).await
+            if let Err(response) = record_operation_with_event(
+                state.control.clone(),
+                &auth.context,
+                event,
+                response_key,
+            )
+            .await
             {
                 return response;
             }
@@ -1149,13 +1511,17 @@ pub(crate) async fn s3_put(
             response.body(axum::body::Body::empty()).unwrap()
         }
         Err(error) => {
-            let error_code = match &error {
-                StreamingPutError::Pipeline(error) => error.code(),
-                StreamingPutError::PreserveReservation(error) => match error.as_ref() {
+            let error_code = if state.final_output_validation.is_some() {
+                maskura_error::codes::INTERNAL
+            } else {
+                match &error {
                     StreamingPutError::Pipeline(error) => error.code(),
+                    StreamingPutError::PreserveReservation(error) => match error.as_ref() {
+                        StreamingPutError::Pipeline(error) => error.code(),
+                        _ => maskura_error::codes::INTERNAL,
+                    },
                     _ => maskura_error::codes::INTERNAL,
-                },
-                _ => maskura_error::codes::INTERNAL,
+                }
             };
             record_failed_pipeline_attempt(
                 state.control.as_ref(),
@@ -1168,11 +1534,16 @@ pub(crate) async fn s3_put(
                 resolution_started.elapsed().as_millis() as u64,
             )
             .await;
+            let error = if state.final_output_validation.is_some() {
+                error.sanitized_for_validation()
+            } else {
+                error
+            };
             streaming_put_failure_response(
                 state.control.as_ref(),
                 &auth_context,
                 &grant,
-                &key,
+                response_key,
                 error,
             )
             .await

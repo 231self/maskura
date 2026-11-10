@@ -854,6 +854,7 @@ pub async fn build_state_with_pipeline_template(
         workspace_endpoint_policy,
         control,
         policy_gate: None,
+        final_output_validation: None,
         legacy_max_object_bytes: legacy_max_object_bytes(config),
         source_body_limits,
         max_pipeline_output_bytes,
