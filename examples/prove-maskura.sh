@@ -13,13 +13,29 @@ CONTAINER="maskura-proof-${PPID}-$$"
 VOLUME="maskura-proof-data-${PPID}-$$"
 TMP_CREATED="$(mktemp -d "${TMPDIR:-/tmp}/maskura-proof.XXXXXX")"
 TMP="$(cd "$TMP_CREATED" && pwd -P)"
+container_attempted=0
+volume_attempted=0
 
 cleanup() {
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  docker volume rm "$VOLUME" >/dev/null 2>&1 || true
-  rm -rf "$TMP"
+  local status=$? cleanup_failed=0
+  trap - EXIT INT TERM
+  if [ "$container_attempted" -eq 1 ]; then
+    docker rm -f "$CONTAINER" >/dev/null 2>&1 || cleanup_failed=1
+  fi
+  if [ "$volume_attempted" -eq 1 ]; then
+    docker volume rm "$VOLUME" >/dev/null 2>&1 || cleanup_failed=1
+  fi
+  rm -rf "$TMP" || cleanup_failed=1
+  unset MASKURA_ROOT_USER MASKURA_ROOT_PASSWORD MASKURA_SECRET_KEK
+  if [ "$cleanup_failed" -ne 0 ]; then
+    echo "FAIL: proof-owned resource cleanup failed" >&2
+    [ "$status" -ne 0 ] || status=1
+  fi
+  exit "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
@@ -46,11 +62,13 @@ PY
 }
 
 disable_plugins() {
+  local ids
+  ids="$(plugin_ids)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     curl -fsS -X PUT -H 'Content-Type: application/json' \
       -d '{"enabled":false}' "$ENDPOINT/dashboard/api/plugins/$id" >/dev/null
-  done < <(plugin_ids)
+  done <<< "$ids"
 }
 
 enable_plugin() {
@@ -65,16 +83,50 @@ enable_plugin() {
 put_with_aws() {
   local source="$1"
   local key="$2"
-  AWS_ACCESS_KEY_ID=proof AWS_SECRET_ACCESS_KEY=proof AWS_DEFAULT_REGION=us-east-1 \
+  AWS_ACCESS_KEY_ID="$MASKURA_ROOT_USER" AWS_SECRET_ACCESS_KEY="$MASKURA_ROOT_PASSWORD" AWS_DEFAULT_REGION=us-east-1 \
     AWS_EC2_METADATA_DISABLED=true aws s3 --endpoint-url "$ENDPOINT" \
     cp "$source" "s3://maskura/$key" --content-type text/plain >/dev/null
 }
 
 get_with_aws() {
   local key="$1"
-  AWS_ACCESS_KEY_ID=proof AWS_SECRET_ACCESS_KEY=proof AWS_DEFAULT_REGION=us-east-1 \
-    AWS_EC2_METADATA_DISABLED=true aws s3 --endpoint-url "$ENDPOINT" \
-    cp "s3://maskura/$key" -
+  local destination="$2"
+  # High-level `aws s3 cp` issues HEAD first, which protected reads deny.
+  AWS_ACCESS_KEY_ID="$MASKURA_ROOT_USER" AWS_SECRET_ACCESS_KEY="$MASKURA_ROOT_PASSWORD" AWS_DEFAULT_REGION=us-east-1 \
+    AWS_EC2_METADATA_DISABLED=true aws s3api --endpoint-url "$ENDPOINT" \
+    get-object --bucket maskura --key "$key" "$destination" >/dev/null
+}
+
+assert_protected_head_denied() {
+  local key="$1"
+  if AWS_ACCESS_KEY_ID="$MASKURA_ROOT_USER" AWS_SECRET_ACCESS_KEY="$MASKURA_ROOT_PASSWORD" AWS_DEFAULT_REGION=us-east-1 \
+    AWS_EC2_METADATA_DISABLED=true aws s3api --endpoint-url "$ENDPOINT" \
+    head-object --bucket maskura --key "$key" >"$TMP/head.out" 2>"$TMP/head.err"; then
+    fail "protected HEAD unexpectedly succeeded"
+  fi
+  grep -q 'error occurred (400) when calling the HeadObject operation' "$TMP/head.err" \
+    || fail "protected HEAD did not return the expected denial"
+}
+
+# Inspect only the synthetic objects created in this disposable appliance, so
+# assertions still prove the write path transformed bytes before storage. No
+# object contents or metadata are printed to the terminal.
+read_stored_fixture() {
+  local key="$1" destination="$2" hash data_file
+  hash="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$key")"
+  docker cp "$CONTAINER:/data/buckets/maskura/metadata/$hash.json" "$TMP/storage-meta.json" >/dev/null
+  data_file="$(python3 - "$TMP/storage-meta.json" "$key" <<'PY'
+import json, re, sys, uuid
+with open(sys.argv[1], encoding="utf-8") as source:
+    metadata = json.load(source)
+assert metadata["key"] == sys.argv[2]
+name = metadata["data_file"]
+assert re.fullmatch(r"[0-9a-f-]{36}\.data", name)
+assert str(uuid.UUID(name[:-5])) == name[:-5]
+print(name)
+PY
+)"
+  docker cp "$CONTAINER:/data/buckets/maskura/objects/$data_file" "$destination" >/dev/null
 }
 
 prove_redaction() {
@@ -83,7 +135,12 @@ prove_redaction() {
   enable_plugin pii-default
   printf 'jane@example.com 4111111111111111\n' > "$TMP/redaction.txt"
   put_with_aws "$TMP/redaction.txt" proof/redaction.txt
-  get_with_aws proof/redaction.txt > "$TMP/redacted.txt"
+  read_stored_fixture proof/redaction.txt "$TMP/redaction-stored.txt"
+  grep -qF '[REDACTED_EMAIL]' "$TMP/redaction-stored.txt" || fail "stored email was not redacted"
+  grep -qF '[REDACTED_CARD]' "$TMP/redaction-stored.txt" || fail "stored card was not redacted"
+  ! grep -qF 'jane@example.com' "$TMP/redaction-stored.txt" || fail "plaintext email reached storage"
+  assert_protected_head_denied proof/redaction.txt
+  get_with_aws proof/redaction.txt "$TMP/redacted.txt"
   grep -qF '[REDACTED_EMAIL]' "$TMP/redacted.txt" || fail "email was not redacted"
   grep -qF '[REDACTED_CARD]' "$TMP/redacted.txt" || fail "card was not redacted"
   ! grep -qF 'jane@example.com' "$TMP/redacted.txt" || fail "plaintext email reached raw read-back"
@@ -109,7 +166,10 @@ assert plugin["enabled"] is True
 PY
   printf 'jane@example.com 4111111111111111\n' > "$TMP/plugin.txt"
   put_with_aws "$TMP/plugin.txt" proof/plugin.txt
-  get_with_aws proof/plugin.txt > "$TMP/plugin-output.txt"
+  read_stored_fixture proof/plugin.txt "$TMP/plugin-stored.txt"
+  grep -qF '[REDACTED_EMAIL]' "$TMP/plugin-stored.txt" || fail "imported component did not transform stored data"
+  grep -qF '4111111111111111' "$TMP/plugin-stored.txt" || fail "unexpected filter changed stored card"
+  get_with_aws proof/plugin.txt "$TMP/plugin-output.txt"
   grep -qF '[REDACTED_EMAIL]' "$TMP/plugin-output.txt" || fail "imported component did not run"
   grep -qF '4111111111111111' "$TMP/plugin-output.txt" || fail "unexpected filter changed card"
   printf 'PASS  Wasm component imported at runtime and changed the live pipeline\n'
@@ -126,6 +186,10 @@ prove_python_hybrid() {
     PYTHONPATH="$ROOT/sdks/python${PYTHONPATH:+:$PYTHONPATH}" \
       MASKURA_PROOF_ENDPOINT="$ENDPOINT" python3 "$ROOT/examples/python-hybrid-roundtrip.py"
   fi
+  read_stored_fixture proof/python-hybrid.txt "$TMP/hybrid-stored.txt"
+  grep -qF '"alg":"X25519+ML-KEM-768/AES-256-GCM"' "$TMP/hybrid-stored.txt" || fail "hybrid envelope was not stored"
+  ! grep -qF 'jane@example.com' "$TMP/hybrid-stored.txt" || fail "plaintext email reached hybrid storage"
+  ! grep -qF '4111111111111111' "$TMP/hybrid-stored.txt" || fail "plaintext card reached hybrid storage"
 }
 
 case "$MODE" in
@@ -137,20 +201,37 @@ require docker
 require curl
 require python3
 
-printf 'Pulling %s\n' "$IMAGE"
-docker pull "$IMAGE" >/dev/null
+if [ "${MASKURA_PROOF_IMAGE_LOCAL:-0}" = 1 ]; then
+  docker image inspect "$IMAGE" >/dev/null
+else
+  printf 'Pulling %s\n' "$IMAGE"
+  docker pull "$IMAGE" >/dev/null
+fi
+# Fresh credentials and wrapping key belong only to this disposable container.
+# Read-spool encryption itself uses a separate random per-request key.
+export MASKURA_ROOT_USER="proof-$(python3 -c 'import secrets; print(secrets.token_hex(8))')"
+export MASKURA_ROOT_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+export MASKURA_SECRET_KEK="$(python3 -c 'import base64, secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())')"
 # Run the zero-config local appliance exactly as the public quickstart does:
 # one volume, the MinIO-convention container port 9000, and the canonical
-# `maskura` bucket. MASKURA_ROOT_USER/PASSWORD pin the SigV4 root credential so
-# the harness does not have to scrape the once-only generated secret, and
+# `maskura` bucket. Fresh root credentials avoid scraping container logs, and
 # AUTH_DISABLED lets it manage the plugin pipeline without a dashboard session.
-docker run --rm -d --name "$CONTAINER" \
+volume_attempted=1
+docker volume create "$VOLUME" >/dev/null
+container_attempted=1
+docker run -d --name "$CONTAINER" \
   -p "127.0.0.1:${PORT}:9000" \
   --volume "$VOLUME:/data" \
   -e AUTH_DISABLED=true \
-  -e MASKURA_ROOT_USER=proof \
-  -e MASKURA_ROOT_PASSWORD=proof \
+  -e MASKURA_ROOT_USER \
+  -e MASKURA_ROOT_PASSWORD \
+  -e MASKURA_SECRET_KEK \
+  -e MASKURA_TRANSFORMED_READ_SPOOL=encrypted \
+  -e MASKURA_SPOOL_DIR=/data/proof-spool \
+  -e MASKURA_SPOOL_MAX_OBJECT_BYTES=1048576 \
+  -e MASKURA_SPOOL_QUOTA_BYTES=4194304 \
   "$IMAGE" >/dev/null
+unset MASKURA_SECRET_KEK
 
 healthy=0
 for _ in $(seq 1 30); do
@@ -161,7 +242,7 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 if [ "$healthy" -ne 1 ]; then
-  docker logs "$CONTAINER" >&2 || true
+  echo "container output omitted: may contain generated credentials" >&2
   fail "gateway did not become healthy at $ENDPOINT"
 fi
 
