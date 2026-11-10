@@ -45,7 +45,7 @@ build-plugins:
   bash scripts/build-plugins.sh
 
 deny:
-  cargo deny check
+  python3 scripts/sqlite-guard.py deny
 
 audit:
   bash scripts/audit-rust.sh
@@ -128,19 +128,19 @@ release-local:
 
 # Build + test in a dagger container (cargo registry + target cached)
 build-local:
-  dagger call ci
+  python3 scripts/guarded-image.py dagger --action ci
 
 # Build the deploy image locally (dagger)
 image-local:
-  dagger call image
+  python3 scripts/guarded-image.py dagger --action image
 
 # Build + publish the deploy image to GHCR (needs: docker login ghcr.io once)
 publish-local TAG='latest':
-  dagger call publish --tag={{TAG}}
+  python3 scripts/guarded-image.py dagger --action publish --tag='{{TAG}}'
 
 # Start local dev environment (Docker Compose + local S3 appliance + gateway)
 dev-up: build-plugins
-  docker compose -f local/docker-compose.yml up -d --build --wait s3 gateway
+  python3 scripts/guarded-image.py compose
   echo "Local dev environment ready:"
   echo "  Local S3:   http://localhost:9000 (maskura appliance, root: minioadmin)"
   echo "  Gateway:   http://localhost:8080/health"

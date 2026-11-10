@@ -9,11 +9,21 @@ ARG CARGO_BUILD_JOBS=2
 
 COPY . .
 
+RUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo fetch --locked \
+    && python3 scripts/sqlite-guard.py \
     && cargo build --locked --release --jobs "$CARGO_BUILD_JOBS" -p maskura-gateway \
+    && python3 scripts/sqlite-guard.py \
     && cp /src/target/release/maskura-gateway /src/gateway-bin
+
+# This step must execute anew for each supported host-wrapper invocation. The
+# expensive compilation above remains cacheable; its actual source graph is
+# inspected again with the wrapper's fresh nonce before an image is assembled.
+ARG MASKURA_GUARD_NONCE
+RUN python3 scripts/sqlite-guard.py --nonce "$MASKURA_GUARD_NONCE"
 
 FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
 RUN apt-get update \

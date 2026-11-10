@@ -276,7 +276,7 @@ dependencies = [
  "aws-smithy-json",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
- "aws-smithy-schema",
+ "aws-smithy-schema 0.2.0",
  "aws-smithy-types",
  "aws-types",
  "bytes",
@@ -370,7 +370,7 @@ dependencies = [
  "aws-smithy-observability",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
- "aws-smithy-schema",
+ "aws-smithy-schema 0.2.0",
  "aws-smithy-types",
  "aws-smithy-xml",
  "aws-types",
@@ -405,7 +405,7 @@ dependencies = [
  "aws-smithy-query",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
- "aws-smithy-schema",
+ "aws-smithy-schema 0.2.0",
  "aws-smithy-types",
  "aws-smithy-xml",
  "aws-types",
@@ -445,9 +445,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-async"
-version = "1.3.0"
+version = "1.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f02e407fb3b54891734224b9ffac8a71fdd35f542500fa1af95754a6b2beb316"
+checksum = "de681a9df7ff79823b759ee17061076ec049cd61a8fa28ece4293d89c9f6964e"
 dependencies = [
  "futures-util",
  "pin-project-lite",
@@ -488,9 +488,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-http"
-version = "0.64.0"
+version = "0.64.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37843d9add67c3aff5856f409c6dc315d3cdff60f9c0cb5b670dab1e9920306d"
+checksum = "ba8960956e0ee0ca3f3161e62913a61bc65a7ef638ca3ef1d4c7159f8443e398"
 dependencies = [
  "aws-smithy-eventstream",
  "aws-smithy-runtime-api",
@@ -504,15 +504,14 @@ dependencies = [
  "http-body-util",
  "percent-encoding",
  "pin-project-lite",
- "pin-utils",
  "tracing",
 ]
 
 [[package]]
 name = "aws-smithy-http-client"
-version = "1.5.0"
+version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51c89cc3f1f281d659a67a519a1b5c6d445b5ce09fa7e5aee40c2c2707e9509d"
+checksum = "859a81364f8185349c584fb41cd8765a400cf982f447adada590cf008a9f3b85"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api",
@@ -539,7 +538,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3dc65a121adb4b33729919fcfa14fa36fb33c1555a8f06bb0e2188dbfdc1d9ef"
 dependencies = [
  "aws-smithy-runtime-api",
- "aws-smithy-schema",
+ "aws-smithy-schema 0.2.0",
  "aws-smithy-types",
 ]
 
@@ -559,7 +558,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "512346c7212ab7436df2d77a16d976a468ae44a418835511d2a69269810aaf62"
 dependencies = [
  "aws-smithy-runtime-api",
- "aws-smithy-schema",
+ "aws-smithy-schema 0.2.0",
  "aws-smithy-types",
  "aws-smithy-xml",
  "urlencoding",
@@ -567,35 +566,32 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime"
-version = "1.14.0"
+version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b82e438d30e02a825d363bd639a9efaed68a8089d86101054b0081e7e0d3e606"
+checksum = "79cef0c41e8ca40f74f68ed8ee4d1ddbde12bb847b95ef9b3c025681ddfae58a"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-http",
  "aws-smithy-http-client",
  "aws-smithy-observability",
  "aws-smithy-runtime-api",
- "aws-smithy-schema",
+ "aws-smithy-schema 1.2.0",
  "aws-smithy-types",
  "bytes",
  "fastrand",
- "http 0.2.12",
  "http 1.5.0",
- "http-body 0.4.6",
  "http-body 1.1.0",
  "http-body-util",
  "pin-project-lite",
- "pin-utils",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "aws-smithy-runtime-api"
-version = "1.19.0"
+version = "1.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0730c16f91124c6a2abb4932c77e299288b3dd9f967ea2e9ec48cc6731e87a4"
+checksum = "0467a2414e84b1b01e37452896fb3562b93926e81c619eba6ecf27ce9e682a0e"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api-macros",
@@ -611,9 +607,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime-api-macros"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "221eaa237ddf1ca79b60d1372aad77e47f9c0ea5b3ce5099da8c61d027dc77b3"
+checksum = "ce237f890a2283c9b328955c3b0918d2d5bf66a1cb6ceccd36a0047246fbc6e6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -632,22 +628,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-smithy-types"
-version = "1.9.0"
+name = "aws-smithy-schema"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55752025c39c0e094962fd73f1c57014b191f678612e517f219468e575af9822"
+checksum = "f7ef30d39e131651359b60a1c560de9a9502a4c3754172ab2d6e8734fe21bcba"
+dependencies = [
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "http 1.5.0",
+]
+
+[[package]]
+name = "aws-smithy-types"
+version = "1.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aff4bf014c512840b2bba80a20417b723cbd6a0a65c02e2d81f50b4268aedfc7"
 dependencies = [
  "base64-simd",
  "bytes",
  "bytes-utils",
  "futures-core",
- "http 0.2.12",
  "http 1.5.0",
- "http-body 0.4.6",
  "http-body 1.1.0",
  "http-body-util",
  "itoa",
- "num-integer",
  "pin-project-lite",
  "ryu",
  "serde",
@@ -663,7 +667,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce84f71c72fee2cbbadde6e7d082f5fb466e3a84733855295fa7aafd1b31b7d8"
 dependencies = [
  "aws-smithy-runtime-api",
- "aws-smithy-schema",
+ "aws-smithy-schema 0.2.0",
  "aws-smithy-types",
  "xmlparser",
 ]
@@ -677,7 +681,7 @@ dependencies = [
  "aws-credential-types",
  "aws-smithy-async",
  "aws-smithy-runtime-api",
- "aws-smithy-schema",
+ "aws-smithy-schema 0.2.0",
  "aws-smithy-types",
  "rustc_version",
  "tracing",
@@ -1774,7 +1778,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2805,7 +2809,7 @@ dependencies = [
 
 [[package]]
 name = "maskura"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2831,7 +2835,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-customer-config"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -2841,14 +2845,14 @@ dependencies = [
 
 [[package]]
 name = "maskura-error"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "maskura-gateway"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "aes-gcm",
  "aes-siv",
@@ -2926,7 +2930,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-mcp"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "anyhow",
  "axum",
@@ -2948,7 +2952,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-mcp-protocol"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "quick-xml",
  "schemars",
@@ -2959,7 +2963,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-pipeline-config"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "base64 0.23.1",
  "ciborium",
@@ -2979,7 +2983,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-crypto-deterministic"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "aes-siv",
  "base64 0.23.1",
@@ -2989,7 +2993,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-crypto-envelope"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "aes-gcm",
  "base64 0.23.1",
@@ -3006,7 +3010,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-filter-email"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "maskura-plugin-pii-core",
  "maskura-plugin-sdk",
@@ -3014,7 +3018,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-filter-payment-card"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "maskura-plugin-pii-core",
  "maskura-plugin-sdk",
@@ -3022,7 +3026,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-filter-pii"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "maskura-plugin-pii-core",
  "maskura-plugin-sdk",
@@ -3030,7 +3034,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-filter-ssn"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "maskura-plugin-pii-core",
  "maskura-plugin-sdk",
@@ -3038,7 +3042,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-pii-core"
-version = "0.7.29"
+version = "0.7.30"
 
 [[package]]
 name = "maskura-plugin-sdk"
@@ -3049,14 +3053,14 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-transform-noop"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "maskura-plugin-sdk",
 ]
 
 [[package]]
 name = "maskura-policy"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "ciborium",
  "ed25519-dalek",
@@ -3069,28 +3073,28 @@ dependencies = [
 
 [[package]]
 name = "maskura-test-plugin-binary-reductor"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "wit-bindgen 0.61.1",
 ]
 
 [[package]]
 name = "maskura-test-plugin-transformer"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "maskura-plugin-sdk",
 ]
 
 [[package]]
 name = "maskura-test-plugin-transformer-context"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "maskura-plugin-sdk",
 ]
 
 [[package]]
 name = "maskura-wasm-runtime"
-version = "0.7.29"
+version = "0.7.30"
 dependencies = [
  "anyhow",
  "hex",
@@ -3636,12 +3640,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
-name = "pin-utils"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
-
-[[package]]
 name = "pkcs1"
 version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3974,7 +3972,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4295,9 +4293,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.6.0"
+version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ceb42e9e47443cd83a834dea57b5816d35481417bae72ade5dc5615c59122e26"
+checksum = "d24a7e92f4bcaa36b97fa93c4fa7ca8f3e669eced949345b3462dba333c7f909"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -4311,6 +4309,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -4321,9 +4320,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "3.7.0"
+version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "967fa7f7935d7d6217d593df0e8e5c9307bcaf256974a5a9ee64476c97735389"
+checksum = "b3140f24a766f80f9ec1607bde85680959a69b83d46fa9ce87dadab7e67ab029"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -4395,7 +4394,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5299,7 +5298,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

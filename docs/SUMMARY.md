@@ -50,3 +50,4 @@
 - [ADR 0028: Iceberg table-format adapter](adr/0028-iceberg-table-format-adapter.md)
 - [ADR 0029: Mandatory read pipeline](adr/0029-mandatory-read-pipeline.md)
 - [ADR 0030: Batch delete via S3 DeleteObjects](adr/0030-batch-delete-objects.md)
+- [ADR 0032: Temporary inactive SQLite advisory exception](adr/0032-temporary-sqlite-advisory-exception.md)
