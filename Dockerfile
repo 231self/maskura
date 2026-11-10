@@ -3,7 +3,7 @@
 # Pre-built Wasm components committed to components/. Each invocation builds
 # one native target; the release workflow assembles its multi-arch manifest.
 
-FROM rust:1.99.0-trixie@sha256:81015672d6939b0265f09adf96d5de125482bb1330106076956b0518e74edc90 AS build
+FROM rust:1.99.1-trixie@sha256:8a4e90c7946b74626488b1446f712c0fe0ed1a596cbd3d871684bc9c5433ae07 AS build
 WORKDIR /src
 ARG CARGO_BUILD_JOBS=2
 
@@ -25,7 +25,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 ARG MASKURA_GUARD_NONCE
 RUN python3 scripts/sqlite-guard.py --nonce "$MASKURA_GUARD_NONCE"
 
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
