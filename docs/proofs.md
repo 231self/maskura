@@ -18,12 +18,17 @@ The default is the current published image. Pin a release when you want the
 same bytes on a later run:
 
 ```bash
-MASKURA_PROOF_IMAGE=ghcr.io/231self/maskura/maskura:v0.7.31 just proof
+MASKURA_PROOF_IMAGE=ghcr.io/231self/maskura/maskura:v0.7.32 just proof
 ```
 
 The harness prints the pulled image digest before it starts its assertions. It
-boots Maskura with transformed reads disabled, so each GET returns the raw
-write-path result rather than applying a second transform on read.
+uses encrypted, bounded transformed-read spooling in its disposable container.
+Protected HEAD remains denied: the AWS CLI uses a direct `s3api get-object`
+instead of high-level `s3 cp`, which first issues HEAD. To verify the write path
+independently of the read transform, the harness also checks the stored bytes
+of its own synthetic fixtures in that disposable container; it never prints
+their contents. This is not a claim that protected HEAD or every S3 client is
+supported.
 
 ## What it proves
 

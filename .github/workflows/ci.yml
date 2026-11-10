@@ -39,6 +39,7 @@ jobs:
           python3 scripts/check-release-contract.py
           bash scripts/test-release-notifications.sh
           python3 -m unittest discover -s tests -p 'test_release_image_smoke.py'
+          python3 -m unittest discover -s tests -p 'test_release_proof.py'
 
   lint:
     runs-on: ubuntu-24.04
@@ -158,6 +159,17 @@ jobs:
         env:
           IMAGE_REF: maskura-pr-smoke:${{ github.sha }}
         run: bash scripts/release-image-smoke.sh "$IMAGE_REF"
+      - name: Install release proof dependencies
+        run: |
+          python3 -m venv .release-venv
+          . .release-venv/bin/activate
+          python3 -m pip install awscli ./sdks/python
+          echo "$PWD/.release-venv/bin" >> "$GITHUB_PATH"
+      - name: Prove the packaged image before merge
+        env:
+          MASKURA_PROOF_IMAGE: maskura-pr-smoke:${{ github.sha }}
+          MASKURA_PROOF_IMAGE_LOCAL: "1"
+        run: bash examples/prove-maskura.sh
 
   postgres:
     runs-on: ubuntu-24.04
