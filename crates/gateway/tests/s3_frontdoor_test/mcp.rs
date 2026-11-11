@@ -390,7 +390,7 @@ async fn active_trusted_mcp_cancellation_releases_precommit_reservation() {
     let config = test_config();
     let state = build_state_with_pipeline_template(
         control.clone(),
-        default_wrapping().expect("wrapping"),
+        fixture_wrapping(),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         test_pipeline_template(),
         &config,

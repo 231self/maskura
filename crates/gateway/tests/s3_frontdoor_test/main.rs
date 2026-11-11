@@ -35,7 +35,7 @@ use maskura_gateway::control::{
 
 use maskura_gateway::file_store::FileStore;
 
-use maskura_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher, default_wrapping};
+use maskura_gateway::key_cipher::{KeyWrapping, LocalKeyWrapping, SecretCipher};
 
 use maskura_gateway::mcp::{
     DeleteObjectRequest, GetObjectRequest, ListObjectsRequest, PutObjectRequest, ToolRequest,
@@ -661,14 +661,37 @@ fn test_pipeline_template() -> &'static StatePipelineTemplate {
 
 fn test_config() -> Config {
     let _ = test_pipeline_template();
-    Config::resolve(None).expect("resolve test config")
+    let mut config = Config::resolve(None).expect("resolve test config");
+    // The outer test process must itself run with a reviewed, cleared
+    // environment: build_state also reads some settings directly from env.
+    // Pin these config fields independently of any inherited configuration.
+    config.auth.disabled = false;
+    config.storage.mode = None;
+    config.storage.local_dir = None;
+    config.storage.s3_endpoint = None;
+    config.storage.single_tenant = true;
+    config.keys.keys_file = None;
+    config.keys.bootstrap_key = None;
+    config.features.dev_memory_streaming = true;
+    config.spool.dir = Some(owned_fixture_spool_dir().display().to_string());
+    config
+}
+
+// Retain these paths for the entire child process, including background worker
+// shutdown. The external launcher owns and removes the parent TMPDIR afterward.
+fn owned_fixture_spool_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("maskura-frontdoor-spool-{}", uuid::Uuid::now_v7()))
+}
+
+fn fixture_wrapping() -> Arc<dyn KeyWrapping> {
+    Arc::new(LocalKeyWrapping::with_kek([0x42; 32]))
 }
 
 async fn test_state() -> Arc<AppState> {
     let config = test_config();
     build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
-        default_wrapping().expect("wrapping"),
+        fixture_wrapping(),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         test_pipeline_template(),
         &config,
@@ -762,8 +785,6 @@ async fn spooled_test_state() -> Arc<AppState> {
     let mut state = test_state().await;
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.transformed_read_spool_enabled = true;
-    state_mut.spool_config.directory =
-        std::env::temp_dir().join(format!("maskura-protected-read-{}", uuid::Uuid::now_v7()));
     state
 }
 
@@ -855,13 +876,8 @@ fn test_transformer_component() -> Vec<u8> {
 
 async fn unsafe_transformed_test_state(later_filter: bool) -> Arc<AppState> {
     let mut state = test_state().await;
-    let spool_dir = std::env::temp_dir().join(format!(
-        "maskura-read-spool-failure-{}",
-        uuid::Uuid::now_v7()
-    ));
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     state_mut.transformed_read_spool_enabled = true;
-    state_mut.spool_config.directory = spool_dir;
     state_mut.spool_config.max_object_bytes = 1024;
     state_mut.spool_quota = Arc::new(SpoolQuota::new(2048));
     for plugin in state.plugins.list() {
@@ -1314,5 +1330,6 @@ mod objects;
 mod pipeline;
 mod policy_gate;
 mod read_mandate;
+mod s3_metadata;
 mod sigv4;
 mod streaming;

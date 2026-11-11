@@ -72,21 +72,38 @@ pub(crate) fn multipart_snapshot(
     plugin_snapshot: serde_json::Value,
     max_bytes: u64,
     verified_policy: Option<crate::policy_gate::VerifiedPolicy>,
-) -> MultipartSnapshot {
-    let mut metadata: std::collections::BTreeMap<String, String> = headers
-        .iter()
-        .filter_map(|(name, value)| {
-            name.as_str()
-                .strip_prefix("x-amz-meta-")
-                .zip(value.to_str().ok())
-                .map(|(name, value)| (name.to_string(), value.to_string()))
-        })
-        .collect();
-    for name in [header::CONTENT_TYPE, header::CONTENT_ENCODING] {
-        if let Some(value) = headers.get(&name).and_then(|value| value.to_str().ok()) {
-            metadata.insert(name.to_string(), value.to_string());
+) -> Result<MultipartSnapshot, &'static str> {
+    let content_type = match headers.get(header::CONTENT_TYPE) {
+        Some(value) => value
+            .to_str()
+            .map_err(|_| "invalid multipart Content-Type")?,
+        None => "application/octet-stream",
+    };
+    let mut users = std::collections::BTreeMap::new();
+    let mut representation = std::collections::BTreeMap::new();
+    for (name, value) in headers {
+        if let Some(name) = name.as_str().strip_prefix("x-amz-meta-") {
+            let value = value
+                .to_str()
+                .map_err(|_| "invalid customer metadata value")?;
+            if users.insert(name.to_string(), value.to_string()).is_some() {
+                return Err("duplicate customer metadata name");
+            }
+        } else if name == header::CONTENT_ENCODING {
+            let value = value.to_str().map_err(|_| "invalid Content-Encoding")?;
+            if representation
+                .insert(name.to_string(), value.to_string())
+                .is_some()
+            {
+                return Err("duplicate Content-Encoding");
+            }
         }
     }
+    let metadata = crate::transaction::metadata::encode_with_representation(
+        content_type,
+        &representation,
+        &users,
+    )?;
     let tags = headers
         .get("x-amz-tagging")
         .and_then(|value| value.to_str().ok())
@@ -107,7 +124,7 @@ pub(crate) fn multipart_snapshot(
         ResolvedBackend::Memory(_) => serde_json::json!({"kind":"memory"}),
         ResolvedBackend::PresignedHttp(_) => serde_json::json!({"kind":"presigned-http"}),
     };
-    MultipartSnapshot {
+    Ok(MultipartSnapshot {
         metadata,
         tags,
         checksum_mode: headers
@@ -118,7 +135,7 @@ pub(crate) fn multipart_snapshot(
         plugin_snapshot,
         max_staged_bytes: max_bytes,
         verified_policy,
-    }
+    })
 }
 
 #[derive(Debug)]
@@ -161,26 +178,50 @@ pub(crate) fn staged_part_reservation(headers: &HeaderMap) -> Result<u64, PartRe
     Ok(bytes)
 }
 
-pub(crate) fn multipart_stored_metadata(snapshot: &MultipartSnapshot) -> MultipartStoredMetadata {
+pub(crate) fn multipart_stored_metadata(
+    snapshot: &MultipartSnapshot,
+) -> Result<MultipartStoredMetadata, &'static str> {
     let mut representation_headers = std::collections::BTreeMap::new();
-    let mut user_metadata = std::collections::BTreeMap::new();
-    for (name, value) in &snapshot.metadata {
-        match name.as_str() {
-            "content-type" => {}
-            "content-encoding" => {
-                representation_headers.insert(name.clone(), value.clone());
-            }
-            _ => {
-                user_metadata.insert(name.clone(), value.clone());
-            }
+    let user_metadata;
+    if snapshot.metadata.keys().any(|name| name.starts_with(':')) {
+        let decoded = crate::transaction::metadata::decode(&snapshot.metadata)?;
+        if !decoded.versioned || !decoded.internal.is_empty() {
+            return Err("invalid multipart metadata record");
         }
+        if let Some(encoding) = decoded.content_encoding {
+            representation_headers.insert("content-encoding".to_string(), encoding);
+        }
+        user_metadata = decoded.user_metadata;
+    } else {
+        // Historical snapshots used flat representation keys. Preserve that
+        // interpretation without reconstructing a colliding customer key.
+        user_metadata = snapshot
+            .metadata
+            .iter()
+            .filter(|(name, _)| {
+                name.as_str() != "content-type" && name.as_str() != "content-encoding"
+            })
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        if let Some(encoding) = snapshot.metadata.get("content-encoding") {
+            representation_headers.insert("content-encoding".to_string(), encoding.clone());
+        }
+        let content_type = snapshot
+            .metadata
+            .get("content-type")
+            .ok_or("multipart Content-Type is missing")?;
+        crate::transaction::metadata::encode_with_representation(
+            content_type,
+            &representation_headers,
+            &user_metadata,
+        )?;
     }
-    MultipartStoredMetadata {
+    Ok(MultipartStoredMetadata {
         representation_headers,
         user_metadata,
         tags: snapshot.tags.clone(),
         checksum_algorithm: snapshot.checksum_mode.clone(),
-    }
+    })
 }
 
 /// Capture single-PUT representation/user metadata and tags from headers so a
@@ -189,12 +230,24 @@ pub(crate) fn single_put_stored_metadata(headers: &HeaderMap) -> MultipartStored
     let mut representation_headers = std::collections::BTreeMap::new();
     let mut user_metadata = std::collections::BTreeMap::new();
     for (name, value) in headers {
+        if let Some(meta) = name.as_str().strip_prefix("x-amz-meta-")
+            && crate::transaction::metadata::RESERVED_PROVIDER_NAMES.contains(&meta)
+        {
+            // Keep reserved names present even when the value is not readable.
+            // Pre-sink validation rejects the name irrespective of its value.
+            user_metadata.insert(meta.to_string(), String::new());
+            continue;
+        }
         let Some(value) = value.to_str().ok() else {
             continue;
         };
         if let Some(meta) = name.as_str().strip_prefix("x-amz-meta-") {
             user_metadata.insert(meta.to_string(), value.to_string());
-        } else if name.as_str() == "content-encoding" {
+        } else if name.as_str() == "content-encoding"
+            && !value.trim().eq_ignore_ascii_case("aws-chunked")
+        {
+            // Accepted aws-chunked PUTs are decoded by the body verifier;
+            // this is transport framing, not the stored representation.
             representation_headers.insert("content-encoding".to_string(), value.to_string());
         }
     }
@@ -947,7 +1000,7 @@ pub(crate) async fn complete_staged_multipart(
             StreamingPutError::Pipeline(error),
         ));
     }
-    if let Some(lance_media) = lance_media_type(content_type) {
+    if lance_media_type(content_type).is_some() {
         if !state.binary_lance_enabled {
             return Err(MultipartCompletionError::Streaming(
                 StreamingPutError::Unsupported(
@@ -963,11 +1016,11 @@ pub(crate) async fn complete_staged_multipart(
             lease,
             operation,
             backend,
-            &lance_media,
+            content_type,
         )
         .await;
     }
-    if let Some(avro_media) = avro_media_type(content_type) {
+    if avro_media_type(content_type).is_some() {
         if !state.binary_avro_enabled {
             return Err(MultipartCompletionError::Streaming(
                 StreamingPutError::Unsupported(
@@ -983,12 +1036,13 @@ pub(crate) async fn complete_staged_multipart(
             lease,
             operation,
             backend,
-            &avro_media,
+            content_type,
         )
         .await;
     }
-    let (format, content_type) = streaming_format_content_type(content_type)?;
-    let stored_metadata = multipart_stored_metadata(&upload.snapshot);
+    let (format, session_content_type) = streaming_format_content_type(content_type)?;
+    let stored_metadata = multipart_stored_metadata(&upload.snapshot)
+        .map_err(|detail| MultipartCompletionError::Invalid(detail.to_string()))?;
     validate_multipart_checksum_mode(&upload.snapshot)
         .map_err(|detail| MultipartCompletionError::Invalid(detail.to_string()))?;
     let fingerprint = upload
@@ -1013,7 +1067,7 @@ pub(crate) async fn complete_staged_multipart(
         destination_operation_id,
         &identity.bucket,
         &identity.key,
-        &content_type,
+        content_type,
         Some((&coordinator, identity, fingerprint)),
         Some(stored_metadata),
     )
@@ -1024,7 +1078,7 @@ pub(crate) async fn complete_staged_multipart(
     let cancellation = trusted_wasm_cancellation();
     let session = maskura_wasm_runtime::Session {
         format: format.as_str().to_string(),
-        content_type,
+        content_type: session_content_type,
         policy_version: 0,
         operation: maskura_wasm_runtime::Operation::Write,
         config_json: None,
@@ -1691,7 +1745,8 @@ pub(crate) async fn complete_staged_avro_multipart(
         );
     let coordinator = multipart_completion_coordinator(state, staging)?;
     renew_and_fence_completion(staging, identity, lease).await?;
-    let stored_metadata = multipart_stored_metadata(&upload.snapshot);
+    let stored_metadata = multipart_stored_metadata(&upload.snapshot)
+        .map_err(|detail| MultipartCompletionError::Invalid(detail.to_string()))?;
     validate_multipart_checksum_mode(&upload.snapshot)
         .map_err(|detail| MultipartCompletionError::Invalid(detail.to_string()))?;
     let mut sink = begin_streaming_sink(
@@ -1856,7 +1911,8 @@ pub(crate) async fn complete_staged_lance_multipart(
         );
     let coordinator = multipart_completion_coordinator(state, staging)?;
     renew_and_fence_completion(staging, identity, lease).await?;
-    let stored_metadata = multipart_stored_metadata(&upload.snapshot);
+    let stored_metadata = multipart_stored_metadata(&upload.snapshot)
+        .map_err(|detail| MultipartCompletionError::Invalid(detail.to_string()))?;
     validate_multipart_checksum_mode(&upload.snapshot)
         .map_err(|detail| MultipartCompletionError::Invalid(detail.to_string()))?;
     let mut sink = begin_streaming_sink(

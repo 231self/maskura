@@ -269,7 +269,23 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         }
 
         let control = Arc::new(MultipartBillingControl::default());
-        let config = Config::resolve(None).expect("resolve multipart test config");
+        let mut config = Config::resolve(None).expect("resolve multipart test config");
+        config.auth.disabled = false;
+        config.storage.mode = None;
+        config.storage.local_dir = None;
+        config.storage.single_tenant = true;
+        config.storage.s3_endpoint = Some(endpoint.clone());
+        config.keys.keys_file = None;
+        config.keys.bootstrap_key = None;
+        config.spool.dir = Some(
+            std::env::temp_dir()
+                .join(format!(
+                    "maskura-db-multipart-spool-{}",
+                    uuid::Uuid::now_v7()
+                ))
+                .display()
+                .to_string(),
+        );
         let mut state = build_state(
             control.clone(),
             Arc::new(LocalKeyWrapping::with_kek(TEST_KEK)),
@@ -297,12 +313,33 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         let bucket = format!("mp-bkt-{}", uuid::Uuid::new_v4());
         let key = format!("object-{}.txt", uuid::Uuid::new_v4());
 
+        let rejected = add_headers(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/{bucket}/reserved?uploads"))
+                .header("x-amz-meta-maskura-operation-id", "customer")
+                .body(Body::empty())
+                .unwrap(),
+            &hdrs,
+        );
+        assert_eq!(
+            app.clone().oneshot(rejected).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            objects.lock().await.is_empty(),
+            "rejected initiation cannot stage a part"
+        );
+
         // CreateMultipartUpload.
         let create = add_headers(
             Request::builder()
                 .method("POST")
                 .uri(format!("/{bucket}/{key}?uploads"))
                 .header(header::CONTENT_TYPE, "text/plain")
+                .header(header::CONTENT_ENCODING, "gzip")
+                .header("x-amz-meta-content-type", "customer-type")
+                .header("x-amz-meta-content-encoding", "customer-encoding")
                 .body(Body::empty())
                 .unwrap(),
             &hdrs,
@@ -351,11 +388,21 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         // Rebuild a fully independent gateway process against the same
         // Postgres and staging backend. Completion must use the persisted
         // immutable resolution rather than process-local plugin identities.
+        let mut restarted_config = config.clone();
+        restarted_config.spool.dir = Some(
+            std::env::temp_dir()
+                .join(format!(
+                    "maskura-db-multipart-spool-{}",
+                    uuid::Uuid::now_v7()
+                ))
+                .display()
+                .to_string(),
+        );
         let mut restarted_state = build_state(
             control.clone(),
             Arc::new(LocalKeyWrapping::with_kek(TEST_KEK)),
             Arc::new(maskura_gateway::workspace_storage::InMemoryWorkspaceStorageRepository::new()),
-            &config,
+            &restarted_config,
         )
         .await
         .expect("restart gateway with durable staged multipart");
@@ -424,6 +471,25 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         let final_etag = extract_xml(&complete_body, "ETag");
         assert!(!final_etag.is_empty());
 
+        {
+            let provider_headers = mock_state.destination_headers.lock().await;
+            let provider_headers = provider_headers
+                .get(&format!("{bucket}/{key}"))
+                .expect("destination PUT headers");
+            assert_eq!(
+                provider_headers.get(header::CONTENT_ENCODING).unwrap(),
+                "gzip"
+            );
+            assert_eq!(
+                provider_headers.get("x-amz-meta-content-type").unwrap(),
+                "customer-type"
+            );
+            assert_eq!(
+                provider_headers.get("x-amz-meta-content-encoding").unwrap(),
+                "customer-encoding"
+            );
+        }
+
         // GET the assembled object: PII redacted and parts in part-number order.
         let get = add_headers(
             Request::builder()
@@ -435,6 +501,18 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         );
         let resp = app.clone().oneshot(get).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "GET assembled object");
+        assert_eq!(
+            resp.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        assert_eq!(
+            resp.headers().get("x-amz-meta-content-type").unwrap(),
+            "customer-type"
+        );
+        assert_eq!(
+            resp.headers().get("x-amz-meta-content-encoding").unwrap(),
+            "customer-encoding"
+        );
         let text = String::from_utf8(
             axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
@@ -647,6 +725,6 @@ fn router_staged_multipart_flow_is_durable_and_idempotent() {
         );
 
         mock_task.abort();
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        // The launcher removes the owned staging root after child worker exit.
     });
 }

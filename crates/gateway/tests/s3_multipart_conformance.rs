@@ -28,7 +28,7 @@ use bytes::Bytes;
 use maskura_customer_config::Config;
 use maskura_gateway::Gateway;
 use maskura_gateway::control::NoopControlPlane;
-use maskura_gateway::key_cipher::default_wrapping;
+use maskura_gateway::key_cipher::LocalKeyWrapping;
 use maskura_gateway::pipeline::{
     ComponentSource, PipelineDirection, PipelineLocator, PipelineResolution, PipelineResolver,
     StaticPipelineResolver, resolution_fingerprint,
@@ -169,7 +169,25 @@ async fn body_bytes(response: axum::response::Response) -> Vec<u8> {
 }
 
 async fn build_isolated_state() -> anyhow::Result<Arc<AppState>> {
-    let config = Config::resolve(None)?;
+    let mut config = Config::resolve(None)?;
+    config.auth.disabled = false;
+    config.storage.mode = Some("local".to_string());
+    config.storage.single_tenant = true;
+    config.storage.s3_endpoint = None;
+    anyhow::ensure!(
+        config.storage.local_dir.as_deref().is_some_and(|path| {
+            Path::new(path).is_absolute() && Path::new(path).starts_with(std::env::temp_dir())
+        }),
+        "local multipart fixture requires an explicit root inside its owned TMPDIR"
+    );
+    config.keys.keys_file = None;
+    config.keys.bootstrap_key = None;
+    config.spool.dir = Some(
+        std::env::temp_dir()
+            .join(format!("maskura-multipart-spool-{}", uuid::Uuid::now_v7()))
+            .display()
+            .to_string(),
+    );
     let pipeline_template = StatePipelineTemplate::from_config_with_executor(
         &config,
         maskura_wasm_runtime::ExecutorConfig {
@@ -180,7 +198,7 @@ async fn build_isolated_state() -> anyhow::Result<Arc<AppState>> {
     )?;
     build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
-        default_wrapping()?,
+        Arc::new(LocalKeyWrapping::with_kek([0x42; 32])),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         &pipeline_template,
         &config,
@@ -736,7 +754,7 @@ async fn run_sdk_multipart_lifecycle() {
     server.abort();
     drop(state);
     drop(env);
-    let _ = std::fs::remove_dir_all(&root);
+    // The outer launcher removes its owned TMPDIR after the child exits.
 }
 
 #[test]
@@ -884,7 +902,7 @@ async fn run_sdk_multipart_replacement() {
     server.abort();
     drop(state);
     drop(env);
-    let _ = std::fs::remove_dir_all(&root);
+    // The outer launcher removes its owned TMPDIR after the child exits.
 }
 
 #[test]
@@ -1057,12 +1075,208 @@ async fn run_sdk_multipart_abort_and_errors() {
     server.abort();
     drop(state);
     drop(env);
-    let _ = std::fs::remove_dir_all(&root);
+    // The outer launcher removes its owned TMPDIR after the child exits.
 }
 
 // ===========================================================================
 // Raw HTTP conformance scenarios (tower oneshot against the built router)
 // ===========================================================================
+
+#[test]
+fn http_multipart_content_type_is_frozen_at_initiation() {
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build test tokio runtime");
+    runtime.block_on(async {
+        let root =
+            std::env::temp_dir().join(format!("maskura-http-content-type-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root).expect("create temporary storage root");
+        let mut env = EnvRestore::new();
+        configure_local_staged_env(&mut env, &root);
+        let (state, app, access_key, secret_key) = build_local_state().await;
+        // This is a synthetic passthrough contract test, not qualification of
+        // bundled production processing components.
+        let write_plugins = state.gateway.plugins.as_ref().expect("write registry");
+        for plugin in write_plugins.list() {
+            assert!(write_plugins.set_enabled(&plugin.id, false).is_some());
+        }
+        let headers = auth_headers(&access_key, &secret_key);
+        let bucket = "content-type-cases";
+        create_bucket_raw(&app, &headers, bucket).await;
+        let rejected = app
+            .clone()
+            .oneshot(add_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/{bucket}/reserved?uploads"))
+                    .header("x-amz-meta-maskura-operation-id", "customer")
+                    .body(Body::empty())
+                    .unwrap(),
+                &headers,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let bytes = b"\x00multipart\xffbinary\x01";
+        let cases = [
+            ("default-no-header", None, None, "application/octet-stream"),
+            (
+                "default-xml",
+                None,
+                Some("application/xml"),
+                "application/octet-stream",
+            ),
+            (
+                "explicit-no-header",
+                Some("binary/octet-stream"),
+                None,
+                "binary/octet-stream",
+            ),
+            (
+                "explicit-xml",
+                Some("binary/octet-stream"),
+                Some("application/xml"),
+                "binary/octet-stream",
+            ),
+            (
+                "explicit-parameters",
+                Some("Text/Plain; charset=utf-8"),
+                Some("application/xml"),
+                "Text/Plain; charset=utf-8",
+            ),
+        ];
+        let mut expected_objects = Vec::new();
+        for (key, create_type, complete_type, expected_type) in cases {
+            let bytes: &[u8] = if key == "explicit-parameters" {
+                b"public synthetic parameter body\n"
+            } else {
+                bytes
+            };
+            let mut create = Request::builder()
+                .method("POST")
+                .uri(format!("/{bucket}/{key}?uploads"))
+                .header(header::CONTENT_ENCODING, "gzip")
+                .header("x-amz-meta-content-type", "customer-type")
+                .header("x-amz-meta-content-encoding", "customer-encoding");
+            if let Some(content_type) = create_type {
+                create = create.header(header::CONTENT_TYPE, content_type);
+            }
+            let response = app
+                .clone()
+                .oneshot(add_headers(create.body(Body::empty()).unwrap(), &headers))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "CreateMultipartUpload {key}"
+            );
+            let xml = String::from_utf8(body_bytes(response).await).unwrap();
+            let upload_id = extract_xml(&xml, "UploadId");
+            assert!(!upload_id.is_empty(), "CreateMultipartUpload {key}");
+            // Part and completion transport types must not replace the object type.
+            let etag = upload_part_raw(&app, &headers, bucket, key, &upload_id, 1, bytes).await;
+            let mut complete = Request::builder()
+                .method("POST")
+                .uri(format!("/{bucket}/{key}?uploadId={upload_id}"));
+            if let Some(content_type) = complete_type {
+                complete = complete.header(header::CONTENT_TYPE, content_type);
+            }
+            let response = app
+                .clone()
+                .oneshot(add_headers(
+                    complete
+                        .body(Body::from(complete_xml(&[(1, &etag)])))
+                        .unwrap(),
+                    &headers,
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let completion = String::from_utf8(body_bytes(response).await).unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "CompleteMultipartUpload {key}: {completion}"
+            );
+            for method in ["HEAD", "GET"] {
+                let response = app
+                    .clone()
+                    .oneshot(add_headers(
+                        Request::builder()
+                            .method(method)
+                            .uri(format!("/{bucket}/{key}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                        &headers,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{method} {key}");
+                for (name, expected) in [
+                    ("content-encoding", "gzip"),
+                    ("x-amz-meta-content-type", "customer-type"),
+                    ("x-amz-meta-content-encoding", "customer-encoding"),
+                    ("content-type", expected_type),
+                ] {
+                    assert_eq!(
+                        response.headers().get(name).and_then(|v| v.to_str().ok()),
+                        Some(expected),
+                        "{key}: {name}"
+                    );
+                }
+                if method == "GET" {
+                    assert_eq!(
+                        body_bytes(response).await.as_slice(),
+                        bytes,
+                        "GetObject bytes {key}"
+                    );
+                }
+            }
+            expected_objects.push((key, expected_type, bytes.to_vec()));
+        }
+        drop(app);
+        drop(state);
+        // Reopen the durable local backend, retaining only this fixture's root
+        // and persisted synthetic credentials; no provider or operator state.
+        let reopened = build_router(build_test_state().await);
+        for (key, expected_type, bytes) in expected_objects {
+            for method in ["HEAD", "GET"] {
+                let response = reopened
+                    .clone()
+                    .oneshot(add_headers(
+                        Request::builder()
+                            .method(method)
+                            .uri(format!("/{bucket}/{key}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                        &headers,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "reopened {method} {key}");
+                assert_eq!(
+                    response.headers().get(header::CONTENT_TYPE).unwrap(),
+                    expected_type
+                );
+                assert_eq!(
+                    response.headers().get("x-amz-meta-content-type").unwrap(),
+                    "customer-type"
+                );
+                if method == "GET" {
+                    assert_eq!(body_bytes(response).await, bytes);
+                }
+            }
+        }
+        drop(reopened);
+        drop(env);
+        // The outer launcher removes its owned TMPDIR after the child exits.
+    });
+}
 
 #[test]
 fn http_conformance_completion_errors_pagination_helpers_and_replay() {
@@ -1212,7 +1426,7 @@ async fn run_completion_error_conformance() {
     drop(app);
     drop(state);
     drop(env);
-    let _ = std::fs::remove_dir_all(&root);
+    // The outer launcher removes its owned TMPDIR after the child exits.
 }
 
 #[test]
@@ -1320,7 +1534,7 @@ async fn run_difficult_keys_conformance() {
     drop(restarted_app);
     drop(restarted_state);
     drop(env);
-    let _ = std::fs::remove_dir_all(&root);
+    // The outer launcher removes its owned TMPDIR after the child exits.
 }
 
 // ===========================================================================
@@ -1578,5 +1792,5 @@ open(os.environ["MASKURA_TEST_BODY_PATH"], "w").write(body)
     server.abort();
     drop(state);
     drop(env);
-    let _ = std::fs::remove_dir_all(&root);
+    // The outer launcher removes its owned TMPDIR after the child exits.
 }

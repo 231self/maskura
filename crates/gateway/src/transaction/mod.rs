@@ -7,6 +7,7 @@ mod file;
 mod file_journal;
 mod journal;
 mod memory;
+pub(crate) mod metadata;
 mod presign;
 mod s3;
 mod spool;

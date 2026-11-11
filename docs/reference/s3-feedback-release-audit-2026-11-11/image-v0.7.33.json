@@ -1,0 +1,26 @@
+{
+  "tested_at_utc": "2026-11-11T18:54:28.588289+00:00",
+  "image": "ghcr.io/231self/maskura/maskura@sha256:a5fea3c997678821884492836921742805570a52345a3f713da0282a539b79cb",
+  "source_commit": "adff2635fa38c82b84b04ebffbf76098f771def7",
+  "architecture": "arm64",
+  "scope": "owned local FileStore appliance with synthetic authenticated HTTP requests; not real-provider, unmodified-SDK or customer acceptance",
+  "probe_completed": true,
+  "product_fixes_complete": false,
+  "observations": {
+    "basic_batch_delete": "HTTP 200; target deleted; absent key idempotent",
+    "wrong_content_md5": "HTTP 200 and target deleted instead of rejection",
+    "multipart_missing_initiation_content_type": "HTTP 400 InvalidRequest for both completion transport-type variants",
+    "multipart_explicit_initiation_content_type": "HTTP 200; exact GET body/type preserved for both completion transport-type variants",
+    "filestore_custom_metadata": "absent on GET and HEAD despite successful PUT",
+    "filestore_custom_metadata_after_restart": "still absent; exact stored body survives restart"
+  },
+  "cleanup": {
+    "owned_container_removed": true,
+    "owned_volume_removed": true,
+    "owned_network_removed": true,
+    "owned_port_closed": true,
+    "audit_label_absence_independently_checked": true
+  },
+  "full_local_report_sha256": "ef11ceb15a507e74d797dea18ad8d27f34257b31a5afa953f713426a46ae7321",
+  "executed_helper_sha256": "38854ff928f8dbe14091538a0ff2ed1b1aa02acd2840bf21a1752637d8118081"
+}

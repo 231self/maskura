@@ -148,8 +148,224 @@ fn batch_body(quiet: bool, keys: &[&str]) -> String {
 }
 
 #[tokio::test]
+async fn batch_delete_rejects_bad_content_md5_before_deleting() {
+    use base64::Engine as _;
+    use md5::{Digest as _, Md5};
+    let (state, _root) = filestore_state().await;
+    let (ak, sk) = make_key(&state).await;
+    let store = state.file_store.as_ref().unwrap();
+    store
+        .put(
+            "batch",
+            "keep.txt",
+            Bytes::from_static(b"synthetic"),
+            "text/plain",
+        )
+        .await
+        .unwrap();
+    let body = batch_body(false, &["keep.txt"]);
+    let app = build_router(state.clone());
+    for digest in ["AAAAAAAAAAAAAAAAAAAAAA==", "not-base64"] {
+        let mut request = delete_objects_request("batch", &body, &auth_headers(&ak, &sk));
+        request
+            .headers_mut()
+            .insert("content-md5", digest.parse().unwrap());
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(store.head("batch", "keep.txt").await.unwrap().is_some());
+    }
+    let valid = base64::engine::general_purpose::STANDARD.encode(Md5::digest(body.as_bytes()));
+    let mut request = delete_objects_request("batch", &body, &auth_headers(&ak, &sk));
+    request
+        .headers_mut()
+        .insert("content-md5", valid.parse().unwrap());
+    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+    assert!(store.head("batch", "keep.txt").await.unwrap().is_none());
+    // The launcher cleans its owned TMPDIR after the child exits.
+}
+
+#[tokio::test]
+async fn batch_delete_content_md5_covers_decoded_aws_chunked_body_and_keeps_transport_integrity() {
+    use aws_sigv4::http_request::SignableBody;
+    use base64::Engine as _;
+    use crc::{CRC_32_ISO_HDLC, Crc};
+    use md5::{Digest as _, Md5};
+    let (mut state, _root) = filestore_state().await;
+    Arc::get_mut(&mut state).unwrap().sigv4_policy = SigV4Policy::new("us-east-1", true);
+    let (ak, sk) = make_key(&state).await;
+    let store = state.file_store.as_ref().unwrap();
+    store
+        .put(
+            "batch",
+            "keep.txt",
+            Bytes::from_static(b"public synthetic"),
+            "text/plain",
+        )
+        .await
+        .unwrap();
+    let body = batch_body(false, &["keep.txt"]);
+    let good_md5 = base64::engine::general_purpose::STANDARD.encode(Md5::digest(body.as_bytes()));
+    let crc = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+    let checksum = base64::engine::general_purpose::STANDARD
+        .encode(crc.checksum(body.as_bytes()).to_be_bytes());
+    let length = body.len().to_string();
+    let app = build_router(state.clone());
+    for (md5, trailer, deleted) in [
+        ("AAAAAAAAAAAAAAAAAAAAAA==", checksum.as_str(), false),
+        (good_md5.as_str(), "AAAAAA==", false),
+        (good_md5.as_str(), checksum.as_str(), true),
+    ] {
+        let framed = format!(
+            "{:X}\r\n{body}\r\n0\r\nx-amz-checksum-crc32:{trailer}\r\n\r\n",
+            body.len()
+        );
+        let request = signed_request_with_signable(
+            &ak,
+            &sk,
+            "POST",
+            "http://maskura.local/batch?delete",
+            framed.as_bytes(),
+            &[
+                ("content-type", "application/xml"),
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", length.as_str()),
+                ("x-amz-sdk-checksum-algorithm", "CRC32"),
+                ("x-amz-trailer", "x-amz-checksum-crc32"),
+                ("content-md5", md5),
+            ],
+            SignableBody::StreamingUnsignedPayloadTrailer,
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            if deleted {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        );
+        assert_eq!(
+            store.head("batch", "keep.txt").await.unwrap().is_none(),
+            deleted
+        );
+    }
+}
+
+#[tokio::test]
+async fn batch_delete_rejects_bad_signed_crc32_before_deleting() {
+    let (state, _root) = filestore_state().await;
+    let (ak, sk) = make_key(&state).await;
+    state
+        .file_store
+        .as_ref()
+        .unwrap()
+        .put(
+            "batch",
+            "keep.txt",
+            Bytes::from_static(b"synthetic"),
+            "text/plain",
+        )
+        .await
+        .unwrap();
+    let body = batch_body(false, &["keep.txt"]);
+    let request = signed_request(
+        &ak,
+        &sk,
+        "POST",
+        "http://maskura.local/batch?delete",
+        body.as_bytes(),
+        &[
+            ("content-type", "application/xml"),
+            ("x-amz-checksum-crc32", "AAAAAA=="),
+        ],
+    );
+    let response = build_router(state.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        state
+            .file_store
+            .as_ref()
+            .unwrap()
+            .head("batch", "keep.txt")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires locally installed boto3"]
+async fn boto3_delete_objects_interoperates_with_gateway() {
+    let (mut state, _root) = filestore_state().await;
+    Arc::get_mut(&mut state).unwrap().sigv4_policy = SigV4Policy::new("us-east-1", true);
+    let (access_key, secret) = make_key(&state).await;
+    state
+        .file_store
+        .as_ref()
+        .unwrap()
+        .put(
+            "batch",
+            "synthetic.txt",
+            Bytes::from_static(b"synthetic"),
+            "text/plain",
+        )
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let app = build_router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let script = r#"
+import boto3, os
+from botocore.config import Config
+s3 = boto3.client('s3', endpoint_url=os.environ['MASKURA_TEST_ENDPOINT'], region_name='us-east-1',
+                  aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'], aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+                  config=Config(s3={'addressing_style': 'path'}, retries={'max_attempts': 0}))
+r = s3.delete_objects(Bucket='batch', Delete={'Objects': [{'Key':'synthetic.txt'}, {'Key':'missing.txt'}]})
+assert {item['Key'] for item in r.get('Deleted', [])} == {'synthetic.txt', 'missing.txt'}, r
+assert not r.get('Errors'), r
+r = s3.delete_objects(Bucket='batch', Delete={'Objects': [{'Key':'synthetic.txt'}], 'Quiet': True})
+assert not r.get('Deleted') and not r.get('Errors'), r
+"#;
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new("python3")
+            .args(["-c", script])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").expect("isolated PATH"))
+            .env("HOME", std::env::var_os("HOME").expect("isolated HOME"))
+            .env("TMPDIR", std::env::temp_dir())
+            .env("MASKURA_TEST_ENDPOINT", endpoint)
+            .env("AWS_ACCESS_KEY_ID", access_key)
+            .env("AWS_SECRET_ACCESS_KEY", secret)
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .expect("python3 must be available");
+    server.abort();
+    assert!(
+        output.status.success(),
+        "boto3 failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        state
+            .file_store
+            .as_ref()
+            .unwrap()
+            .head("batch", "synthetic.txt")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn filestore_batch_delete_answers_every_key_and_is_idempotent() {
-    let (state, root) = filestore_state().await;
+    let (state, _root) = filestore_state().await;
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
     let app = build_router(state.clone());
@@ -209,12 +425,12 @@ async fn filestore_batch_delete_answers_every_key_and_is_idempotent() {
         app.clone().oneshot(get).await.unwrap().status(),
         StatusCode::NOT_FOUND
     );
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 #[tokio::test]
 async fn filestore_batch_delete_quiet_mode_suppresses_deleted_but_not_error_entries() {
-    let (state, root) = filestore_state().await;
+    let (state, _root) = filestore_state().await;
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
     let gate = Arc::new(DenyKeysGate {
@@ -257,12 +473,12 @@ async fn filestore_batch_delete_quiet_mode_suppresses_deleted_but_not_error_entr
         [("denied.txt".to_string(), "policy.denied".to_string())],
         "quiet mode must never suppress Error entries: {xml}"
     );
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 #[tokio::test]
 async fn filestore_batch_delete_partial_denial_proceeds_per_key() {
-    let (state, root) = filestore_state().await;
+    let (state, _root) = filestore_state().await;
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
     let gate = Arc::new(DenyKeysGate {
@@ -349,12 +565,12 @@ async fn filestore_batch_delete_partial_denial_proceeds_per_key() {
         app.clone().oneshot(first_get).await.unwrap().status(),
         StatusCode::NOT_FOUND
     );
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 #[tokio::test]
 async fn filestore_batch_delete_accepts_exactly_1000_keys() {
-    let (state, root) = filestore_state().await;
+    let (state, _root) = filestore_state().await;
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
     let app = build_router(state.clone());
@@ -381,12 +597,12 @@ async fn filestore_batch_delete_accepts_exactly_1000_keys() {
         1000,
         "exactly 1000 keys must be accepted and answered"
     );
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 #[tokio::test]
 async fn filestore_batch_delete_rejects_1001_keys_before_touching_any_key() {
-    let (state, root) = filestore_state().await;
+    let (state, _root) = filestore_state().await;
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
     let app = build_router(state.clone());
@@ -427,12 +643,12 @@ async fn filestore_batch_delete_rejects_1001_keys_before_touching_any_key() {
             "{key} must survive a rejected batch"
         );
     }
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 #[tokio::test]
 async fn filestore_batch_delete_rejects_oversized_bodies_before_touching_any_key() {
-    let (state, root) = filestore_state().await;
+    let (state, _root) = filestore_state().await;
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
     let app = build_router(state.clone());
@@ -473,12 +689,12 @@ async fn filestore_batch_delete_rejects_oversized_bodies_before_touching_any_key
         StatusCode::OK,
         "no key may be deleted by a rejected batch"
     );
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 #[tokio::test]
 async fn filestore_batch_delete_rejects_malformed_xml_and_bad_auth_before_touching_any_key() {
-    let (state, root) = filestore_state().await;
+    let (state, _root) = filestore_state().await;
     let (ak, sk) = make_key(&state).await;
     let hdrs = auth_headers(&ak, &sk);
     let app = build_router(state.clone());
@@ -538,7 +754,7 @@ async fn filestore_batch_delete_rejects_malformed_xml_and_bad_auth_before_touchi
         StatusCode::OK,
         "no key may be deleted by a rejected batch"
     );
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 #[tokio::test]

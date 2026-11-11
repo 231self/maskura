@@ -231,6 +231,10 @@ pub(crate) async fn streaming_put_failure_response(
 }
 
 pub(crate) fn streaming_format(headers: &HeaderMap) -> Result<(Format, String), StreamingPutError> {
+    streaming_format_content_type(&stored_content_type(headers)?)
+}
+
+fn stored_content_type(headers: &HeaderMap) -> Result<String, StreamingPutError> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .map(|value| {
@@ -240,7 +244,7 @@ pub(crate) fn streaming_format(headers: &HeaderMap) -> Result<(Format, String), 
         })
         .transpose()?
         .unwrap_or("application/octet-stream");
-    streaming_format_content_type(content_type)
+    Ok(content_type.to_string())
 }
 
 pub(crate) fn streaming_format_content_type(
@@ -355,6 +359,9 @@ pub(crate) async fn streaming_single_put(
         .await;
     }
     let (format, content_type) = streaming_format(headers)?;
+    // Format/session selection remains normalized; object representation does
+    // not lose valid parameters or spelling from the supplied header.
+    let representation_content_type = stored_content_type(headers)?;
     let mut content_md5 =
         ContentMd5Verifier::from_headers(headers).map_err(StreamingPutError::Integrity)?;
     let decoder_limits = crate::record::DecoderLimits {
@@ -374,7 +381,7 @@ pub(crate) async fn streaming_single_put(
         grant.operation_id(),
         grant.bucket(),
         key,
-        &content_type,
+        &representation_content_type,
         None,
         Some(single_put_stored_metadata(headers)),
     )
@@ -805,11 +812,7 @@ pub(crate) async fn streaming_avro_single_put(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| StreamingPutError::InvalidRequest("Content-Type is required".to_string()))?
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
+        .to_string();
     let mut content_md5 =
         ContentMd5Verifier::from_headers(headers).map_err(StreamingPutError::Integrity)?;
     let sink = begin_streaming_sink(
@@ -824,7 +827,7 @@ pub(crate) async fn streaming_avro_single_put(
         key,
         &content_type,
         None,
-        None,
+        Some(single_put_stored_metadata(headers)),
     )
     .await?;
     let mut sink_guard = SinkAbortGuard::new(sink);
@@ -952,11 +955,7 @@ pub(crate) async fn streaming_lance_single_put(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| StreamingPutError::InvalidRequest("Content-Type is required".to_string()))?
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
+        .to_string();
     let mut content_md5 =
         ContentMd5Verifier::from_headers(headers).map_err(StreamingPutError::Integrity)?;
     let sink = begin_streaming_sink(
@@ -971,7 +970,7 @@ pub(crate) async fn streaming_lance_single_put(
         key,
         &content_type,
         None,
-        None,
+        Some(single_put_stored_metadata(headers)),
     )
     .await?;
     let mut sink_guard = SinkAbortGuard::new(sink);

@@ -98,9 +98,19 @@ class ReleaseSmokeTests(unittest.TestCase):
         build = "cargo build --locked --release -p maskura-gateway -p maskura-mcp -p maskura"
         self.assertIn(build, workflow)
         self.assertIn(build, release)
-        self.assertIn('cp target/release/maskura-mcp dist/maskura-mcp-linux-amd64', workflow)
-        self.assertIn('cp target/release/maskura dist/maskura-linux-amd64', workflow)
-        self.assertIn('test "$(dist/maskura-linux-amd64 --version)" = "$expected"', workflow)
+        candidate = workflow.split("  release-image-smoke:", 1)[1].split("  postgres:", 1)[0]
+        self.assertIn("runs-on: ${{ matrix.runs-on }}", candidate)
+        for architecture, runner in (("amd64", "ubuntu-24.04"), ("arm64", "ubuntu-24.04-arm")):
+            self.assertIn(
+                f"- platform: linux/{architecture}\n"
+                f"            suffix: {architecture}\n"
+                f"            runs-on: {runner}\n",
+                candidate,
+            )
+        self.assertIn("ARCH: ${{ matrix.suffix }}", candidate)
+        self.assertIn('cp target/release/maskura-mcp "dist/maskura-mcp-linux-$ARCH"', candidate)
+        self.assertIn('cp target/release/maskura "dist/maskura-linux-$ARCH"', candidate)
+        self.assertIn('test "$(dist/maskura-linux-$ARCH --version)" = "$expected"', candidate)
         self.assertIn("file: Dockerfile.release", workflow)
         self.assertIn("bash scripts/release-image-smoke.sh", workflow)
         aggregate = workflow[workflow.index("  check:"):]

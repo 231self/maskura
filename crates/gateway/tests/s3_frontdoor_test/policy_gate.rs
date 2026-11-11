@@ -136,6 +136,14 @@ fn coverage_config() -> (Config, std::path::PathBuf) {
     )
     .expect("write coverage config");
     let mut config = Config::resolve(Some(&path)).expect("resolve coverage config");
+    config.auth.disabled = false;
+    config.storage.mode = Some("local".to_string());
+    config.storage.local_dir = Some(scratch.display().to_string());
+    config.storage.s3_endpoint = None;
+    config.storage.single_tenant = true;
+    config.keys.keys_file = None;
+    config.keys.bootstrap_key = None;
+    config.spool.dir = Some(owned_fixture_spool_dir().display().to_string());
     config.features.multipart_mode = ConfigMultipartMode::Staged;
     config.features.transformed_read_spool = true;
     assert_eq!(config.features.multipart_mode, ConfigMultipartMode::Staged);
@@ -157,7 +165,7 @@ async fn coverage_router_with(
     let (config, _scratch) = coverage_config();
     let mut state = build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
-        default_wrapping().expect("wrapping"),
+        fixture_wrapping(),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         test_pipeline_template(),
         &config,
@@ -520,7 +528,7 @@ async fn batch_delete_answers_each_key_under_its_own_verdict() {
     let (config, _scratch) = coverage_config();
     let mut state = build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
-        default_wrapping().expect("wrapping"),
+        fixture_wrapping(),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         test_pipeline_template(),
         &config,
@@ -639,7 +647,7 @@ async fn gate_rejection_denies_the_request_with_a_typed_policy_code() {
     let (config, _scratch) = coverage_config();
     let mut state = build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
-        default_wrapping().expect("wrapping"),
+        fixture_wrapping(),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         test_pipeline_template(),
         &config,
@@ -727,7 +735,7 @@ async fn check_use_drift_denies_the_request() {
     let (config, _scratch) = coverage_config();
     let mut state = build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
-        default_wrapping().expect("wrapping"),
+        fixture_wrapping(),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         test_pipeline_template(),
         &config,
@@ -803,7 +811,7 @@ async fn check_use_match_allows_the_request() {
     let (config, _scratch) = coverage_config();
     let mut state = build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
-        default_wrapping().expect("wrapping"),
+        fixture_wrapping(),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         test_pipeline_template(),
         &config,
@@ -912,7 +920,7 @@ async fn gated_router(gate: Arc<dyn PolicyGate>) -> (Router, Arc<AppState>) {
     let (config, _scratch) = coverage_config();
     let mut state = build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
-        default_wrapping().expect("wrapping"),
+        fixture_wrapping(),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         test_pipeline_template(),
         &config,
@@ -1714,7 +1722,7 @@ async fn lance_effective_state_entry_is_keyed_to_the_lance_feature_gate() {
     config.features.enable_lance = true;
     let enabled = build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
-        default_wrapping().expect("wrapping"),
+        fixture_wrapping(),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         test_pipeline_template(),
         &config,

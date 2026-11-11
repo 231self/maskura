@@ -209,6 +209,7 @@ pub(crate) fn validate_durable_child_commit(
     child: Option<&object_operation::Model>,
     operation: &ManagedLogicalOperation,
     result: &ExactPhysicalCommit,
+    physical_intent: &PhysicalWriteIntent,
 ) -> Result<(), ManagedError> {
     let Some(child) = child else {
         return Err(ManagedError::RecoveryBlocked("missing_child_journal"));
@@ -220,6 +221,25 @@ pub(crate) fn validate_durable_child_commit(
         .evidence
         .as_ref()
         .ok_or(ManagedError::RecoveryBlocked("missing_usage_evidence"))?;
+    let recipe = operation
+        .intent
+        .publication_recipe
+        .as_ref()
+        .ok_or(ManagedError::RecoveryBlocked("missing_publication_recipe"))?;
+    let child_metadata = serde_json::from_value(child.expected_metadata.clone())
+        .map_err(|_| ManagedError::RecoveryBlocked("corrupt_child_metadata"))?;
+    if !crate::transaction::metadata::managed_child_matches(
+        &recipe.metadata,
+        &child_metadata,
+        &operation.intent.generation.to_string(),
+        &physical_intent.storage_identity.provider_instance_id,
+        &physical_intent.storage_identity.provider_account_id,
+        physical_intent.credential_epoch,
+    )
+    .map_err(|_| ManagedError::RecoveryBlocked("corrupt_child_metadata"))?
+    {
+        return Err(ManagedError::RecoveryBlocked("child_metadata_mismatch"));
+    }
     if child.state != "COMMITTED"
         || !child.committed_version_history_complete
         || child.tenant_id.as_deref() != Some(operation.intent.logical.tenant_id.as_str())

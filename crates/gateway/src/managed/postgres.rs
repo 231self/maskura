@@ -1749,7 +1749,7 @@ impl ManagedRepository for PostgresManagedRepository {
                 .one(&txn)
                 .await
                 .map_err(persistence)?;
-        validate_durable_child_commit(child.as_ref(), &operation, &result)?;
+        validate_durable_child_commit(child.as_ref(), &operation, &result, &durable_intent.intent)?;
         let expected_targets = expected_physical_targets(
             &durable_intent.intent,
             physical_lease.namespace_epoch,

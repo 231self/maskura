@@ -24,6 +24,9 @@ check-lint:
 check-evidence: check-release check-plugin-contract check-public-copy test-release-notifications
   python3 -m unittest discover -s tests -p 'test_release_image_smoke.py'
   python3 -m unittest discover -s tests -p 'test_release_proof.py'
+  python3 -B -m unittest discover -s tests -p 'test_release_feedback.py'
+  python3 -B -m unittest discover -s tests -p 'test_release_publication.py'
+  python3 -B scripts/tests/test_managed_release_tls.py
   bash -n examples/prove-maskura.sh examples/local-quickstart.sh examples/maskura-demo.sh scripts/bench-plugins.sh scripts/release-notes.sh scripts/post-release-discord.sh scripts/test-release-notifications.sh
   python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("examples/python-hybrid-roundtrip.py").read_text())'
 

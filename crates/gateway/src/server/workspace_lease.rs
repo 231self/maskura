@@ -208,6 +208,20 @@ pub(crate) async fn begin_streaming_sink(
     metadata: Option<MultipartStoredMetadata>,
 ) -> Result<Box<dyn ObjectSinkTransaction>, StreamingPutError> {
     validate_streaming_backend(state, &backend)?;
+    // Validate before any backend acquires a sink or admits a durable intent.
+    // File and memory stores obey the same reserved-name boundary as S3.
+    let expected_metadata = match metadata.as_ref() {
+        Some(stored) => crate::transaction::metadata::encode_with_representation(
+            content_type,
+            &stored.representation_headers,
+            &stored.user_metadata,
+        )
+        .map_err(|detail| StreamingPutError::InvalidRequest(detail.to_string()))?,
+        None => std::collections::BTreeMap::from([(
+            "content-type".to_string(),
+            content_type.to_string(),
+        )]),
+    };
     match backend {
         ResolvedBackend::S3 {
             kind,
@@ -230,10 +244,7 @@ pub(crate) async fn begin_streaming_sink(
                 ));
             }
             let expected = ExpectedObject {
-                metadata: std::collections::BTreeMap::from([(
-                    "content-type".to_string(),
-                    content_type.to_string(),
-                )]),
+                metadata: expected_metadata,
                 ..ExpectedObject::default()
             };
             let scope = direct_operation_scope(operation, destination_operation_id);
@@ -469,15 +480,16 @@ pub(crate) async fn begin_streaming_sink(
                 ))
             }
         }
-        ResolvedBackend::Memory(store) if state.dev_memory_streaming_enabled => {
-            Ok(Box::new(MemorySinkTransaction::new(
+        ResolvedBackend::Memory(store) if state.dev_memory_streaming_enabled => Ok(Box::new(
+            MemorySinkTransaction::new(
                 store,
                 bucket,
                 key,
                 content_type,
                 state.dev_memory_max_object_bytes,
-            )?))
-        }
+            )?
+            .with_metadata(metadata.clone().unwrap_or_default()),
+        )),
         ResolvedBackend::Memory(_) => Err(StreamingPutError::Unsupported(
             "development memory streaming is not enabled".to_string(),
         )),
@@ -547,10 +559,7 @@ pub(crate) async fn begin_streaming_sink(
                         workspace_binding: None,
                     },
                     ExpectedObject {
-                        metadata: std::collections::BTreeMap::from([(
-                            "content-type".to_string(),
-                            content_type.to_string(),
-                        )]),
+                        metadata: expected_metadata.clone(),
                         ..ExpectedObject::default()
                     },
                 );
@@ -564,7 +573,7 @@ pub(crate) async fn begin_streaming_sink(
                     })?;
             }
             let sink = storage
-                .begin_managed_put_sink(
+                .begin_managed_put_sink_with_metadata(
                     journal,
                     capabilities,
                     logical,
@@ -576,6 +585,7 @@ pub(crate) async fn begin_streaming_sink(
                     grant.max_processed_bytes(),
                     expected_authority_cas,
                     prior_logical_size,
+                    expected_metadata,
                 )
                 .await?;
             Ok(sink)

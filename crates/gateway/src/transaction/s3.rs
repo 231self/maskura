@@ -169,6 +169,7 @@ impl AwsS3TransactionBackend {
         &self,
         operation: &OperationRecord,
         source_version_id: Option<&str>,
+        source_etag: &str,
     ) -> Result<StoredObjectMeta, BackendError> {
         let size = operation.expected.size.ok_or_else(|| {
             BackendError::definitive("verified multipart output is missing an expected size")
@@ -176,6 +177,18 @@ impl AwsS3TransactionBackend {
         if size == 0 {
             return Err(BackendError::definitive(
                 "cannot rewrite a zero-byte multipart object",
+            ));
+        }
+        if source_etag.is_empty() || (self.exact_version_recovery && source_version_id.is_none()) {
+            return Err(BackendError::ambiguous(
+                "metadata rewrite source omitted its exact provider identity",
+            ));
+        }
+        let part_size = DIRECT_PART_BYTES as u64;
+        let part_count = size.div_ceil(part_size);
+        if part_count > 10_000 {
+            return Err(BackendError::definitive(
+                "multipart object has too many parts",
             ));
         }
 
@@ -186,7 +199,8 @@ impl AwsS3TransactionBackend {
                     .bucket(&operation.destination.bucket)
                     .key(&operation.destination.physical_key)
                     .set_content_type(operation.expected.metadata.get("content-type").cloned())
-                    .set_metadata(Some(object_metadata(operation)))
+                    .set_content_encoding(object_content_encoding(operation)?)
+                    .set_metadata(Some(object_metadata(operation)?))
                     .set_server_side_encryption(
                         self.server_side_encryption.map(|value| value.sdk_value()),
                     )
@@ -203,19 +217,7 @@ impl AwsS3TransactionBackend {
         let upload_id = upload.upload_id().ok_or_else(|| {
             BackendError::ambiguous("metadata rewrite create-multipart response omitted upload ID")
         })?;
-        if self.exact_version_recovery && source_version_id.is_none() {
-            return Err(BackendError::ambiguous(
-                "metadata rewrite source omitted its exact provider version ID",
-            ));
-        }
         let source = copy_source(operation, source_version_id);
-        let part_size = DIRECT_PART_BYTES as u64;
-        let part_count = size.div_ceil(part_size);
-        if part_count > 10_000 {
-            return Err(BackendError::definitive(
-                "multipart object has too many parts",
-            ));
-        }
         let result = async {
             let mut parts =
                 Vec::with_capacity(usize::try_from(part_count).map_err(|_| {
@@ -235,6 +237,7 @@ impl AwsS3TransactionBackend {
                             .upload_id(upload_id)
                             .part_number(part_number)
                             .copy_source(&source)
+                            .copy_source_if_match(source_etag)
                             .copy_source_range(format!("bytes={start}-{end}"))
                             .send(),
                     )
@@ -328,8 +331,19 @@ impl AwsS3TransactionBackend {
         &self,
         operation: &OperationRecord,
     ) -> Result<CompletionProbe, BackendError> {
+        self.finalized_multipart_at_version(operation, None).await
+    }
+
+    async fn finalized_multipart_at_version(
+        &self,
+        operation: &OperationRecord,
+        source_version_id: Option<&str>,
+    ) -> Result<CompletionProbe, BackendError> {
+        object_metadata(operation)?;
         if self.exact_version_recovery
-            && let Some(stored) = self.resolve_exact_version_history(operation, None).await?
+            && let Some(stored) = self
+                .resolve_exact_version_history(operation, source_version_id)
+                .await?
         {
             return Ok(CompletionProbe::Committed(stored));
         }
@@ -339,6 +353,7 @@ impl AwsS3TransactionBackend {
                     .head_object()
                     .bucket(&operation.destination.bucket)
                     .key(&operation.destination.physical_key)
+                    .set_version_id(source_version_id.map(ToOwned::to_owned))
                     .send(),
             )
             .await?
@@ -354,19 +369,29 @@ impl AwsS3TransactionBackend {
                         .and_then(|size| u64::try_from(size).ok())
                         == Some(expected)
                 });
-                if !matches_operation || !matches_size {
+                if !matches_operation {
                     return Ok(CompletionProbe::Inconclusive);
                 }
-                if metadata_matches(output.metadata(), operation) {
+                if !matches_size
+                    || source_version_id.is_some_and(|version| output.version_id() != Some(version))
+                    || !self.encryption_matches(output.server_side_encryption())
+                {
+                    return Err(BackendError::ambiguous(
+                        "completed object identity conflicts with its frozen intent",
+                    ));
+                }
+                if metadata_matches(
+                    output.metadata(),
+                    output.content_type(),
+                    output.content_encoding(),
+                    operation,
+                )? {
                     let stored = StoredObjectMeta {
                         etag: output.e_tag().map(ToOwned::to_owned),
                         version_id: output.version_id().map(ToOwned::to_owned),
                         superseded_version_ids: Vec::new(),
                         version_history_complete: false,
                     };
-                    if !self.encryption_matches(output.server_side_encryption()) {
-                        return Ok(CompletionProbe::Inconclusive);
-                    }
                     if self.exact_version_recovery {
                         return self
                             .resolve_exact_version_history(operation, stored.version_id.as_deref())
@@ -380,7 +405,26 @@ impl AwsS3TransactionBackend {
                     }
                     return Ok(CompletionProbe::Committed(stored));
                 }
-                self.rewrite_completed_multipart_metadata(operation, output.version_id())
+                // Only a journaled MPU can have initiation metadata lacking the
+                // two late-bound output fields. Every frozen field and the
+                // physical identity must already match; never "repair" a
+                // mismatched committed object (including an ambiguous PUT).
+                if !multipart_initiation_metadata_matches(
+                    output.metadata(),
+                    output.content_type(),
+                    output.content_encoding(),
+                    operation,
+                )? {
+                    return Err(BackendError::ambiguous(
+                        "completed object metadata conflicts with its frozen intent",
+                    ));
+                }
+                let Some(etag) = output.e_tag() else {
+                    return Err(BackendError::ambiguous(
+                        "metadata rewrite source omitted its ETag",
+                    ));
+                };
+                self.rewrite_completed_multipart_metadata(operation, output.version_id(), etag)
                     .await
                     .map(CompletionProbe::Committed)
             }
@@ -412,40 +456,81 @@ impl AwsS3TransactionBackend {
     }
 }
 
-fn object_metadata(operation: &OperationRecord) -> std::collections::HashMap<String, String> {
-    operation
-        .expected
-        .metadata
-        .iter()
-        .filter(|(key, _)| key.as_str() != "content-type")
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .chain([("maskura-operation-id".to_string(), operation.id.to_string())])
-        .chain(
-            operation
-                .expected
-                .digest
-                .as_ref()
-                .map(|digest| ("maskura-sha256".to_string(), digest.clone())),
-        )
-        .chain(
-            operation
-                .expected
-                .size
-                .map(|size| ("maskura-size".to_string(), size.to_string())),
-        )
-        .collect()
+fn object_metadata(
+    operation: &OperationRecord,
+) -> Result<std::collections::HashMap<String, String>, BackendError> {
+    super::metadata::provider_metadata(
+        &operation.expected.metadata,
+        &operation.id.to_string(),
+        operation.expected.digest.as_deref(),
+        operation.expected.size,
+    )
+    .map(|values| values.into_iter().collect())
+    .map_err(|_| BackendError::ambiguous("invalid or ambiguous transaction metadata"))
+}
+
+fn object_content_encoding(operation: &OperationRecord) -> Result<Option<String>, BackendError> {
+    super::metadata::decode(&operation.expected.metadata)
+        .map(|decoded| decoded.content_encoding)
+        .map_err(|_| BackendError::ambiguous("invalid or ambiguous transaction metadata"))
 }
 
 fn metadata_matches(
     actual: Option<&std::collections::HashMap<String, String>>,
+    content_type: Option<&str>,
+    content_encoding: Option<&str>,
     operation: &OperationRecord,
-) -> bool {
-    let expected = object_metadata(operation);
-    actual.is_some_and(|actual| {
+) -> Result<bool, BackendError> {
+    let expected = object_metadata(operation)?;
+    let decoded = super::metadata::decode(&operation.expected.metadata)
+        .map_err(|_| BackendError::ambiguous("invalid or ambiguous transaction metadata"))?;
+    if decoded.versioned {
+        return Ok(actual == Some(&expected)
+            && content_type == decoded.content_type.as_deref()
+            && content_encoding == decoded.content_encoding.as_deref());
+    }
+    if decoded.content_type.is_some() && content_type != decoded.content_type.as_deref() {
+        return Ok(false);
+    }
+    Ok(actual.is_some_and(|actual| {
         expected
             .iter()
             .all(|(key, value)| actual.get(key) == Some(value))
-    })
+    }))
+}
+
+fn multipart_initiation_metadata_matches(
+    actual: Option<&std::collections::HashMap<String, String>>,
+    content_type: Option<&str>,
+    content_encoding: Option<&str>,
+    operation: &OperationRecord,
+) -> Result<bool, BackendError> {
+    if operation.upload_id.as_deref().is_none_or(str::is_empty)
+        || !matches!(
+            operation.state,
+            OperationState::Completing | OperationState::CommitUnknown
+        )
+        || operation.expected.digest.is_none()
+        || operation.expected.size.is_none_or(|size| size == 0)
+    {
+        return Ok(false);
+    }
+    let expected = super::metadata::provider_metadata(
+        &operation.expected.metadata,
+        &operation.id.to_string(),
+        None,
+        None,
+    )
+    .map_err(|_| BackendError::ambiguous("invalid or ambiguous transaction metadata"))?
+    .into_iter()
+    .collect::<std::collections::HashMap<_, _>>();
+    let decoded = super::metadata::decode(&operation.expected.metadata)
+        .map_err(|_| BackendError::ambiguous("invalid or ambiguous transaction metadata"))?;
+    // Exact comparison also applies to legacy initiation records: fields not
+    // frozen in their journal cannot be invented or discarded by a rewrite.
+    Ok(actual == Some(&expected)
+        && content_type == decoded.content_type.as_deref()
+        && content_encoding == decoded.content_encoding.as_deref())
 }
 
 fn copy_source(operation: &OperationRecord, version_id: Option<&str>) -> String {
@@ -559,7 +644,8 @@ impl TransactionBackend for AwsS3TransactionBackend {
                     .bucket(&operation.destination.bucket)
                     .key(&operation.destination.physical_key)
                     .set_content_type(operation.expected.metadata.get("content-type").cloned())
-                    .set_metadata(Some(object_metadata(operation)))
+                    .set_content_encoding(object_content_encoding(operation)?)
+                    .set_metadata(Some(object_metadata(operation)?))
                     .set_server_side_encryption(
                         self.server_side_encryption.map(|value| value.sdk_value()),
                     )
@@ -598,7 +684,8 @@ impl TransactionBackend for AwsS3TransactionBackend {
                     .bucket(&operation.destination.bucket)
                     .key(&operation.destination.physical_key)
                     .set_content_type(operation.expected.metadata.get("content-type").cloned())
-                    .set_metadata(Some(object_metadata(operation)))
+                    .set_content_encoding(object_content_encoding(operation)?)
+                    .set_metadata(Some(object_metadata(operation)?))
                     .set_server_side_encryption(
                         self.server_side_encryption.map(|value| value.sdk_value()),
                     )
@@ -621,6 +708,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
         part_number: i32,
         body: Bytes,
     ) -> Result<String, BackendError> {
+        object_metadata(operation)?;
         let output = self
             .fenced(
                 self.client
@@ -680,9 +768,19 @@ impl TransactionBackend for AwsS3TransactionBackend {
                     &error,
                 )
             })?;
-        let mut rewritten = self
-            .rewrite_completed_multipart_metadata(operation, first.version_id())
-            .await?;
+        // Observe the completed version before the metadata-only copy. A
+        // successful CompleteMultipartUpload is not proof of its metadata.
+        let mut rewritten = match self
+            .finalized_multipart_at_version(operation, first.version_id())
+            .await?
+        {
+            CompletionProbe::Committed(stored) => stored,
+            _ => {
+                return Err(BackendError::ambiguous(
+                    "completed multipart metadata did not match its frozen intent",
+                ));
+            }
+        };
         if let Some(version_id) = first.version_id()
             && rewritten.version_id.as_deref() != Some(version_id)
             && !rewritten
@@ -702,6 +800,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
         operation: &OperationRecord,
         upload_id: &str,
     ) -> Result<(), BackendError> {
+        object_metadata(operation)?;
         self.fenced(
             self.client
                 .abort_multipart_upload()
@@ -725,6 +824,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
         &self,
         operation: &OperationRecord,
     ) -> Result<Vec<DiscoveredUpload>, BackendError> {
+        object_metadata(operation)?;
         let mut key_marker: Option<String> = None;
         let mut upload_id_marker: Option<String> = None;
         let mut discovered = Vec::new();
@@ -788,6 +888,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
         &self,
         operation: &OperationRecord,
     ) -> Result<Vec<DiscoveredObjectVersion>, BackendError> {
+        object_metadata(operation)?;
         let mut key_marker = None;
         let mut version_id_marker = None;
         let mut discovered = Vec::new();
@@ -842,6 +943,33 @@ impl TransactionBackend for AwsS3TransactionBackend {
                     .metadata()
                     .and_then(|metadata| metadata.get("maskura-operation-id"))
                     .is_some_and(|id| id == &operation.id.to_string());
+                let expected_metadata_matches = metadata_matches(
+                    head.metadata(),
+                    head.content_type(),
+                    head.content_encoding(),
+                    operation,
+                )?;
+                if operation_matches
+                    && (!self.encryption_matches(head.server_side_encryption())
+                        || operation.expected.size.is_some_and(|size| {
+                            head.content_length()
+                                .and_then(|value| u64::try_from(value).ok())
+                                != Some(size)
+                        })
+                        || (!expected_metadata_matches
+                            && !multipart_initiation_metadata_matches(
+                                head.metadata(),
+                                head.content_type(),
+                                head.content_encoding(),
+                                operation,
+                            )?))
+                {
+                    // Never discard a mismatched same-operation version as
+                    // redundant provenance while selecting another version.
+                    return Err(BackendError::ambiguous(
+                        "provider version metadata conflicts with its frozen intent",
+                    ));
+                }
                 discovered.push(DiscoveredObjectVersion {
                     version_id: version_id.to_string(),
                     etag: head
@@ -858,7 +986,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
                         .and_then(|timestamp| timestamp.to_millis().ok()),
                     delete_marker: false,
                     operation_matches,
-                    expected_metadata_matches: metadata_matches(head.metadata(), operation),
+                    expected_metadata_matches,
                     encryption_matches: self.encryption_matches(head.server_side_encryption()),
                 });
             }
@@ -906,6 +1034,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
         operation: &OperationRecord,
         version_id: &str,
     ) -> Result<(), BackendError> {
+        object_metadata(operation)?;
         if version_id.is_empty() {
             return Err(BackendError::definitive(
                 "exact object-version deletion requires a version ID",
@@ -1771,7 +1900,7 @@ impl Drop for DirectS3Sink {
 mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use aws_sdk_s3::config::{Credentials, Region};
@@ -2430,7 +2559,11 @@ mod tests {
         rewrite.expected.digest = Some("digest".to_string());
         rewrite.expected.size = Some(3);
         encrypted
-            .rewrite_completed_multipart_metadata(&rewrite, Some("source/version +1"))
+            .rewrite_completed_multipart_metadata(
+                &rewrite,
+                Some("source/version +1"),
+                "\"source-etag\"",
+            )
             .await
             .unwrap();
         let recorded = requests.lock().unwrap();
@@ -2476,6 +2609,550 @@ mod tests {
         assert!(!create.2.contains_key("x-amz-server-side-encryption"));
         assert_eq!(backend.capabilities(), capabilities);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_put_uses_namespaced_customer_metadata_without_authority_collision() {
+        let (client, requests, server) = provider_client().await;
+        let users = std::collections::BTreeMap::from([
+            ("project".to_string(), "synthetic".to_string()),
+            ("content-type".to_string(), "customer-value".to_string()),
+            (
+                "content-encoding".to_string(),
+                "customer-encoding".to_string(),
+            ),
+        ]);
+        let representation = std::collections::BTreeMap::from([(
+            "content-encoding".to_string(),
+            "gzip".to_string(),
+        )]);
+        let operation = OperationRecord::intent(
+            destination(),
+            ExpectedObject {
+                metadata: crate::transaction::metadata::encode_with_representation(
+                    "text/plain",
+                    &representation,
+                    &users,
+                )
+                .unwrap(),
+                ..ExpectedObject::default()
+            },
+        );
+        AwsS3TransactionBackend::new(client, ScriptBackend::default().capabilities())
+            .put_object(&operation, Bytes::from_static(b"synthetic"))
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let headers = &requests[0].2;
+        assert_eq!(headers.get("content-type").unwrap(), "text/plain");
+        assert_eq!(headers.get("content-encoding").unwrap(), "gzip");
+        assert_eq!(
+            headers.get("x-amz-meta-content-encoding").unwrap(),
+            "customer-encoding"
+        );
+        assert_eq!(headers.get("x-amz-meta-project").unwrap(), "synthetic");
+        assert_eq!(
+            headers.get("x-amz-meta-content-type").unwrap(),
+            "customer-value"
+        );
+        assert_eq!(
+            headers.get("x-amz-meta-maskura-operation-id").unwrap(),
+            operation.id.to_string().as_str()
+        );
+        drop(requests);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_put_rejects_ambiguous_legacy_metadata_without_network_mutation() {
+        let (client, requests, server) = provider_client().await;
+        let operation = OperationRecord::intent(
+            destination(),
+            ExpectedObject {
+                metadata: std::collections::BTreeMap::from([(
+                    "project".to_string(),
+                    "ambiguous".to_string(),
+                )]),
+                ..ExpectedObject::default()
+            },
+        );
+        let backend = AwsS3TransactionBackend::new(client, ScriptBackend::default().capabilities());
+        assert!(
+            backend
+                .put_object(&operation, Bytes::from_static(b"synthetic"))
+                .await
+                .is_err()
+        );
+        assert!(backend.probe_completion(&operation).await.is_err());
+        assert!(
+            backend
+                .abort_multipart(&operation, "synthetic-upload")
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .delete_object_version(&operation, "synthetic-version")
+                .await
+                .is_err()
+        );
+        assert!(requests.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[test]
+    fn versioned_reconciliation_requires_exact_metadata_and_content_type() {
+        let users =
+            std::collections::BTreeMap::from([("project".to_string(), "synthetic".to_string())]);
+        let operation = OperationRecord::intent(
+            destination(),
+            ExpectedObject {
+                metadata: crate::transaction::metadata::encode("text/plain", &users).unwrap(),
+                ..ExpectedObject::default()
+            },
+        );
+        let actual = object_metadata(&operation).unwrap();
+        assert!(metadata_matches(Some(&actual), Some("text/plain"), None, &operation).unwrap());
+        assert!(
+            !metadata_matches(Some(&actual), Some("application/json"), None, &operation).unwrap()
+        );
+        let mut extra = actual.clone();
+        extra.insert("unexpected".to_string(), "untrusted".to_string());
+        assert!(!metadata_matches(Some(&extra), Some("text/plain"), None, &operation).unwrap());
+        let mut wrong = actual;
+        wrong.insert("project".to_string(), "other".to_string());
+        assert!(!metadata_matches(Some(&wrong), Some("text/plain"), None, &operation).unwrap());
+    }
+
+    #[test]
+    fn versioned_reconciliation_requires_exact_content_encoding() {
+        let representation =
+            std::collections::BTreeMap::from([("content-encoding".into(), "gzip".into())]);
+        let users =
+            std::collections::BTreeMap::from([("content-encoding".into(), "customer".into())]);
+        let operation = OperationRecord::intent(
+            destination(),
+            ExpectedObject {
+                metadata: crate::transaction::metadata::encode_with_representation(
+                    "text/plain",
+                    &representation,
+                    &users,
+                )
+                .unwrap(),
+                ..ExpectedObject::default()
+            },
+        );
+        let actual = object_metadata(&operation).unwrap();
+        assert_eq!(
+            actual.get("content-encoding").map(String::as_str),
+            Some("customer")
+        );
+        assert_eq!(
+            object_content_encoding(&operation).unwrap().as_deref(),
+            Some("gzip")
+        );
+        assert!(
+            metadata_matches(Some(&actual), Some("text/plain"), Some("gzip"), &operation).unwrap()
+        );
+        assert!(!metadata_matches(Some(&actual), Some("text/plain"), None, &operation).unwrap());
+        assert!(
+            !metadata_matches(Some(&actual), Some("text/plain"), Some("br"), &operation).unwrap()
+        );
+    }
+
+    #[derive(Default)]
+    struct MetadataCompletionProvider {
+        headers: Mutex<HeaderMap>,
+        rewrite_headers: Mutex<HeaderMap>,
+        requests: ProviderRequests,
+        visible: AtomicBool,
+        deny_rewrite: AtomicBool,
+    }
+
+    async fn metadata_completion_provider(
+        State(provider): State<Arc<MetadataCompletionProvider>>,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        provider
+            .requests
+            .lock()
+            .unwrap()
+            .push((method.clone(), uri.to_string(), headers.clone()));
+        let query = uri.query().unwrap_or_default();
+        let mut response = axum::response::Response::builder().status(StatusCode::OK);
+        if method == Method::GET && query.contains("versions") {
+            return response.header("content-type", "application/xml").body(Body::from(
+                "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>key</Key><VersionId>initial-version</VersionId><IsLatest>true</IsLatest><Size>3</Size></Version></ListVersionsResult>"
+            )).unwrap();
+        }
+        if method == Method::HEAD {
+            if !provider.visible.load(Ordering::SeqCst) {
+                return xml_error(StatusCode::NOT_FOUND, "NoSuchKey");
+            }
+            response = response
+                .header("content-length", "3")
+                .header("etag", "\"source-etag\"")
+                .header("x-amz-version-id", "initial-version");
+            for (name, value) in provider.headers.lock().unwrap().iter() {
+                response = response.header(name, value);
+            }
+            return response.body(Body::empty()).unwrap();
+        }
+        response = response.header("content-type", "application/xml");
+        if method == Method::POST && query.contains("uploads") {
+            if provider.deny_rewrite.load(Ordering::SeqCst) {
+                return xml_error(StatusCode::FORBIDDEN, "AccessDenied");
+            }
+            *provider.rewrite_headers.lock().unwrap() = headers
+                .iter()
+                .filter(|(name, _)| {
+                    matches!(
+                        name.as_str(),
+                        "content-type" | "content-encoding" | "x-amz-server-side-encryption"
+                    ) || name.as_str().starts_with("x-amz-meta-")
+                })
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            return response.body(Body::from("<InitiateMultipartUploadResult><UploadId>rewrite-upload</UploadId></InitiateMultipartUploadResult>")).unwrap();
+        }
+        if method == Method::PUT && query.contains("uploadId=rewrite-upload") {
+            assert_eq!(
+                headers.get("x-amz-copy-source-if-match").unwrap(),
+                "\"source-etag\""
+            );
+            assert!(
+                headers
+                    .get("x-amz-copy-source")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .contains("versionId=initial-version")
+            );
+            return response
+                .body(Body::from(
+                    "<CopyPartResult><ETag>\"copied\"</ETag></CopyPartResult>",
+                ))
+                .unwrap();
+        }
+        if method == Method::POST && query.contains("uploadId=") {
+            if query.contains("uploadId=rewrite-upload") {
+                *provider.headers.lock().unwrap() =
+                    provider.rewrite_headers.lock().unwrap().clone();
+            }
+            provider.visible.store(true, Ordering::SeqCst);
+            return response.header("x-amz-version-id", if query.contains("rewrite-upload") { "final-version" } else { "initial-version" })
+                .body(Body::from("<CompleteMultipartUploadResult><Bucket>bucket</Bucket><Key>physical</Key><ETag>\"completed\"</ETag></CompleteMultipartUploadResult>")).unwrap();
+        }
+        panic!("unexpected synthetic provider request");
+    }
+
+    fn metadata_completion_operation(versioned: bool) -> OperationRecord {
+        let mut metadata = if versioned {
+            super::super::metadata::encode_with_representation(
+                "text/plain; charset=utf-8",
+                &std::collections::BTreeMap::from([("content-encoding".into(), "gzip".into())]),
+                &std::collections::BTreeMap::from([("project".into(), "synthetic".into())]),
+            )
+            .unwrap()
+        } else {
+            std::collections::BTreeMap::from([(
+                "content-type".into(),
+                "text/plain; charset=utf-8".into(),
+            )])
+        };
+        metadata.insert("maskura-generation".into(), "synthetic-generation".into());
+        metadata.insert(
+            "maskura-provider-instance".into(),
+            "synthetic-instance".into(),
+        );
+        metadata.insert(
+            "maskura-provider-account".into(),
+            "synthetic-account".into(),
+        );
+        metadata.insert("maskura-credential-epoch".into(), "1".into());
+        let mut operation = OperationRecord::intent(
+            destination(),
+            ExpectedObject {
+                digest: Some("digest".into()),
+                size: Some(3),
+                metadata,
+            },
+        );
+        operation.state = OperationState::Completing;
+        operation.upload_id = Some("original-upload".into());
+        operation
+    }
+
+    fn metadata_completion_headers(operation: &OperationRecord, finalized: bool) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let decoded = super::super::metadata::decode(&operation.expected.metadata).unwrap();
+        if let Some(value) = decoded.content_type {
+            headers.insert("content-type", value.parse().unwrap());
+        }
+        if let Some(value) = decoded.content_encoding {
+            headers.insert("content-encoding", value.parse().unwrap());
+        }
+        headers.insert("x-amz-server-side-encryption", "AES256".parse().unwrap());
+        let values = super::super::metadata::provider_metadata(
+            &operation.expected.metadata,
+            &operation.id.to_string(),
+            finalized.then_some("digest"),
+            finalized.then_some(3),
+        )
+        .unwrap();
+        for (name, value) in values {
+            headers.insert(
+                format!("x-amz-meta-{name}")
+                    .parse::<axum::http::HeaderName>()
+                    .unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[tokio::test]
+    async fn probe_completion_rejects_metadata_mismatch_without_provider_mutation() {
+        for exact_history in [false, true] {
+            for versioned in [false, true] {
+                for case in [
+                    "customer",
+                    "content-type",
+                    "encoding",
+                    "digest",
+                    "size",
+                    "identity",
+                    "extra",
+                    "partial-late-fields",
+                    "encryption",
+                    "unmarked-put",
+                    "unknown-record-version",
+                ] {
+                    if !versioned
+                        && matches!(case, "customer" | "encoding" | "unknown-record-version")
+                    {
+                        continue;
+                    }
+                    let mut operation = metadata_completion_operation(versioned);
+                    let mut headers = metadata_completion_headers(
+                        &operation,
+                        matches!(case, "digest" | "size" | "content-type"),
+                    );
+                    match case {
+                        "customer" => {
+                            headers.insert("x-amz-meta-project", "wrong".parse().unwrap());
+                        }
+                        "content-type" => {
+                            headers.insert("content-type", "application/json".parse().unwrap());
+                        }
+                        "encoding" => {
+                            headers.insert("content-encoding", "br".parse().unwrap());
+                        }
+                        "digest" => {
+                            headers.insert("x-amz-meta-maskura-sha256", "wrong".parse().unwrap());
+                        }
+                        "size" => {
+                            headers.insert("x-amz-meta-maskura-size", "99".parse().unwrap());
+                        }
+                        "identity" => {
+                            headers.insert(
+                                "x-amz-meta-maskura-provider-account",
+                                "wrong".parse().unwrap(),
+                            );
+                        }
+                        "extra" => {
+                            headers.insert("x-amz-meta-extra", "unfrozen".parse().unwrap());
+                        }
+                        "partial-late-fields" => {
+                            headers.insert("x-amz-meta-maskura-size", "3".parse().unwrap());
+                        }
+                        "encryption" => {
+                            headers
+                                .insert("x-amz-server-side-encryption", "aws:kms".parse().unwrap());
+                        }
+                        "unmarked-put" => {
+                            operation.upload_id = None;
+                        }
+                        "unknown-record-version" => {
+                            operation
+                                .expected
+                                .metadata
+                                .insert(":maskura:metadata-version".into(), "999".into());
+                        }
+                        _ => unreachable!(),
+                    }
+                    let provider = Arc::new(MetadataCompletionProvider {
+                        headers: Mutex::new(headers),
+                        visible: AtomicBool::new(true),
+                        ..Default::default()
+                    });
+                    let app = Router::new()
+                        .fallback(any(metadata_completion_provider))
+                        .with_state(provider.clone());
+                    let (client, server) = client_for_app(app).await;
+                    let backend = if exact_history {
+                        AwsS3TransactionBackend::new_b2(
+                            client,
+                            ScriptBackend::default().capabilities(),
+                        )
+                    } else {
+                        AwsS3TransactionBackend::new(
+                            client,
+                            ScriptBackend::default().capabilities(),
+                        )
+                    }
+                    .with_server_side_encryption(S3ServerSideEncryption::Aes256);
+                    assert!(
+                        !matches!(
+                            backend.probe_completion(&operation).await,
+                            Ok(CompletionProbe::Committed(_))
+                        ),
+                        "{case}, versioned={versioned}, exact={exact_history}"
+                    );
+                    let requests = provider.requests.lock().unwrap();
+                    assert_eq!(requests.is_empty(), case == "unknown-record-version");
+                    assert!(requests.iter().all(|(method, _, _)| *method == Method::HEAD || *method == Method::GET), "{case}");
+                    server.abort();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_history_conflicting_version_is_not_discarded_as_redundant_provenance() {
+        let operation = metadata_completion_operation(true);
+        let good = metadata_completion_headers(&operation, true);
+        let mut wrong = good.clone();
+        wrong.insert("x-amz-meta-project", "wrong".parse().unwrap());
+        let requests: ProviderRequests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let app = Router::new().fallback(move |method: Method, uri: Uri, headers: HeaderMap| {
+            let good = good.clone(); let wrong = wrong.clone(); let recorded = recorded.clone();
+            async move {
+                recorded.lock().unwrap().push((method.clone(), uri.to_string(), headers));
+                let mut response = axum::response::Response::builder().status(StatusCode::OK);
+                if method == Method::GET {
+                    return response.header("content-type", "application/xml").body(Body::from(
+                        "<ListVersionsResult><IsTruncated>false</IsTruncated><Version><Key>key</Key><VersionId>good</VersionId><Size>3</Size></Version><Version><Key>key</Key><VersionId>conflicting</VersionId><Size>3</Size></Version></ListVersionsResult>"
+                    )).unwrap();
+                }
+                assert_eq!(method, Method::HEAD, "conflicting provenance cannot authorize mutations");
+                let source = if uri.query().unwrap_or_default().contains("versionId=good") { good } else { wrong };
+                response = response.header("content-length", "3").header("etag", "\"synthetic\"");
+                for (name, value) in source.iter() { response = response.header(name, value); }
+                response.body(Body::empty()).unwrap()
+            }
+        });
+        let (client, server) = client_for_app(app).await;
+        let backend =
+            AwsS3TransactionBackend::new_b2(client, ScriptBackend::default().capabilities());
+        assert!(!matches!(
+            backend.probe_completion(&operation).await,
+            Ok(CompletionProbe::Committed(_))
+        ));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|(method, _, _)| *method == Method::GET || *method == Method::HEAD)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_rejects_tampered_completed_source_before_rewrite() {
+        for already_visible in [false, true] {
+            let operation = metadata_completion_operation(true);
+            let mut headers = metadata_completion_headers(&operation, false);
+            headers.insert("x-amz-meta-project", "wrong".parse().unwrap());
+            let provider = Arc::new(MetadataCompletionProvider {
+                headers: Mutex::new(headers),
+                visible: AtomicBool::new(already_visible),
+                ..Default::default()
+            });
+            let (client, server) = client_for_app(
+                Router::new()
+                    .fallback(any(metadata_completion_provider))
+                    .with_state(provider.clone()),
+            )
+            .await;
+            let backend =
+                AwsS3TransactionBackend::new(client, ScriptBackend::default().capabilities());
+            assert!(
+                backend
+                    .complete_multipart(
+                        &operation,
+                        "original-upload",
+                        &[UploadedPart {
+                            part_number: 1,
+                            etag: "etag".into()
+                        }]
+                    )
+                    .await
+                    .is_err()
+            );
+            let requests = provider.requests.lock().unwrap();
+            let mutations: Vec<_> = requests
+                .iter()
+                .filter(|(method, _, _)| *method != Method::HEAD && *method != Method::GET)
+                .collect();
+            assert_eq!(mutations.len(), usize::from(!already_visible));
+            if !already_visible {
+                assert_eq!(mutations[0].0, Method::POST);
+                assert!(mutations[0].1.contains("uploadId=original-upload"));
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_only_late_binds_verified_initiation_metadata() {
+        for versioned in [false, true] {
+            let operation = metadata_completion_operation(versioned);
+            let provider = Arc::new(MetadataCompletionProvider {
+                headers: Mutex::new(metadata_completion_headers(&operation, false)),
+                ..Default::default()
+            });
+            let app = Router::new()
+                .fallback(any(metadata_completion_provider))
+                .with_state(provider.clone());
+            let (client, server) = client_for_app(app).await;
+            let backend =
+                AwsS3TransactionBackend::new(client, ScriptBackend::default().capabilities())
+                    .with_server_side_encryption(S3ServerSideEncryption::Aes256);
+            let stored = backend
+                .complete_multipart(
+                    &operation,
+                    "original-upload",
+                    &[UploadedPart {
+                        part_number: 1,
+                        etag: "part-etag".into(),
+                    }],
+                )
+                .await
+                .unwrap();
+            assert_eq!(stored.version_id.as_deref(), Some("final-version"));
+            {
+                let headers = provider.headers.lock().unwrap();
+                let expected = metadata_completion_headers(&operation, true);
+                for (name, value) in &expected {
+                    assert_eq!(headers.get(name), Some(value), "{name}");
+                }
+            }
+            let before = provider.requests.lock().unwrap().len();
+            assert!(matches!(
+                backend.probe_completion(&operation).await.unwrap(),
+                CompletionProbe::Committed(_)
+            ));
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), before + 1);
+            assert_eq!(requests.last().unwrap().0, Method::HEAD);
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -2706,18 +3383,18 @@ mod tests {
                 ..ExpectedObject::default()
             },
         );
-        let initiation_metadata = object_metadata(&operation);
+        let initiation_metadata = object_metadata(&operation).unwrap();
 
-        assert!(metadata_matches(Some(&initiation_metadata), &operation));
+        assert!(metadata_matches(Some(&initiation_metadata), None, None, &operation).unwrap());
         assert!(!initiation_metadata.contains_key("maskura-sha256"));
         assert!(!initiation_metadata.contains_key("maskura-size"));
 
         operation.expected.digest = Some("verified-digest".to_string());
         operation.expected.size = Some((DIRECT_PART_BYTES + 1) as u64);
 
-        assert!(!metadata_matches(Some(&initiation_metadata), &operation));
-        let completed_metadata = object_metadata(&operation);
-        assert!(metadata_matches(Some(&completed_metadata), &operation));
+        assert!(!metadata_matches(Some(&initiation_metadata), None, None, &operation).unwrap());
+        let completed_metadata = object_metadata(&operation).unwrap();
+        assert!(metadata_matches(Some(&completed_metadata), None, None, &operation).unwrap());
         assert_eq!(
             completed_metadata.get("maskura-sha256"),
             Some(&"verified-digest".to_string())
@@ -2920,31 +3597,20 @@ mod tests {
         assert_eq!(error.kind, super::super::BackendErrorKind::Ambiguous);
         server.abort();
 
-        let rewrite_app = Router::new().fallback(|method: Method, uri: Uri| async move {
-            let query = uri.query().unwrap_or_default();
-            if method == Method::HEAD {
-                return xml_error(StatusCode::NOT_FOUND, "NoSuchKey");
-            }
-            if method == Method::POST && query.contains("uploadId=original") {
-                return axum::response::Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/xml")
-                    .header("x-amz-version-id", "original-version")
-                    .body(Body::from(
-                        r#"<CompleteMultipartUploadResult><Bucket>bucket</Bucket><Key>physical</Key><ETag>&quot;etag&quot;</ETag></CompleteMultipartUploadResult>"#,
-                    ))
-                    .unwrap();
-            }
-            assert!(method == Method::POST && query.contains("uploads"));
-            xml_error(StatusCode::FORBIDDEN, "AccessDenied")
+        let operation = metadata_completion_operation(true);
+        let provider = Arc::new(MetadataCompletionProvider {
+            headers: Mutex::new(metadata_completion_headers(&operation, false)),
+            deny_rewrite: AtomicBool::new(true),
+            ..Default::default()
         });
+        let rewrite_app = Router::new()
+            .fallback(any(metadata_completion_provider))
+            .with_state(provider.clone());
         let (client, server) = client_for_app(rewrite_app).await;
-        let mut operation = OperationRecord::intent(destination(), ExpectedObject::default());
-        operation.expected.size = Some(4);
         let error = AwsS3TransactionBackend::new(client, capabilities)
             .complete_multipart(
                 &operation,
-                "original",
+                "original-upload",
                 &[UploadedPart {
                     part_number: 1,
                     etag: "etag".to_string(),
@@ -2953,6 +3619,17 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind, super::super::BackendErrorKind::Ambiguous);
+        assert_eq!(
+            provider
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, uri, _)| *method == Method::POST && uri.contains("uploads"))
+                .count(),
+            1,
+            "the post-completion denial must actually reach the metadata rewrite request"
+        );
         server.abort();
     }
 

@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use crate::store::MemoryStore;
 
 use super::{
-    DestinationCommitAuthority, ObjectSinkTransaction, SinkCommitState, StoredObjectMeta,
-    TransactionError,
+    DestinationCommitAuthority, MultipartStoredMetadata, ObjectSinkTransaction, SinkCommitState,
+    StoredObjectMeta, TransactionError,
 };
 
 /// Development-only atomic sink. Its configured limit is a hard memory bound;
@@ -18,6 +18,7 @@ pub struct MemorySinkTransaction {
     bucket: String,
     key: String,
     content_type: String,
+    metadata: MultipartStoredMetadata,
     max_bytes: usize,
     buffer: BytesMut,
     hasher: Sha256,
@@ -41,12 +42,18 @@ impl MemorySinkTransaction {
             bucket: bucket.into(),
             key: key.into(),
             content_type: content_type.into(),
+            metadata: MultipartStoredMetadata::default(),
             max_bytes,
             buffer: BytesMut::new(),
             hasher: Sha256::new(),
             output_verified: false,
             finished: false,
         })
+    }
+
+    pub fn with_metadata(mut self, metadata: MultipartStoredMetadata) -> Self {
+        self.metadata = metadata;
+        self
     }
 }
 
@@ -98,11 +105,12 @@ impl ObjectSinkTransaction for MemorySinkTransaction {
             return Err(TransactionError::OutputMismatch);
         }
         authority.validate(None, &self.bucket, &self.key).await?;
-        let object = self.store.put(
+        let object = self.store.put_with_metadata(
             &self.bucket,
             &self.key,
             self.buffer.split().freeze(),
             &self.content_type,
+            self.metadata.clone(),
         );
         self.finished = true;
         Ok(StoredObjectMeta {

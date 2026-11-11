@@ -849,7 +849,7 @@ impl ServiceStorage {
                 }
                 continue;
             }
-            if operation.intent.publication_recipe.is_none() {
+            let Some(recipe) = operation.intent.publication_recipe.as_ref() else {
                 if operation.state != ManagedLogicalOperationState::RecoveryBlocked {
                     warn!(
                         operation_id = %operation.intent.operation_id,
@@ -861,7 +861,7 @@ impl ServiceStorage {
                     .mark_logical_recovery_blocked(&claim, "missing_publication_recipe")
                     .await?;
                 continue;
-            }
+            };
             let Some(durable) = durable else {
                 if operation.state != ManagedLogicalOperationState::RecoveryBlocked {
                     warn!(
@@ -913,6 +913,24 @@ impl ServiceStorage {
                 }
                 repository
                     .mark_logical_recovery_blocked(&claim, "child_evidence_mismatch")
+                    .await?;
+                continue;
+            }
+            // Reconciliation can copy, abort, or delete provider objects. Bind
+            // the immutable recipe and physical identity before it can run,
+            // not only at transactional publication after those mutations.
+            if !crate::transaction::metadata::managed_child_matches(
+                &recipe.metadata,
+                &child.expected.metadata,
+                &operation.intent.generation.to_string(),
+                &durable.intent.storage_identity.provider_instance_id,
+                &durable.intent.storage_identity.provider_account_id,
+                durable.intent.credential_epoch,
+            )
+            .unwrap_or(false)
+            {
+                repository
+                    .mark_logical_recovery_blocked(&claim, "child_metadata_mismatch")
                     .await?;
                 continue;
             }
@@ -1256,6 +1274,8 @@ impl ServiceStorage {
 
     pub(crate) fn metadata_matches(
         metadata: Option<&std::collections::HashMap<String, String>>,
+        content_type: Option<&str>,
+        content_encoding: Option<&str>,
         content_length: Option<i64>,
         authority: &ObjectAuthority,
         ranged: bool,
@@ -1263,6 +1283,27 @@ impl ServiceStorage {
         let Some(metadata) = metadata else {
             return false;
         };
+        let Ok(decoded) = crate::transaction::metadata::decode(&authority.metadata) else {
+            return false;
+        };
+        if decoded.versioned {
+            if !decoded.internal.is_empty()
+                || content_type != decoded.content_type.as_deref()
+                || content_encoding != decoded.content_encoding.as_deref()
+            {
+                return false;
+            }
+            let customer = metadata.iter().filter(|(name, _)| {
+                !crate::transaction::metadata::RESERVED_PROVIDER_NAMES.contains(&name.as_str())
+            });
+            if customer.clone().count() != decoded.user_metadata.len()
+                || !customer
+                    .into_iter()
+                    .all(|(name, value)| decoded.user_metadata.get(name) == Some(value))
+            {
+                return false;
+            }
+        }
         let generation_matches = metadata
             .get("maskura-generation")
             .is_some_and(|value| value == &authority.generation.to_string());
@@ -1366,6 +1407,8 @@ impl ServiceStorage {
         };
         Self::metadata_matches(
             output.metadata(),
+            output.content_type(),
+            output.content_encoding(),
             output.content_length(),
             authority,
             range.is_some(),
@@ -1461,8 +1504,15 @@ impl ServiceStorage {
                 return None;
             }
         };
-        Self::metadata_matches(output.metadata(), output.content_length(), authority, false)
-            .then_some(output)
+        Self::metadata_matches(
+            output.metadata(),
+            output.content_type(),
+            output.content_encoding(),
+            output.content_length(),
+            authority,
+            false,
+        )
+        .then_some(output)
     }
 
     pub async fn head_authoritative(
@@ -1721,10 +1771,26 @@ impl ServiceStorage {
                 "managed logical parent does not match its reserved physical child".to_string(),
             ));
         }
-        let mut metadata = BTreeMap::from([
-            ("content-type".to_string(), content_type.to_string()),
-            ("maskura-generation".to_string(), generation.to_string()),
-        ]);
+        let mut metadata = parent
+            .intent
+            .publication_recipe
+            .as_ref()
+            .ok_or_else(|| {
+                TransactionError::Publication("managed publication recipe is missing".to_string())
+            })?
+            .metadata
+            .clone();
+        let decoded = crate::transaction::metadata::decode(&metadata).map_err(|_| {
+            TransactionError::Publication(
+                "managed publication metadata is invalid or ambiguous".to_string(),
+            )
+        })?;
+        if decoded.content_type.as_deref() != Some(content_type) || !decoded.internal.is_empty() {
+            return Err(TransactionError::Publication(
+                "managed publication metadata does not match its parent".to_string(),
+            ));
+        }
+        metadata.insert("maskura-generation".to_string(), generation.to_string());
         let primary = self
             .direct_sink_for(
                 &journal,
@@ -1778,6 +1844,49 @@ impl ServiceStorage {
         expected_authority_cas: Option<u64>,
         prior_logical_size: u64,
     ) -> Result<Box<dyn ObjectSinkTransaction>, TransactionError> {
+        self.begin_managed_put_sink_with_metadata(
+            journal,
+            capabilities,
+            logical,
+            content_type,
+            operation_id,
+            receipt_id,
+            occurred_at_ms,
+            rate_version,
+            max_processed_bytes,
+            expected_authority_cas,
+            prior_logical_size,
+            BTreeMap::from([("content-type".to_string(), content_type.to_string())]),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn begin_managed_put_sink_with_metadata(
+        self: &Arc<Self>,
+        journal: Arc<dyn OperationJournal>,
+        capabilities: BackendCapabilities,
+        logical: LogicalObjectKey,
+        content_type: &str,
+        operation_id: uuid::Uuid,
+        receipt_id: uuid::Uuid,
+        occurred_at_ms: i64,
+        rate_version: i32,
+        max_processed_bytes: u64,
+        expected_authority_cas: Option<u64>,
+        prior_logical_size: u64,
+        metadata: BTreeMap<String, String>,
+    ) -> Result<Box<dyn ObjectSinkTransaction>, TransactionError> {
+        let decoded = crate::transaction::metadata::decode(&metadata).map_err(|_| {
+            TransactionError::Publication(
+                "managed publication metadata is invalid or ambiguous".to_string(),
+            )
+        })?;
+        if decoded.content_type.as_deref() != Some(content_type) || !decoded.internal.is_empty() {
+            return Err(TransactionError::Publication(
+                "managed publication metadata is not tenant-owned".to_string(),
+            ));
+        }
         if self.managed_mode != ManagedStreamingMode::Enforce {
             return Err(TransactionError::Publication(
                 ManagedError::MutationDisabled(self.managed_mode).to_string(),
@@ -1847,7 +1956,7 @@ impl ServiceStorage {
                 placement_version: placement.version,
                 primary_backend_id: placement.primary_backend_id.clone(),
                 replica_backend_id: placement.replica_backend_id.clone(),
-                metadata: BTreeMap::from([("content-type".to_string(), content_type.to_string())]),
+                metadata,
                 primary_status: CopyStatus::Ready,
                 replica_status: if placement.replica_backend_id.is_some() {
                     CopyStatus::RepairPending
@@ -2246,6 +2355,8 @@ impl ServiceStorage {
         };
         if !Self::metadata_matches(
             output.metadata(),
+            output.content_type(),
+            output.content_encoding(),
             output.content_length(),
             &authority,
             false,

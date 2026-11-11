@@ -1,6 +1,495 @@
 use super::*;
 
 #[tokio::test]
+async fn memory_put_metadata_roundtrips_and_overwrite_clears_it() {
+    let mut state = explicit_passthrough_test_state(None).await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .dev_memory_streaming_enabled = true;
+    let (access_key, secret_key) = make_key(&state).await;
+    let headers = auth_headers(&access_key, &secret_key);
+    let app = build_router(state);
+    for marker in [Some("synthetic-one"), Some("synthetic-two"), None] {
+        let mut request = Request::builder()
+            .method("PUT")
+            .uri("/metadata/example.txt")
+            .header(header::CONTENT_TYPE, "Text/Plain; charset=utf-8");
+        if let Some(value) = marker {
+            request = request.header("x-amz-meta-project", value);
+        }
+        let response = app
+            .clone()
+            .oneshot(add_headers(
+                request.body(Body::from("synthetic payload")).unwrap(),
+                &headers,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        if marker == Some("synthetic-one") {
+            let failed = add_headers(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/metadata/example.txt")
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .header("x-amz-meta-project", "must-not-commit")
+                    .header("content-md5", "AAAAAAAAAAAAAAAAAAAAAA==")
+                    .body(Body::from("other payload"))
+                    .unwrap(),
+                &headers,
+            );
+            assert_eq!(
+                app.clone().oneshot(failed).await.unwrap().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        for method in ["HEAD", "GET"] {
+            let request = add_headers(
+                Request::builder()
+                    .method(method)
+                    .uri("/metadata/example.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+                &headers,
+            );
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "Text/Plain; charset=utf-8"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-amz-meta-project")
+                    .and_then(|v| v.to_str().ok()),
+                marker,
+                "{method} after overwrite"
+            );
+            if method == "GET" {
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                    Bytes::from_static(b"synthetic payload")
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn transformed_memory_read_does_not_disclose_stored_user_metadata() {
+    let mut state = test_state().await;
+    let config = Arc::get_mut(&mut state).unwrap();
+    config.auth_disabled = true;
+    config.dev_memory_streaming_enabled = true;
+    config.transformed_read_spool_enabled = true;
+    config.spool_config.max_object_bytes = 1024;
+    config.spool_quota = Arc::new(SpoolQuota::new(2048));
+    let app = build_router(state);
+    let put = Request::builder()
+        .method("PUT")
+        .uri("/metadata/private.txt")
+        .header(header::CONTENT_TYPE, "text/plain")
+        .header("x-amz-meta-project", "synthetic-private-marker")
+        .body(Body::from("synthetic payload"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(put).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let get = Request::builder()
+        .method("GET")
+        .uri("/metadata/private.txt")
+        .header("x-maskura-process", "read")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(get).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key("x-amz-meta-project"));
+    // The launcher owns the startup spool and removes its TMPDIR after exit.
+}
+
+#[tokio::test]
+async fn filestore_single_put_metadata_survives_restart() {
+    let root = std::env::temp_dir().join(format!("maskura-metadata-file-{}", uuid::Uuid::now_v7()));
+    let mut state = explicit_passthrough_test_state(None).await;
+    let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+    store.create_bucket("metadata").await.unwrap();
+    Arc::get_mut(&mut state).unwrap().file_store = Some(store);
+    let (ak, sk) = make_key(&state).await;
+    let headers = auth_headers(&ak, &sk);
+    let app = build_router(state.clone());
+    let put = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/metadata/example.txt")
+            .header(header::CONTENT_TYPE, "Text/Plain; charset=utf-8")
+            .header("x-amz-meta-project", "synthetic-marker")
+            .body(Body::from("synthetic payload"))
+            .unwrap(),
+        &headers,
+    );
+    assert_eq!(
+        app.clone().oneshot(put).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let fresh = app
+        .clone()
+        .oneshot(add_headers(
+            Request::builder()
+                .method("HEAD")
+                .uri("/metadata/example.txt")
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh.headers().get(header::CONTENT_TYPE).unwrap(),
+        "Text/Plain; charset=utf-8"
+    );
+    drop(app);
+    Arc::get_mut(&mut state).unwrap().file_store =
+        Some(Arc::new(FileStore::new(root.clone()).await.unwrap()));
+    let app = build_router(state);
+    for method in ["HEAD", "GET"] {
+        let request = add_headers(
+            Request::builder()
+                .method(method)
+                .uri("/metadata/example.txt")
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "Text/Plain; charset=utf-8"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-amz-meta-project")
+                .and_then(|v| v.to_str().ok()),
+            Some("synthetic-marker")
+        );
+        if method == "GET" {
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+                Bytes::from_static(b"synthetic payload")
+            );
+        }
+    }
+    let failed = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/metadata/example.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header("x-amz-meta-project", "must-not-commit")
+            .header("content-md5", "AAAAAAAAAAAAAAAAAAAAAA==")
+            .body(Body::from("other payload"))
+            .unwrap(),
+        &headers,
+    );
+    assert_eq!(
+        app.clone().oneshot(failed).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    let head = || {
+        add_headers(
+            Request::builder()
+                .method("HEAD")
+                .uri("/metadata/example.txt")
+                .body(Body::empty())
+                .unwrap(),
+            &headers,
+        )
+    };
+    let response = app.clone().oneshot(head()).await.unwrap();
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-meta-project")
+            .and_then(|v| v.to_str().ok()),
+        Some("synthetic-marker")
+    );
+    let overwrite = add_headers(
+        Request::builder()
+            .method("PUT")
+            .uri("/metadata/example.txt")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("replacement"))
+            .unwrap(),
+        &headers,
+    );
+    assert_eq!(
+        app.clone().oneshot(overwrite).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let response = app.clone().oneshot(head()).await.unwrap();
+    assert!(!response.headers().contains_key("x-amz-meta-project"));
+    drop(app);
+    // Keep the owned FileStore root until the launcher observes child exit.
+}
+
+#[tokio::test]
+async fn memory_and_file_reject_reserved_metadata_before_overwrite() {
+    for file in [false, true] {
+        let mut state = explicit_passthrough_test_state(None).await;
+        if file {
+            let root = std::env::temp_dir()
+                .join(format!("maskura-reserved-file-{}", uuid::Uuid::now_v7()));
+            let store = Arc::new(FileStore::new(root).await.unwrap());
+            store.create_bucket("metadata").await.unwrap();
+            Arc::get_mut(&mut state).unwrap().file_store = Some(store);
+        }
+        let (ak, sk) = make_key(&state).await;
+        let headers = auth_headers(&ak, &sk);
+        let app = build_router(state);
+        let put = |reserved: Option<&str>| {
+            let mut request = Request::builder()
+                .method("PUT")
+                .uri("/metadata/reserved.txt")
+                .header(header::CONTENT_TYPE, "text/plain");
+            if let Some(name) = reserved {
+                request = request.header(name, "untrusted");
+            }
+            add_headers(
+                request
+                    .body(Body::from(if reserved.is_some() {
+                        "must not commit"
+                    } else {
+                        "synthetic"
+                    }))
+                    .unwrap(),
+                &headers,
+            )
+        };
+        assert_eq!(
+            app.clone().oneshot(put(None)).await.unwrap().status(),
+            StatusCode::OK
+        );
+        for reserved in [
+            "x-amz-meta-maskura-operation-id",
+            "x-amz-meta-maskura-sha256",
+            "x-amz-meta-maskura-size",
+            "x-amz-meta-maskura-generation",
+            "x-amz-meta-maskura-provider-instance",
+            "x-amz-meta-maskura-provider-account",
+            "x-amz-meta-maskura-credential-epoch",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(put(Some(reserved)))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+            let get = add_headers(
+                Request::builder()
+                    .uri("/metadata/reserved.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+                &headers,
+            );
+            let response = app.clone().oneshot(get).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap(),
+                Bytes::from_static(b"synthetic")
+            );
+        }
+    }
+}
+
+fn synthetic_binary_metadata_object(lance: bool) -> Vec<u8> {
+    use maskura_gateway::binary_ir::{
+        SchemaField, SchemaIr, SchemaKind, SchemaNode, Value, ValueField, ValueIr,
+    };
+    let schema = SchemaIr::new(SchemaNode::required(SchemaKind::Record {
+        fields: vec![SchemaField {
+            name: "value".into(),
+            schema: SchemaNode::required(SchemaKind::String),
+        }],
+    }));
+    let values = [ValueIr::new(Value::Record {
+        fields: vec![ValueField {
+            name: "value".into(),
+            value: Value::String {
+                value: "public synthetic marker".into(),
+            },
+        }],
+    })];
+    if lance {
+        maskura_gateway::lance::encode_lance(&schema, &values, Default::default()).unwrap()
+    } else {
+        maskura_gateway::avro::encode_ocf(&schema, &values, Default::default()).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn avro_and_lance_put_metadata_roundtrips_and_reserved_overwrites_do_not_poll_body() {
+    for file in [false, true] {
+        for lance in [false, true] {
+            let mut state = explicit_passthrough_test_state(None).await;
+            let config = Arc::get_mut(&mut state).unwrap();
+            config.binary_avro_enabled = true;
+            config.binary_lance_enabled = true;
+            if file {
+                let root = std::env::temp_dir()
+                    .join(format!("maskura-binary-metadata-{}", uuid::Uuid::now_v7()));
+                let store = Arc::new(FileStore::new(root).await.unwrap());
+                store.create_bucket("metadata").await.unwrap();
+                config.file_store = Some(store);
+            }
+            let (ak, sk) = make_key(&state).await;
+            let headers = auth_headers(&ak, &sk);
+            let content_type = if lance {
+                "application/vnd.apache.lance; synthetic=1"
+            } else {
+                "application/avro; synthetic=1"
+            };
+            let path = if lance {
+                "/metadata/synthetic.lance"
+            } else {
+                "/metadata/synthetic.avro"
+            };
+            let input = synthetic_binary_metadata_object(lance);
+            let app = build_router(state);
+            let put = add_headers(
+                Request::builder()
+                    .method("PUT")
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, content_type)
+                    .header("x-amz-meta-project", "synthetic")
+                    .header("x-amz-meta-content-type", "customer-type")
+                    .body(Body::from(input.clone()))
+                    .unwrap(),
+                &headers,
+            );
+            assert_eq!(
+                app.clone().oneshot(put).await.unwrap().status(),
+                StatusCode::OK
+            );
+            let mut committed = Bytes::new();
+            for method in ["HEAD", "GET"] {
+                let response = app
+                    .clone()
+                    .oneshot(add_headers(
+                        Request::builder()
+                            .method(method)
+                            .uri(path)
+                            .body(Body::empty())
+                            .unwrap(),
+                        &headers,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response.headers().get(header::CONTENT_TYPE).unwrap(),
+                    content_type
+                );
+                assert_eq!(
+                    response.headers().get("x-amz-meta-project").unwrap(),
+                    "synthetic"
+                );
+                assert_eq!(
+                    response.headers().get("x-amz-meta-content-type").unwrap(),
+                    "customer-type"
+                );
+                if method == "GET" {
+                    committed = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                }
+            }
+            let mut values = Vec::new();
+            if lance {
+                maskura_gateway::lance::decode_lance(
+                    committed.as_ref(),
+                    Default::default(),
+                    |value| {
+                        values.push(value);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            } else {
+                maskura_gateway::avro::decode_ocf(
+                    committed.as_ref(),
+                    Default::default(),
+                    |value| {
+                        values.push(value);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            }
+            assert_eq!(values.len(), 1);
+            for reserved in [
+                "x-amz-meta-maskura-operation-id",
+                "x-amz-meta-maskura-sha256",
+                "x-amz-meta-maskura-generation",
+            ] {
+                for value in [
+                    axum::http::HeaderValue::from_static("untrusted"),
+                    axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+                ] {
+                    let polls = Arc::new(AtomicUsize::new(0));
+                    let overwrite = add_headers(
+                        Request::builder()
+                            .method("PUT")
+                            .uri(path)
+                            .header(header::CONTENT_TYPE, content_type)
+                            .header(reserved, value)
+                            .body(Body::new(PollTrackingBody {
+                                polls: polls.clone(),
+                                data: Some(Bytes::copy_from_slice(&input)),
+                            }))
+                            .unwrap(),
+                        &headers,
+                    );
+                    assert_eq!(
+                        app.clone().oneshot(overwrite).await.unwrap().status(),
+                        StatusCode::BAD_REQUEST
+                    );
+                    assert_eq!(polls.load(Ordering::SeqCst), 0);
+                    let response = app
+                        .clone()
+                        .oneshot(add_headers(
+                            Request::builder().uri(path).body(Body::empty()).unwrap(),
+                            &headers,
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(
+                        response.headers().get("x-amz-meta-project").unwrap(),
+                        "synthetic"
+                    );
+                    assert_eq!(
+                        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                            .await
+                            .unwrap(),
+                        committed
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn streaming_put_is_frame_invariant_and_preserves_separators() {
     let input = b"contact a@b.com now\r\nsecond line\n";
     let mut state = test_state().await;
@@ -126,7 +615,7 @@ async fn avro_acquires_workspace_lease_before_first_body_poll() {
     let config = test_config();
     let mut state = build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
-        default_wrapping().expect("wrapping"),
+        fixture_wrapping(),
         Arc::new(RejectingAttestedRepository),
         test_pipeline_template(),
         &config,
@@ -521,7 +1010,7 @@ async fn streaming_file_get_preserves_frames_ranges_and_metadata_only_head() {
         app.oneshot(get).await.unwrap().status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 #[tokio::test]
@@ -565,7 +1054,7 @@ async fn streaming_file_get_enforces_source_limit_during_body_read() {
             .contains("source body is at least 8 bytes")
     );
     assert!(!error.to_string().contains("123456789"));
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 // These are original Rust scenarios based on observable behavior covered by
@@ -783,14 +1272,10 @@ async fn stable_transformed_reads_succeed_without_disclosing_pii() {
 #[tokio::test]
 async fn unsafe_transformed_read_stages_then_sanitizes_source_headers() {
     let mut state = test_state().await;
-    let spool_dir = std::env::temp_dir().join(format!(
-        "maskura-read-spool-router-{}",
-        uuid::Uuid::now_v7()
-    ));
+    let spool_dir = state.spool_config.directory.clone();
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
     let control = Arc::new(RecordingMeteringControl::default());
     state_mut.transformed_read_spool_enabled = true;
-    state_mut.spool_config.directory = spool_dir.clone();
     state_mut.spool_config.max_object_bytes = 1024;
     state_mut.spool_quota = Arc::new(SpoolQuota::new(2048));
     state_mut.control = control.clone();
@@ -1059,14 +1544,10 @@ async fn nonempty_prefix_safe_reads_stream_and_settle_without_spool() {
 
     let mut state = test_state().await;
     let control = Arc::new(RecordingMeteringControl::default());
+    let spool_dir = state.spool_config.directory.clone();
     let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
-    let spool_dir = std::env::temp_dir().join(format!(
-        "maskura-direct-read-no-spool-{}",
-        uuid::Uuid::now_v7()
-    ));
     let spool_quota = Arc::new(SpoolQuota::new(2048));
     state_mut.transformed_read_spool_enabled = false;
-    state_mut.spool_config.directory = spool_dir.clone();
     state_mut.spool_config.max_object_bytes = 1024;
     state_mut.spool_quota = spool_quota.clone();
     state_mut.control = control.clone();

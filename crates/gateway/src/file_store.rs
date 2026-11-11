@@ -520,6 +520,29 @@ impl FileStore {
         size: u64,
         etag: &str,
     ) -> Result<(), FileStoreError> {
+        self.commit_temp_with_metadata(
+            bucket,
+            key,
+            temp_path,
+            content_type,
+            size,
+            etag,
+            &Default::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn commit_temp_with_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        temp_path: &Path,
+        content_type: &str,
+        size: u64,
+        etag: &str,
+        stored: &crate::transaction::MultipartStoredMetadata,
+    ) -> Result<(), FileStoreError> {
         let _guard = self.mutation_lock.lock().await;
         self.ensure_bucket_layout(bucket).await?;
         validate_key(key)?;
@@ -542,9 +565,9 @@ impl FileStore {
             size,
             data_file,
             last_modified_ms: Some(crate::transaction::unix_time_ms()),
-            representation_headers: BTreeMap::new(),
-            user_metadata: BTreeMap::new(),
-            tags: BTreeMap::new(),
+            representation_headers: stored.representation_headers.clone(),
+            user_metadata: stored.user_metadata.clone(),
+            tags: stored.tags.clone(),
             checksum: None,
             output_sha256: None,
             operation_id: None,
