@@ -194,7 +194,8 @@ class FeedbackTests(unittest.TestCase):
         return code, value, summary, module
     def test_main_preserves_preflight_and_start_boundary_codes_and_fixed_actions(self):
         for stage, category, action in (('preflight', 'native-daemon-platform', 'daemon-platform'),
-                                        ('start', 'command-nonzero', 'create-container')):
+                                        ('start', 'command-nonzero', 'create-container'),
+                                        ('start', 'relay-endpoint-invalid', 'owned-container-endpoint')):
             obj = MainImage(); setattr(obj, stage + '_error', transport.BoundaryError(category))
             obj.commands = [dict(action=action, passed=False, stdout='PRIVATE_COMMAND_OUTPUT' + 'f' * 64, stderr='PRIVATE_ERROR_OUTPUT')]
             code, value, summary, _ = self.invoke_main(obj)
@@ -202,6 +203,13 @@ class FeedbackTests(unittest.TestCase):
             self.assertEqual(value['failure'], dict(category=category, stage=stage, action=action))
             self.assertNotIn('PRIVATE_', json.dumps([value, summary]))
             self.assertNotIn('f' * 64, json.dumps([value, summary]))
+    def test_main_all_relay_failure_codes_remain_closed_and_allowlisted(self):
+        from release_feedback.relay import RELAY_CODES
+        for category in RELAY_CODES:
+            obj = MainImage(); obj.start_error = transport.BoundaryError(category)
+            code, value, _, _ = self.invoke_main(obj)
+            self.assertEqual(code, 1)
+            self.assertEqual(value['failure'], dict(category=category, stage='start'))
     def test_main_preserves_core_rows_after_passes_and_failed_row(self):
         code, value, _, _ = self.invoke_main(MainImage('invalid-auth-accepted'))
         self.assertEqual(code, 1)
@@ -594,8 +602,15 @@ class FeedbackTests(unittest.TestCase):
         self.assertIn('              dist/QUALIFIED_IMAGE_CHILDREN.json \\', release)
         self.assertIn('test -f verify-dist/QUALIFIED_IMAGE_CHILDREN.json', release)
         self.assertIn('bash scripts/audit-dependencies.sh', (ROOT / '.github/workflows/ci.yml').read_text())
-        self.assertEqual(release.count('github.ref_name'), 1)
+        # The independently guarded managed-release caller also binds its source
+        # input. Native child/index jobs must still use the single RELEASE_TAG.
+        native_release = re.sub(r'^  managed-release:\n.*?(?=^  [a-zA-Z][a-zA-Z0-9_-]*:|\Z)', '', release, flags=re.M | re.S)
+        self.assertEqual(native_release.count('github.ref_name'), 1)
         for path in ('.github/workflows/ci.yml', '.github/workflows/release.yml'):
-            for action in re.findall(r'uses: ([^\s]+)', (ROOT / path).read_text()): self.assertRegex(action, r'@[0-9a-f]{40}$')
+            for action in re.findall(r'uses: ([^\s]+)', (ROOT / path).read_text()):
+                if action.startswith('./'):
+                    # This reusable workflow is bound to the caller's own commit.
+                    self.assertEqual(action, './.github/workflows/managed-release.yml')
+                else: self.assertRegex(action, r'@[0-9a-f]{40}$')
 
 if __name__ == '__main__': unittest.main()

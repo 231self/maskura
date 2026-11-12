@@ -15,7 +15,7 @@ SCOPE = 'packaged-filestore-core'
 PHASES = ('candidate', 'native-child', 'published-replay')
 EXCLUSIONS = ('memory', 'direct-s3', 'managed', 'postgres', 'protected-pipeline', 'process-recovery', 'unmodified-sdk', 'reporter-environment',
               'signed-multipart-initiation-decoding-snapshot-cleanup')
-CODE = ('__init__.py', 'cases.py', 'signing.py', 'signed_cases.py', 'transport.py', 'image.py', 'receipts.py')
+CODE = ('__init__.py', 'cases.py', 'signing.py', 'signed_cases.py', 'transport.py', 'image.py', 'relay.py', 'receipts.py')
 
 def require(condition):
     if not condition: raise ValueError('release-feedback-receipt-invalid')

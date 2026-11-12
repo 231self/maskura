@@ -91,6 +91,23 @@ It retains absolute deadlines, resource limits, ownership checks, captured-child
 cleanup and successful structured resource-absence inventories. Permission or
 transport errors are not proof that a resource or listener is absent.
 
+The connector keeps Docker's owned bridge network `--internal`. Docker 28 does
+not program host publication for internal networks, so incompatible `-p` is
+replaced by an explicitly owned host-loopback TCP relay, not by accepting missing
+port metadata or enabling external networking. Container/network IDs, ownership
+labels, births, exact network membership, matching EndpointID and owned RFC1918
+IPv4 IPAM membership are verified before targeting numeric IPv4 port 9000 only.
+The relay binds kernel-allocated `127.0.0.1:0` with bounded attempts excluding
+default database ports. One selector worker permits at most eight connections,
+64 KiB queued per direction and 2 MiB wire bytes per direction per connection;
+absolute connection deadlines are at most 25s and clipped to existing work/stage
+deadlines. Existing HTTP, disk, container and monitor bounds remain unchanged.
+Worker/FD retirement and sticky failure participate in the existing cleanup
+contract and shared reserve. Restart first closes and refusal-checks the old
+relay, then re-verifies the endpoint and creates a fresh relay. Every allocated
+port must produce exact ECONNREFUSED after cleanup. This connector change and
+its fake I/O tests do not qualify any image or relax the exact 29+2 assertion set.
+
 ## Consequences
 
 - Pre-tag qualification requires both native architectures. Candidate images are

@@ -466,3 +466,37 @@ The owner has authorized publishing the corrective release once the current PR
 passes CI; no further release-approval prompt is required. This does not turn
 skipped required storage cases into passes or waive immutable-source, native
 image, dependency-security and published-digest qualification requirements.
+
+## Second CI result and connector correction (2026-11-12)
+
+Run `43218945917` completed against PR head
+`6d2b091474657d3f496ce8a856b4b805aefc27c1`. Postgres job `131185237169`
+passed against one fresh job-owned service: initial full target 32 passed / 0
+failed / 15 ignored; exact recovery 1 / 0 / 0; exact router 1 / 0 / 0; repeated
+full target 32 / 0 / 15. Both exact selectors genuinely executed. This verifies
+fixture cleanup and repeatability, not the 13 ignored managed cases. The
+production off-mode authority guard remains unchanged.
+
+All jobs except both native packaged-feedback legs and aggregate `check` passed.
+Both native failure receipts contain zero case rows, all seven cleanup checks
+true, and closed failure `numeric-loopback-publication` at stage `start`.
+Their source is synthetic merge revision
+`1eb1699d7d86385051580523496b79bcb38a9e04`, not the PR head. Docker 28.0.4 does
+not program host publication for these internal networks. The existing guard
+correctly rejected missing connectivity; no FileStore assertion ran.
+
+The owner separately approved an owned, bounded host-loopback connector to the
+independently verified private container endpoint. This additive change retains
+the internal network and replaces only the incompatible Docker publication.
+Endpoint/container/network births and membership, RFC1918 IPAM, loopback binding,
+bounded concurrency/buffering/wire/deadlines, restart endpoint revalidation and
+worker/socket/refusal cleanup are explicit requirements. The relay source now
+participates in the harness hash; failed receipts remain rejected. All 31 product
+assertions and the seven cleanup acceptance checks remain unchanged. Fresh native
+AMD64/ARM64 CI must establish actual success; offline tests are not qualification.
+
+This connector correction is published independently of the unfinished Linux
+storage-check backend. The owner separately approved that implementation and
+bounded fresh-runner execution, but all 13 managed cases remain unqualified and
+must actually pass before release. The expired Mac campaign remains closed,
+private schema expansion stays paused, and v0.7.33 remains untouched.

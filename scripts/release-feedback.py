@@ -12,6 +12,7 @@ from release_feedback.cases import Cases, Failure, IMPLEMENTED, CODES
 from release_feedback.signed_cases import run_signed, SIGNED_CASES
 from release_feedback.image import ImageIO, ID
 from release_feedback.transport import Budget, BoundaryError
+from release_feedback.relay import RELAY_CODES
 from release_feedback.receipts import EXCLUSIONS, PHASES, SCOPE, digest, harness_sha, identity, validate_report, write
 
 # Closed vocabulary only: never persist exception text, command output or I/O data.
@@ -36,7 +37,7 @@ BOUNDARY_CODES = frozenset((
     'owned-writable-layer-cap', 'ownership-mismatch', 'ownership-shape',
     'pulled-repodigest-binding', 'successful-inventory-required',
     'owned-store-monitor-total-deadline',
-))
+)) | RELAY_CODES
 ASSERTION_CODES = frozenset((
     'batch-per-key-error', 'openapi-shape', 'synthetic-payload-bound',
     'unexpected-delete-result-entry', 'unknown-case', 'xml-declaration-forbidden',
@@ -62,6 +63,7 @@ ACTIONS = frozenset((
     'daemon-platform', 'bound-local-image', 'internal-network', 'start-packaged-image',
     'official-components-only', 'native-packaged-elf', 'owned-store-metadata-only',
     'owned-writable-layer-size', 'owned-loopback-port', 'restart-owned-container',
+    'owned-container-endpoint', 'owned-network-endpoint',
     *(prefix + kind for prefix in ('inventory-', 'owner-', 'create-', 'remove-owned-')
       for kind in ('container', 'volume', 'network')),
 ))

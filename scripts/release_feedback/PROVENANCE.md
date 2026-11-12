@@ -121,8 +121,32 @@ contract checks are not replaced or removed.
   Missing tools/permissions/invalid metadata fail closed, not a fake monitor pass.
 - Private host attempt <=1 MiB/128 entries; request/response payloads <=1 MiB;
   captured command output <=64 KiB. Container <=2 CPUs/1 GiB/256 PIDs, no core dumps,
-  internal owned network, numeric loopback publication, fresh HOME/TMP/Docker config.
+  internal owned network, an explicitly owned numeric loopback relay, fresh HOME/TMP/Docker config.
   No inherited customer/provider/proxy/auth env or container output/log bodies.
+- Docker 28 does not publish host ports for an internal network. The connector
+  therefore removes `-p`, not `--internal`: an in-process TCP relay binds only
+  kernel-allocated `127.0.0.1:0` (at most eight attempts, excluding default database
+  ports). Before any connection, projected container/network metadata must match
+  the existing verified IDs, labels and births, one exact owned bridge network,
+  a shared EndpointID, and one numeric RFC1918 IPv4 address in its owned IPAM
+  subnet. Extra networks/endpoints, host publications, IPv6, global/loopback/link-
+  local destinations and DNS/proxy targets are rejected. The destination port is
+  always 9000. Empty Docker port metadata is expected, but is never connector or
+  qualification evidence by itself. Endpoint drift is checked inside the existing
+  aggregate 2s store monitor, without extending that ceiling.
+- The relay uses one tracked nonblocking selector worker, backlog/concurrency <=8,
+  <=64 KiB queued per direction/connection and <=2 MiB wire bytes per direction
+  (<=4 MiB total/connection). Backpressure disables reads when a queue is full.
+  Every connection has an absolute <=25s deadline clipped to the original work/
+  stage deadline; activity cannot renew it. The HTTP client's existing absolute
+  8s deadline and 2 MiB receive-wire bound remain unchanged. Relay failures are
+  sticky closed codes, never payloads or exception text. Listener, channels,
+  selector and worker are explicitly retired under the existing shared cleanup
+  reserve; no-active-handles and no-sticky-failure cleanup facts include them.
+  Restart closes the old relay, proves exact ECONNREFUSED on its allocated ports,
+  re-verifies ownership and the new endpoint, then allocates a fresh relay. Every
+  allocated relay port is also checked for exact kernel refusal at final cleanup.
+  Fake I/O tests do not establish actual TCP or packaged-image qualification.
 - Resources have random private ownership labels. Creation intent is recorded
   before the create command. Exact successful inventory requires exit0 and parses
   projected names/IDs; Docker exit1/errors are not absence. Before deletion, exact

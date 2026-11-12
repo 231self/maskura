@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from .transport import IO, BoundaryError
 from .signing import streaming
+from .relay import Loopback, Relay, verify_endpoint
 
 LABEL = 'maskura.release.feedback'
 COMPONENTS = ('noop', 'pii-default', 'email-detect', 'ssn-detect', 'card-detect', 'envelope-encrypt', 'stable-encrypt')
@@ -53,6 +54,7 @@ class ImageIO(IO):
         self.image_id = image_id; self.arch = arch; self.source = source; self.version = version
         self.token = secrets.token_hex(16); self.names = {kind: 'maskura-feedback-' + kind + '-' + self.token for kind in ('container', 'volume', 'network')}
         self.created = []; self.identities = {}; self.ports = set(); self.lock_fd = None
+        self.relays = []; self.relay = None; self.endpoint = None; self.connector = None
         self.running = False; self.in_monitor = False; self.last_monitor = -1e30; self.docker_root = None
         for name in ('home', 'tmp', 'docker-config'): (root / name).mkdir(mode=0o700)
         self.access = 'feedback-' + secrets.token_hex(12); self.secret = secrets.token_urlsafe(32)
@@ -64,6 +66,7 @@ class ImageIO(IO):
         try:
             super().guard()
             if not self.cleaning:
+                for relay in getattr(self, 'relays', ()): relay.check()
                 for path in (self.root, self.docker_root or self.root):
                     if shutil.disk_usage(path).free < 12 * 2**30: raise BoundaryError('host-12GiB-floor')
                 size, entries = root_usage(self.root)
@@ -152,7 +155,7 @@ class ImageIO(IO):
         self.create('volume', ['--label', label, self.names['volume']])
         self.create('container', ['--pull=never', '--platform=linux/' + self.arch, '--name', self.names['container'],
             '--label', label, '--network', self.names['network'], '--cpus', '2', '--memory', '1g', '--pids-limit', '256',
-            '--log-driver=none', '--ulimit', 'core=0', '-p', '127.0.0.1::9000', '--mount', 'type=volume,source=' + self.names['volume'] + ',target=/data',
+            '--log-driver=none', '--ulimit', 'core=0', '--mount', 'type=volume,source=' + self.names['volume'] + ',target=/data',
             '-e', 'MASKURA_ROOT_USER', '-e', 'MASKURA_ROOT_PASSWORD', self.image_id])
         self.docker('start-packaged-image', ['start', self.owner('container')]); self.running = True
         self.resolve_port(); self.ready()
@@ -166,6 +169,8 @@ class ImageIO(IO):
         self.in_monitor = True
         try:
             with self.budget.scope(2, 'owned-store-monitor-total-deadline'):
+                if getattr(self, 'endpoint', None) is not None and self.owned_endpoint() != self.endpoint:
+                    raise BoundaryError('relay-endpoint-changed')
                 container = self.owner('container')
                 _, raw = self.docker('owned-store-metadata-only', ['exec', container, 'find', '/data', '-xdev', '-printf', '%s\n'], timeout=2)
                 sizes = [integer(line) for line in raw.decode('ascii').splitlines()]
@@ -173,13 +178,35 @@ class ImageIO(IO):
                 _, raw = self.docker('owned-writable-layer-size', ['container', 'inspect', '--size', container, '--format', '{{json .SizeRw}}'], timeout=2)
                 if integer(raw.decode('ascii').strip()) > 64 * 2**20: raise BoundaryError('owned-writable-layer-cap')
         finally: self.in_monitor = False; self.last_monitor = self.budget.clock()
+    def owned_endpoint(self):
+        container = self.owner('container'); network = self.owner('network')
+        fmt = '{"id":{{json .Id}},"running":{{json .State.Running}},"network_mode":{{json .HostConfig.NetworkMode}},"networks":{{json .NetworkSettings.Networks}},"ports":{{json .NetworkSettings.Ports}},"bindings":{{json .HostConfig.PortBindings}}}'
+        _, raw = self.docker('owned-container-endpoint', ['container', 'inspect', container, '--format', fmt], timeout=2)
+        container_value = strict_json(raw)
+        fmt = '{"id":{{json .Id}},"internal":{{json .Internal}},"driver":{{json .Driver}},"ipam":{{json .IPAM.Config}},"containers":{{json .Containers}}}'
+        _, raw = self.docker('owned-network-endpoint', ['network', 'inspect', network, '--format', fmt], timeout=2)
+        return verify_endpoint(container_value, strict_json(raw), container, network, self.names['container'], self.names['network'])
     def resolve_port(self):
-        _, raw = self.docker('owned-loopback-port', ['container', 'inspect', self.owner('container'), '--format', '{{json (index .NetworkSettings.Ports "9000/tcp")}}'])
-        entries = strict_json(raw)
-        if not isinstance(entries, list) or len(entries) != 1 or entries[0].get('HostIp') != '127.0.0.1': raise BoundaryError('numeric-loopback-publication')
-        port = integer(entries[0]['HostPort'])
-        if not 1 <= port <= 65535: raise BoundaryError('owned-port-range')
-        self.port = port; self.ports.add(port)
+        if self.relay is not None and not self.relay.clear(): raise BoundaryError('relay-state-invalid')
+        endpoint = self.owned_endpoint()
+        factory = getattr(self, 'relay_factory', Relay)
+        relay = factory(endpoint, min(self.stage_deadline, self.budget.origin + 1780), self.budget.clock)
+        self.relays.append(relay); self.relay = relay
+        try:
+            port = relay.start()
+            if type(relay.binding) is not Loopback or relay.binding.port != port: raise BoundaryError('relay-listener-invalid')
+            self.connector = relay.binding; self.port = self.connector.port
+        finally: self.ports.update(relay.ports)
+        self.endpoint = endpoint
+    def stop_relay(self, deadline):
+        relay = self.relay; self.port = None; self.endpoint = None; self.connector = None
+        if relay is None: return True
+        complete = relay.stop(deadline)
+        for port in relay.ports:
+            remaining = deadline - self.budget.clock()
+            if remaining <= 0 or not closed_port(port, min(0.25, remaining)): complete = False
+        if not complete: relay.fail('relay-cleanup-incomplete')
+        return complete
     def ready(self):
         self.ready_deadline = self.budget.clock() + self.budget.limit(45)
         try:
@@ -197,12 +224,18 @@ class ImageIO(IO):
         wire, fields = streaming(method, path, '127.0.0.1:' + str(self.port), self.access, self.secret, body, headers, **kwargs)
         return self.request(method, path, wire, fields, authenticated=False)
     def restart_and_resolve_port(self):
+        with self.budget.scope(2, 'relay-cleanup-incomplete'):
+            if not self.stop_relay(self.budget.clock() + self.budget.limit(2)): raise BoundaryError('relay-cleanup-incomplete')
         self.docker('restart-owned-container', ['restart', '--time', '2', self.owner('container')])
         self.resolve_port(); self.ready()
     def cleanup(self):
         self.allowed(); self.cleaning = True; self.budget.begin_cleanup(); results = []
+        self.port = None; self.endpoint = None; self.connector = None
         if self.http_transport is not None: self.http_transport.force_close(); self.http_transport = None
         try:
+            for relay in getattr(self, 'relays', ()):
+                try: results.append(relay.stop(self.budget.begin_cleanup()))
+                except BaseException: results.append(False)
             for process in list(self.active.values()): results.append(self.stop(process))
             for kind in ('container', 'volume', 'network'):
                 if kind not in self.created: continue
@@ -222,5 +255,6 @@ class ImageIO(IO):
             self.env.pop('MASKURA_ROOT_PASSWORD', None); self.env.pop('MASKURA_ROOT_USER', None)
         return dict(owned_resources_absent=all(results), allocated_ports_kernel_refused=refused,
             captured_children_reaped=all(c.reaped and c.group_absent and c.retired for c in self.children.values()),
-            no_active_handles=not self.active, no_sticky_command_failure=self.command_failure_category is None,
+            no_active_handles=not self.active and all(relay.clear() for relay in getattr(self, 'relays', ())),
+            no_sticky_command_failure=self.command_failure_category is None and all(relay.failure_code is None for relay in getattr(self, 'relays', ())),
             lock_released=self.lock_fd is None, cleanup_within_shared_reserve=self.budget.clock() <= self.budget.begin_cleanup())
