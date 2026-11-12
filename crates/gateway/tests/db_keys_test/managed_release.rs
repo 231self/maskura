@@ -6,7 +6,7 @@ use super::managed_release_fixture::*;
 use super::*;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use maskura_gateway::managed::ManagedLogicalOperation;
-use maskura_gateway::service_storage::ServiceStorage;
+use maskura_gateway::service_storage::{ServiceStorage, parse_service_backends};
 use maskura_gateway::transaction::{
     AwsS3TransactionBackend, DIRECT_PART_BYTES, DestinationCommitAuthority, ManagedChildRole,
     ManagedOperationScope, TransactionBackend,
@@ -1652,9 +1652,131 @@ fn specific_certificate_cause(error: &(dyn std::error::Error + 'static), mode: T
         {
             return true;
         }
-        current = error.source();
+        // io::Error::source skips its payload's own value. hyper-rustls nests
+        // the InvalidData certificate error inside io::Error::other, so visit
+        // each retained payload before continuing through ordinary sources.
+        current = match error.downcast_ref::<std::io::Error>() {
+            Some(io) => io
+                .get_ref()
+                .map(|cause| cause as &(dyn std::error::Error + 'static)),
+            None => error.source(),
+        };
     }
     false
+}
+
+#[test]
+fn tls_certificate_cause_visits_nested_io_payloads() {
+    for mode in [TlsMode::UnrelatedCa, TlsMode::WrongName] {
+        for wrappers in 0..=3 {
+            let mut error =
+                std::io::Error::new(std::io::ErrorKind::InvalidData, mode.certificate_cause());
+            for _ in 0..wrappers {
+                error = std::io::Error::other(error);
+            }
+            assert!(specific_certificate_cause(&error, mode));
+        }
+    }
+}
+
+#[test]
+fn tls_certificate_cause_rejects_wrong_kind_transport_alert_or_different_cause() {
+    for mode in [TlsMode::UnrelatedCa, TlsMode::WrongName] {
+        for kind in [
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            let error = std::io::Error::other(std::io::Error::new(kind, mode.certificate_cause()));
+            assert!(!specific_certificate_cause(&error, mode));
+        }
+        for cause in [
+            "connection refused",
+            "TLS handshake timed out",
+            "unexpected EOF",
+            "received fatal alert: UnknownCA",
+            "invalid peer certificate: Expired",
+            "invalid peer certificate: UnknownIssuer extra text",
+        ] {
+            let error =
+                std::io::Error::other(std::io::Error::new(std::io::ErrorKind::InvalidData, cause));
+            assert!(!specific_certificate_cause(&error, mode));
+        }
+        let wrong_mode = match mode {
+            TlsMode::UnrelatedCa => TlsMode::WrongName,
+            TlsMode::WrongName => TlsMode::UnrelatedCa,
+            TlsMode::Trusted => unreachable!(),
+        };
+        let error = std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            wrong_mode.certificate_cause(),
+        ));
+        assert!(!specific_certificate_cause(&error, mode));
+    }
+}
+
+#[test]
+fn tls_certificate_cause_keeps_original_traversal_bound() {
+    let mut error = std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        TlsMode::UnrelatedCa.certificate_cause(),
+    );
+    for _ in 0..16 {
+        error = std::io::Error::other(error);
+    }
+    assert!(!specific_certificate_cause(&error, TlsMode::UnrelatedCa));
+}
+
+fn same_numeric_tls_endpoint(backend: &str, fixture: &str, address: std::net::SocketAddr) -> bool {
+    let Ok(expected) = reqwest::Url::parse(&format!("https://{address}")) else {
+        return false;
+    };
+    // The service parser stores canonical URL strings, including the root '/'.
+    // Retain exact numeric scheme/authority/root identity after canonicalizing
+    // the fixture spelling; do not relax path, query, credential or host checks.
+    backend == expected.as_str()
+        && reqwest::Url::parse(fixture).is_ok_and(|endpoint| endpoint == expected)
+}
+
+#[test]
+fn tls_numeric_endpoint_accepts_canonical_root_from_service_parser() {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], 18443));
+    for fixture in [format!("https://{address}"), format!("https://{address}/")] {
+        let backends = must(
+            parse_service_backends(&format!(
+                "b2|release-primary|release-account|1|{fixture}|us-east-1|{PRIMARY}|managed-fixture-access|managed-fixture-secret"
+            )),
+            "release endpoint regression backend parse failed",
+        );
+        assert!(same_numeric_tls_endpoint(
+            &backends[0].endpoint,
+            &fixture,
+            address
+        ));
+        assert!(backends[0].endpoint.ends_with('/'));
+    }
+}
+
+#[test]
+fn tls_numeric_endpoint_rejects_changed_authority_or_request_target() {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], 18443));
+    let expected = format!("https://{address}/");
+    for invalid in [
+        "http://127.0.0.1:18443/",
+        "https://127.0.0.2:18443/",
+        "https://127.0.0.1:18444/",
+        "https://localhost:18443/",
+        "https://[::1]:18443/",
+        "https://127.0.0.1:18443/other",
+        "https://127.0.0.1:18443/?query=fixture",
+        "https://127.0.0.1:18443/#fragment",
+        "https://fixture:fixture@127.0.0.1:18443/",
+        "not-a-url",
+    ] {
+        assert!(!same_numeric_tls_endpoint(invalid, &expected, address));
+        assert!(!same_numeric_tls_endpoint(&expected, invalid, address));
+    }
 }
 
 fn tls_rejection_case(case: &'static str, mode: TlsMode) {
@@ -1688,8 +1810,7 @@ fn tls_rejection_case(case: &'static str, mode: TlsMode) {
         );
         let backend = fixture.backends().remove(0);
         assert!(
-            backend.endpoint == fixture.endpoint
-                && backend.endpoint == format!("https://{address}"),
+            same_numeric_tls_endpoint(&backend.endpoint, &fixture.endpoint, address),
             "release TLS rejection did not use the same reachable numeric endpoint"
         );
         // Unchanged real ServiceBackend::build_client: normal chain/name checks,

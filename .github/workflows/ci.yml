@@ -43,6 +43,7 @@ jobs:
           python3 -B -m unittest discover -s tests -p 'test_release_feedback.py'
           python3 -B -m unittest discover -s tests -p 'test_release_relay.py'
           python3 -B -m unittest discover -s tests -p 'test_release_publication.py'
+          python3 -B -m unittest discover -s tests -p 'test_managed_linux_*.py'
 
   lint:
     runs-on: ubuntu-24.04
@@ -342,10 +343,17 @@ jobs:
       - name: Analyze
         uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
 
+  managed-release:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/managed-release.yml
+    with:
+      source_ref: ${{ github.sha }}
+
   # Aggregate status so branch protection's required `check` keeps working
   # and never ends up "skipped" when a constituent job fails.
   check:
-    needs: [fmt, lint, test, sdk, e2e, release-image-smoke, postgres, interop, security, dependency-review, codeql]
+    needs: [fmt, lint, test, sdk, e2e, release-image-smoke, postgres, managed-release, interop, security, dependency-review, codeql]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5

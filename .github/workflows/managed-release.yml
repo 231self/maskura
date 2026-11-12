@@ -1,0 +1,48 @@
+name: Native Linux managed release qualification
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Exact current source or final release tag; never a prior receipt
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  managed-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: never
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - name: Bind checked-out source and prepare within twenty minutes
+        timeout-minutes: 20
+        run: |
+          source_sha="$(git rev-parse HEAD)"
+          echo "MANAGED_SOURCE_SHA=$source_sha" >> "$GITHUB_ENV"
+          python3 -B scripts/managed-release-linux.py --execute --prepare --source-sha "$source_sha"
+      - name: Qualify all thirteen cases with independent owned cleanup
+        id: managed
+        timeout-minutes: 60
+        run: |
+          sudo -- /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+            /usr/bin/python3 -I -B -c \
+            'import runpy,sys; sys.path.insert(0,"scripts"); runpy.run_path("scripts/managed-release-linux.py",run_name="__main__")' \
+            --execute --warden --source-sha "$MANAGED_SOURCE_SHA"
+      - name: Retain only closed qualification metadata
+        if: ${{ !cancelled() && (steps.managed.outcome == 'success' || steps.managed.outcome == 'failure') }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.1
+        with:
+          name: maskura-managed-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .managed-release-prepared/qualification.json
+          if-no-files-found: error

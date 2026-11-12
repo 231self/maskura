@@ -4,7 +4,156 @@ Status: corrective source and reviewed managed qualification files incorporated 
 Date: 2026-11-11
 Target: public v0.7.33
 
+Run `43257251690` (head `a9c225d1`) failed preparation: the guarded open
+preflight succeeded but all three file-argument mirrors reported
+`coordinator-script-policy`. This isolates the observed failure to the launch
+path, not the interactive flag or plan mount. A fixed `-c` bootstrap and an
+init-only file-launch preflight are pending native CI qualification. No managed
+cases or cleanup acceptance are claimed for that run.
+
+Run `43266767139` (head `e733e906`) reached `no_guard=coordinator-identity`
+and `full=coordinator-plan`, proving coordinator startup but not plan acceptance.
+Preparation creates mirror plans as the runner user whereas the real warden
+creates them as root; the coordinator requires root ownership. The next mirror
+verifies root ownership to match the actual campaign. No managed cases or
+cleanup acceptance are claimed for that run.
+
+Run `43269118146` (head `f0cbcf0e`) passed preparation with
+`no_guard=coordinator-identity` and `full=frame-ok`; runtime failed after
+coordinator startup with `internal-failure`. Its failure receipt makes no
+acceptance or cleanup claim. The next revision adds only closed categories and
+stage markers around coordinator binding and cleanup to distinguish the cause.
+
+Run `43274752991` (head `dbb26984`) reached coordinator binding and the first
+executor; executor preparation failed with `internal-failure`, and the
+coordinator cgroup check returned `resource-missing` after container stop.
+Neither acceptance nor cleanup is claimed. Further closed executor diagnostics
+are pending; cgroup disappearance is not treated as cleanup proof.
+
 ## Release identity
+
+Run `43321455896` (PR head `28e1f4af`) passed the corrected endpoint assertion;
+`tls-unrelated-ca` then failed the specific-certificate-cause assertion at line
+1763. Local-init cleanup flags were true and host cleanup remained unproved.
+The locked HTTP client documents that hyper-rustls nests its `InvalidData`
+certificate error inside `io::Error::other`, whose `source()` skips the payload's
+own value. A local regression reproduced the missed nested cause before the
+fix. Traversal now visits each I/O payload via `get_ref()` and otherwise follows
+ordinary sources, retaining the original 16-step bound, exact cause matching,
+required `InvalidData` kind and outer `DispatchFailure` assertion. All five pure
+TLS endpoint/cause regressions pass, including wrong-kind/transport/alert/wrong-
+certificate-cause and excessive-depth rejection. They supply no live TLS or
+managed qualification evidence; fresh native CI remains required.
+
+Run `43313723597` (PR head `66fab60f`) identified the remaining failure as
+`tls-unrelated-ca`, at the endpoint-equality assertion before the certificate
+rejection check. The closed result recorded selected=1, zero pass/summary/complete/
+shutdown markers, a `MANAGED_CASE` panic at line 1690, and true local-init cleanup
+flags. Host cleanup remained unproved, so the campaign still fails closed.
+The service parser canonicalizes root URLs with a trailing slash while the
+fixture compared them to an uncanonicalized spelling. The correction compares
+the parsed fixture URL and canonical backend to the same numeric HTTPS root,
+with regressions for the actual service parser and changed scheme/host/port/
+path/query/fragment/credentials. Real client certificate verification, exact
+certificate-cause checks and no-dispatch/no-mutation assertions are unchanged.
+All other substantive CI jobs passed; the aggregate check failed with managed
+qualification. No managed-release acceptance or completed 13-case campaign is
+claimed until the corrected source passes fresh native CI.
+
+Run `43311174476` (PR head `a7e215da`, checked-out merge source `b98a823a`)
+completed native preparation and the controls, then reached concurrent product
+execution. One case failed and host cleanup remained unproved. The closed failed
+receipt reports zero qualified cases and no acceptance/cleanup claim; it does not
+retain a per-case breakdown, so the specific failure is not yet identified.
+The next diagnostic change logs only already validated, case-bound failed-init
+facts (case ID, status/counts, local cleanup flags and allowlisted panic locations)
+before the existing acceptance rejection. No raw output or private descriptor
+fields are exposed and acceptance criteria are unchanged. Both image-smoke jobs,
+Postgres and security checks passed in this run; managed qualification remains
+the release blocker.
+
+### Disposable Linux development reproduction
+
+A subsequent kernel-policy startup failure was isolated to deadline argument
+serialization, separate from process identity. Python float addition produced
+more than nine fractional digits; the native guard correctly rejected that
+grammar. A 200-invocation development probe reproduced 42 argument rejections,
+all exactly correlated with that excess precision. The controller now floors
+the original campaign deadline to nine decimal digits without extending or
+renewing it; native parser bounds are unchanged. This final correction has local
+regression coverage but has not yet been executed in a full native campaign.
+
+Development testing ended before all 13 product cases could be exercised. The
+original temporary environment was disposed of; no replacement or lifetime
+extension was used. Disposal does not repair failed attempts' unproved cleanup.
+Fresh final-source standard-runner qualification remains required.
+
+The intermittent HTTP identity failure was narrowed to `uid` alone: PID, PGID
+and birth matched on an exited/zombie process. A separate native probe confirmed
+Linux changes proc-file ownership to root at zombie transition while effective
+UID stays unchanged. Local readback now pins the process directory and validates
+the effective UID from bounded `status` alongside `stat`; all identity mismatch,
+signal authorization, zombie/reaping and cleanup checks remain strict. The first
+instrumented HTTP retry passed with its own cleanup; full sequential development
+verification and fresh final-source standard-runner qualification remain pending.
+
+CI run `43290591715` (head `b88493ea`) progressed past the corrected capability
+readback and coordinator teardown, then failed the first control. On the
+disposable development host, native tracing of a tiny synthetic script identified
+CPython's denied `ioctl(FIOCLEX)` as the file-launch failure; the narrow allowance
+only sets close-on-exec. The existing exhaustive native ioctl self-test and
+explicit FIONCLEX denial remain part of validation.
+
+Native development also exposed the successful-case teardown ordering issue:
+owned BPF detach now occurs only after independently proved init-only membership
+and listener closure, but before releasing the trusted wait-stop init. The
+corrected isolation control passed with its own cleanup proved. The deliberately
+killed before-start control additionally needed discard-only stdout to accept a
+bounded partial libtest prefix; stderr and product acceptance parsing remain
+unchanged. Before-start and descendant controls then passed with their own
+cleanup. A strict-provider attempt failed a schema check, followed by a passing
+development attempt; repeat testing is required, not assumed. No full managed
+product campaign or final-source release qualification is claimed by these
+instrumented, sequential development runs.
+
+A separately authorized native development environment reproduced the two
+remaining harness failures against source `8fd864c3` without a Rust rebuild.
+Docker's actual capability readback uses the `CAP_` spelling; the old exact
+comparison incorrectly rejected the correct executor capability set. The fix
+accepts only either complete spelling of the same exact three-capability set;
+mixed spellings, missing/extra capabilities and SYS_ADMIN remain rejected.
+
+Docker teardown also deletes the original cgroup before `cgroup.procs` can be
+reopened. Pre-opened `cgroup.procs`/`cgroup.events` return ENODEV; the pinned
+directory has a kernel deleted marker and the pinned pidfd reports exit. Native
+development checks of the corrected verifier accepted the actual Docker
+configuration, rejected an added capability, rejected cleanup while the init
+was alive, then proved pinned-cgroup deletion and owned container absence after
+stop. These are harness development regressions, **not** the 13 managed product
+cases and not release qualification. Fresh standard-runner CI remains required.
+
+Run `43282563873` (head `730d516d`) found a non-absolute mountinfo root with
+an absolute target; the coordinator pidfd was exited but its cgroup did not
+report zero links. Parsing now retains unrelated non-path roots while requiring
+an absolute, parent-free root for the selected source, preserving overlap and
+ownership checks. The missing cgroup is still not treated as cleanup proof.
+
+Run `43280331109` (head `077058c0`) identified the case-mount failure as
+`host-mount-path-invalid`; cgroup cleanup remained unproved. A subsequent
+diagnostic records only fixed path-invariant booleans and, when available,
+whether the pinned cgroup is unlinked and pidfd exited. These facts are not
+themselves a cleanup claim.
+
+Run `43277552509` (head `3b0693f6`) validated the executor descriptor and
+created its inputs, but failed during the case host mount. Coordinator cgroup
+cleanup again returned `resource-missing`. No managed-case acceptance or
+cleanup is claimed. Fixed, allowlisted host-mount diagnostics are pending.
+
+Run `43272021598` (head `89548c02`) validated the first coordinator frame and
+binding, then failed the first control with `case-or-cleanup-failed` and
+`coordinator-cleanup-unproved`. No case acceptance or cleanup is claimed.
+Closed stage and exception-class diagnostics were added to isolate both failures;
+no raw exception text is retained.
 
 - Tag/source: `adff2635fa38c82b84b04ebffbf76098f771def7`.
 - Image: `ghcr.io/231self/maskura/maskura:v0.7.33`.
@@ -500,3 +649,84 @@ storage-check backend. The owner separately approved that implementation and
 bounded fresh-runner execution, but all 13 managed cases remain unqualified and
 must actually pass before release. The expired Mac campaign remains closed,
 private schema expansion stays paused, and v0.7.33 remains untouched.
+
+## Verified native candidate pass (2026-11-12)
+
+CI run `43229853337` is fully green for PR head
+`9427e06fd72c062bf1ccfb0dfd657e6fdaa5cbb3`. Its actual receipts and images bind
+synthetic merge source `7c0890a03de6a630928848601569869dcbcc0cb4`, not that PR
+head. AMD64 job `131221966608` completed in 14m52s and ARM64 job `131221966588`
+in 17m49s. Each independently retained candidate receipt has exactly 31 passing
+expected rows and all seven cleanup facts true. The harness identity includes
+the relay source and matches the executed source. Both native protected-pipeline
+proof steps also succeeded.
+
+The candidate image IDs are
+`sha256:6dc2dee3c6e1933862f85ae0e6eb5bc30915eed1bc733c766de7b34e88ed6333`
+(AMD64) and
+`sha256:79a8dfe7fdc23136f0d6aa81a4e09f10a11cf3d59cf0fdd8de652e824e1e33ae`
+(ARM64). These are loaded candidate artifact identities, not published registry
+digests. Phase remains `candidate`, scope `packaged-filestore-core`, and
+`full_feedback_matrix_passed=false`. This closes the connector gap for that
+candidate source; it establishes neither published replay nor acceptance of the
+13 ignored managed cases. Final synchronized release source still needs fresh
+managed/native qualification and immutable published-digest verification.
+
+## First managed Linux run (2026-11-12)
+
+CI run `43237274215` executed the new required `managed-release` job against
+PR head `eb108d492478b4a4f50687898d6fa4c0b844e559` (receipt source is the run's
+merge revision `3ce93cfd892beb59bb57197c5c827137c846b8a6`). Every other job
+passed; the aggregate `check` correctly failed with it.
+
+The preparation phase **succeeded in ~6.5 minutes** inside its 20-minute cap:
+both native C guards compiled with `-Werror`, their `--self-test` suites passed
+on Linux (first actual native compilation), the Rust test artifact and Wasm
+components built at default runner parallelism, pinned images pulled, the
+runtime image built, and the `ld.so --list` ABI check passed. Admission,
+ownership and input-mount setup also passed: the runtime failure was the closed
+code `channel-eof` in under one second — the coordinator container's attach
+stream ended before its first frame, so zero managed cases ran and no cleanup
+or acceptance is claimed.
+
+The failed receipt retains `failure_category` plus (new) `adapter_exit`,
+`container_started` and `container_exit`; runtime stage labels and fixed
+coordinator/guard startup frames were added so a rerun localizes the empty
+stream to guard failure, coordinator startup phase, interpreter crash, adapter
+failure or a never-started container — all without exporting exception text,
+OCI errors, paths or plan contents. This is an instrumented fail-closed attempt,
+not qualification; all 13 cases remain unqualified.
+
+The instrumented rerun, CI run `43242973058`, again failed only
+`managed-release` (all other jobs passed). Its closed receipt gives the exact
+cause: `failure_category: "coordinator-arguments"`, `container_started: true`,
+`adapter_exit: 2`, `container_exit: 2` — preparation passed again (~6.5 min),
+admission and input mounts passed, the coordinator container started, and
+CPython exited 2 before writing a frame. That is either "can't open file" for
+`coordinator.py` or an interpreter-level argument rejection; argparse failures
+inside `main()` would now emit a frame and exit 11, so they are excluded. The
+next revision adds two independent closed kill-shots: exact
+`Config.Entrypoint`/`Config.Cmd` verification after `docker create`
+(`coordinator-entrypoint-unproved` catches a silently unapplied override), and
+a bounded fixed-marker classifier over the adapter's startup stderr
+(`coordinator-script-unopened`, `coordinator-argparse-uncaught`,
+`coordinator-interpreter-traceback`, `coordinator-interpreter-argv`,
+`coordinator-stderr-unclassified`, `coordinator-adapter-error`,
+`coordinator-runtime-error`). The classified bytes are discarded after mapping;
+only the enum enters step logs and receipts. Zero managed cases have run in
+either attempt; no cleanup or acceptance is claimed.
+
+Run `43249132962` (head `cdb3e11a675d`) confirmed the path: entrypoint
+verification passed, the container started, and stderr classified as
+`coordinator-script-unopened` — CPython could not open the main script. Run
+`43252978351` (head `10950d4f130d`) then split the question with a guarded
+prep-phase preflight: **the file opens fine in the exact runtime context**
+(`opened=True mode='444' uid=0 gid=0 dir_mode='555'`), yet the runtime
+coordinator still failed with `coordinator-script-policy` (Errno 1, EPERM).
+Since image, guard, seccomp profile and UID are identical, the difference must
+be one of the three runtime-only container elements: `--interactive`, the plan
+bind mount, or file-argument versus `-c` invocation. The next revision adds a
+mirror preflight that reproduces the exact runtime container during
+preparation and bisects across `no_interactive` and `no_plan_mount` variants,
+each bounded and reporting only closed outcome codes. Still zero managed cases
+run; release remains gated.

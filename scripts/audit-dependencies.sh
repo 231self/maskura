@@ -59,7 +59,14 @@ if grep -REn \
   exit 1
 fi
 
-if grep -nE '^FROM[[:space:]]+' Dockerfile Dockerfile.release \
+for dockerfile in Dockerfile Dockerfile.release Dockerfile.managed-tests; do
+  if [[ ! -f "$dockerfile" ]]; then
+    echo "error: required Dockerfile is missing" >&2
+    exit 1
+  fi
+done
+
+if grep -nE '^FROM[[:space:]]+' Dockerfile Dockerfile.release Dockerfile.managed-tests \
   | grep -Ev '@sha256:[0-9a-f]{64}([[:space:]]|$)'; then
   echo "error: Docker base images must use an immutable sha256 digest" >&2
   exit 1

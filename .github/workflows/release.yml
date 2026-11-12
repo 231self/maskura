@@ -43,11 +43,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 -B scripts/check-release-publication.py
 
+  managed-release:
+    needs: contract
+    permissions:
+      contents: read
+    uses: ./.github/workflows/managed-release.yml
+    with:
+      source_ref: ${{ github.sha }}
+
   # Native per-arch builds: amd64 on the x64 runner, arm64 on the native
   # arm64 runner. No cross-compilation, so ring/aws-lc-sys/openssl-sys build
   # against each runner's own native libs. Both legs run in parallel.
   build:
-    needs: contract
+    needs: [contract, managed-release]
     timeout-minutes: 90
     strategy:
       matrix:
