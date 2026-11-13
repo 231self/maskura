@@ -80,8 +80,9 @@ Versioning alone does not enforce create-only reservations, prevent authorized
 deletion, or provide object lock, retention policies or bucket IAM.
 
 [The delivery plan](../plans/2026-11-13-filestore-versioning.md) records the design
-gates and executed source-test evidence. Implementation is local and unreleased;
-packaged Linux/container qualification remains pending. Full S3 compatibility is
+gates, executed tests and published-image verification. Implementation shipped
+in v0.7.35; both native Linux images passed all 35 feedback cases before publication
+and during published-child replay. Full S3 compatibility is
 not claimed. This record extends the current-object and multipart contracts in
 ADRs [0012](0012-local-filesystem-object-storage.md),
 [0013](0013-durable-local-multipart-storage.md),

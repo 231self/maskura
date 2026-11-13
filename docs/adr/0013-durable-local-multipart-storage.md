@@ -84,7 +84,8 @@ object at the same key is not proof of completion.
 [ADR 0035](0035-proposed-filestore-object-versioning.md) extends proofs with
 the published S3 version ID. Recovery searches retained generations behind newer
 objects/markers; completion replay preserves the original ID without republishing.
-This extension is unreleased and awaits packaged qualification.
+This extension shipped in v0.7.35 with native packaged qualification and
+published-child replay on both Linux architectures.
 
 Run validation and reconciliation before serving traffic, followed by a
 bounded recurring cleanup and recovery worker. Multipart HTTP handlers and the

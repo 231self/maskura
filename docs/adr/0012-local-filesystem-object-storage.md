@@ -40,8 +40,8 @@ Add `FileStore`, enabled for explicit single-tenant deployments by
 - A gateway can be a standalone local S3 endpoint with a mounted volume and no
   MinIO, Postgres, or cloud credentials.
 - This is a single-node backend. It has no replication, lifecycle
-  rules, or bucket IAM. ADR 0035 adds opt-in local S3 versioning (unreleased,
-  packaged qualification pending). ADR 0013 adds durable multipart, an exclusive process
+  rules, or bucket IAM. ADR 0035 adds opt-in local S3 versioning, shipped and
+  natively qualified in v0.7.35. ADR 0013 adds durable multipart, an exclusive process
   lock, encrypted staging, and crash recovery without changing that boundary.
 - Orphaned temp files are removed at FileStore startup. A crash after a data-file
   rename but before its metadata commit can leave unreferenced data, but cannot

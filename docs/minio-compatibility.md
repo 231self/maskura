@@ -24,13 +24,14 @@ same change.
 | **Not implemented** | Recognized and rejected before dispatch with `501 NotImplemented`, without touching state. |
 | **Not routed** | No route exists for the request; it does not reach a handler. |
 
-## Unreleased FileStore versioning
+## FileStore versioning (v0.7.35)
 
-The following is implemented in source with passing selected regression suites. It is
-**not in v0.7.34 or any qualified published image**. Native packaged Linux
-qualification remains pending; see the [delivery evidence](plans/2026-11-13-filestore-versioning.md).
+The following ships in **v0.7.35 for Docker/FileStore only**. Both native Linux
+images passed all 35 source-bound feedback cases before publication and again
+against the published children, including four unmodified AWS CLI versioning
+cases. See the [delivery evidence](plans/2026-11-13-filestore-versioning.md).
 
-| Operation | Local source behavior | Evidence |
+| Operation | Local appliance behavior | Evidence |
 | --- | --- | --- |
 | Get/PutBucketVersioning | Durable Enabled/Suspended; never-versioned reads return an empty configuration. Strict bounded XML rejects MFA Delete/unsupported fields. | [Protocol units](../crates/gateway/src/server/s3_versioning.rs), [HTTP and unmodified SDK restart tests](../crates/gateway/tests/s3_frontdoor_test/versioning.rs) |
 | Versioned PUT and exact GET/HEAD | Retained versions and concrete IDs; exact reads preserve the selected metadata across restart. Existing protected read rules apply. | [Storage tests](../crates/gateway/src/file_store/versioning.rs), [HTTP/SDK tests](../crates/gateway/tests/s3_frontdoor_test/versioning.rs) |
@@ -65,7 +66,7 @@ There is no automatic history expiry, object lock or create-only write guarantee
 | ListMultipartUploads | `GET /{bucket}?uploads` | Supported | [`s3_multipart_conformance::sdk_multipart_abort_list_uploads_and_no_such_upload`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_multipart_conformance.rs) | In-progress uploads for the bucket. |
 | CopyObject | `PUT /{bucket}/{key}` + `x-amz-copy-source` | Not implemented | [`s3_protocol::s3_not_implemented_returns_501`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_protocol.rs), [`crates/gateway/src/server.rs`](https://github.com/231self/maskura/blob/main/crates/gateway/src/server.rs) (`x-amz-copy-source` pre-dispatch gate) | Rejected before the body is polled. |
 | UploadPartCopy | `PUT ?partNumber&uploadId` + `x-amz-copy-source` | Not implemented | [`crates/gateway/src/server.rs`](https://github.com/231self/maskura/blob/main/crates/gateway/src/server.rs) (`s3_upload_part` copy-source check) | Rejected before any part is stored. |
-| DeleteObjects (batch) | `POST /{bucket}?delete` | Supported | [`s3_frontdoor_test::filestore_batch_delete_answers_every_key_and_is_idempotent`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_frontdoor_test/batch_delete.rs) | Per-key `<Deleted>`/`<Error>` (N gated deletes, one usage receipt per key); ≤1000 keys / 128 KiB; `Quiet` supported; missing unversioned key → `<Deleted>`. Malformed, oversized or invalid Content-MD5 requests fail before mutation. The unreleased local extension above accepts `VersionId`; ordinary versioned retries create additional markers. |
+| DeleteObjects (batch) | `POST /{bucket}?delete` | Supported | [`s3_frontdoor_test::filestore_batch_delete_answers_every_key_and_is_idempotent`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_frontdoor_test/batch_delete.rs) | Per-key `<Deleted>`/`<Error>` (N gated deletes, one usage receipt per key); ≤1000 keys / 128 KiB; `Quiet` supported; missing unversioned key → `<Deleted>`. Malformed, oversized or invalid Content-MD5 requests fail before mutation. The local extension above accepts `VersionId`; ordinary versioned retries create additional markers. |
 | SelectObjectContent | `POST /{bucket}/{key}?select` | Not implemented | [`s3_protocol::s3_not_implemented_returns_501`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_protocol.rs), [`crates/gateway/src/server.rs`](https://github.com/231self/maskura/blob/main/crates/gateway/src/server.rs) (`select` subresource gate) | Rejected before dispatch. |
 
 ## Object metadata
@@ -84,7 +85,7 @@ cannot be reconstructed after it has already been lost; see
 [ADR 0013](adr/0013-durable-local-multipart-storage.md) and
 [ADR 0018](adr/0018-atomic-managed-write-finalization-and-recovery.md) for the
 snapshot and recovery contracts.
-The unreleased local versioning extension preserves the selected source's
+The local versioning extension preserves the selected source's
 `x-amz-version-id` on successful transformed GETs; it does not restore stored
 ETags/checksums, custom metadata, ranges or protected HEAD support.
 
@@ -112,9 +113,8 @@ by `just proof`; see [Run the claims](proofs.md).
 
 ## Limits
 
-Released-image versioning, create-only write and access-policy gaps are tracked
-in [Known S3 compatibility gaps](known-gaps.md). The unreleased versioning extension
-is limited to Docker/FileStore.
+Non-FileStore versioning, create-only writes and access-policy gaps are tracked
+in [Known S3 compatibility gaps](known-gaps.md). Versioning is limited to Docker/FileStore.
 
 The appliance is a single-node, byte-preserving local store, not a claim of full
 AWS S3 or historical MinIO feature parity. With no plugins configured (the
