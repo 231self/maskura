@@ -31,6 +31,7 @@ pub struct FileSinkTransaction {
     md5: Md5,
     output_verified: bool,
     finished: bool,
+    publication_started: bool,
     operation_id: Option<uuid::Uuid>,
     representation_headers: BTreeMap<String, String>,
     user_metadata: BTreeMap<String, String>,
@@ -78,6 +79,7 @@ impl FileSinkTransaction {
             md5: Md5::new(),
             output_verified: false,
             finished: false,
+            publication_started: false,
             operation_id: None,
             representation_headers: BTreeMap::new(),
             user_metadata: BTreeMap::new(),
@@ -143,6 +145,8 @@ impl ObjectSinkTransaction for FileSinkTransaction {
     fn commit_state(&self) -> SinkCommitState {
         if self.finished {
             SinkCommitState::Committed
+        } else if self.publication_started {
+            SinkCommitState::CommitUnknown
         } else {
             SinkCommitState::PreCommit
         }
@@ -204,7 +208,7 @@ impl ObjectSinkTransaction for FileSinkTransaction {
         drop(file);
 
         let etag = format!("\"{}\"", hex::encode(self.md5.clone().finalize()));
-        match &authority {
+        let version_id = match &authority {
             DestinationCommitAuthority::SinglePut => {
                 let metadata = MultipartStoredMetadata {
                     representation_headers: self.representation_headers.clone(),
@@ -212,7 +216,9 @@ impl ObjectSinkTransaction for FileSinkTransaction {
                     tags: self.tags.clone(),
                     checksum_algorithm: self.checksum_algorithm.clone(),
                 };
-                self.store
+                self.publication_started = true;
+                match self
+                    .store
                     .commit_temp_with_metadata(
                         &self.bucket,
                         &self.key,
@@ -223,7 +229,14 @@ impl ObjectSinkTransaction for FileSinkTransaction {
                         &metadata,
                     )
                     .await
-                    .map_err(file_error)?;
+                {
+                    Ok(version) => version,
+                    Err(error) => {
+                        self.publication_started =
+                            matches!(error, crate::file_store::FileStoreError::MutationUnknown(_));
+                        return Err(file_error(error));
+                    }
+                }
             }
             DestinationCommitAuthority::ClientMultipart(multipart) => {
                 let permit = &multipart.permit;
@@ -254,22 +267,34 @@ impl ObjectSinkTransaction for FileSinkTransaction {
                     .await
                     .map_err(file_error)?;
                 authority.validate(None, &self.bucket, &self.key).await?;
-                self.store
+                self.publication_started = true;
+                match self
+                    .store
                     .publish_transaction(&self.temp_path, &context, &etag)
                     .await
-                    .map_err(file_error)?;
+                {
+                    Ok(proof) => proof.version_id,
+                    Err(error) => {
+                        self.publication_started =
+                            matches!(error, crate::file_store::FileStoreError::MutationUnknown(_));
+                        return Err(file_error(error));
+                    }
+                }
             }
-        }
+        };
         self.finished = true;
         Ok(StoredObjectMeta {
             etag: Some(etag),
-            version_id: None,
+            version_id,
             superseded_version_ids: Vec::new(),
             version_history_complete: true,
         })
     }
 
     async fn abort(&mut self) -> Result<(), TransactionError> {
+        if self.publication_started && !self.finished {
+            return Err(TransactionError::CompletionAmbiguous);
+        }
         if self.finished {
             return Ok(());
         }

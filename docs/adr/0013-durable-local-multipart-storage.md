@@ -81,6 +81,11 @@ immutable commit receipts preserve exact proof across crashes, replacement,
 and deletion. Recovery requires exact operation identity; finding an arbitrary
 object at the same key is not proof of completion.
 
+[ADR 0035](0035-proposed-filestore-object-versioning.md) extends proofs with
+the published S3 version ID. Recovery searches retained generations behind newer
+objects/markers; completion replay preserves the original ID without republishing.
+This extension is unreleased and awaits packaged qualification.
+
 Run validation and reconciliation before serving traffic, followed by a
 bounded recurring cleanup and recovery worker. Multipart HTTP handlers and the
 transformation pipeline remain persistence-neutral.
@@ -101,7 +106,7 @@ transformation pipeline remain persistence-neutral.
   backends and gain reusable fenced-commit orchestration rather than FileStore
   branches in request handlers. Artifact reads become provider-neutral rather
   than exposing AWS SDK stream types in the shared trait.
-- This decision does not add replication, distributed locking, versioning,
+- This decision does not add replication, distributed locking,
   lifecycle policies, ACLs, or other advanced MinIO features.
 - Implementation details and crash-state requirements are specified in
   `docs/plans/2026-09-08-local-filesystem-multipart-phase-2.md`.

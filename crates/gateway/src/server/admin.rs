@@ -84,6 +84,11 @@ pub(crate) struct DeleteMcpTokenRequest {
 
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct S3Query {
+    pub(crate) versions: Option<String>,
+    #[serde(rename = "versionId")]
+    pub(crate) version_id: Option<String>,
+    #[serde(rename = "version-id-marker")]
+    pub(crate) version_id_marker: Option<String>,
     #[serde(rename = "uploads")]
     pub(crate) uploads: Option<String>,
     #[serde(rename = "uploadId")]

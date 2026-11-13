@@ -41,6 +41,7 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_release_image_smoke.py'
           python3 -m unittest discover -s tests -p 'test_release_proof.py'
           python3 -B -m unittest discover -s tests -p 'test_release_feedback.py'
+          python3 -B -m unittest discover -s tests -p 'test_release_versioning.py'
           python3 -B -m unittest discover -s tests -p 'test_release_relay.py'
           python3 -B -m unittest discover -s tests -p 'test_release_publication.py'
           python3 -B -m unittest discover -s tests -p 'test_managed_linux_*.py'
@@ -85,7 +86,11 @@ jobs:
           cargo test --locked -p maskura-gateway --test final_output_validation | tee "$log"
           grep -E '^test result: ok\. 23 passed; 0 failed; 0 ignored;' "$log"
       - name: Test
-        run: cargo test --locked --workspace
+        # Keep process-wide runtime/fixture admission tests isolated. Individual
+        # concurrency tests still exercise their own real concurrent operations.
+        run: cargo test --locked --workspace -- --test-threads=1
+      - name: Real FileStore disk-exhaustion qualification
+        run: bash scripts/test-filestore-enospc.sh
 
   sdk:
     runs-on: ubuntu-24.04

@@ -2,7 +2,9 @@
 
 SPDX-License-Identifier: Apache-2.0. These sources use the repository's Apache-2.0
 license. They are portable repository code with normal imports: no temp paths,
-AST inheritance, native-library attestation framework or external Python dependency.
+AST inheritance or native-library attestation framework. The versioning rows
+require the installed, unmodified AWS CLI; credentials are passed only through
+the isolated captured-child environment.
 
 ## Reviewed origins
 
@@ -36,7 +38,7 @@ AST inheritance, native-library attestation framework or external Python depende
 
 No predecessor source/evidence is changed or loaded at runtime by this package.
 
-## Scope: 29 core rows + 2 signed rows, NOT the full matrix
+## Scope: 29 core rows + 2 signed rows + 4 versioning SDK rows
 
 `release-feedback.py --execute` always uses the actual loaded image ID. There is
 no fake/mock transport option in the executable. The runner tests the packaged
@@ -77,15 +79,30 @@ AUTH_DISABLED, fake signatures, UNSIGNED streaming, TLS exemptions or test route
 The core-only oracle's historical `unimplemented` list is superseded **only for
 the narrow operations above after their actual execution succeeds**, not for signed
 multipart initiation or all request formats. A passing receipt requires
-exactly all 31 rows plus all cleanup facts; `full_feedback_matrix_passed=false`.
+exactly all 35 rows plus all cleanup facts; `full_feedback_matrix_passed=false`.
+
+The four `versioning.py` rows invoke the unmodified AWS CLI through the existing
+captured-child boundary: durable Enabled state and exact A/B GET/HEAD after
+restart (plus legacy null reads); multipart completion/replay behind an overwrite
+and restart without duplicate history; markers and Suspended/null replacement;
+and paired listing pagination, URL-encoded delimiter listing, same-key batch
+version deletion and empty-bucket deletion. They use a separate disposable bucket
+inside the same owned volume. CLI deadlines are 15s under the unchanged campaign
+clock, with 2s connect/8s read limits and one SDK attempt. The CLI resolves the
+current owned relay port on every call. No caller secrets, provider credentials,
+raw CLI output, object identities or content enter reports.
+Each SDK process also has a 128-block file-size limit (at most 128 KiB on the
+supported shells), so unexpected GET output cannot fill the host filesystem
+between periodic attempt-directory checks. The shell uses `exec`, retaining the
+existing captured-child process identity and cleanup rules.
 
 | Surface | Claim by this runner |
 |---|---|
-| Packaged FileStore core + signed rows | Qualified only if the actual image run passes |
+| Packaged FileStore core + signed + versioning SDK rows | Qualified only if the actual image run passes |
 | Signed multipart-initiation decoding/snapshot cleanup | Not exercised; only UploadPart is signed, with ordinary initiation |
 | Memory / direct S3 / managed / Postgres | Not exercised |
 | Protected pipeline / official encryption | Existing `prove-maskura.sh` remains a separate required gate |
-| Kill/crash process recovery / unmodified SDK / reporter environment | Not exercised by this runner |
+| Kill/crash process recovery / non-versioning unmodified SDK / reporter environment | Not exercised by this runner |
 | Full feedback matrix or 13 managed cases | Never claimed |
 
 No TEST component is installed. The image must contain exactly the fourteen regular

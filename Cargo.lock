@@ -2809,7 +2809,7 @@ dependencies = [
 
 [[package]]
 name = "maskura"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2835,7 +2835,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-customer-config"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -2845,14 +2845,14 @@ dependencies = [
 
 [[package]]
 name = "maskura-error"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "maskura-gateway"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "aes-gcm",
  "aes-siv",
@@ -2899,6 +2899,7 @@ dependencies = [
  "proptest",
  "prost",
  "psl",
+ "quick-xml",
  "rand 0.8.8",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
@@ -2930,7 +2931,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-mcp"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "anyhow",
  "axum",
@@ -2952,7 +2953,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-mcp-protocol"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "quick-xml",
  "schemars",
@@ -2963,7 +2964,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-pipeline-config"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "base64 0.23.1",
  "ciborium",
@@ -2983,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-crypto-deterministic"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "aes-siv",
  "base64 0.23.1",
@@ -2993,7 +2994,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-crypto-envelope"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "aes-gcm",
  "base64 0.23.1",
@@ -3010,7 +3011,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-filter-email"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "maskura-plugin-pii-core",
  "maskura-plugin-sdk",
@@ -3018,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-filter-payment-card"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "maskura-plugin-pii-core",
  "maskura-plugin-sdk",
@@ -3026,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-filter-pii"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "maskura-plugin-pii-core",
  "maskura-plugin-sdk",
@@ -3034,7 +3035,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-filter-ssn"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "maskura-plugin-pii-core",
  "maskura-plugin-sdk",
@@ -3042,7 +3043,7 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-pii-core"
-version = "0.7.34"
+version = "0.7.35"
 
 [[package]]
 name = "maskura-plugin-sdk"
@@ -3053,14 +3054,14 @@ dependencies = [
 
 [[package]]
 name = "maskura-plugin-transform-noop"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "maskura-plugin-sdk",
 ]
 
 [[package]]
 name = "maskura-policy"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "ciborium",
  "ed25519-dalek",
@@ -3073,28 +3074,28 @@ dependencies = [
 
 [[package]]
 name = "maskura-test-plugin-binary-reductor"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "wit-bindgen 0.61.1",
 ]
 
 [[package]]
 name = "maskura-test-plugin-transformer"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "maskura-plugin-sdk",
 ]
 
 [[package]]
 name = "maskura-test-plugin-transformer-context"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "maskura-plugin-sdk",
 ]
 
 [[package]]
 name = "maskura-wasm-runtime"
-version = "0.7.34"
+version = "0.7.35"
 dependencies = [
  "anyhow",
  "hex",
@@ -3941,9 +3942,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.18"
+version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
+checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -3963,9 +3964,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.5.15"
+version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
+checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
 dependencies = [
  "cfg_aliases",
  "libc",

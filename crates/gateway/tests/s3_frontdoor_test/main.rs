@@ -1333,3 +1333,4 @@ mod read_mandate;
 mod s3_metadata;
 mod sigv4;
 mod streaming;
+mod versioning;

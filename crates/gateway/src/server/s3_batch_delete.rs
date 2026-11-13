@@ -14,8 +14,8 @@
 //! The request body is parsed as the small DeleteObjects grammar only (no
 //! general XML resolver): DTDs, entity declarations, comments, and CDATA are
 //! rejected outright, and only XML's predefined and numeric character
-//! references are decoded. `VersionId`/MFA delete are rejected (versioning is
-//! an unsupported subresource).
+//! references are decoded. VersionId is supported only by the local FileStore;
+//! MFA delete remains unsupported.
 
 use super::*;
 
@@ -37,6 +37,7 @@ pub(crate) const MAX_DELETE_OBJECTS_XML_BYTES: usize = 128 * 1024;
 pub(crate) struct DeleteObjectsRequest {
     pub(crate) quiet: bool,
     pub(crate) keys: Vec<String>,
+    pub(crate) versions: Vec<Option<String>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -110,7 +111,7 @@ fn validate_delete_xml_attributes(rest: &str) -> Result<(), &'static str> {
 /// Strictly parse the small DeleteObjects grammar instead of using a general
 /// XML resolver. DTDs, comments, and CDATA are rejected outright (`<!`),
 /// self-closing elements are not allowed, and anything outside
-/// `<Delete>(<Quiet>|<Object><Key>…</Key></Object>)</Delete>` fails the whole
+/// `<Delete>(<Quiet>|<Object><Key>…</Key>[<VersionId>…</VersionId>]</Object>)</Delete>` fails the whole
 /// request before any key is touched.
 pub(crate) fn parse_delete_objects_xml(
     body: &[u8],
@@ -127,6 +128,8 @@ pub(crate) fn parse_delete_objects_xml(
     }
     let mut stack = Vec::<String>::new();
     let mut keys = Vec::<String>::new();
+    let mut versions = Vec::new();
+    let mut current_version: Option<String> = None;
     let mut quiet: Option<bool> = None;
     let mut current_key: Option<String> = None;
     let mut current_quiet_text: Option<String> = None;
@@ -154,6 +157,11 @@ pub(crate) fn parse_delete_objects_xml(
                     && let Some(text) = current_quiet_text.as_mut()
                 {
                     text.push_str(&decoded);
+                }
+            }
+            Some("VersionId") => {
+                if let Some(version) = current_version.as_mut() {
+                    version.push_str(&decode_delete_xml_text(raw_text)?);
                 }
             }
             _ => {
@@ -198,6 +206,11 @@ pub(crate) fn parse_delete_objects_xml(
                         .take()
                         .ok_or(DeleteObjectsXmlError::Malformed("Object is missing Key"))?;
                     keys.push(key);
+                    if let Some(id) = &current_version {
+                        crate::file_store::validate_version_id(id)
+                            .map_err(|_| DeleteObjectsXmlError::Malformed("invalid VersionId"))?;
+                    }
+                    versions.push(current_version.take());
                     if keys.len() > MAX_DELETE_OBJECTS_KEYS {
                         return Err(DeleteObjectsXmlError::TooManyKeys);
                     }
@@ -243,6 +256,7 @@ pub(crate) fn parse_delete_objects_xml(
             }
             (1, "Object") if stack.last().map(String::as_str) == Some("Delete") => {
                 current_key = None;
+                current_version = None;
                 current_quiet_text = None;
                 stack.push(name.to_string());
             }
@@ -256,6 +270,12 @@ pub(crate) fn parse_delete_objects_xml(
                     return Err(DeleteObjectsXmlError::Malformed(
                         "duplicate Key element in Object",
                     ));
+                }
+                stack.push(name.to_string());
+            }
+            (2, "VersionId") if stack.last().map(String::as_str) == Some("Object") => {
+                if current_version.replace(String::new()).is_some() {
+                    return Err(DeleteObjectsXmlError::Malformed("duplicate VersionId"));
                 }
                 stack.push(name.to_string());
             }
@@ -279,6 +299,7 @@ pub(crate) fn parse_delete_objects_xml(
     Ok(DeleteObjectsRequest {
         quiet: quiet.unwrap_or(false),
         keys,
+        versions,
     })
 }
 
@@ -286,7 +307,20 @@ pub(crate) fn parse_delete_objects_xml(
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BatchKeyOutcome {
     Deleted,
-    Failed { code: &'static str, message: String },
+    VersionDeleted {
+        requested: Option<String>,
+        marker: bool,
+        version_id: Option<String>,
+    },
+    VersionFailed {
+        version_id: String,
+        code: &'static str,
+        message: String,
+    },
+    Failed {
+        code: &'static str,
+        message: String,
+    },
 }
 
 /// Escape a value for element text in a DeleteObjects response document,
@@ -340,6 +374,38 @@ pub(crate) fn delete_objects_result_xml(
                     body.push_str("</Deleted>\n");
                 }
             }
+            BatchKeyOutcome::VersionDeleted {
+                requested,
+                marker,
+                version_id,
+            } => {
+                if !quiet {
+                    body.push_str("<Deleted>");
+                    push_delete_xml_element(&mut body, "Key", key);
+                    if let Some(version) = requested {
+                        push_delete_xml_element(&mut body, "VersionId", version);
+                    }
+                    if *marker {
+                        push_delete_xml_element(&mut body, "DeleteMarker", "true");
+                        if let Some(version) = version_id {
+                            push_delete_xml_element(&mut body, "DeleteMarkerVersionId", version);
+                        }
+                    }
+                    body.push_str("</Deleted>");
+                }
+            }
+            BatchKeyOutcome::VersionFailed {
+                version_id,
+                code,
+                message,
+            } => {
+                body.push_str("<Error>");
+                push_delete_xml_element(&mut body, "Key", key);
+                push_delete_xml_element(&mut body, "VersionId", version_id);
+                push_delete_xml_element(&mut body, "Code", code);
+                push_delete_xml_element(&mut body, "Message", message);
+                body.push_str("</Error>");
+            }
             BatchKeyOutcome::Failed { code, message } => {
                 body.push_str("  <Error>");
                 push_delete_xml_element(&mut body, "Key", key);
@@ -383,7 +449,8 @@ pub(crate) enum DeleteKeyFailure {
     /// The managed authoritative delete failed.
     ManagedDelete(ManagedDeleteError),
     /// The local file store delete failed.
-    FileStore(String),
+    FileStore(crate::file_store::FileStoreError),
+    UnsupportedVersion,
     /// The usage event for a completed delete could not be recorded.
     Metering(MeteringError),
     /// The usage reservation could not be released after a failed key.
@@ -400,6 +467,10 @@ impl DeleteKeyFailure {
             | Self::PresignedRejected(_)
             | Self::BackendResolution
             | Self::ManagedObserveDisabled => true,
+            Self::UnsupportedVersion => true,
+            Self::FileStore(error) => {
+                !matches!(error, crate::file_store::FileStoreError::MutationUnknown(_))
+            }
             Self::ManagedDelete(error) => matches!(error, ManagedDeleteError::PreCommit(_)),
             _ => false,
         }
@@ -433,7 +504,8 @@ impl DeleteKeyFailure {
             Self::ManagedDelete(_) => {
                 s3_error::internal_error(key, "The managed delete could not be completed.")
             }
-            Self::FileStore(detail) => s3_error::internal_error(key, &detail),
+            Self::FileStore(error) => super::s3_versioning::file_error_response(key, error),
+            Self::UnsupportedVersion => s3_error::not_implemented(key),
             Self::Metering(error) => metering_error_response(key, error),
             Self::ReleaseUnavailable => s3_error::service_unavailable(
                 key,
@@ -473,6 +545,14 @@ impl DeleteKeyFailure {
                 ),
             },
             Self::PresignedRejected(_) => ("AccessDenied", "Access Denied".to_string()),
+            Self::UnsupportedVersion => (
+                "NotImplemented",
+                "Version deletion is not supported for this backend.".into(),
+            ),
+            Self::FileStore(crate::file_store::FileStoreError::NoSuchBucket) => (
+                "NoSuchBucket",
+                "The specified bucket does not exist.".into(),
+            ),
             Self::PresignedStatus(_) | Self::PresignedTransport | Self::FileStore(_) => (
                 "InternalError",
                 "We encountered an internal error.".to_string(),
@@ -554,16 +634,18 @@ pub(crate) async fn delete_object_key(
     headers: &HeaderMap,
     bucket: &str,
     key: &str,
-) -> Result<(), DeleteKeyFailure> {
+    version: Option<&str>,
+) -> Result<crate::file_store::FileDeleteResult, DeleteKeyFailure> {
     let grant = authorize_delete_key(state, auth, bucket).await?;
     info!(
         operation_id = %grant.operation_id(),
         receipt_id = %grant.receipt_id(),
         "DELETE authorized"
     );
-    let failure = delete_authorized_object_key(state, auth, headers, bucket, key, &grant).await;
+    let failure =
+        delete_authorized_object_key(state, auth, headers, bucket, key, version, &grant).await;
     let failure = match failure {
-        Ok(()) => return Ok(()),
+        Ok(result) => return Ok(result),
         Err(failure) => failure,
     };
     Err(release_failed_key(state.control.as_ref(), &auth.context, &grant, failure).await)
@@ -590,14 +672,16 @@ pub(crate) async fn release_failed_key(
     failure
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn delete_authorized_object_key(
     state: &Arc<AppState>,
     auth: &Auth,
     headers: &HeaderMap,
     bucket: &str,
     key: &str,
+    version: Option<&str>,
     grant: &AuthorizationGrant,
-) -> Result<(), DeleteKeyFailure> {
+) -> Result<crate::file_store::FileDeleteResult, DeleteKeyFailure> {
     let mut selection = resolve_backend(state, auth, headers, StorageOperation::Delete)
         .await
         .map_err(|_| DeleteKeyFailure::BackendResolution)?;
@@ -622,6 +706,10 @@ pub(crate) async fn delete_authorized_object_key(
     if let Err(error) = crate::policy_gate::consume_policy(&policy, &selection.snapshot) {
         return Err(DeleteKeyFailure::Policy(error));
     }
+    if version.is_some() && !matches!(backend, ResolvedBackend::File(_)) {
+        return Err(DeleteKeyFailure::UnsupportedVersion);
+    }
+    let mut deleted = crate::file_store::FileDeleteResult::default();
     match backend {
         ResolvedBackend::PresignedHttp(url) => {
             let client = state
@@ -694,18 +782,20 @@ pub(crate) async fn delete_authorized_object_key(
                     "durable managed DELETE settlement remains pending"
                 );
             }
-            return Ok(());
+            return Ok(deleted);
         }
         ResolvedBackend::File(store) => {
-            if let Err(error) = store.delete(bucket, key).await {
-                return Err(DeleteKeyFailure::FileStore(error.to_string()));
-            }
+            deleted = store
+                .delete_version(bucket, key, version)
+                .await
+                .map_err(DeleteKeyFailure::FileStore)?;
         }
         ResolvedBackend::Memory(store) => {
             store.delete(bucket, key);
         }
     }
-    record_delete_usage(state, auth, grant).await
+    record_delete_usage(state, auth, grant).await?;
+    Ok(deleted)
 }
 
 /// Record the per-key usage receipt (`UsageRoute::DeleteObject`) after the
@@ -794,12 +884,34 @@ pub(crate) async fn s3_delete_objects(
         Err(error) => return error.response(&bucket),
     };
     let mut outcomes = Vec::with_capacity(request.keys.len());
-    for key in &request.keys {
-        let outcome = match delete_object_key(&state, &auth, &parts.headers, &bucket, key).await {
-            Ok(()) => BatchKeyOutcome::Deleted,
+    for (key, version) in request.keys.iter().zip(&request.versions) {
+        let outcome = match delete_object_key(
+            &state,
+            &auth,
+            &parts.headers,
+            &bucket,
+            key,
+            version.as_deref(),
+        )
+        .await
+        {
+            Ok(result) if result.version_id.is_some() => BatchKeyOutcome::VersionDeleted {
+                requested: version.clone(),
+                marker: result.delete_marker,
+                version_id: result.version_id,
+            },
+            Ok(_) => BatchKeyOutcome::Deleted,
             Err(failure) => {
                 let (code, message) = failure.entry();
-                BatchKeyOutcome::Failed { code, message }
+                if let Some(version_id) = version {
+                    BatchKeyOutcome::VersionFailed {
+                        version_id: version_id.clone(),
+                        code,
+                        message,
+                    }
+                } else {
+                    BatchKeyOutcome::Failed { code, message }
+                }
             }
         };
         outcomes.push((key.clone(), outcome));
@@ -916,14 +1028,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_versioned_and_mfa_delete_shapes() {
+    fn rejects_invalid_version_ids_and_mfa_delete_shapes() {
         for body in [
             "<Delete><Object><Key>k</Key><VersionId>v</VersionId></Object></Delete>",
             "<Delete><Object><Key>k</Key></Object><MFA>true</MFA></Delete>",
             "<Delete><Object><VersionId>v</VersionId></Object></Delete>",
+            "<Delete><Object><Key>k</Key><VersionId></VersionId></Object></Delete>",
+            "<Delete><Object><Key>k</Key><VersionId>null</VersionId><VersionId>null</VersionId></Object></Delete>",
         ] {
             assert!(parse(body).is_err(), "expected {body:?} to be rejected");
         }
+    }
+
+    #[test]
+    fn parses_distinct_versions_of_one_key_and_an_ordinary_delete() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let request = parse(&format!(
+            "<Delete><Object><Key>k</Key><VersionId>{id}</VersionId></Object><Object><VersionId>null</VersionId><Key>k</Key></Object><Object><Key>k</Key></Object></Delete>"
+        )).unwrap();
+        assert_eq!(request.keys, ["k", "k", "k"]);
+        assert_eq!(request.versions, [Some(id), Some("null".into()), None]);
     }
 
     #[test]

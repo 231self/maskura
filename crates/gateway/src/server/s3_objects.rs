@@ -127,6 +127,8 @@ pub(crate) fn backend_resolution_error_response(key: &str) -> axum::response::Re
 
 #[derive(Debug)]
 pub(crate) enum OpenObjectError {
+    FileVersion(crate::file_store::FileStoreError),
+    UnsupportedVersion,
     NotFound,
     InvalidRange { object_length: u64 },
     Rejected(String),
@@ -183,6 +185,10 @@ pub(crate) fn open_error_response(
     error: OpenObjectError,
 ) -> axum::response::Response {
     match error {
+        OpenObjectError::FileVersion(error) => {
+            super::s3_versioning::file_error_response(key, error)
+        }
+        OpenObjectError::UnsupportedVersion => s3_error::not_implemented(key),
         OpenObjectError::NotFound => s3_error::no_such_key(key),
         OpenObjectError::InvalidRange { object_length } => {
             s3_error::invalid_range(key, object_length)
@@ -597,6 +603,7 @@ pub(crate) fn apply_file_stored_headers(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_backend_object(
     state: &AppState,
     backend: ResolvedBackend,
@@ -604,8 +611,12 @@ pub(crate) async fn open_backend_object(
     bucket: &str,
     key: &str,
     headers: &HeaderMap,
+    version: Option<&str>,
     head_only: bool,
 ) -> Result<OpenedObject, OpenObjectError> {
+    if version.is_some() && !matches!(&backend, ResolvedBackend::File(_)) {
+        return Err(OpenObjectError::UnsupportedVersion);
+    }
     let range = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok());
@@ -733,9 +744,9 @@ pub(crate) async fn open_backend_object(
         ResolvedBackend::File(store) => {
             if head_only {
                 let stored = store
-                    .stored_meta(bucket, key)
+                    .stored_meta_version(bucket, key, version)
                     .await
-                    .map_err(|error| OpenObjectError::Backend(error.to_string()))?
+                    .map_err(OpenObjectError::FileVersion)?
                     .ok_or(OpenObjectError::NotFound)?;
                 let mut metadata = ObjectMetadata::default();
                 metadata.insert(header::CONTENT_LENGTH, stored.size.to_string());
@@ -752,6 +763,10 @@ pub(crate) async fn open_backend_object(
                     &stored.tags,
                     stored.checksum.as_ref(),
                 );
+                if let Some(version) = stored.version_id {
+                    metadata.insert(HeaderName::from_static("x-amz-version-id"), &version);
+                    metadata.version_id = Some(version);
+                }
                 return Ok(OpenedObject::new(
                     StatusCode::OK,
                     metadata,
@@ -760,9 +775,9 @@ pub(crate) async fn open_backend_object(
                 ));
             }
             let object = store
-                .open(bucket, key)
+                .open_version(bucket, key, version)
                 .await
-                .map_err(|error| OpenObjectError::Backend(error.to_string()))?
+                .map_err(OpenObjectError::FileVersion)?
                 .ok_or(OpenObjectError::NotFound)?;
             let selected = parse_byte_range(object.object_length, range)?;
             let mut metadata = ObjectMetadata::default();
@@ -780,6 +795,10 @@ pub(crate) async fn open_backend_object(
                 &object.tags,
                 object.checksum.as_ref(),
             );
+            if let Some(version) = &object.version_id {
+                metadata.insert(HeaderName::from_static("x-amz-version-id"), version);
+                metadata.version_id = Some(version.clone());
+            }
             let object = object
                 .into_range(selected.start, selected.length)
                 .await
@@ -2162,6 +2181,7 @@ pub(crate) async fn s3_get(
             &bucket,
             &key,
             &headers,
+            params.version_id.as_deref(),
             true,
         )
         .await
@@ -2225,6 +2245,7 @@ pub(crate) async fn s3_get(
                 &bucket,
                 &key,
                 &headers,
+                params.version_id.as_deref(),
                 false,
             )
             .await
@@ -2234,7 +2255,8 @@ pub(crate) async fn s3_get(
             };
             let source_bytes = content_length(&object.metadata.headers);
             let response_metadata = object.metadata.clone();
-            let (response, completed_source_bytes) = lance_transformed_read_response(
+            let version_id = response_metadata.version_id.clone();
+            let (mut response, completed_source_bytes) = lance_transformed_read_response(
                 &state,
                 &auth,
                 &headers,
@@ -2243,6 +2265,7 @@ pub(crate) async fn s3_get(
                 &key,
             )
             .await;
+            super::s3_versioning::apply_read_version(&mut response, backend, version_id.as_deref());
             return metered_read_response(
                 state.control.clone(),
                 &auth,
@@ -2273,6 +2296,7 @@ pub(crate) async fn s3_get(
                 &bucket,
                 &key,
                 &headers,
+                params.version_id.as_deref(),
                 false,
             )
             .await
@@ -2282,7 +2306,8 @@ pub(crate) async fn s3_get(
             };
             let source_bytes = content_length(&object.metadata.headers);
             let response_metadata = object.metadata.clone();
-            let (response, completed_source_bytes) = avro_transformed_read_response(
+            let version_id = response_metadata.version_id.clone();
+            let (mut response, completed_source_bytes) = avro_transformed_read_response(
                 &state,
                 &auth,
                 &headers,
@@ -2291,6 +2316,7 @@ pub(crate) async fn s3_get(
                 &key,
             )
             .await;
+            super::s3_versioning::apply_read_version(&mut response, backend, version_id.as_deref());
             return metered_read_response(
                 state.control.clone(),
                 &auth,
@@ -2322,6 +2348,7 @@ pub(crate) async fn s3_get(
             &bucket,
             &key,
             &headers,
+            params.version_id.as_deref(),
             false,
         )
         .await
@@ -2385,8 +2412,9 @@ pub(crate) async fn s3_get(
         }
         let source_bytes = content_length(&object.metadata.headers);
         let response_metadata = object.metadata.clone();
+        let version_id = response_metadata.version_id.clone();
         let mut pipeline_evidence = None;
-        let (response, completed_source_bytes, direct) = transformed_read_response(
+        let (mut response, completed_source_bytes, direct) = transformed_read_response(
             &state,
             &auth,
             operation,
@@ -2401,6 +2429,7 @@ pub(crate) async fn s3_get(
             &mut pipeline_evidence,
         )
         .await;
+        super::s3_versioning::apply_read_version(&mut response, backend, version_id.as_deref());
         if direct {
             return response;
         }
@@ -2435,6 +2464,7 @@ pub(crate) async fn s3_get(
         &bucket,
         &key,
         &headers,
+        params.version_id.as_deref(),
         false,
     )
     .await
@@ -2478,6 +2508,7 @@ pub(crate) async fn s3_get(
 pub(crate) async fn s3_head(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<S3Query>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -2623,6 +2654,7 @@ pub(crate) async fn s3_head(
         &bucket,
         &key,
         &headers,
+        params.version_id.as_deref(),
         true,
     )
     .await
@@ -2948,8 +2980,18 @@ pub(crate) async fn s3_delete(
         };
     }
 
-    match delete_authorized_object_key(&state, &auth, &headers, &bucket, &key, &grant).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    match delete_authorized_object_key(
+        &state,
+        &auth,
+        &headers,
+        &bucket,
+        &key,
+        params.version_id.as_deref(),
+        &grant,
+    )
+    .await
+    {
+        Ok(result) => super::s3_versioning::delete_response(result),
         Err(failure) => release_failed_key(state.control.as_ref(), &auth.context, &grant, failure)
             .await
             .response(&bucket, &key),
@@ -3687,6 +3729,35 @@ pub(crate) async fn s3_list_objects(
     }
     if params.uploads.is_some() {
         let response = list_multipart_uploads_response(&state, &auth, &bucket, &params).await;
+        if !response.status().is_success() {
+            return release_failure(
+                state.control.as_ref(),
+                &auth.context,
+                &grant,
+                &bucket,
+                response,
+            )
+            .await;
+        }
+        if let Err(response) = record_operation(
+            state.control.clone(),
+            &auth.context,
+            OperationUsage {
+                grant: &grant,
+                source_bytes: 0,
+                output_bytes: 0,
+            },
+            &bucket,
+        )
+        .await
+        {
+            return response;
+        }
+        return response;
+    }
+    if params.versions.is_some() {
+        let response =
+            super::s3_versioning::list_versions_response(backend, &bucket, &params).await;
         if !response.status().is_success() {
             return release_failure(
                 state.control.as_ref(),

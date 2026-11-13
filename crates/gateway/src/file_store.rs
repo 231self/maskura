@@ -12,14 +12,32 @@ use tokio::sync::Mutex;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::filesystem_persistence::{FilesystemPersistence, PersistenceError};
+use crate::filesystem_persistence::{FilesystemPersistence, PersistenceError, RootLock};
 use crate::store::StoredObject;
+
+mod versioning;
+pub(crate) use versioning::validate_version_id;
+pub use versioning::{FileDeleteResult, FileVersion, FileVersioning};
 
 const FILE_OBJECT_METADATA_VERSION: u32 = 2;
 const LOCAL_COMMIT_PROOF_VERSION: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FileStoreError {
+    #[error("local storage bucket does not exist")]
+    NoSuchBucket,
+    #[error("invalid local version selector")]
+    InvalidVersion,
+    #[error("the specified version does not exist")]
+    NoSuchVersion,
+    #[error("the selected version is a delete marker")]
+    DeleteMarker {
+        version_id: String,
+        explicit: bool,
+        last_modified_ms: i64,
+    },
+    #[error("local object version metadata capacity exceeded")]
+    HistoryFull,
     #[error("local storage bucket is invalid")]
     InvalidBucket,
     #[error("local storage object key is invalid")]
@@ -65,6 +83,8 @@ struct FileObjectMetadata {
     generation_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     completion_fence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -79,6 +99,7 @@ pub struct LocalChecksumState {
 /// metadata without reopening the metadata file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileStoredMeta {
+    pub version_id: Option<String>,
     pub size: u64,
     pub content_type: String,
     pub etag: String,
@@ -130,6 +151,8 @@ pub struct CommittedLocalCommitProof {
     pub prepared: PreparedLocalCommitProof,
     pub data_file: String,
     pub etag: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -150,6 +173,7 @@ pub enum LocalCommitProbe {
 
 #[derive(Debug)]
 pub struct FileObjectReader<R> {
+    pub version_id: Option<String>,
     pub reader: R,
     pub object_length: u64,
     pub content_type: String,
@@ -169,6 +193,7 @@ impl FileObjectReader<File> {
     ) -> Result<FileObjectReader<Take<File>>, FileStoreError> {
         self.reader.seek(SeekFrom::Start(start)).await?;
         Ok(FileObjectReader {
+            version_id: self.version_id,
             reader: self.reader.take(length),
             object_length: self.object_length,
             content_type: self.content_type,
@@ -188,11 +213,14 @@ impl FileObjectReader<File> {
 /// A completed metadata rename is therefore the visibility commit: readers see
 /// either the previous object version or the new complete version, never a
 /// partially-written file.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FileStore {
     root: PathBuf,
     mutation_lock: Arc<Mutex<()>>,
     persistence: FilesystemPersistence,
+    // Every owned publication clone must retain process-level ownership, even
+    // if its caller and the surrounding local runtime have already been dropped.
+    _root_lock: Option<Arc<RootLock>>,
 }
 
 impl FileStore {
@@ -202,14 +230,20 @@ impl FileStore {
     /// startup must use `LocalStorageRuntime`, which holds the root lock before
     /// this store creates directories or removes stale temporary files.
     pub async fn new(root: PathBuf) -> Result<Self, FileStoreError> {
-        Self::initialize(root).await
+        Self::initialize(root, None).await
     }
 
-    pub(crate) async fn open_locked(root: PathBuf) -> Result<Self, FileStoreError> {
-        Self::initialize(root).await
+    pub(crate) async fn open_locked(
+        root: PathBuf,
+        root_lock: Arc<RootLock>,
+    ) -> Result<Self, FileStoreError> {
+        Self::initialize(root, Some(root_lock)).await
     }
 
-    async fn initialize(root: PathBuf) -> Result<Self, FileStoreError> {
+    async fn initialize(
+        root: PathBuf,
+        root_lock: Option<Arc<RootLock>>,
+    ) -> Result<Self, FileStoreError> {
         fs::create_dir_all(root.join("buckets")).await?;
         let metadata = fs::metadata(&root).await?;
         if !metadata.is_dir() {
@@ -222,7 +256,9 @@ impl FileStore {
             root,
             mutation_lock: Arc::new(Mutex::new(())),
             persistence: FilesystemPersistence::default(),
+            _root_lock: root_lock,
         };
+        store.validate_version_state().await?;
         store.remove_stale_temps().await?;
         Ok(store)
     }
@@ -335,38 +371,15 @@ impl FileStore {
         bucket: &str,
         key: &str,
     ) -> Result<Option<FileStoredMeta>, FileStoreError> {
-        Ok(self
-            .load_metadata(bucket, key)
-            .await?
-            .map(|metadata| FileStoredMeta {
-                size: metadata.size,
-                content_type: metadata.content_type,
-                etag: metadata.etag,
-                last_modified_ms: metadata.last_modified_ms,
-                representation_headers: metadata.representation_headers,
-                user_metadata: metadata.user_metadata,
-                tags: metadata.tags,
-                checksum: metadata.checksum,
-            }))
+        self.stored_meta_version(bucket, key, None).await
     }
 
     pub async fn delete(&self, bucket: &str, key: &str) -> Result<bool, FileStoreError> {
-        let _guard = self.mutation_lock.lock().await;
-        let Some(metadata) = self.load_metadata(bucket, key).await? else {
-            return Ok(false);
-        };
-        self.backfill_metadata_proof(bucket, &metadata).await?;
-        let metadata_path = self.metadata_path(bucket, key)?;
-        fs::remove_file(metadata_path).await?;
-        if let Err(error) = fs::remove_file(self.data_path(bucket, &metadata.data_file)?).await
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(
-                error_kind = ?error.kind(),
-                "local storage left an unreferenced object file"
-            );
+        match self.delete_version(bucket, key, None).await {
+            Ok(result) => Ok(result.existed),
+            Err(FileStoreError::NoSuchBucket) => Ok(false),
+            Err(error) => Err(error),
         }
-        Ok(true)
     }
 
     pub async fn list_keys(&self) -> Result<Vec<String>, FileStoreError> {
@@ -431,7 +444,9 @@ impl FileStore {
             {
                 continue;
             }
-            let metadata = read_metadata_file(&entry.path()).await?;
+            let Some(metadata) = versioning::latest_metadata(&entry.path()).await? else {
+                continue;
+            };
             validate_key(&metadata.key)?;
             objects.push((
                 metadata.key,
@@ -475,16 +490,18 @@ impl FileStore {
             if !entry.file_type().await?.is_file() {
                 continue;
             }
-            found_object = true;
             if entry
                 .path()
                 .extension()
                 .is_none_or(|extension| extension != "json")
             {
+                found_object = true;
                 continue;
             }
-            let metadata = read_metadata_file(&entry.path()).await?;
-            self.backfill_metadata_proof(bucket, &metadata).await?;
+            found_object |= versioning::has_versions(&entry.path()).await?;
+            for metadata in versioning::retained_metadata(&entry.path()).await? {
+                self.backfill_metadata_proof(bucket, &metadata).await?;
+            }
         }
         if found_object {
             return Err(FileStoreError::BucketNotEmpty);
@@ -530,6 +547,7 @@ impl FileStore {
             &Default::default(),
         )
         .await
+        .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -542,12 +560,51 @@ impl FileStore {
         size: u64,
         etag: &str,
         stored: &crate::transaction::MultipartStoredMetadata,
-    ) -> Result<(), FileStoreError> {
+    ) -> Result<Option<String>, FileStoreError> {
+        let store = self.clone();
+        let (bucket, key, temp_path, content_type, etag, stored) = (
+            bucket.to_owned(),
+            key.to_owned(),
+            temp_path.to_owned(),
+            content_type.to_owned(),
+            etag.to_owned(),
+            stored.clone(),
+        );
+        versioning::joined(
+            tokio::spawn(async move {
+                store
+                    .commit_temp_inner(
+                        &bucket,
+                        &key,
+                        &temp_path,
+                        &content_type,
+                        size,
+                        &etag,
+                        &stored,
+                    )
+                    .await
+            })
+            .await,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_temp_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        temp_path: &Path,
+        content_type: &str,
+        size: u64,
+        etag: &str,
+        stored: &crate::transaction::MultipartStoredMetadata,
+    ) -> Result<Option<String>, FileStoreError> {
         let _guard = self.mutation_lock.lock().await;
         self.ensure_bucket_layout(bucket).await?;
         validate_key(key)?;
 
         let metadata_path = self.metadata_path(bucket, key)?;
+        let versioning = self.versioning(bucket).await?;
         let previous = self.load_metadata(bucket, key).await?;
         if let Some(previous) = previous.as_ref() {
             self.backfill_metadata_proof(bucket, previous).await?;
@@ -573,7 +630,14 @@ impl FileStore {
             operation_id: None,
             generation_id: None,
             completion_fence: None,
+            version_id: None,
         };
+        if versioning != FileVersioning::Unversioned {
+            return Ok(self
+                .publish_version(bucket, metadata, versioning)
+                .await?
+                .version_id);
+        }
         write_metadata_atomically(&metadata_path, &metadata, false).await?;
 
         if let Some(previous) = previous
@@ -585,7 +649,7 @@ impl FileStore {
                 "local storage left an unreferenced object file"
             );
         }
-        Ok(())
+        Ok(None)
     }
 
     pub async fn prepare_transaction(
@@ -616,8 +680,25 @@ impl FileStore {
         context: &LocalCommitContext,
         etag: &str,
     ) -> Result<CommittedLocalCommitProof, FileStoreError> {
+        let store = self.clone();
+        let (temp_path, context, etag) = (temp_path.to_owned(), context.clone(), etag.to_owned());
+        versioning::joined(
+            tokio::spawn(async move {
+                store
+                    .publish_transaction_inner(&temp_path, &context, &etag)
+                    .await
+            })
+            .await,
+        )
+    }
+
+    async fn publish_transaction_inner(
+        &self,
+        temp_path: &Path,
+        context: &LocalCommitContext,
+        etag: &str,
+    ) -> Result<CommittedLocalCommitProof, FileStoreError> {
         validate_commit_context(context)?;
-        verify_transaction_temp(temp_path, context).await?;
         let _guard = self.mutation_lock.lock().await;
         let prepared = PreparedLocalCommitProof::from(context);
         match self.load_commit_proof(context.operation_id).await? {
@@ -627,8 +708,28 @@ impl FileStore {
             }
             _ => return Err(FileStoreError::CommitProofMismatch),
         }
+        if let Some(metadata) = self
+            .generation_metadata(
+                &context.bucket,
+                &context.key,
+                context.operation_id,
+                context.generation_id,
+            )
+            .await?
+        {
+            let proof = committed_proof(&metadata, prepared)?;
+            self.write_commit_proof(
+                &self.commit_proof_path(context.operation_id),
+                &LocalCommitProof::Committed(proof.clone()),
+            )
+            .await
+            .map_err(|error| FileStoreError::MutationUnknown(error.to_string()))?;
+            return Ok(proof);
+        }
+        verify_transaction_temp(temp_path, context).await?;
 
         self.ensure_bucket_layout(&context.bucket).await?;
+        let versioning = self.versioning(&context.bucket).await?;
         let previous = self.load_metadata(&context.bucket, &context.key).await?;
         if let Some(previous) = previous.as_ref() {
             self.backfill_metadata_proof(&context.bucket, previous)
@@ -657,13 +758,20 @@ impl FileStore {
             operation_id: Some(context.operation_id),
             generation_id: Some(context.generation_id),
             completion_fence: Some(context.completion_fence),
+            version_id: None,
         };
-        write_metadata_atomically(
-            &self.metadata_path(&context.bucket, &context.key)?,
-            &metadata,
-            true,
-        )
-        .await?;
+        let metadata = if versioning != FileVersioning::Unversioned {
+            self.publish_version(&context.bucket, metadata, versioning)
+                .await?
+        } else {
+            write_metadata_atomically(
+                &self.metadata_path(&context.bucket, &context.key)?,
+                &metadata,
+                true,
+            )
+            .await?;
+            metadata
+        };
 
         let committed = committed_proof(&metadata, prepared)?;
         if let Err(error) = self
@@ -676,7 +784,8 @@ impl FileStore {
             return Err(FileStoreError::MutationUnknown(error.to_string()));
         }
 
-        if let Some(previous) = previous
+        if versioning == FileVersioning::Unversioned
+            && let Some(previous) = previous
             && previous.data_file != data_file
             && let Err(error) =
                 fs::remove_file(self.data_path(&context.bucket, &previous.data_file)?).await
@@ -712,7 +821,15 @@ impl FileStore {
                 if prepared.generation_id != generation_id {
                     return Ok(LocalCommitProbe::Mismatch);
                 }
-                match self.load_metadata(&prepared.bucket, &prepared.key).await? {
+                match self
+                    .generation_metadata(
+                        &prepared.bucket,
+                        &prepared.key,
+                        operation_id,
+                        generation_id,
+                    )
+                    .await?
+                {
                     Some(metadata)
                         if metadata.operation_id == Some(operation_id)
                             && metadata.generation_id == Some(generation_id) =>
@@ -737,6 +854,23 @@ impl FileStore {
     ) -> Result<Option<CommittedLocalCommitProof>, FileStoreError> {
         let _guard = self.mutation_lock.lock().await;
         let Some(metadata) = self.load_metadata(bucket, key).await? else {
+            return Ok(None);
+        };
+        self.backfill_metadata_proof(bucket, &metadata).await
+    }
+
+    pub(crate) async fn backfill_generation_proof(
+        &self,
+        bucket: &str,
+        key: &str,
+        operation: Uuid,
+        generation: Uuid,
+    ) -> Result<Option<CommittedLocalCommitProof>, FileStoreError> {
+        let _guard = self.mutation_lock.lock().await;
+        let Some(metadata) = self
+            .generation_metadata(bucket, key, operation, generation)
+            .await?
+        else {
             return Ok(None);
         };
         self.backfill_metadata_proof(bucket, &metadata).await
@@ -775,15 +909,7 @@ impl FileStore {
 
     /// Repairs exact proofs for all currently visible transactional objects.
     pub(crate) async fn backfill_current_commit_proofs(&self) -> Result<usize, FileStoreError> {
-        let mut repaired = 0;
-        for bucket in self.list_buckets().await? {
-            for (key, _, _, _) in self.list_objects(&bucket).await? {
-                if self.backfill_commit_proof(&bucket, &key).await?.is_some() {
-                    repaired += 1;
-                }
-            }
-        }
-        Ok(repaired)
+        self.backfill_retained_proofs().await
     }
 
     pub async fn retire_commit_proof(
@@ -860,8 +986,8 @@ impl FileStore {
         key: &str,
     ) -> Result<Option<FileObjectMetadata>, FileStoreError> {
         let path = self.metadata_path(bucket, key)?;
-        match read_metadata_file(&path).await {
-            Ok(metadata) => {
+        match versioning::latest_metadata(&path).await {
+            Ok(Some(metadata)) => {
                 if !(1..=FILE_OBJECT_METADATA_VERSION).contains(&metadata.schema_version) {
                     return Err(FileStoreError::CorruptMetadata(format!(
                         "unsupported metadata schema version {}",
@@ -875,6 +1001,7 @@ impl FileStore {
                 }
                 Ok(Some(metadata))
             }
+            Ok(None) => Ok(None),
             Err(FileStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 Ok(None)
             }
@@ -882,6 +1009,8 @@ impl FileStore {
         }
     }
 
+    // Legacy latest-only callers retain bounded race recovery. Exact-version
+    // requests instead use open_version's locked selection and never fall back.
     async fn open_metadata(
         &self,
         bucket: &str,
@@ -899,16 +1028,16 @@ impl FileStore {
                         metadata = refreshed;
                         continue;
                     }
-                    return Err(FileStoreError::CorruptMetadata(format!(
-                        "metadata for {bucket}/{key} points to missing content"
-                    )));
+                    return Err(FileStoreError::CorruptMetadata(
+                        "current object content is missing".into(),
+                    ));
                 }
                 Err(error) => return Err(error.into()),
             };
             if file.metadata().await?.len() != metadata.size {
-                return Err(FileStoreError::CorruptMetadata(format!(
-                    "metadata size mismatch for {bucket}/{key}"
-                )));
+                return Err(FileStoreError::CorruptMetadata(
+                    "current object size mismatch".into(),
+                ));
             }
             return Ok(Some(FileObjectReader {
                 reader: file,
@@ -920,9 +1049,10 @@ impl FileStore {
                 user_metadata: metadata.user_metadata,
                 tags: metadata.tags,
                 checksum: metadata.checksum,
+                version_id: metadata.version_id,
             }));
         }
-        unreachable!("file open retry loop always returns")
+        unreachable!("bounded open loop always returns")
     }
 
     async fn remove_stale_temps(&self) -> Result<(), FileStoreError> {
@@ -1001,10 +1131,14 @@ impl FileStore {
         let path = path.to_path_buf();
         let proof = proof.clone();
         let persistence = self.persistence.clone();
-        tokio::task::spawn_blocking(move || persistence.atomic_write_snapshot(&path, 0, &proof))
-            .await
-            .map_err(|error| FileStoreError::Io(std::io::Error::other(error)))?
-            .map_err(persistence_error)
+        let root_lock = self._root_lock.clone();
+        tokio::task::spawn_blocking(move || {
+            let _root_lock = root_lock;
+            persistence.atomic_write_snapshot(&path, 0, &proof)
+        })
+        .await
+        .map_err(|error| FileStoreError::Io(std::io::Error::other(error)))?
+        .map_err(persistence_error)
     }
 
     async fn backfill_metadata_proof(
@@ -1110,6 +1244,7 @@ fn committed_proof(
         prepared,
         data_file: metadata.data_file.clone(),
         etag: metadata.etag.clone(),
+        version_id: metadata.version_id.clone(),
     })
 }
 
@@ -1202,11 +1337,6 @@ fn validate_key(key: &str) -> Result<(), FileStoreError> {
 
 fn key_hash(key: &str) -> String {
     hex::encode(Sha256::digest(key.as_bytes()))
-}
-
-async fn read_metadata_file(path: &Path) -> Result<FileObjectMetadata, FileStoreError> {
-    let bytes = fs::read(path).await?;
-    Ok(serde_json::from_slice(&bytes)?)
 }
 
 async fn write_metadata_atomically(

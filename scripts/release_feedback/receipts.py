@@ -9,13 +9,16 @@ import stat
 from pathlib import Path
 from .cases import IMPLEMENTED
 from .signed_cases import SIGNED_CASES
+from .versioning import VERSIONING_CASES
 from .image import strict_json
 
 SCOPE = 'packaged-filestore-core'
 PHASES = ('candidate', 'native-child', 'published-replay')
-EXCLUSIONS = ('memory', 'direct-s3', 'managed', 'postgres', 'protected-pipeline', 'process-recovery', 'unmodified-sdk', 'reporter-environment',
+EXCLUSIONS = ('memory', 'direct-s3', 'managed', 'postgres', 'protected-pipeline', 'process-recovery', 'unmodified-sdk-nonversioning', 'reporter-environment',
               'signed-multipart-initiation-decoding-snapshot-cleanup')
-CODE = ('__init__.py', 'cases.py', 'signing.py', 'signed_cases.py', 'transport.py', 'image.py', 'relay.py', 'receipts.py')
+CODE = ('__init__.py', 'cases.py', 'signing.py', 'signed_cases.py', 'versioning.py', 'transport.py', 'image.py', 'relay.py', 'receipts.py')
+ALL_CASES = IMPLEMENTED + SIGNED_CASES + VERSIONING_CASES
+CASE_COUNT = len(ALL_CASES)
 
 def require(condition):
     if not condition: raise ValueError('release-feedback-receipt-invalid')
@@ -50,9 +53,9 @@ def validate_report(value, source, version, arch, phase, expected_harness):
     digest(value['image_id']); require(value['full_feedback_matrix_passed'] is False and value['scope_exclusions'] == list(EXCLUSIONS))
     if phase == 'published-replay': digest(value['digest'])
     else: require(value['digest'] is None)
-    rows = value['cases']; require(isinstance(rows, list) and len(rows) == 31)
+    rows = value['cases']; require(isinstance(rows, list) and len(rows) == CASE_COUNT)
     require(all(isinstance(row, dict) and set(row) == {'case', 'passed'} and row['passed'] is True for row in rows))
-    require(len({row['case'] for row in rows}) == 31 and {row['case'] for row in rows} == set(IMPLEMENTED + SIGNED_CASES))
+    require(len({row['case'] for row in rows}) == CASE_COUNT and {row['case'] for row in rows} == set(ALL_CASES))
     keys = {'owned_resources_absent', 'allocated_ports_kernel_refused', 'captured_children_reaped', 'no_active_handles', 'no_sticky_command_failure', 'lock_released', 'cleanup_within_shared_reserve'}
     require(set(value['cleanup']) == keys and all(value['cleanup'][key] is True for key in keys))
     return value
@@ -71,7 +74,7 @@ def seal(local, published, raw_manifest, source, version, arch, expected_harness
     require(child.get('config', {}).get('digest') == local['image_id'] and 'manifests' not in child)
     return dict(schema_version=1, scope=SCOPE, phase='qualified-native-child', source_sha=source, version=version,
         architecture=arch, image_id=local['image_id'], digest=published['digest'], harness_sha256=expected_harness,
-        case_count=31, pre_push_passed=True, published_replay_passed=True, full_feedback_matrix_passed=False)
+        case_count=CASE_COUNT, pre_push_passed=True, published_replay_passed=True, full_feedback_matrix_passed=False)
 def children(receipts, source, version, expected_harness):
     require(len(receipts) == 2); result = {}
     keys = {'schema_version', 'scope', 'phase', 'source_sha', 'version', 'architecture', 'image_id', 'digest', 'harness_sha256', 'case_count', 'pre_push_passed', 'published_replay_passed', 'full_feedback_matrix_passed'}
@@ -79,7 +82,7 @@ def children(receipts, source, version, expected_harness):
         require(set(row) == keys); arch = row['architecture']; identity(source, version, arch)
         require(type(row['schema_version']) is int and row['schema_version'] == 1 and row['scope'] == SCOPE and row['phase'] == 'qualified-native-child')
         require((row['source_sha'], row['version'], row['harness_sha256']) == (source, version, expected_harness))
-        require(arch not in result and type(row['case_count']) is int and row['case_count'] == 31 and row['pre_push_passed'] is True and row['published_replay_passed'] is True and row['full_feedback_matrix_passed'] is False)
+        require(arch not in result and type(row['case_count']) is int and row['case_count'] == CASE_COUNT and row['pre_push_passed'] is True and row['published_replay_passed'] is True and row['full_feedback_matrix_passed'] is False)
         digest(row['digest']); digest(row['image_id']); result[arch] = row
     require(set(result) == {'amd64', 'arm64'} and len({r['digest'] for r in result.values()}) == 2 and len({r['image_id'] for r in result.values()}) == 2)
     return result

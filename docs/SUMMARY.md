@@ -5,6 +5,7 @@
 - [Demo](demo.md)
 - [MinIO-compatible Docker image](minio-docker.md)
 - [S3 data-plane compatibility](minio-compatibility.md)
+- [Known S3 compatibility gaps](known-gaps.md)
 - [Run the claims](proofs.md)
 - [v0.6.0 release notes](releases/v0.6.0.md)
 - [Plugins](plugins.md)
@@ -52,3 +53,4 @@
 - [ADR 0030: Batch delete via S3 DeleteObjects](adr/0030-batch-delete-objects.md)
 - [ADR 0031: Native final-output validation for single PUT](adr/0031-native-final-output-validation.md)
 - [ADR 0032: Temporary inactive SQLite advisory exception](adr/0032-temporary-sqlite-advisory-exception.md)
+- [ADR 0035: FileStore object versioning](adr/0035-proposed-filestore-object-versioning.md)

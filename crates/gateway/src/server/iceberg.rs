@@ -349,6 +349,19 @@ pub(crate) async fn iceberg_transformed_read_response(
             ));
         }
     };
+    // The walker follows the current table pointer and has no S3-version
+    // snapshot binding for referenced manifests/data files.
+    if params.version_id.is_some() {
+        return Some((
+            transformed_read_error_response(
+                key,
+                TransformedReadError::Pipeline(metadata::unsupported_table_operation(
+                    "exact-version Iceberg processing is not supported",
+                )),
+            ),
+            None,
+        ));
+    }
     if !state.binary_iceberg_enabled {
         return Some((
             transformed_read_error_response(

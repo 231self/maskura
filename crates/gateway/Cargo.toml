@@ -71,6 +71,7 @@ num-bigint = "0.4"
 semver = "1"
 toml = "0.8"
 url = "2"
+quick-xml = { version = "0.41", default-features = false }
 
 [dev-dependencies]
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

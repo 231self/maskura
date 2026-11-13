@@ -101,6 +101,28 @@ pub fn no_such_key(key: &str) -> axum::response::Response {
     )
 }
 
+pub fn no_such_version(key: &str) -> axum::response::Response {
+    s3_error_xml(
+        "NoSuchVersion",
+        "The specified version does not exist.",
+        key,
+        StatusCode::NOT_FOUND,
+    )
+}
+
+pub fn delete_marker(key: &str, explicit: bool) -> axum::response::Response {
+    if explicit {
+        s3_error_xml(
+            "MethodNotAllowed",
+            "The specified version is a delete marker.",
+            key,
+            StatusCode::METHOD_NOT_ALLOWED,
+        )
+    } else {
+        no_such_key(key)
+    }
+}
+
 pub fn no_such_bucket(bucket: &str) -> axum::response::Response {
     s3_error_xml(
         "NoSuchBucket",

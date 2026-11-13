@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from release_feedback.cases import Cases, Failure, IMPLEMENTED, CODES
 from release_feedback.signed_cases import run_signed, SIGNED_CASES
+from release_feedback.versioning import run_versioning, VERSIONING_CASES
 from release_feedback.image import ImageIO, ID
 from release_feedback.transport import Budget, BoundaryError
 from release_feedback.relay import RELAY_CODES
@@ -56,14 +57,20 @@ ASSERTION_CODES = frozenset((
     'signed-delete-still-listed', 'signed-delete-valid-outcomes', 'signed-delete-valid-status',
     'signed-mpu-complete', 'signed-mpu-init', 'signed-mpu-part', 'signed-mpu-still-open',
     'signed-put-status', 'signed-response-bound',
+    'versioning-sdk-unavailable', 'versioning-sdk-command', 'versioning-sdk-json',
+    'versioning-state', 'versioning-identity', 'versioning-exact-identity',
+    'versioning-exact-metadata', 'versioning-exact-bytes', 'versioning-missing-version',
+    'versioning-multipart-replay', 'versioning-multipart-duplicate',
+    'versioning-marker', 'versioning-null', 'versioning-pagination', 'versioning-batch-delete',
 ))
-CASE_NAMES = frozenset(IMPLEMENTED + SIGNED_CASES)
-STAGES = frozenset(('setup', 'lock', 'preflight', 'start', 'core', 'signed', 'cleanup', 'receipt'))
+CASE_NAMES = frozenset(IMPLEMENTED + SIGNED_CASES + VERSIONING_CASES)
+STAGES = frozenset(('setup', 'lock', 'preflight', 'start', 'core', 'signed', 'versioning', 'cleanup', 'receipt'))
 ACTIONS = frozenset((
     'daemon-platform', 'bound-local-image', 'internal-network', 'start-packaged-image',
     'official-components-only', 'native-packaged-elf', 'owned-store-metadata-only',
     'owned-writable-layer-size', 'owned-loopback-port', 'restart-owned-container',
     'owned-container-endpoint', 'owned-network-endpoint',
+    'versioning-sdk',
     *(prefix + kind for prefix in ('inventory-', 'owner-', 'create-', 'remove-owned-')
       for kind in ('container', 'volume', 'network')),
 ))
@@ -104,7 +111,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not args.execute:
         print(json.dumps({'status': 'not-executed', 'scope': SCOPE, 'full_feedback_matrix_passed': False})); return 2
-    budget = Budget(); io = suite = None; signed_rows = []; stage = 'setup'; previous = {}; interrupted = [False]
+    budget = Budget(); io = suite = None; signed_rows = []; versioning_rows = []; stage = 'setup'; previous = {}; interrupted = [False]
     def stop_requested(signum, frame):
         interrupted[0] = True
         if io is not None: io.cancelled = True  # Cooperative; capture gap remains safe.
@@ -129,18 +136,19 @@ def main(argv=None):
         stage = 'preflight'; io.preflight(args.published_ref)
         stage = 'start'; io.start()
         stage = 'core'; suite = Cases(io, args.version); suite.run()
-        stage = 'signed'; run_signed(suite, rows=signed_rows); report['status'] = 'passed'
+        stage = 'signed'; run_signed(suite, rows=signed_rows)
+        stage = 'versioning'; run_versioning(suite, rows=versioning_rows); report['status'] = 'passed'
     except BaseException as exc:
         report['failure'] = closed_failure(exc, stage, io, suite)
     finally:
         if suite is not None:
-            rows = suite.rows + signed_rows
+            rows = suite.rows + signed_rows + versioning_rows
             report['cases'] = closed_rows(rows)
             if len(report['cases']) != len(rows) or any(set(row) != {'case', 'passed'} for row in rows if isinstance(row, dict)):
                 report['status'] = 'failed'
                 report.setdefault('failure', {'category': 'receipt-contract-failed', 'stage': 'receipt'})
             case = getattr(suite, 'case', None)
-            if stage in ('core', 'signed') and report['status'] == 'failed' and known(case, CASE_NAMES):
+            if stage in ('core', 'signed', 'versioning') and report['status'] == 'failed' and known(case, CASE_NAMES):
                 if not any(row['case'] == case for row in report['cases']):
                     report['cases'].append(dict(case=case, passed=False))
         report['cleanup'] = dict.fromkeys(CLEANUP_KEYS, False)

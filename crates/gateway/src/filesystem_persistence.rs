@@ -175,7 +175,7 @@ impl FilesystemPersistence {
         }
     }
 
-    fn atomic_write(
+    pub(crate) fn atomic_write(
         &self,
         path: &Path,
         bytes: &[u8],
