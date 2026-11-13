@@ -1,0 +1,28 @@
+{
+  "verified_on": "2026-11-13",
+  "release": "https://github.com/231self/maskura/releases/tag/v0.7.34",
+  "release_workflow": "https://github.com/231self/maskura/actions/runs/43399086123",
+  "source_sha": "79e1f67843e1cdd26ce32fbd26fcdac7bbc28f8e",
+  "version": "0.7.34",
+  "canonical_image": "ghcr.io/231self/maskura/maskura@sha256:dbac45fc128bf75e7e7060aa2a474c102d08ed8713434a3a7c7c131e1a94b021",
+  "child_digests": {
+    "amd64": "sha256:de91483e29116918efb6c93903f910726cd74651b0db5a782d3c00f3a2385605",
+    "arm64": "sha256:a4a00f38b13cbb864c8403a64527e1253052c036c7834ea1cd1d8f646e3975b9"
+  },
+  "managed_cases": 13,
+  "controls": 7,
+  "ignored": 0,
+  "managed_cleanup": true,
+  "packaged_scope": "packaged-filestore-core",
+  "packaged_rows_per_architecture_per_phase": 31,
+  "packaged_cleanup_checks_per_architecture_per_phase": 7,
+  "native_pre_push_and_published_replay_verified": true,
+  "release_assets_anonymously_downloaded_and_verified": 14,
+  "anonymous_registry_verified": true,
+  "latest_matches_version": true,
+  "historical_v0733_source": "adff2635fa38c82b84b04ebffbf76098f771def7",
+  "historical_v0733_image_digest": "sha256:a5fea3c997678821884492836921742805570a52345a3f713da0282a539b79cb",
+  "historical_v0733_unchanged": true,
+  "reporter_environment_acceptance": false,
+  "execution_attestation": false
+}
