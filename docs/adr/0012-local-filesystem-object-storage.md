@@ -22,6 +22,8 @@ Add `FileStore`, enabled for explicit single-tenant deployments by
 - A per-key metadata JSON file atomically points to that data file. Renaming the
   metadata is the visibility commit, so readers observe the old complete object
   or the new complete object.
+  [ADR 0035](0035-proposed-filestore-object-versioning.md) extends this pointer
+  to one ordered retained-version manifest for versioned buckets.
 - Keys are hashed for on-disk metadata lookup, avoiding path traversal and the
   `foo` versus `foo/bar` namespace collision. Metadata retains the original key,
   content type, MD5 S3 ETag, and size.
@@ -37,8 +39,9 @@ Add `FileStore`, enabled for explicit single-tenant deployments by
 
 - A gateway can be a standalone local S3 endpoint with a mounted volume and no
   MinIO, Postgres, or cloud credentials.
-- This is a single-node backend. It has no replication, versioning, lifecycle
-  rules, or bucket IAM. ADR 0013 adds durable multipart, an exclusive process
+- This is a single-node backend. It has no replication, lifecycle
+  rules, or bucket IAM. ADR 0035 adds opt-in local S3 versioning (unreleased,
+  packaged qualification pending). ADR 0013 adds durable multipart, an exclusive process
   lock, encrypted staging, and crash recovery without changing that boundary.
 - Orphaned temp files are removed at FileStore startup. A crash after a data-file
   rename but before its metadata commit can leave unreferenced data, but cannot

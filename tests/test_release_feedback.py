@@ -30,6 +30,7 @@ sys.addaudithook(deny_external)
 sys.path.insert(0, str(ROOT / 'scripts'))
 from release_feedback import cases, image, receipts, signing, transport
 from release_feedback.signed_cases import SIGNED_CASES, run_signed
+from release_feedback.versioning import VERSIONING_CASES
 from release_feedback_fixture import FakeHTTP, FAULTS, error
 
 def verify_signed(method, target, fields, wire, secret):
@@ -121,7 +122,7 @@ def report(arch='amd64', phase='native-child', child_digest=None, harness=None):
     return dict(schema_version=1, scope=receipts.SCOPE, status='passed', source_sha='a' * 40, version='9.9.9',
         architecture=arch, image_id='sha256:' + ('b' if arch == 'amd64' else 'c') * 64,
         phase=phase, digest=child_digest, harness_sha256=harness or receipts.harness_sha(),
-        cases=[dict(case=name, passed=True) for name in cases.IMPLEMENTED + SIGNED_CASES],
+        cases=[dict(case=name, passed=True) for name in receipts.ALL_CASES],
         cleanup={key: True for key in ('owned_resources_absent', 'allocated_ports_kernel_refused', 'captured_children_reaped', 'no_active_handles', 'no_sticky_command_failure', 'lock_released', 'cleanup_within_shared_reserve')},
         full_feedback_matrix_passed=False, scope_exclusions=list(receipts.EXCLUSIONS))
 def child_receipt(arch='amd64'):
@@ -164,12 +165,19 @@ class FeedbackTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
         captured = []; output = io.StringIO(); errors = io.StringIO()
         def save(path, value): captured.append(copy.deepcopy(value))
+        def versioning(suite, rows):
+            # Only a main/receipt fixture; real oracle controls live in
+            # test_release_versioning.py and no image execution is claimed.
+            for name in VERSIONING_CASES:
+                suite.case = name
+                rows.append(dict(case=name, passed=True))
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(module, 'ImageIO', return_value=obj))
             stack.enter_context(patch.object(module.tempfile, 'mkdtemp', return_value=str(ROOT / 'not-created-feedback-test')))
             stack.enter_context(patch.object(module.resource, 'setrlimit'))
             stack.enter_context(patch.object(module.signal, 'signal', return_value=None))
             stack.enter_context(patch.object(module, 'write', side_effect=save))
+            stack.enter_context(patch.object(module, 'run_versioning', side_effect=versioning))
             stack.enter_context(contextlib.redirect_stdout(output)); stack.enter_context(contextlib.redirect_stderr(errors))
             if configure is not None: configure(module, stack)
             before = len(AUDIT_TRIPS); AUDIT_ACTIVE = True
@@ -291,7 +299,7 @@ class FeedbackTests(unittest.TestCase):
             if fault == 'extra': obj.cleanup_value['PRIVATE_EXTRA'] = 'PRIVATE_VALUE'
             if fault == 'hostile': obj.cleanup_error = RuntimeError('PRIVATE_CLEANUP_ERROR')
             code, value, summary, _ = self.invoke_main(obj)
-            self.assertEqual(code, 1); self.assertEqual(len(value['cases']), 31)
+            self.assertEqual(code, 1); self.assertEqual(len(value['cases']), receipts.CASE_COUNT)
             self.assertTrue(all(row['passed'] for row in value['cases']))
             self.assertEqual(set(value['cleanup']), set(report()['cleanup']))
             self.assertEqual(value['failure'], value['cleanup_failure'])
@@ -299,20 +307,29 @@ class FeedbackTests(unittest.TestCase):
             if fault == 'false':
                 self.assertTrue(value['cleanup']['owned_resources_absent'])
                 self.assertFalse(value['cleanup']['allocated_ports_kernel_refused'])
-    def test_main_success_keeps_exact_31_row_receipt_contract(self):
+    def test_main_success_keeps_exact_required_row_receipt_contract(self):
         code, value, summary, _ = self.invoke_main(MainImage())
         self.assertEqual(code, 0)
         expected = report(phase='candidate')
-        expected['cases'] = cases.Cases(FakeHTTP(), '9.9.9').run()['cases'] + [dict(case=name, passed=True) for name in SIGNED_CASES]
+        expected['cases'] = cases.Cases(FakeHTTP(), '9.9.9').run()['cases'] + [dict(case=name, passed=True) for name in SIGNED_CASES + VERSIONING_CASES]
         self.assertEqual(value, expected)
-        self.assertEqual(summary, dict(scope=receipts.SCOPE, status='passed', case_count=31, full_feedback_matrix_passed=False))
+        self.assertEqual(summary, dict(scope=receipts.SCOPE, status='passed', case_count=receipts.CASE_COUNT, full_feedback_matrix_passed=False))
         receipts.validate_report(value, 'a' * 40, '9.9.9', 'amd64', 'candidate', receipts.harness_sha())
     def test_main_missing_signed_row_cannot_qualify(self):
         def configure(module, stack):
             def partial(suite, rows): rows.append(dict(case=SIGNED_CASES[0], passed=True))
             stack.enter_context(patch.object(module, 'run_signed', new=partial))
         code, value, _, _ = self.invoke_main(MainImage(), configure)
-        self.assertEqual(code, 1); self.assertEqual(len(value['cases']), 30)
+        self.assertEqual(code, 1); self.assertEqual(len(value['cases']), receipts.CASE_COUNT - 1)
+        self.assertEqual(value['failure'], dict(category='receipt-contract-failed', stage='receipt'))
+    def test_main_missing_versioning_row_cannot_qualify(self):
+        def configure(module, stack):
+            def partial(suite, rows):
+                rows.extend(dict(case=name, passed=True) for name in VERSIONING_CASES[:-1])
+            stack.enter_context(patch.object(module, 'run_versioning', new=partial))
+        code, value, _, _ = self.invoke_main(MainImage(), configure)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(value['cases']), receipts.CASE_COUNT - 1)
         self.assertEqual(value['failure'], dict(category='receipt-contract-failed', stage='receipt'))
     def test_main_invalid_row_material_is_omitted_without_making_a_valid_receipt(self):
         def configure(module, stack):
@@ -322,7 +339,7 @@ class FeedbackTests(unittest.TestCase):
                 return value
             stack.enter_context(patch.object(module.Cases, 'run', new=corrupt))
         code, value, summary, _ = self.invoke_main(MainImage(), configure)
-        self.assertEqual(code, 1); self.assertEqual(len(value['cases']), 31)
+        self.assertEqual(code, 1); self.assertEqual(len(value['cases']), receipts.CASE_COUNT)
         self.assertEqual(value['failure'], dict(category='receipt-contract-failed', stage='receipt'))
         self.assertNotIn('PRIVATE_', json.dumps([value, summary]))
     def test_all_29_core_cases_and_18_regressions(self):
@@ -489,7 +506,7 @@ class FeedbackTests(unittest.TestCase):
         self.assertIn(exclusion, receipts.EXCLUSIONS)
         value = report()
         self.assertIn(exclusion, value['scope_exclusions'])
-        self.assertEqual(len(value['cases']), 31); self.assertFalse(value['full_feedback_matrix_passed'])
+        self.assertEqual(len(value['cases']), receipts.CASE_COUNT); self.assertFalse(value['full_feedback_matrix_passed'])
         value['scope_exclusions'].remove(exclusion)
         with self.assertRaises(ValueError):
             receipts.validate_report(value, 'a' * 40, '9.9.9', 'amd64', 'native-child', receipts.harness_sha())

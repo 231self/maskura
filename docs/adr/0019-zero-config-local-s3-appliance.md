@@ -56,10 +56,12 @@ as a zero-config local S3 appliance instead of failing startup.
   `BucketAlreadyExists`; `DeleteBucket` on a missing bucket returns
   `NoSuchBucket`.
 - **Fail-closed dispatch.** Recognized-but-unsupported S3 subresources
-  (`?tagging`, `?versioning`, `?policy`, `?acl`, `?delete`, …) and
+  (`?tagging`, `?policy`, `?acl`, …) and
   `x-amz-copy-source` (CopyObject/UploadPartCopy) return `501 NotImplemented`
   before method/path dispatch, so they can never be misrouted into a destructive
   operation.
+  ADR 0030 adds guarded batch delete; ADR 0035 adds guarded local versioning
+  dispatch while keeping other destinations unsupported.
 - **Readiness.** A `/ready` endpoint and an OCI `HEALTHCHECK` are added so
   Compose can gate on readiness, not just liveness.
 
@@ -73,5 +75,7 @@ as a zero-config local S3 appliance instead of failing startup.
   scoped to local-appliance initialization; later starts reuse the persisted
   credential silently.
 - The appliance is single-node and byte-preserving; it is not a claim of full
-  AWS S3 or historical MinIO feature parity. Versioning, ACLs, policies,
+  AWS S3 or historical MinIO feature parity. Local versioning is added by
+  [ADR 0035](0035-proposed-filestore-object-versioning.md), with packaged
+  qualification pending. ACLs, policies,
   tagging, lifecycle, and copy remain unsupported and fail closed.

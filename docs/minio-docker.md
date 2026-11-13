@@ -65,10 +65,38 @@ implements bucket create/delete (appliance only), object
 `PutObject`/`GetObject`/`HeadObject`/`DeleteObject`, `ListObjects` v1 and v2,
 `ListBuckets`, and durable staged multipart upload.
 
+## Local versioning (unreleased)
+
+The pending FileStore change adds persistent Enabled/Suspended bucket settings,
+retained versions, exact-version GET/HEAD and deletion, delete markers, batch
+version deletion and paginated version listing. It is not available in v0.7.34
+or a qualified published image. Follow the [delivery plan](plans/2026-11-13-filestore-versioning.md)
+for source-test evidence and remaining packaged qualification.
+
+On a build containing that change, authenticated AWS CLI operations use the
+existing endpoint/credentials:
+
+```bash
+aws --endpoint-url http://127.0.0.1:9000 s3api put-bucket-versioning \
+  --bucket maskura --versioning-configuration Status=Enabled
+aws --endpoint-url http://127.0.0.1:9000 s3api list-object-versions --bucket maskura
+# Use a captured VersionId, including after restarting on the same volume:
+aws --endpoint-url http://127.0.0.1:9000 s3api get-object \
+  --bucket maskura --key README.md --version-id "$VERSION_ID" ./historical
+```
+
+Keep the entire persistent volume, including internal metadata and wrapping keys.
+Retained versions consume disk until explicitly deleted; ordinary DELETE only
+adds a marker in an Enabled bucket. Suspension replaces the null version while
+retaining non-null history. Every version and marker must be deleted before
+deleting the bucket. There is no automatic expiry or object-lock protection.
+Back up the stopped volume before upgrade; do not downgrade a volume containing
+new manifests to a pre-versioning binary.
+
 ## Unsupported operations
 
 S3 features outside the data-plane verb list return `501 NotImplemented` rather
-than being handled as a different operation: versioning, ACLs, bucket/object
+than being handled as a different operation: ACLs, bucket/object
 tagging, policies, lifecycle, encryption config, website, CORS, replication,
 object-lock, legal-hold, notifications, logging, request-payment, and
 `CopyObject`/`UploadPartCopy` (`x-amz-copy-source`). The full per-verb status is

@@ -40,7 +40,7 @@ pub(crate) struct LocalStorageRuntime {
         reason = "consumed by subsequent local multipart startup wiring"
     )]
     wrapping: Arc<FileKeyWrapping>,
-    _root_lock: RootLock,
+    _root_lock: Arc<RootLock>,
 }
 
 impl LocalStorageRuntime {
@@ -57,11 +57,11 @@ impl LocalStorageRuntime {
         root: PathBuf,
         quotas: StagingQuotaLimits,
     ) -> Result<Self, LocalStorageError> {
-        let root_lock = FilesystemPersistence::default().acquire_root_lock(&root)?;
+        let root_lock = Arc::new(FilesystemPersistence::default().acquire_root_lock(&root)?);
         let wrapping = Arc::new(FileKeyWrapping::load_or_create(
             &root.join(".maskura").join("wrapping.key"),
         )?);
-        let file_store = Arc::new(FileStore::open_locked(root.clone()).await?);
+        let file_store = Arc::new(FileStore::open_locked(root.clone(), root_lock.clone()).await?);
         let staging_artifacts = Arc::new(FileStagingArtifactStore::open(
             root.join(".maskura").join("multipart"),
         )?);

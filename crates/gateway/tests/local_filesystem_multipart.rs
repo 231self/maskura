@@ -1327,3 +1327,171 @@ async fn build_local_state() -> (Arc<AppState>, Router, String, String) {
     let (access_key, secret_key) = make_credentials(&state).await;
     (state, router, access_key, secret_key)
 }
+
+#[test]
+fn local_versioned_multipart_keeps_exact_identity_through_overwrite_restart_and_replay() {
+    let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let root =
+            std::env::temp_dir().join(format!("maskura-versioned-multipart-{}", Uuid::new_v4()));
+        let mut env = EnvRestore::new();
+        remove_host_configuration(&mut env);
+        for (key, value) in [
+            ("AUTH_DISABLED", "0"),
+            ("MASKURA_SINGLE_TENANT", "1"),
+            ("MASKURA_STORAGE_MODE", "local"),
+            ("MASKURA_MULTIPART_MODE", "staged"),
+        ] {
+            env.set(key, value);
+        }
+        env.set("MASKURA_LOCAL_STORAGE_DIR", root.to_str().unwrap());
+        let state = build_test_state().await;
+        let app = build_router(state.clone());
+        let (access, secret) = make_credentials(&state).await;
+        let headers = auth_headers(&access, &secret);
+        create_bucket(&app, &headers, "versioned").await;
+        let configure = add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri("/versioned?versioning")
+                .body(Body::from(
+                    "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+                ))
+                .unwrap(),
+            &headers,
+        );
+        assert_eq!(
+            app.clone().oneshot(configure).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let put = add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri("/versioned/key")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("before\n"))
+                .unwrap(),
+            &headers,
+        );
+        let before = app.clone().oneshot(put).await.unwrap();
+        assert_eq!(before.status(), StatusCode::OK);
+        let before_id = before.headers()["x-amz-version-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let upload = initiate_upload_with_metadata(
+            &app,
+            &headers,
+            "versioned",
+            "key",
+            &[("x-amz-meta-purpose", "version-test")],
+        )
+        .await;
+        let etag = upload_part(
+            &app,
+            &headers,
+            "versioned",
+            "key",
+            &upload,
+            1,
+            b"alice@example.com\n",
+        )
+        .await;
+        let completion = complete_xml(&[(1, &etag)]);
+        let uri = format!("/versioned/key?uploadId={upload}");
+        let request = add_headers(
+            Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header(header::CONTENT_TYPE, "application/xml")
+                .body(Body::from(completion.clone()))
+                .unwrap(),
+            &headers,
+        );
+        let completed = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(completed.status(), StatusCode::OK);
+        let completed_id = completed.headers()["x-amz-version-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(before_id, completed_id);
+        let after = add_headers(
+            Request::builder()
+                .method("PUT")
+                .uri("/versioned/key")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("after\n"))
+                .unwrap(),
+            &headers,
+        );
+        assert_eq!(
+            app.clone().oneshot(after).await.unwrap().status(),
+            StatusCode::OK
+        );
+        drop(app);
+        drop(state);
+        let state = build_test_state().await;
+        let app = build_router(state.clone());
+        for _ in 0..2 {
+            let replay = add_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header(header::CONTENT_TYPE, "application/xml")
+                    .body(Body::from(completion.clone()))
+                    .unwrap(),
+                &headers,
+            );
+            let response = app.clone().oneshot(replay).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()["x-amz-version-id"],
+                completed_id.as_str()
+            );
+        }
+        let exact = app
+            .clone()
+            .oneshot(get_request(
+                &headers,
+                "GET",
+                &format!("/versioned/key?versionId={completed_id}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(exact.status(), StatusCode::OK);
+        assert_eq!(exact.headers()["x-amz-meta-purpose"], "version-test");
+        let bytes = body_bytes(exact).await;
+        assert!(String::from_utf8_lossy(&bytes).contains(REDACTED_EMAIL));
+        assert!(!String::from_utf8_lossy(&bytes).contains(PLAINTEXT_EMAIL_A));
+        let before = app
+            .clone()
+            .oneshot(get_request(
+                &headers,
+                "GET",
+                &format!("/versioned/key?versionId={before_id}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(body_bytes(before).await, b"before\n");
+        assert_eq!(
+            state
+                .file_store
+                .as_ref()
+                .unwrap()
+                .list_versions("versioned")
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        drop(app);
+        drop(state);
+        drop(env);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    });
+}

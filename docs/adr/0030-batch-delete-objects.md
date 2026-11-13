@@ -34,14 +34,16 @@ the response envelope, and the loop.
   `<Object><Key>` and returns the standard `<DeleteResult>` with per-key
   `<Deleted><Key>` and `<Error><Key><Code><Message>` entries; `Quiet`
   suppresses `<Deleted>` entries only. Caps: 1000 keys / 128 KiB (S3's own
-  limits). No `VersionId`, no MFA Delete — versioning is an unsupported
-  subresource and versioned-delete requests fail closed as `MalformedXML`.
+  limits). ADR 0035 extends entries with optional `VersionId` for FileStore
+  only; other backends return a per-entry unsupported error. MFA Delete remains
+  unsupported.
 - **Per-key results, systemic preconditions.** A policy-denied or failed key
   lands in `<Error>` (same typed code the single-key path surfaces) while the
   other keys proceed; every key is answered. Systemic failures — bad auth,
   malformed XML, oversized bodies — fail the request as typed S3 errors
-  before any key is touched. The batch is idempotent: a missing key reports
-  `<Deleted>`, so retries and double-batches are safe.
+  before any key is touched. A missing unversioned key or exact version reports
+  `<Deleted>`. Ordinary deletes in Enabled buckets create a fresh marker on
+  each call, including retries; they never permanently remove retained history.
 - **Evidence stays per operation.** Each key presents its own
   `PolicyOperation::Delete` verdict and produces its own usage receipt
   (`UsageRoute::DeleteObject`). A 1000-key batch is 1000 auditable deletes,
@@ -67,5 +69,5 @@ the response envelope, and the loop.
 - Batch latency ≈ N × single-delete latency (sequential), which is acceptable
   for cleanup workloads; bounded concurrency is the named follow-up.
 - Out of scope and unchanged: async/job deletion (the hosted `data-deletion`
-  machinery), prefix deletes, versioned deletes, MFA Delete, and an MCP batch
+  machinery), prefix deletes, MFA Delete, and an MCP batch
   tool (a cheap follow-up once the handler exists).

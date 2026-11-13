@@ -142,6 +142,7 @@ pub(crate) use openapi::*;
 pub use routing::build_router;
 pub(crate) use s3_batch_delete::*;
 pub(crate) use s3_objects::*;
+mod s3_versioning;
 pub(crate) use s3_upload::*;
 pub(crate) use state::*;
 pub use state::{AppState, StatePipelineTemplate};

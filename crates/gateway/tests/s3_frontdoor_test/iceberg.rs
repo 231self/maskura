@@ -90,6 +90,68 @@ async fn iceberg_state(gate_open: bool) -> Arc<AppState> {
     .expect("build iceberg test state")
 }
 
+#[tokio::test]
+async fn exact_filestore_version_cannot_preview_latest_iceberg_table() {
+    let root = owned_fixture_spool_dir();
+    let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+    store.create_bucket(BUCKET).await.unwrap();
+    store
+        .set_versioning(BUCKET, maskura_gateway::file_store::FileVersioning::Enabled)
+        .await
+        .unwrap();
+    let relative = "metadata/00000-2440e43d-7df5-4e36-984c-633a0da038e6.metadata.json";
+    let key = format!("v2_empty/{relative}");
+    store
+        .put(
+            BUCKET,
+            &key,
+            fixture_bytes("v2_empty", relative),
+            "application/json",
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            BUCKET,
+            "v2_empty/metadata/version-hint.text",
+            "0\n",
+            "text/plain",
+        )
+        .await
+        .unwrap();
+    let id = store
+        .list_versions(BUCKET)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.key == key)
+        .unwrap()
+        .version_id;
+    for gate_open in [false, true] {
+        let mut state = iceberg_state(gate_open).await;
+        Arc::get_mut(&mut state).unwrap().file_store = Some(store.clone());
+        let (ak, sk) = make_key(&state).await;
+        let response = build_router(state)
+            .oneshot(add_headers(
+                Request::builder()
+                    .uri(format!("/{BUCKET}/{key}?versionId={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+                &auth_headers(&ak, &sk),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key("x-maskura-iceberg-preview"));
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("exact-version Iceberg processing"));
+    }
+    drop(store);
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
 /// A gate that records the operations presented to it and admits everything
 /// unbound (the table path must hit the same seam as every other operation).
 #[derive(Default)]

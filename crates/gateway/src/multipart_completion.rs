@@ -126,7 +126,12 @@ impl MultipartCommitProof for FileMultipartCommitProof {
             LocalCommitProbe::Published(proof) => {
                 let proof = self
                     .store
-                    .backfill_commit_proof(&proof.prepared.bucket, &proof.prepared.key)
+                    .backfill_generation_proof(
+                        &proof.prepared.bucket,
+                        &proof.prepared.key,
+                        operation_id,
+                        generation_id,
+                    )
                     .await
                     .map_err(|error| MultipartCoordinatorError::Invalid(error.to_string()))?
                     .ok_or_else(|| {
@@ -373,7 +378,7 @@ impl MultipartCompletionCoordinator {
                 let precommit = self.completion_evidence(operation.id).await?;
                 let stored = StoredObjectMeta {
                     etag: Some(proof.etag),
-                    version_id: None,
+                    version_id: proof.version_id,
                     superseded_version_ids: Vec::new(),
                     version_history_complete: true,
                 };

@@ -15,8 +15,6 @@ pub(crate) const UNSUPPORTED_S3_SUBRESOURCES: &[&str] = &[
     "acl",
     "tagging",
     "policy",
-    "versioning",
-    "versions",
     "location",
     "lifecycle",
     "retention",
@@ -46,21 +44,31 @@ pub(crate) const UNSUPPORTED_S3_SUBRESOURCES: &[&str] = &[
 /// is only routed for `POST /{bucket}` (Multi-Object Delete); every other
 /// method/path carrying `?delete` is rejected here before dispatch.
 pub(crate) async fn reject_unsupported_s3_operations(
+    State(state): State<Arc<AppState>>,
     request: Request,
     next: Next,
 ) -> axum::response::Response {
     if request.headers().contains_key("x-amz-copy-source") {
         return s3_error::not_implemented("");
     }
-    let query = request.uri().query();
-    if query.is_some_and(|query| {
-        query.split('&').any(|pair| {
-            let key = pair.split('=').next().unwrap_or(pair);
-            UNSUPPORTED_S3_SUBRESOURCES.contains(&key)
-        })
-    }) {
+    let pairs = match super::s3_versioning::query_pairs(request.uri().query()) {
+        Ok(pairs) => pairs,
+        Err(()) => return s3_error::invalid_argument("", "Malformed query encoding."),
+    };
+    if pairs
+        .iter()
+        .any(|(key, _)| UNSUPPORTED_S3_SUBRESOURCES.contains(&key.as_str()))
+    {
         return s3_error::not_implemented("");
     }
+    let configuration = match super::s3_versioning::validate_query(&request, &pairs) {
+        Ok(configuration) => configuration,
+        Err(()) => return s3_error::invalid_argument("", "Invalid versioning query."),
+    };
+    if configuration {
+        return super::s3_versioning::bucket_configuration(state, request).await;
+    }
+    let query = request.uri().query();
     if super::s3_batch_delete::has_delete_subresource(query) {
         let is_bucket_level = request
             .uri()
@@ -93,7 +101,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/{bucket}/{*key}", head(s3_head))
         .route("/{bucket}/{*key}", delete(s3_delete))
         .route("/{bucket}/{*key}", post(s3_post))
-        .route_layer(middleware::from_fn(reject_unsupported_s3_operations));
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            reject_unsupported_s3_operations,
+        ));
     let mut router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))

@@ -87,7 +87,10 @@ jobs:
           bash scripts/build-plugins.sh
 
       - name: Test workspace
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace -- --test-threads=1
+
+      - name: Qualify real FileStore disk exhaustion
+        run: bash scripts/test-filestore-enospc.sh
 
       - name: Build gateway, CLI, and MCP releases (${{ matrix.suffix }})
         run: |
