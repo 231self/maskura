@@ -6,6 +6,8 @@
 - [MinIO-compatible Docker image](minio-docker.md)
 - [S3 data-plane compatibility](minio-compatibility.md)
 - [Known S3 compatibility gaps](known-gaps.md)
+- [FileStore versioning delivery evidence](plans/2026-11-13-filestore-versioning.md)
+- [FileStore versioning design](superpowers/specs/2026-11-13-filestore-versioning-design.md)
 - [Run the claims](proofs.md)
 - [v0.6.0 release notes](releases/v0.6.0.md)
 - [Plugins](plugins.md)
