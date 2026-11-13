@@ -76,6 +76,6 @@ as a zero-config local S3 appliance instead of failing startup.
   credential silently.
 - The appliance is single-node and byte-preserving; it is not a claim of full
   AWS S3 or historical MinIO feature parity. Local versioning is added by
-  [ADR 0035](0035-proposed-filestore-object-versioning.md), with packaged
-  qualification pending. ACLs, policies,
+  [ADR 0035](0035-proposed-filestore-object-versioning.md), shipped with native
+  packaged qualification in v0.7.35. ACLs, policies,
   tagging, lifecycle, and copy remain unsupported and fail closed.

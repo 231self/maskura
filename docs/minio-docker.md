@@ -65,16 +65,16 @@ implements bucket create/delete (appliance only), object
 `PutObject`/`GetObject`/`HeadObject`/`DeleteObject`, `ListObjects` v1 and v2,
 `ListBuckets`, and durable staged multipart upload.
 
-## Local versioning (unreleased)
+## Local versioning (v0.7.35)
 
-The pending FileStore change adds persistent Enabled/Suspended bucket settings,
+Version v0.7.35 adds persistent Enabled/Suspended bucket settings,
 retained versions, exact-version GET/HEAD and deletion, delete markers, batch
-version deletion and paginated version listing. It is not available in v0.7.34
-or a qualified published image. Follow the [delivery plan](plans/2026-11-13-filestore-versioning.md)
-for source-test evidence and remaining packaged qualification.
+version deletion and paginated version listing. Both published Linux architectures
+passed native qualification and published-child replay. The
+[delivery evidence](plans/2026-11-13-filestore-versioning.md) records source identity,
+qualification scope and artifact verification.
 
-On a build containing that change, authenticated AWS CLI operations use the
-existing endpoint/credentials:
+Authenticated AWS CLI operations use the existing endpoint/credentials:
 
 ```bash
 aws --endpoint-url http://127.0.0.1:9000 s3api put-bucket-versioning \

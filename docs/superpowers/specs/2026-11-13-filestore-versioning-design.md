@@ -1,7 +1,8 @@
 # Docker/FileStore S3 versioning design
 
 Status: owner-approved on 2026-11-13; local implementation and selected source
-regressions passed; dependency gate repaired, packaged qualification pending.
+regressions passed; shipped in v0.7.35 with both native Linux children qualified
+before publication and during published replay. See the delivery plan for evidence.
 Date: 2026-11-13
 Related: [ADR 0035](../../adr/0035-proposed-filestore-object-versioning.md) and
 [delivery plan](../../plans/2026-11-13-filestore-versioning.md).

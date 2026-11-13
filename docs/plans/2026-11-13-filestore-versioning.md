@@ -1,7 +1,6 @@
 # Docker/FileStore persistent S3 versioning
 
-Status: implemented locally; selected source regressions passed on 2026-11-13;
-dependency gate repaired, v0.7.35 publication and packaged qualification in progress.
+Status: v0.7.35 published and independently verified on 2026-11-13.
 Date: 2026-11-13
 Scope: Docker local appliance backed by a persistent FileStore volume.
 Decision: [ADR 0035](../adr/0035-proposed-filestore-object-versioning.md).
@@ -51,7 +50,8 @@ Execution checklist (tests are recorded only after actual execution):
 - [x] Strict local-only S3 configuration, selectors, version listing and deletes.
 - [x] Batch version deletion and existing authorization/read-processing fences.
 - [x] Fault/cancellation/restart and unmodified SDK integration evidence.
-- [ ] Repository gates and native packaged Linux qualification.
+- [x] Repository gates and native candidate packaged Linux qualification.
+- [x] Published native-child replay, promotion and final artifact verification.
 
 1. **Freeze the contract.** Resolve the lifecycle gates above; review ADR 0035
    and a source-bound design. Keep the current compatibility matrix unchanged
@@ -106,7 +106,8 @@ Focused warnings-denied runs passed:
   loopback TCP. Configuration, both exact GET/HEAD versions, paired listing
   markers and delete-marker lifecycle survive gateway restart.
 - Formatting and workspace all-target Clippy passed with warnings denied.
-- Final full gateway library suite: **789 passed**, zero failed/ignored.
+- Initial full gateway library suite: **789 passed**, zero failed/ignored.
+  After the two shutdown/root-lock regressions, **791 passed**.
 - Final complete frontdoor suite (one test thread): **170 passed**, zero failed,
   two existing ignored cases (optional boto3 batch interoperability and soak).
 - Protected historical reads redact the selected version's bytes and preserve its
@@ -125,8 +126,9 @@ exposed a transformed-read timing failure that passed alone; the complete final
 frontdoor rerun used one test thread and passed. This does not establish that the
 parallel timing issue is resolved.
 
-The final run passed **981 tests across the five listed Rust suites**, with the
-two frontdoor ignores above. It did not execute every workspace test target.
+The initial focused run passed **981 tests across the five listed Rust suites**,
+with the two frontdoor ignores above. Subsequent complete workspace validation
+is recorded below.
 
 The dependency audit initially blocked publication: RustSec reported RUSTSEC-2026-0523 and
 RUSTSEC-2026-0524 for `quinn-proto 0.11.18`, and RUSTSEC-2026-0538 for
@@ -135,9 +137,9 @@ then authorized completion through publishing. Minimal lock updates to
 `quinn-proto 0.11.19` and `quinn-udp 0.5.16` cleared the complete Rust/Python/npm/
 pinning audit. No advisory exception or gate bypass was added.
 
-Remaining gates include the v0.7.35 full workspace checks/security review,
-explicit disk-exhaustion qualification, and packaged Linux AMD64/ARM64 restart tests.
-Persistence fault injection does not establish real ENOSPC behavior. Retained
+The protected PR and merged-source CI runs passed full workspace/security checks,
+real disk-exhaustion qualification and packaged Linux AMD64/ARM64 restart tests.
+Published-child replay and final publication verification also passed. Retained
 bytes consume ordinary volume capacity; writes never evict history to free space.
 There is no performance/large-bucket scaling claim: listing materializes bucket
 history, and each mutation rewrites its bounded per-key manifest.
@@ -145,7 +147,8 @@ history, and each mutation rewrites its bounded per-key manifest.
 ## v0.7.35 publication gates
 
 - Version-bound SDK regeneration and full workspace formatting/lint/tests passed
-  locally: **1,551 passed, zero failed, 18 ignored registrations** on macOS.
+  locally: **1,553 passed, zero failed, 18 ignored registrations** on macOS,
+  including both shutdown/root-ownership regressions.
   The dedicated Linux-only ENOSPC case is executed separately, never counted as a
   local macOS pass. Database/native-image evidence remains the CI gate's job.
 - Execute the real ENOSPC test on an isolated 8 MiB tmpfs in Linux CI and both
@@ -160,5 +163,46 @@ history, and each mutation rewrites its bounded per-key manifest.
 - Verify both native child receipts, canonical index identity, anonymous access,
   checksums, public artifacts and successful post-publication verification.
 
-No versioning image or release has been published yet. Native GitHub runners are
-the intended qualification environment; no Spot resource was launched.
+The versioning image and release are published. Qualification ran on native
+GitHub runners; no Spot resource was launched.
+
+### Verified pre-publication evidence
+
+- [PR #275](https://github.com/231self/maskura/pull/275) merged only after the
+  protected aggregate passed for head `f789deffaad2b7a993a87c881d4d819085934a25`.
+- [PR CI run 43456678641](https://github.com/231self/maskura/actions/runs/43456678641)
+  qualified both native candidate images with all 35 source-bound rows and all
+  cleanup facts true. Its tested merge tree matches the PR head exactly.
+- The same run executed the dedicated real-ENOSPC case on the isolated 8 MiB
+  tmpfs: one passed, zero failed, zero ignored.
+- [Main CI run 43459387165](https://github.com/231self/maskura/actions/runs/43459387165)
+  passed on merge commit `b3d407cd5a2670123c9d380e53ad1cd9d2446ba2`, also the
+  `v0.7.35` tag target. The release source tree matches the qualified PR tree.
+- [Release workflow 43459387364](https://github.com/231self/maskura/actions/runs/43459387364)
+  passed native-child qualification/replay, promotion and final release verification.
+
+### Independently verified publication
+
+- [v0.7.35 release](https://github.com/231self/maskura/releases/tag/v0.7.35),
+  source `b3d407cd5a2670123c9d380e53ad1cd9d2446ba2`.
+- Canonical index:
+  `sha256:8c6bab97c44c767707d82352795184854435c4c01cc000c0dad9d7eef9878b95`.
+  Anonymous registry reads of `v0.7.35` and `latest` resolve to that same index,
+  with exactly the two qualified Linux AMD64/ARM64 children.
+- Both native release jobs executed the isolated 8 MiB real-ENOSPC test:
+  one passed, zero failed, zero ignored per architecture.
+- Both native-child and published-replay receipts contain all 35 passing cases
+  and all cleanup facts true. Their source, harness, image configuration and
+  child digests match the public `QUALIFIED_IMAGE_CHILDREN.json`.
+- All 14 public assets match their GitHub SHA-256 digests; all 13 entries in
+  `SHA256SUMS` match the downloaded files. Image configuration labels bind both
+  children to the release source and version.
+- GitHub attestation verification passed for all 13 checksummed artifacts and
+  the canonical image, enforcing the release-workflow signer, exact release
+  source digest and GitHub-hosted runners.
+- The v0.7.34 tag, release notes and original asset identities/digests remain
+  unchanged.
+
+These results qualify the recorded FileStore surface. Atomic create-only writes,
+bucket/prefix policies, non-FileStore versioning and object-lock/retention remain
+outside this release's support claim.
