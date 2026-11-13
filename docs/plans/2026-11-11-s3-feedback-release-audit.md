@@ -1,6 +1,6 @@
 # S3 feedback release-content audit
 
-Status: corrective source merged in PR #271 after all CI checks passed. Genuine managed and native packaged candidate qualification verified. Corrective v0.7.34 publication and final-tag replay remain pending; no customer-resolved claim yet.
+Status: corrective v0.7.34 published and independently verified after genuine final-source qualification and published native replay. All 14 public release assets and canonical/index/latest bindings verified. Historical v0.7.33 unchanged; reporter-environment acceptance is not claimed.
 Date: 2026-11-11
 Last verified: 2026-11-13
 Target: historical public v0.7.33; corrective release v0.7.34
@@ -21,13 +21,36 @@ packaged FileStore rows and seven true cleanup checks. Their scope remains
 All other CI jobs, including Postgres, interoperability, E2E, SDK, security and
 CodeQL, passed. PR #271 was merged as `bc15b206cab38d2da313806efbf17e2018ef6874`.
 
-The v0.7.34 preparation synchronizes the workspace/lock and SDK metadata plus
-release-facing image references; the OpenAPI schema is unchanged apart from its
-version. The release workflow must independently repeat managed qualification
-on the final source and run native child qualification and published replay
-before image-index/`latest` promotion and binary publication. Historical v0.7.33
-tags/artifacts remain unchanged. Final published digests and binaries have not
-yet been verified; the historical failed-attempt records below remain failures.
+The v0.7.34 update synchronized workspace/lock and SDK metadata plus release-facing
+image references; the OpenAPI schema and transitive dependency graph were unchanged.
+PR #273 merged as `79e1f67843e1cdd26ce32fbd26fcdac7bbc28f8e`, and the new `v0.7.34`
+tag points to that exact final source. Version-PR CI run `43381984648` and final-main
+CI run `43399086206` both passed all checks.
+
+[Release workflow 43399086123](https://github.com/231self/maskura/actions/runs/43399086123)
+passed final-tag managed qualification (13 exact cases, seven controls, zero ignores,
+complete cleanup) before publishing the native children. Each architecture then
+passed 31 packaged FileStore rows and seven cleanup checks both before push and
+after pulling its published digest on the same native runner. The protected proof,
+provenance and logged-out verification stages also passed.
+
+Independent readback verified the final managed receipt, both native/replay receipt
+pairs, their source/version/harness bindings, the public two-child index, each
+child's image/config identity and source/version labels, and equality of the
+version tag and `latest` to the canonical digest. All 14 public release assets were
+downloaded anonymously and their checksums verified, including CLI/MCP binaries for
+Linux AMD64/ARM64 and macOS ARM64, the gateway, plugins, both SDKs, SBOM and receipt
+metadata. [Release v0.7.34](https://github.com/231self/maskura/releases/tag/v0.7.34)
+is published; the closed [verification summary](../reference/s3-feedback-release-audit-2026-11-11/release-v0.7.34.json)
+records the immutable digests and scope.
+
+Canonical image:
+`ghcr.io/231self/maskura/maskura@sha256:dbac45fc128bf75e7e7060aa2a474c102d08ed8713434a3a7c7c131e1a94b021`.
+Historical v0.7.33 still points to source `adff2635fa38c82b84b04ebffbf76098f771def7`
+and image digest `sha256:a5fea3c997678821884492836921742805570a52345a3f713da0282a539b79cb`.
+The historical failed-attempt records below remain failures. Packaged receipts
+retain their `packaged-filestore-core` scope, and no reporter-environment acceptance
+or execution-attestation claim is made by this audit.
 
 Run `43257251690` (head `a9c225d1`) failed preparation: the guarded open
 preflight succeeded but all three file-argument mirrors reported
