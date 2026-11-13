@@ -1,8 +1,33 @@
 # S3 feedback release-content audit
 
-Status: corrective source and reviewed managed qualification files incorporated locally; completed local qualifications verified. Not published or customer-resolved; managed execution and native packaged qualification remain outstanding.
+Status: corrective source merged in PR #271 after all CI checks passed. Genuine managed and native packaged candidate qualification verified. Corrective v0.7.34 publication and final-tag replay remain pending; no customer-resolved claim yet.
 Date: 2026-11-11
-Target: public v0.7.33
+Last verified: 2026-11-13
+Target: historical public v0.7.33; corrective release v0.7.34
+
+## Current qualification and release state
+
+[CI run 43379562176](https://github.com/231self/maskura/actions/runs/43379562176)
+passed all checks for PR head `e0f4576e`. The checked-out merge source was
+`a4c8bad241b7d57e821b0d59ec2e334276aaa16d`; its closed receipt independently
+confirms all 13 exact managed cases, seven controls, zero ignores, successful
+case cleanup, and removal of every recorded host mount. Both negative TLS cases
+passed the actual SDK certificate-cause/no-dispatch checks. This is the first
+complete standard-runner managed qualification in this audit.
+
+The same run's native AMD64 and ARM64 candidate receipts each report 31/31
+packaged FileStore rows and seven true cleanup checks. Their scope remains
+`packaged-filestore-core`; neither receipt alone claims the full feedback matrix.
+All other CI jobs, including Postgres, interoperability, E2E, SDK, security and
+CodeQL, passed. PR #271 was merged as `bc15b206cab38d2da313806efbf17e2018ef6874`.
+
+The v0.7.34 preparation synchronizes the workspace/lock and SDK metadata plus
+release-facing image references; the OpenAPI schema is unchanged apart from its
+version. The release workflow must independently repeat managed qualification
+on the final source and run native child qualification and published replay
+before image-index/`latest` promotion and binary publication. Historical v0.7.33
+tags/artifacts remain unchanged. Final published digests and binaries have not
+yet been verified; the historical failed-attempt records below remain failures.
 
 Run `43257251690` (head `a9c225d1`) failed preparation: the guarded open
 preflight succeeded but all three file-argument mirrors reported
