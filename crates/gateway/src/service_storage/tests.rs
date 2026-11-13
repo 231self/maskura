@@ -179,8 +179,8 @@ async fn scratch_repro_managed_multipart_full_publish() {
     };
     use sha2::Digest;
 
-    struct TempDir(PathBuf);
-    impl TempDir {
+    struct OwnedScratchPath(PathBuf);
+    impl OwnedScratchPath {
         fn new() -> Self {
             Self(std::env::temp_dir().join(format!("maskura-scratch-{}", uuid::Uuid::now_v7())))
         }
@@ -188,13 +188,8 @@ async fn scratch_repro_managed_multipart_full_publish() {
             &self.0
         }
     }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    let directory = TempDir::new();
+    // The launcher owns TMPDIR and cleans it only after the child has exited.
+    let directory = OwnedScratchPath::new();
     let staging = Arc::new(
         FileMultipartRepository::open(
             directory.path().join("multipart"),
@@ -210,16 +205,27 @@ async fn scratch_repro_managed_multipart_full_publish() {
         key: "key-a".to_string(),
         upload_id: uuid::Uuid::now_v7().to_string(),
     };
+    let user_metadata = BTreeMap::from([
+        ("content-type".to_string(), "customer-type".to_string()),
+        (
+            "content-encoding".to_string(),
+            "customer-encoding".to_string(),
+        ),
+    ]);
+    let representation = BTreeMap::from([("content-encoding".to_string(), "gzip".to_string())]);
+    let metadata = crate::transaction::metadata::encode_with_representation(
+        "application/json",
+        &representation,
+        &user_metadata,
+    )
+    .unwrap();
     let now = now_ms();
     staging
         .create(MultipartUpload {
             identity: identity.clone(),
             namespace_epoch: None,
             snapshot: MultipartSnapshot {
-                metadata: BTreeMap::from([(
-                    "content-type".to_string(),
-                    "application/json".to_string(),
-                )]),
+                metadata: metadata.clone(),
                 tags: BTreeMap::new(),
                 checksum_mode: None,
                 destination: serde_json::json!({"kind": "managed"}),
@@ -331,10 +337,7 @@ async fn scratch_repro_managed_multipart_full_publish() {
             placement_version: 1,
             primary_backend_id: "primary".to_string(),
             replica_backend_id: None,
-            metadata: BTreeMap::from([(
-                "content-type".to_string(),
-                "application/json".to_string(),
-            )]),
+            metadata: metadata.clone(),
             primary_status: CopyStatus::Ready,
             replica_status: CopyStatus::Absent,
         }),
@@ -378,10 +381,7 @@ async fn scratch_repro_managed_multipart_full_publish() {
                     workspace_binding: None,
                 },
                 crate::transaction::ExpectedObject {
-                    metadata: BTreeMap::from([(
-                        "content-type".to_string(),
-                        "application/json".to_string(),
-                    )]),
+                    metadata: metadata.clone(),
                     ..crate::transaction::ExpectedObject::default()
                 },
             ),
@@ -390,6 +390,17 @@ async fn scratch_repro_managed_multipart_full_publish() {
         )
         .await
         .unwrap();
+
+    assert_eq!(
+        journal
+            .get(operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .expected
+            .metadata,
+        metadata
+    );
 
     // Managed sink over a fake provider destination.
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -406,7 +417,7 @@ async fn scratch_repro_managed_multipart_full_publish() {
         },
         logical_operation_id: Some(operation_id),
         expected_cas: None,
-        metadata: BTreeMap::new(),
+        metadata: metadata.clone(),
         primary: Box::new(primary),
         replica: None,
         output: None,
@@ -473,6 +484,15 @@ async fn scratch_repro_managed_multipart_full_publish() {
         .unwrap();
     assert_eq!(operation.state, ManagedLogicalOperationState::Committed);
     assert!(operation.evidence.is_some());
+    assert_eq!(operation.intent.receipt_id, receipt_id);
+    assert_eq!(
+        operation.intent.publication_recipe.unwrap().metadata,
+        metadata
+    );
+    assert_eq!(
+        repository.get(&logical).await.unwrap().unwrap().metadata,
+        metadata
+    );
     let _ = StoredObjectMeta::default();
 }
 
@@ -736,6 +756,293 @@ fn authority() -> ObjectAuthority {
         created_at_ms: 0,
         updated_at_ms: 0,
     }
+}
+
+#[derive(Default)]
+struct MetadataProvider {
+    object: Mutex<Option<(axum::http::HeaderMap, Bytes)>>,
+    puts: std::sync::atomic::AtomicUsize,
+}
+
+async fn metadata_provider(
+    State(provider): State<Arc<MetadataProvider>>,
+    request: axum::http::Request<Body>,
+) -> axum::response::Response {
+    let (parts, body) = request.into_parts();
+    if parts.method == Method::GET && parts.uri.query().is_some_and(|q| q.contains("versioning")) {
+        return axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/xml")
+            .body(Body::from(
+                r#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>"#,
+            ))
+            .unwrap();
+    }
+    if parts.method == Method::PUT {
+        provider
+            .puts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in &parts.headers {
+            if name == axum::http::header::CONTENT_TYPE
+                || name == axum::http::header::CONTENT_ENCODING
+                || name.as_str().starts_with("x-amz-meta-")
+            {
+                headers.insert(name, value.clone());
+            }
+        }
+        *provider.object.lock().unwrap() = Some((headers, bytes));
+        return axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("etag", "\"synthetic\"")
+            .body(Body::empty())
+            .unwrap();
+    }
+    let Some((headers, bytes)) = provider.object.lock().unwrap().clone() else {
+        return axum::response::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::empty())
+            .unwrap();
+    };
+    let mut response = axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-length", bytes.len())
+        .header("etag", "\"synthetic\"");
+    for (name, value) in &headers {
+        response = response.header(name, value);
+    }
+    response
+        .body(if parts.method == Method::HEAD {
+            Body::empty()
+        } else {
+            Body::from(bytes)
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn managed_versioned_metadata_is_bound_through_commit_and_tampered_repair_fails() {
+    use crate::control::{AuthorizationGrant, UsageAuthorization};
+    let provider = Arc::new(MetadataProvider::default());
+    let router = Router::new()
+        .fallback(any(metadata_provider))
+        .with_state(provider.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let repository = Arc::new(InMemoryManagedRepository::new());
+    let backends = parse_service_backends("aws|managed-primary|account|1|https://provider.example|us-east-1|provider-bucket|key|secret").unwrap();
+    let mut capabilities = managed_test_capabilities();
+    capabilities.versioning = VersioningCapability::Unsupported;
+    let storage = Arc::new(
+        ServiceStorage::with_management(
+            backends,
+            repository.clone(),
+            ManagedStreamingMode::Enforce,
+            1,
+        )
+        .with_managed_capabilities(Some(capabilities)),
+    );
+    let client = Client::from_conf(
+        aws_sdk_s3::Config::builder()
+            .behavior_version_latest()
+            .credentials_provider(Credentials::new(
+                "synthetic",
+                "synthetic",
+                None,
+                None,
+                "test",
+            ))
+            .region(Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .build(),
+    );
+    storage.clients.write().await[0] = Some(client);
+    let journal: Arc<dyn OperationJournal> =
+        Arc::new(crate::transaction::InMemoryOperationJournal::durable_for_test());
+    let logical = LogicalObjectKey::new("tenant", "bucket", "key");
+    let operation_id = uuid::Uuid::now_v7();
+    let receipt_id = uuid::Uuid::now_v7();
+    let user_metadata = BTreeMap::from([
+        ("project".to_string(), "synthetic".to_string()),
+        ("content-encoding".to_string(), "customer".to_string()),
+    ]);
+    let representation = BTreeMap::from([("content-encoding".to_string(), "gzip".to_string())]);
+    let record = crate::transaction::metadata::encode_with_representation(
+        "text/plain",
+        &representation,
+        &user_metadata,
+    )
+    .unwrap();
+    let mut sink = storage
+        .begin_managed_put_sink_with_metadata(
+            journal.clone(),
+            capabilities,
+            logical.clone(),
+            "text/plain",
+            operation_id,
+            receipt_id,
+            crate::transaction::unix_time_ms(),
+            1,
+            1024,
+            None,
+            0,
+            record.clone(),
+        )
+        .await
+        .unwrap();
+    let parent = repository
+        .logical_operation(operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        parent.intent.publication_recipe.as_ref().unwrap().metadata,
+        record
+    );
+    let child = journal
+        .get(parent.intent.primary_child_operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::transaction::metadata::decode(&child.expected.metadata)
+            .unwrap()
+            .user_metadata,
+        user_metadata
+    );
+    sink.write(Bytes::from_static(b"abc")).await.unwrap();
+    sink.verify_output(
+        3,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    )
+    .await
+    .unwrap();
+    let auth = UsageAuthorization::new(
+        operation_id,
+        receipt_id,
+        "bucket",
+        UsageRoute::CompleteMultipartUpload,
+        RequestKind::Write,
+        1024,
+    );
+    let grant = AuthorizationGrant::new(&auth, chrono::Utc::now(), 1);
+    sink.record_usage_evidence(&UsageEvent::from_grant(&grant, 3, 3))
+        .await
+        .unwrap();
+    sink.complete(DestinationCommitAuthority::SinglePut)
+        .await
+        .unwrap();
+    let authority = repository.get(&logical).await.unwrap().unwrap();
+    assert_eq!(authority.metadata, record);
+    let committed = repository
+        .logical_operation(operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.intent.receipt_id, receipt_id);
+    assert_eq!(
+        committed.evidence.unwrap().payload["route"],
+        UsageRoute::CompleteMultipartUpload.as_str()
+    );
+    let head = storage.head_authoritative(&logical).await.unwrap().unwrap();
+    assert_eq!(head.content_encoding(), Some("gzip"));
+    assert_eq!(
+        head.metadata()
+            .unwrap()
+            .get("content-encoding")
+            .map(String::as_str),
+        Some("customer")
+    );
+    assert_eq!(
+        head.metadata().unwrap().get("project").map(String::as_str),
+        Some("synthetic")
+    );
+    let opened = storage
+        .open_authoritative(&logical, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        opened
+            .metadata()
+            .unwrap()
+            .get("project")
+            .map(String::as_str),
+        Some("synthetic")
+    );
+    assert_eq!(
+        opened.body.collect().await.unwrap().into_bytes(),
+        Bytes::from_static(b"abc")
+    );
+    let repair = RepairRecord::copy(
+        RepairKind::Replica,
+        &authority,
+        Some(storage.backends[0].id()),
+        storage.backends[0].id(),
+        RepairTargetRole::Replica,
+        1,
+    );
+    let before = provider.puts.load(std::sync::atomic::Ordering::SeqCst);
+    provider
+        .object
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .0
+        .insert("content-encoding", "br".parse().unwrap());
+    assert!(
+        storage
+            .head_authoritative(&logical)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let error = storage
+        .execute_repair(journal.clone(), capabilities, &repair)
+        .await
+        .unwrap_err();
+    assert!(error.contains("does not match authority"), "{error}");
+    assert_eq!(
+        provider.puts.load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+    provider
+        .object
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .0
+        .insert("content-encoding", "gzip".parse().unwrap());
+    provider
+        .object
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .0
+        .insert("x-amz-meta-project", "tampered".parse().unwrap());
+    assert!(
+        storage
+            .head_authoritative(&logical)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let error = storage
+        .execute_repair(journal, capabilities, &repair)
+        .await
+        .unwrap_err();
+    assert!(error.contains("does not match authority"), "{error}");
+    assert_eq!(
+        provider.puts.load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+    server.abort();
 }
 
 fn purge_request() -> NamespacePurgeRequest {
@@ -1191,6 +1498,215 @@ async fn abort_after_lost_put_response_and_retry_ambiguity_preserves_blocking_in
 }
 
 #[tokio::test]
+async fn logical_recovery_rejects_child_metadata_before_any_provider_request() {
+    for case in [
+        "customer",
+        "content-type",
+        "encoding",
+        "identity",
+        "unknown-version",
+    ] {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(any(purge_provider_mock))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = ServiceBackend {
+            provider: "mock".into(),
+            provider_instance_id: Some("managed-primary".into()),
+            provider_account_id: Some("test-account".into()),
+            credential_epoch: Some(1),
+            placement_weight: 1,
+            placement_capacity_units: 1,
+            endpoint: format!("http://{}", listener.local_addr().unwrap()),
+            region: "us-east-1".into(),
+            bucket: "provider-bucket".into(),
+            access_key: "synthetic".into(),
+            secret_key: "synthetic".into(),
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let repository = Arc::new(InMemoryManagedRepository::new());
+        let logical = LogicalObjectKey::new("tenant", "bucket", "synthetic");
+        let generation = uuid::Uuid::now_v7();
+        let metadata = crate::transaction::metadata::encode_with_representation(
+            "text/plain",
+            &BTreeMap::from([("content-encoding".into(), "gzip".into())]),
+            &BTreeMap::from([("project".into(), "synthetic".into())]),
+        )
+        .unwrap();
+        let intent = ManagedLogicalOperationIntent {
+            operation_id: uuid::Uuid::now_v7(),
+            receipt_id: uuid::Uuid::now_v7(),
+            logical: logical.clone(),
+            kind: ManagedMutationKind::Put,
+            generation,
+            fence: repository.route_fence("tenant").await.unwrap(),
+            expected_authority_cas: None,
+            prior_logical_size: 0,
+            primary_child_operation_id: uuid::Uuid::now_v7(),
+            backend_id: provider.id(),
+            provider_bucket: provider.bucket.clone(),
+            physical_key: generation_physical_key(&logical, generation),
+            occurred_at_ms: crate::transaction::unix_time_ms(),
+            rate_version: 1,
+            route: UsageRoute::PutObject,
+            request_kind: RequestKind::Write,
+            max_processed_bytes: 1024,
+            publication_recipe: Some(ManagedPublicationRecipe {
+                version: MANAGED_PUBLICATION_RECIPE_VERSION,
+                placement_version: 1,
+                primary_backend_id: provider.id(),
+                replica_backend_id: None,
+                metadata: metadata.clone(),
+                primary_status: CopyStatus::Ready,
+                replica_status: CopyStatus::Absent,
+            }),
+        };
+        repository
+            .admit_logical_operation(intent.clone(), 4096)
+            .await
+            .unwrap();
+        let physical = PhysicalWriteIntent {
+            intent_id: intent.primary_child_operation_id,
+            tenant_id: "tenant".into(),
+            backend_id: provider.id(),
+            storage_identity: provider.storage_identity().unwrap(),
+            credential_epoch: 1,
+            provider_bucket: provider.bucket.clone(),
+            physical_key: intent.physical_key.clone(),
+            versioning_mode: BackendVersioningMode::Enabled,
+            versioning_capability: BackendVersioningCapability::Optional,
+            lease_owner: "writer".into(),
+        };
+        let lease = repository
+            .begin_physical_write(physical.clone())
+            .await
+            .unwrap();
+        repository
+            .renew_physical_write_intent(&lease, 0)
+            .await
+            .unwrap();
+        repository
+            .record_logical_usage_and_begin_completion(
+                intent.operation_id,
+                ManagedUsageEvidence {
+                    expected_output_digest: Some("digest".into()),
+                    expected_output_size: 3,
+                    source_bytes: 3,
+                    processed_bytes: 3,
+                    payload: serde_json::json!({"synthetic": true}),
+                },
+            )
+            .await
+            .unwrap();
+        let mut child_metadata = metadata;
+        child_metadata.extend(BTreeMap::from([
+            ("maskura-generation".into(), generation.to_string()),
+            (
+                "maskura-provider-instance".into(),
+                physical.storage_identity.provider_instance_id,
+            ),
+            (
+                "maskura-provider-account".into(),
+                physical.storage_identity.provider_account_id,
+            ),
+            ("maskura-credential-epoch".into(), "1".into()),
+        ]));
+        let changed = match case {
+            "customer" => (":maskura:user:project", "wrong"),
+            "content-type" => ("content-type", "application/json"),
+            "encoding" => (":maskura:representation:content-encoding", "br"),
+            "identity" => ("maskura-provider-account", "wrong"),
+            "unknown-version" => (":maskura:metadata-version", "999"),
+            _ => unreachable!(),
+        };
+        child_metadata.insert(changed.0.into(), changed.1.into());
+        let journal = Arc::new(crate::transaction::InMemoryOperationJournal::durable_for_test());
+        let mut child = crate::transaction::OperationRecord::scoped_intent(
+            intent.primary_child_operation_id,
+            ObjectDestination {
+                backend_id: provider.id(),
+                bucket: provider.bucket.clone(),
+                logical_key: logical.object_key(),
+                physical_key: intent.physical_key.clone(),
+                workspace_binding: None,
+            },
+            ExpectedObject {
+                digest: Some("digest".into()),
+                size: Some(3),
+                metadata: child_metadata,
+            },
+            "tenant".into(),
+            lease.namespace_epoch,
+        );
+        child.created_at_ms = 0;
+        child.updated_at_ms = 0;
+        journal.insert_intent(child).await.unwrap();
+        journal
+            .set_open(intent.primary_child_operation_id, Some("original-upload"))
+            .await
+            .unwrap();
+        journal
+            .transition(
+                intent.primary_child_operation_id,
+                OperationState::Open,
+                OperationState::Completing,
+                None,
+            )
+            .await
+            .unwrap();
+        let storage = ServiceStorage::with_management(
+            vec![provider],
+            repository.clone(),
+            ManagedStreamingMode::Enforce,
+            1,
+        )
+        .with_managed_capabilities(Some(managed_test_capabilities()));
+        assert_eq!(
+            storage
+                .reconcile_managed_logical_operations(
+                    journal.clone(),
+                    managed_test_capabilities(),
+                    Duration::ZERO,
+                    10
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        let recovered = repository
+            .logical_operation(intent.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.state,
+            ManagedLogicalOperationState::RecoveryBlocked,
+            "{case}"
+        );
+        assert_eq!(
+            recovered.last_error_class.as_deref(),
+            Some("child_metadata_mismatch")
+        );
+        assert_eq!(
+            journal
+                .get(intent.primary_child_operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            OperationState::Completing
+        );
+        assert!(repository.get(&logical).await.unwrap().is_none());
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "{case}: provider reconciliation must not start"
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn multi_instance_reconciler_skips_fresh_and_recovers_expired_terminal_intent() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new()
@@ -1329,6 +1845,103 @@ async fn multi_instance_reconciler_skips_fresh_and_recovers_expired_terminal_int
 }
 
 #[test]
+fn managed_authority_rejects_wrong_or_extra_customer_metadata() {
+    let mut authority = authority();
+    let users = BTreeMap::from([("project".to_string(), "synthetic".to_string())]);
+    authority.metadata = crate::transaction::metadata::encode("text/plain", &users).unwrap();
+    let mut provider = std::collections::HashMap::from([
+        (
+            "maskura-generation".to_string(),
+            authority.generation.to_string(),
+        ),
+        ("maskura-sha256".to_string(), authority.digest.clone()),
+        ("maskura-size".to_string(), authority.size.to_string()),
+        ("project".to_string(), "synthetic".to_string()),
+    ]);
+    assert!(ServiceStorage::metadata_matches(
+        Some(&provider),
+        Some("text/plain"),
+        None,
+        Some(authority.size as i64),
+        &authority,
+        false
+    ));
+    assert!(!ServiceStorage::metadata_matches(
+        Some(&provider),
+        Some("application/json"),
+        None,
+        Some(authority.size as i64),
+        &authority,
+        false
+    ));
+    provider.insert("project".to_string(), "tampered".to_string());
+    assert!(!ServiceStorage::metadata_matches(
+        Some(&provider),
+        Some("text/plain"),
+        None,
+        Some(authority.size as i64),
+        &authority,
+        false
+    ));
+    provider.insert("project".to_string(), "synthetic".to_string());
+    provider.insert("extra".to_string(), "unexpected".to_string());
+    assert!(!ServiceStorage::metadata_matches(
+        Some(&provider),
+        Some("text/plain"),
+        None,
+        Some(authority.size as i64),
+        &authority,
+        false
+    ));
+}
+
+#[test]
+fn managed_authority_rejects_wrong_representation_encoding() {
+    let mut authority = authority();
+    let representation = BTreeMap::from([("content-encoding".to_string(), "gzip".to_string())]);
+    let users = BTreeMap::from([("content-encoding".to_string(), "customer".to_string())]);
+    authority.metadata = crate::transaction::metadata::encode_with_representation(
+        "text/plain",
+        &representation,
+        &users,
+    )
+    .unwrap();
+    let provider = std::collections::HashMap::from([
+        (
+            "maskura-generation".to_string(),
+            authority.generation.to_string(),
+        ),
+        ("maskura-sha256".to_string(), authority.digest.clone()),
+        ("maskura-size".to_string(), authority.size.to_string()),
+        ("content-encoding".to_string(), "customer".to_string()),
+    ]);
+    assert!(ServiceStorage::metadata_matches(
+        Some(&provider),
+        Some("text/plain"),
+        Some("gzip"),
+        Some(authority.size as i64),
+        &authority,
+        false
+    ));
+    assert!(!ServiceStorage::metadata_matches(
+        Some(&provider),
+        Some("text/plain"),
+        Some("br"),
+        Some(authority.size as i64),
+        &authority,
+        false
+    ));
+    assert!(!ServiceStorage::metadata_matches(
+        Some(&provider),
+        Some("text/plain"),
+        None,
+        Some(authority.size as i64),
+        &authority,
+        false
+    ));
+}
+
+#[test]
 fn stale_replica_metadata_can_never_match_current_authority() {
     let authority = authority();
     let current = std::collections::HashMap::from([
@@ -1341,6 +1954,8 @@ fn stale_replica_metadata_can_never_match_current_authority() {
     ]);
     assert!(ServiceStorage::metadata_matches(
         Some(&current),
+        None,
+        None,
         Some(authority.size as i64),
         &authority,
         false,
@@ -1353,6 +1968,8 @@ fn stale_replica_metadata_can_never_match_current_authority() {
     );
     assert!(!ServiceStorage::metadata_matches(
         Some(&stale_generation),
+        None,
+        None,
         Some(authority.size as i64),
         &authority,
         false,
@@ -1361,12 +1978,16 @@ fn stale_replica_metadata_can_never_match_current_authority() {
     stale_digest.insert("maskura-sha256".to_string(), "old".to_string());
     assert!(!ServiceStorage::metadata_matches(
         Some(&stale_digest),
+        None,
+        None,
         Some(authority.size as i64),
         &authority,
         false,
     ));
     assert!(!ServiceStorage::metadata_matches(
         Some(&current),
+        None,
+        None,
         Some(41),
         &authority,
         false,
@@ -1653,7 +2274,7 @@ async fn managed_sink_rejects_mismatched_multipart_operation_before_propagation(
         Err(TransactionError::CommitAuthority(_))
     ));
     assert!(primary.lock().unwrap().completion_authorities.is_empty());
-    tokio::fs::remove_dir_all(root).await.unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 #[tokio::test]

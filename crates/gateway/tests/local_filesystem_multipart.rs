@@ -18,7 +18,7 @@ use bytes::Bytes;
 use maskura_customer_config::Config;
 use maskura_gateway::Gateway;
 use maskura_gateway::control::NoopControlPlane;
-use maskura_gateway::key_cipher::default_wrapping;
+use maskura_gateway::key_cipher::LocalKeyWrapping;
 use maskura_gateway::pipeline::{
     ComponentSource, PipelineDirection, PipelineLocator, PipelineResolution, PipelineResolver,
     StaticPipelineResolver, resolution_fingerprint,
@@ -169,7 +169,25 @@ async fn body_bytes(response: axum::response::Response) -> Vec<u8> {
 }
 
 async fn build_isolated_state() -> anyhow::Result<Arc<AppState>> {
-    let config = Config::resolve(None)?;
+    let mut config = Config::resolve(None)?;
+    config.auth.disabled = false;
+    config.storage.mode = Some("local".to_string());
+    config.storage.single_tenant = true;
+    config.storage.s3_endpoint = None;
+    anyhow::ensure!(
+        config.storage.local_dir.as_deref().is_some_and(|path| {
+            Path::new(path).is_absolute() && Path::new(path).starts_with(std::env::temp_dir())
+        }),
+        "local multipart fixture requires an explicit root inside its owned TMPDIR"
+    );
+    config.keys.keys_file = None;
+    config.keys.bootstrap_key = None;
+    config.spool.dir = Some(
+        std::env::temp_dir()
+            .join(format!("maskura-filestore-spool-{}", uuid::Uuid::now_v7()))
+            .display()
+            .to_string(),
+    );
     let pipeline_template = StatePipelineTemplate::from_config_with_executor(
         &config,
         maskura_wasm_runtime::ExecutorConfig {
@@ -180,7 +198,7 @@ async fn build_isolated_state() -> anyhow::Result<Arc<AppState>> {
     )?;
     build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
-        default_wrapping()?,
+        Arc::new(LocalKeyWrapping::with_kek([0x42; 32])),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         &pipeline_template,
         &config,
@@ -576,7 +594,7 @@ async fn run_single_lifecycle() {
     run_lifecycle(&root).await;
 
     drop(env);
-    let _ = std::fs::remove_dir_all(&root);
+    // The launcher removes its owned TMPDIR after the child and workers exit.
 }
 
 async fn run_lifecycle(root: &Path) {
@@ -1298,7 +1316,7 @@ async fn run_restart_matrix() {
     drop(state);
 
     drop(env);
-    let _ = std::fs::remove_dir_all(&root);
+    // The launcher removes its owned TMPDIR after the child and workers exit.
 }
 
 /// Build a fresh isolated local-staged state plus router and credentials for

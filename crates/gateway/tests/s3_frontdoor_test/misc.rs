@@ -43,7 +43,7 @@ async fn resolved_feature_limit_and_wasm_config_populates_state_without_late_env
         StatePipelineTemplate::from_config(&config).expect("compile configured pipeline");
     let state = build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
-        default_wrapping().expect("wrapping"),
+        fixture_wrapping(),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         &pipeline_template,
         &config,
@@ -95,7 +95,7 @@ async fn resolved_feature_limit_and_wasm_config_populates_state_without_late_env
 
     drop(app);
     drop(state);
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher removes this owned root after all child workers have exited.
 }
 
 #[test]
@@ -237,7 +237,7 @@ async fn cancellation_during_committed_settlement_returns_success_without_releas
     let config = test_config();
     let state = build_state_with_pipeline_template(
         control.clone(),
-        default_wrapping().expect("wrapping"),
+        fixture_wrapping(),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         test_pipeline_template(),
         &config,

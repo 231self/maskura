@@ -206,14 +206,21 @@ impl ObjectSinkTransaction for FileSinkTransaction {
         let etag = format!("\"{}\"", hex::encode(self.md5.clone().finalize()));
         match &authority {
             DestinationCommitAuthority::SinglePut => {
+                let metadata = MultipartStoredMetadata {
+                    representation_headers: self.representation_headers.clone(),
+                    user_metadata: self.user_metadata.clone(),
+                    tags: self.tags.clone(),
+                    checksum_algorithm: self.checksum_algorithm.clone(),
+                };
                 self.store
-                    .commit_temp(
+                    .commit_temp_with_metadata(
                         &self.bucket,
                         &self.key,
                         &self.temp_path,
                         &self.content_type,
                         self.bytes,
                         &etag,
+                        &metadata,
                     )
                     .await
                     .map_err(file_error)?;

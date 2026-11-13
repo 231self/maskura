@@ -776,6 +776,18 @@ pub(crate) async fn s3_delete_objects(
                 return s3_error::invalid_request(&bucket, "DeleteObjects request body failed");
             }
         };
+    let mut content_md5 = match ContentMd5Verifier::from_headers(&parts.headers) {
+        Ok(verifier) => verifier,
+        Err(error) => return s3_error::bad_digest(&bucket, &error.to_string()),
+    };
+    if let Some(verifier) = &mut content_md5 {
+        verifier.update(&body);
+    }
+    if let Some(verifier) = content_md5
+        && let Err(error) = verifier.finish()
+    {
+        return s3_error::bad_digest(&bucket, &error.to_string());
+    }
     // Parsing (and every cap) completes before any key is touched.
     let request = match parse_delete_objects_xml(&body) {
         Ok(request) => request,

@@ -869,7 +869,7 @@ mod multipart_listing_validation_tests {
             .insert("content-encoding".into(), "gzip".into());
         snapshot.metadata.insert("project".into(), "maskura".into());
         snapshot.tags.insert("team".into(), "data".into());
-        let stored = multipart_stored_metadata(&snapshot);
+        let stored = multipart_stored_metadata(&snapshot).unwrap();
         assert_eq!(
             stored
                 .representation_headers
@@ -932,6 +932,50 @@ mod multipart_listing_validation_tests {
         assert_eq!(stored.user_metadata.len(), 1);
         assert_eq!(stored.tags.get("team").map(String::as_str), Some("data"));
         assert_eq!(stored.checksum_algorithm.as_deref(), Some("SHA256"));
+    }
+
+    #[test]
+    fn single_put_reserved_metadata_is_rejected_even_with_unreadable_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-meta-maskura-operation-id",
+            axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        let stored = single_put_stored_metadata(&headers);
+        assert!(
+            crate::transaction::metadata::encode_with_representation(
+                "text/plain",
+                &stored.representation_headers,
+                &stored.user_metadata,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn single_put_does_not_persist_aws_chunked_transport_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-encoding",
+            axum::http::HeaderValue::from_static("aws-chunked"),
+        );
+        headers.insert(
+            "x-amz-meta-content-encoding",
+            axum::http::HeaderValue::from_static("customer"),
+        );
+        let stored = single_put_stored_metadata(&headers);
+        assert!(
+            !stored
+                .representation_headers
+                .contains_key("content-encoding")
+        );
+        assert_eq!(
+            stored
+                .user_metadata
+                .get("content-encoding")
+                .map(String::as_str),
+            Some("customer")
+        );
     }
 
     #[test]

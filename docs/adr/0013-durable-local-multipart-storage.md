@@ -41,6 +41,15 @@ compacted per-upload and per-operation snapshots, owner-only permissions,
 unique temporary files, file sync, atomic rename, and directory sync. Corrupt
 durable state fails startup closed.
 
+New multipart metadata snapshots distinguish customer metadata names from
+representation headers with a versioned internal namespace; provider-reserved
+transaction names are rejected on admission. Historical flat snapshots retain
+their historical interpretation of `content-type` and `content-encoding` as
+representation fields: a customer value already overwritten in such a snapshot
+cannot be reconstructed. Unknown versions and detectable corruption fail closed;
+a marker-less record identical to a valid historical record cannot be identified
+as altered from that record alone.
+
 Generate and persist a local 256-bit wrapping key under the FileStore root on
 first use. The mounted data volume and wrapping key form one backup and recovery
 unit.

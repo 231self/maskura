@@ -1,6 +1,137 @@
 use super::super::*;
 use super::*;
 
+#[test]
+fn multipart_snapshot_defaults_absent_content_type_at_initiation() {
+    let backend = ResolvedBackend::Memory(Arc::new(crate::store::MemoryStore::new()));
+    let mut headers = HeaderMap::new();
+    let snapshot =
+        multipart_snapshot(&headers, &backend, serde_json::json!({}), 1024, None).unwrap();
+    assert_eq!(
+        snapshot.metadata.get("content-type").map(String::as_str),
+        Some("application/octet-stream")
+    );
+
+    headers.insert("x-amz-meta-content-type", "user-metadata".parse().unwrap());
+    let snapshot =
+        multipart_snapshot(&headers, &backend, serde_json::json!({}), 1024, None).unwrap();
+    assert_eq!(
+        snapshot.metadata.get("content-type").map(String::as_str),
+        Some("application/octet-stream")
+    );
+    assert_eq!(
+        multipart_stored_metadata(&snapshot)
+            .unwrap()
+            .user_metadata
+            .get("content-type")
+            .map(String::as_str),
+        Some("user-metadata")
+    );
+}
+
+#[test]
+fn multipart_snapshot_preserves_explicit_content_type() {
+    let backend = ResolvedBackend::Memory(Arc::new(crate::store::MemoryStore::new()));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        "text/plain; charset=utf-8".parse().unwrap(),
+    );
+    headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+    headers.insert(
+        "x-amz-meta-content-encoding",
+        "customer-value".parse().unwrap(),
+    );
+    let snapshot =
+        multipart_snapshot(&headers, &backend, serde_json::json!({}), 1024, None).unwrap();
+
+    assert_eq!(
+        snapshot.metadata.get("content-type").map(String::as_str),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(
+        multipart_stored_metadata(&snapshot)
+            .unwrap()
+            .representation_headers
+            .get("content-encoding")
+            .map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(
+        multipart_stored_metadata(&snapshot)
+            .unwrap()
+            .user_metadata
+            .get("content-encoding")
+            .map(String::as_str),
+        Some("customer-value")
+    );
+}
+
+#[test]
+fn multipart_snapshot_does_not_default_invalid_explicit_content_type() {
+    let backend = ResolvedBackend::Memory(Arc::new(crate::store::MemoryStore::new()));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+    );
+    assert!(multipart_snapshot(&headers, &backend, serde_json::json!({}), 1024, None).is_err());
+}
+
+#[test]
+fn multipart_snapshot_rejects_reserved_and_corrupt_metadata() {
+    let backend = ResolvedBackend::Memory(Arc::new(crate::store::MemoryStore::new()));
+    let mut headers = HeaderMap::new();
+    headers.insert("x-amz-meta-maskura-operation-id", "bad".parse().unwrap());
+    assert!(multipart_snapshot(&headers, &backend, serde_json::json!({}), 1024, None).is_err());
+    headers.clear();
+    headers.insert("x-amz-meta-project", "synthetic".parse().unwrap());
+    let mut snapshot =
+        multipart_snapshot(&headers, &backend, serde_json::json!({}), 1024, None).unwrap();
+    snapshot
+        .metadata
+        .insert(":maskura:metadata-version".into(), "999".into());
+    assert!(multipart_stored_metadata(&snapshot).is_err());
+    snapshot.metadata.remove(":maskura:metadata-version");
+    assert!(multipart_stored_metadata(&snapshot).is_err());
+}
+
+#[test]
+fn multipart_legacy_snapshot_is_read_without_rewriting_and_rejects_reserved_names() {
+    let backend = ResolvedBackend::Memory(Arc::new(crate::store::MemoryStore::new()));
+    let mut snapshot = multipart_snapshot(
+        &HeaderMap::new(),
+        &backend,
+        serde_json::json!({}),
+        1024,
+        None,
+    )
+    .unwrap();
+    snapshot.metadata = std::collections::BTreeMap::from([
+        ("content-type".into(), "text/plain".into()),
+        ("content-encoding".into(), "gzip".into()),
+        ("project".into(), "synthetic".into()),
+    ]);
+    let original = snapshot.metadata.clone();
+    let stored = multipart_stored_metadata(&snapshot).unwrap();
+    assert_eq!(
+        stored.user_metadata.get("project").map(String::as_str),
+        Some("synthetic")
+    );
+    assert_eq!(
+        stored
+            .representation_headers
+            .get("content-encoding")
+            .map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(snapshot.metadata, original);
+    snapshot
+        .metadata
+        .insert("maskura-operation-id".into(), "ambiguous".into());
+    assert!(multipart_stored_metadata(&snapshot).is_err());
+}
+
 #[tokio::test]
 async fn multipart_crash_recovery_restores_exact_precommit_pipeline_evidence() {
     let journal: Arc<dyn OperationJournal> =

@@ -84,9 +84,15 @@ impl AuthenticatedMcpPrincipal {
     }
 }
 
+#[derive(Debug, Clone)]
+struct MemoryStoredObject {
+    object: StoredObject,
+    metadata: crate::transaction::MultipartStoredMetadata,
+}
+
 #[derive(Debug)]
 pub struct MemoryStore {
-    objects: RwLock<HashMap<String, StoredObject>>,
+    objects: RwLock<HashMap<String, MemoryStoredObject>>,
 }
 
 impl MemoryStore {
@@ -107,16 +113,30 @@ impl MemoryStore {
         data: impl Into<Bytes>,
         content_type: &str,
     ) -> StoredObject {
+        self.put_with_metadata(bucket, key, data, content_type, Default::default())
+    }
+
+    pub(crate) fn put_with_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: impl Into<Bytes>,
+        content_type: &str,
+        metadata: crate::transaction::MultipartStoredMetadata,
+    ) -> StoredObject {
         let etag = format!("\"{}\"", Uuid::new_v4());
         let obj = StoredObject {
             data: data.into(),
             content_type: content_type.to_string(),
             etag: etag.clone(),
         };
-        self.objects
-            .write()
-            .unwrap()
-            .insert(Self::object_key(bucket, key), obj.clone());
+        self.objects.write().unwrap().insert(
+            Self::object_key(bucket, key),
+            MemoryStoredObject {
+                object: obj.clone(),
+                metadata,
+            },
+        );
         obj
     }
 
@@ -125,7 +145,19 @@ impl MemoryStore {
             .read()
             .unwrap()
             .get(&Self::object_key(bucket, key))
-            .cloned()
+            .map(|entry| entry.object.clone())
+    }
+
+    pub(crate) fn get_with_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Option<(StoredObject, crate::transaction::MultipartStoredMetadata)> {
+        self.objects
+            .read()
+            .unwrap()
+            .get(&Self::object_key(bucket, key))
+            .map(|entry| (entry.object.clone(), entry.metadata.clone()))
     }
 
     pub fn head(&self, bucket: &str, key: &str) -> Option<StoredObject> {
@@ -135,8 +167,8 @@ impl MemoryStore {
             .get(&Self::object_key(bucket, key))
             .map(|object| StoredObject {
                 data: Bytes::new(),
-                content_type: object.content_type.clone(),
-                etag: object.etag.clone(),
+                content_type: object.object.content_type.clone(),
+                etag: object.object.etag.clone(),
             })
     }
 
@@ -147,9 +179,9 @@ impl MemoryStore {
             .get(&Self::object_key(bucket, key))
             .map(|object| {
                 (
-                    object.data.len(),
-                    object.content_type.clone(),
-                    object.etag.clone(),
+                    object.object.data.len(),
+                    object.object.content_type.clone(),
+                    object.object.etag.clone(),
                 )
             })
     }

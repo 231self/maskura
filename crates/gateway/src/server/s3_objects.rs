@@ -805,14 +805,21 @@ pub(crate) async fn open_backend_object(
         }
         ResolvedBackend::Memory(store) => {
             if head_only {
-                let (size, content_type, etag) = store
-                    .metadata(bucket, key)
+                let (object, stored) = store
+                    .get_with_metadata(bucket, key)
                     .ok_or(OpenObjectError::NotFound)?;
                 let mut metadata = ObjectMetadata::default();
-                metadata.insert(header::CONTENT_LENGTH, size.to_string());
-                metadata.insert(header::CONTENT_TYPE, content_type);
-                metadata.insert(header::ETAG, etag);
+                metadata.insert(header::CONTENT_LENGTH, object.data.len().to_string());
+                metadata.insert(header::CONTENT_TYPE, &object.content_type);
+                metadata.insert(header::ETAG, &object.etag);
                 metadata.insert(header::ACCEPT_RANGES, "bytes");
+                apply_file_stored_headers(
+                    &mut metadata,
+                    &stored.representation_headers,
+                    &stored.user_metadata,
+                    &stored.tags,
+                    None,
+                );
                 return Ok(OpenedObject::new(
                     StatusCode::OK,
                     metadata,
@@ -820,13 +827,22 @@ pub(crate) async fn open_backend_object(
                     state.source_body_limits,
                 ));
             }
-            let object = store.get(bucket, key).ok_or(OpenObjectError::NotFound)?;
+            let (object, stored) = store
+                .get_with_metadata(bucket, key)
+                .ok_or(OpenObjectError::NotFound)?;
             let (data, content_range) = memory_range(&object.data, range)?;
             let mut metadata = ObjectMetadata::default();
             metadata.insert(header::CONTENT_LENGTH, data.len().to_string());
             metadata.insert(header::CONTENT_TYPE, object.content_type);
             metadata.insert(header::ETAG, object.etag);
             metadata.insert(header::ACCEPT_RANGES, "bytes");
+            apply_file_stored_headers(
+                &mut metadata,
+                &stored.representation_headers,
+                &stored.user_metadata,
+                &stored.tags,
+                None,
+            );
             if let Some(content_range) = content_range {
                 metadata.insert(header::CONTENT_RANGE, content_range);
             }
@@ -3494,6 +3510,18 @@ pub(crate) async fn s3_post(
             Ok(snapshot) => snapshot,
             Err(error) => return s3_error::internal_error(&key, &error.to_string()),
         };
+        let snapshot = match multipart_snapshot(
+            &parts.headers,
+            backend,
+            plugin_snapshot,
+            state.source_body_limits.max_bytes,
+            // Freeze only bound verdicts; unbound/legacy uploads have no
+            // approval evidence to retain in the staged-artifact digest.
+            policy.is_bound().then_some(policy),
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(detail) => return s3_error::invalid_request(&key, detail),
+        };
         let upload_id = Uuid::now_v7().to_string();
         let managed_registration = if let ResolvedBackend::Managed(storage) = &backend {
             match storage
@@ -3515,18 +3543,7 @@ pub(crate) async fn s3_post(
         let upload = MultipartUpload {
             identity: multipart_identity(&auth, &bucket, &key, &upload_id),
             namespace_epoch: managed_registration.as_ref().map(|(_, epoch)| *epoch),
-            snapshot: multipart_snapshot(
-                &parts.headers,
-                backend,
-                plugin_snapshot,
-                state.source_body_limits.max_bytes,
-                // Freeze only bound verdicts: an unbound verdict freezes
-                // nothing (there is no approval evidence to retain), which
-                // keeps the OSS staged-artifact digest preimage at the
-                // historical layout. `None` means "no frozen approval" for
-                // both legacy uploads and unbound-at-create alike.
-                policy.is_bound().then_some(policy),
-            ),
+            snapshot,
             lifecycle: MultipartLifecycle::Open,
             staged_bytes: 0,
             reserved_bytes: 0,

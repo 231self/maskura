@@ -81,7 +81,7 @@ async fn iceberg_state(gate_open: bool) -> Arc<AppState> {
     config.features.dev_memory_streaming = true;
     build_state_with_pipeline_template(
         Arc::new(NoopControlPlane),
-        default_wrapping().expect("wrapping"),
+        fixture_wrapping(),
         Arc::new(InMemoryWorkspaceStorageRepository::new()),
         test_pipeline_template(),
         &config,

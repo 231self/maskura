@@ -17,6 +17,12 @@ permissions:
   id-token: write
   packages: write
 
+# Normalize reusable calls and tag pushes to the same version key. Preserve the
+# running publisher; the next run must recheck release absence after it finishes.
+concurrency:
+  group: release-${{ github.repository }}-${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -32,12 +38,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify release tag and version surfaces
         run: python3 scripts/check-release-contract.py --tag "${{ env.RELEASE_TAG }}"
+      - name: Refuse existing releases and bind tag to source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 -B scripts/check-release-publication.py
+
+  managed-release:
+    needs: contract
+    permissions:
+      contents: read
+    uses: ./.github/workflows/managed-release.yml
+    with:
+      source_ref: ${{ github.sha }}
 
   # Native per-arch builds: amd64 on the x64 runner, arm64 on the native
   # arm64 runner. No cross-compilation, so ring/aws-lc-sys/openssl-sys build
   # against each runner's own native libs. Both legs run in parallel.
   build:
-    needs: contract
+    needs: [contract, managed-release]
     timeout-minutes: 90
     strategy:
       matrix:
@@ -109,11 +127,39 @@ jobs:
           platforms: ${{ matrix.platform }}
           load: true
           tags: ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}-${{ matrix.suffix }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+
+      - name: Resolve native loaded image once
+        id: feedback-image
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}-${{ matrix.suffix }}
+        run: |
+          image_id="$(docker image inspect "$IMAGE_REF" --format '{{.Id}}')"
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+
+      - name: Install native smoke dependencies
+        run: |
+          python3 -m venv .release-venv
+          . .release-venv/bin/activate
+          python3 -m pip install awscli
+          echo "$PWD/.release-venv/bin" >> "$GITHUB_PATH"
 
       - name: Boot-smoke image (${{ matrix.suffix }})
         env:
-          IMAGE_REF: ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}-${{ matrix.suffix }}
+          IMAGE_REF: ${{ steps.feedback-image.outputs.image_id }}
         run: bash scripts/release-image-smoke.sh "$IMAGE_REF"
+
+      - name: Qualify native child before push
+        env:
+          IMAGE_ID: ${{ steps.feedback-image.outputs.image_id }}
+          ARCH: ${{ matrix.suffix }}
+        run: |
+          python3 -B scripts/release-feedback.py --execute --image-id "$IMAGE_ID" \
+            --arch "$ARCH" --source-sha "$GITHUB_SHA" --version "${RELEASE_TAG#v}" \
+            --phase native-child --report "dist/image-qualification/$ARCH/native-child.json"
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -126,10 +172,44 @@ jobs:
         run: python3 scripts/sqlite-guard.py
 
       - name: Push image (${{ matrix.suffix }})
+        id: pushed-child
         env:
           IMAGE_REF: ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}-${{ matrix.suffix }}
+          IMAGE_ID: ${{ steps.feedback-image.outputs.image_id }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
-          docker push "$IMAGE_REF"
+          test "$(docker image inspect "$IMAGE_REF" --format '{{.Id}}')" = "$IMAGE_ID"
+          docker push --platform "$PLATFORM" "$IMAGE_REF" > native-push.log
+          digest="$(python3 -B scripts/release-feedback-receipts.py push-digest --manifest native-push.log)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Replay published child on the same native runner
+        env:
+          CHILD_DIGEST: ${{ steps.pushed-child.outputs.digest }}
+          IMAGE_ID: ${{ steps.feedback-image.outputs.image_id }}
+          ARCH: ${{ matrix.suffix }}
+        run: |
+          published="$IMAGE@$CHILD_DIGEST"
+          docker pull --platform "linux/$ARCH" "$published"
+          test "$(docker image inspect "$published" --format '{{.Id}}')" = "$IMAGE_ID"
+          python3 -B scripts/release-feedback.py --execute --image-id "$IMAGE_ID" \
+            --arch "$ARCH" --source-sha "$GITHUB_SHA" --version "${RELEASE_TAG#v}" \
+            --phase published-replay --published-ref "$published" \
+            --report "dist/image-qualification/$ARCH/published-replay.json"
+          docker buildx imagetools inspect "$published" --raw > native-child-manifest.json
+          python3 -B scripts/release-feedback-receipts.py seal \
+            --local "dist/image-qualification/$ARCH/native-child.json" \
+            --published "dist/image-qualification/$ARCH/published-replay.json" \
+            --manifest native-child-manifest.json --source "$GITHUB_SHA" \
+            --version "${RELEASE_TAG#v}" --arch "$ARCH" \
+            --output "dist/image-qualification/$ARCH/qualified.json"
+
+      - name: Upload qualified native child receipt (${{ matrix.suffix }})
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.1
+        with:
+          name: maskura-image-receipt-${{ matrix.suffix }}
+          path: dist/image-qualification/${{ matrix.suffix }}/
+          if-no-files-found: error
 
   build-macos:
     needs: contract
@@ -231,19 +311,42 @@ jobs:
         with:
           node-version: 22
 
-      - name: Merge multi-arch manifest
+      - name: Download qualified child receipts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.1
+        with:
+          pattern: maskura-image-receipt-*
+          path: qualified-image-receipts
+
+      - name: Bind both qualified native children
+        id: qualified-children
+        run: |
+          python3 -B scripts/release-feedback-receipts.py children \
+            --receipt qualified-image-receipts/maskura-image-receipt-amd64/qualified.json \
+            --receipt qualified-image-receipts/maskura-image-receipt-arm64/qualified.json \
+            --source "$GITHUB_SHA" --version "${RELEASE_TAG#v}" \
+            --output dist/QUALIFIED_IMAGE_CHILDREN.json --github-output "$GITHUB_OUTPUT"
+
+      - name: Merge multi-arch manifest from qualified digests
+        env:
+          AMD64_DIGEST: ${{ steps.qualified-children.outputs.amd64 }}
+          ARM64_DIGEST: ${{ steps.qualified-children.outputs.arm64 }}
         run: |
           docker buildx imagetools create \
             -t ${{ env.IMAGE }}:${{ env.RELEASE_TAG }} \
-            ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}-amd64 \
-            ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}-arm64
+            "$IMAGE@$AMD64_DIGEST" \
+            "$IMAGE@$ARM64_DIGEST"
 
       - name: Resolve published image digests
         id: image-digests
         run: |
-          canonical=$(docker buildx imagetools inspect "${{ env.IMAGE }}:${{ env.RELEASE_TAG }}" --format '{{json .Manifest}}' | jq -r '.digest')
-          test -n "$canonical" && test "$canonical" != "null"
-          echo "canonical=$canonical" >> "$GITHUB_OUTPUT"
+          docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --format '{{json .Manifest}}' > index-metadata.json
+          canonical="$(python3 -B scripts/release-feedback-receipts.py canonical --manifest index-metadata.json)"
+          docker buildx imagetools inspect "$IMAGE@$canonical" --raw > canonical-index.json
+          python3 -B scripts/release-feedback-receipts.py index --canonical "$canonical" \
+            --manifest canonical-index.json --source "$GITHUB_SHA" --version "${RELEASE_TAG#v}" \
+            --receipt qualified-image-receipts/maskura-image-receipt-amd64/qualified.json \
+            --receipt qualified-image-receipts/maskura-image-receipt-arm64/qualified.json \
+            --github-output "$GITHUB_OUTPUT"
           printf '%s@%s\n' "${{ env.IMAGE }}" "$canonical" > dist/IMAGE_DIGESTS
 
       - name: Install proof dependencies
@@ -255,7 +358,7 @@ jobs:
 
       - name: Prove the versioned image before promotion
         env:
-          MASKURA_PROOF_IMAGE: ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}
+          MASKURA_PROOF_IMAGE: ${{ env.IMAGE }}@${{ steps.image-digests.outputs.canonical }}
         run: bash examples/prove-maskura.sh
 
       - name: Attest canonical container provenance
@@ -266,9 +369,12 @@ jobs:
           push-to-registry: true
 
       - name: Extract release artifacts from image
+        env:
+          AMD64_DIGEST: ${{ steps.qualified-children.outputs.amd64 }}
         run: |
           mkdir -p dist/plugins
-          docker create --name maskura-extract --platform linux/amd64 "${{ env.IMAGE }}:${{ env.RELEASE_TAG }}-amd64"
+          docker pull --platform linux/amd64 "$IMAGE@$AMD64_DIGEST"
+          docker create --pull=never --name maskura-extract --platform linux/amd64 "$IMAGE@$AMD64_DIGEST"
           docker cp maskura-extract:/usr/local/bin/maskura-gateway dist/maskura-gateway-linux-x86_64
           docker cp maskura-extract:/app/components/. dist/plugins/
           docker rm maskura-extract
@@ -304,10 +410,14 @@ jobs:
         run: python3 scripts/sqlite-guard.py
 
       - name: Promote verified images to latest
+        env:
+          CANONICAL_DIGEST: ${{ steps.image-digests.outputs.canonical }}
         run: |
           docker buildx imagetools create \
-            -t ${{ env.IMAGE }}:latest \
-            ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}
+             -t ${{ env.IMAGE }}:latest \
+             ${{ env.IMAGE }}@${{ steps.image-digests.outputs.canonical }}
+          docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' > latest-metadata.json
+          test "$(python3 -B scripts/release-feedback-receipts.py canonical --manifest latest-metadata.json)" = "$CANONICAL_DIGEST"
 
       - name: Verify anonymous pullability before release
         run: |
@@ -331,12 +441,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view "${{ env.RELEASE_TAG }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "release ${{ env.RELEASE_TAG }} already exists; leaving it unchanged (no re-announce)"
-            echo "created=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           gh release create "${{ env.RELEASE_TAG }}" \
              dist/maskura-gateway-linux-x86_64 \
              dist/maskura-mcp-linux-amd64 \
@@ -349,8 +453,9 @@ jobs:
              dist/maskura-python-sdk.tar.gz \
              dist/maskura-typescript-sdk.tar.gz \
              dist/maskura-sbom.spdx.json \
-             dist/IMAGE_DIGESTS \
-             dist/SHA256SUMS \
+              dist/IMAGE_DIGESTS \
+              dist/QUALIFIED_IMAGE_CHILDREN.json \
+              dist/SHA256SUMS \
              --repo "${{ github.repository }}" \
              --verify-tag \
              --fail-on-no-commits \
@@ -414,6 +519,7 @@ jobs:
           test -f verify-dist/maskura-typescript-sdk.tar.gz
           test -f verify-dist/maskura-sbom.spdx.json
           test -f verify-dist/IMAGE_DIGESTS
+          test -f verify-dist/QUALIFIED_IMAGE_CHILDREN.json
           canonical_digest="$(jq -r .digest manifest.json)"
           grep -Fx \
             "${{ env.IMAGE }}@${canonical_digest}" \

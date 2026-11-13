@@ -30,6 +30,7 @@ use maskura_gateway::entity::managed_object_authority;
 use maskura_gateway::entity::managed_object_repair;
 
 use maskura_gateway::entity::managed_physical_object_version;
+use maskura_gateway::entity::managed_physical_write_intent;
 
 use maskura_gateway::entity::managed_workspace_usage;
 
@@ -309,11 +310,22 @@ async fn insert_committed_child(
     size: u64,
     result: &ExactPhysicalCommit,
 ) {
+    insert_committed_child_with_metadata(pool, intent, digest, size, result, BTreeMap::new()).await;
+}
+
+async fn insert_committed_child_with_metadata(
+    pool: &PgPool,
+    intent: &ManagedLogicalOperationIntent,
+    digest: &str,
+    size: u64,
+    result: &ExactPhysicalCommit,
+    metadata: BTreeMap<String, String>,
+) {
     let journal = PostgresOperationJournal::new(pool.clone());
     let expected = ExpectedObject {
         digest: Some(digest.to_string()),
         size: Some(size),
-        metadata: BTreeMap::new(),
+        metadata,
     };
     journal
         .insert_intent(OperationRecord::scoped_intent(
@@ -573,6 +585,70 @@ where
     });
 }
 
+/// Release cases are mandatory and restricted to the launcher's owned target.
+/// In particular, validate BEFORE either a connection or migration is attempted.
+fn with_release_pool<F, Fut, T>(case: &'static str, body: F) -> T
+where
+    F: FnOnce(PgPool) -> Fut + Send,
+    Fut: std::future::Future<Output = T>,
+    T: Send,
+{
+    let url = managed_release_fixture::assert_owned_target(case);
+    let _guard = DB_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::thread::scope(|scope| {
+        let (done, result) = mpsc::sync_channel(1);
+        let owner = scope.spawn(move || {
+            let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = tokio::runtime::Runtime::new().expect("release runtime unavailable");
+                let value = rt.block_on(async move {
+                    tokio::time::timeout(Duration::from_secs(180), async move {
+                        let pool = PgPoolOptions::new()
+                            .max_connections(10)
+                            .connect(&url)
+                            .await
+                            .unwrap_or_else(|_| panic!("owned release database unavailable"));
+                        maskura_gateway::run_engine_migrations(&pool)
+                            .await
+                            .unwrap_or_else(|_| panic!("owned release migration failed"));
+                        let value = body(pool.clone()).await;
+                        pool.close().await;
+                        value
+                    })
+                    .await
+                    .unwrap_or_else(|_| panic!("owned release case deadline exceeded"))
+                });
+                // Full runtime destruction, including blocking workers, must
+                // finish BEFORE the next phase. shutdown_timeout alone is not
+                // evidence that every worker ended.
+                drop(rt);
+                value
+            }));
+            let _ = done.send(value);
+        });
+        let value = result
+            .recv_timeout(Duration::from_secs(185))
+            .unwrap_or_else(|_| {
+                // Cannot return across a still-borrowing scoped worker and then
+                // implicitly join forever. Fail the exact owned test process;
+                // outer owner MUST reap its ledger-recorded TLS group/resources.
+                eprintln!("MANAGED_RELEASE_SHUTDOWN_FAILED runtime-owner-deadline");
+                std::process::abort()
+            });
+        let end = std::time::Instant::now() + Duration::from_secs(1);
+        while !owner.is_finished() {
+            if std::time::Instant::now() >= end {
+                eprintln!("MANAGED_RELEASE_SHUTDOWN_FAILED runtime-owner-exit");
+                std::process::abort();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(owner.join().is_ok(), "release runtime owner thread failed");
+        value.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    })
+}
+
 fn auth_headers(ak: &str, sk: &str) -> Vec<(&'static str, String)> {
     vec![
         ("x-maskura-access-key", ak.to_string()),
@@ -603,6 +679,7 @@ type MockObjects = Arc<tokio::sync::Mutex<HashMap<String, Vec<u8>>>>;
 #[derive(Clone, Default)]
 struct MockS3State {
     objects: MockObjects,
+    destination_headers: Arc<tokio::sync::Mutex<HashMap<String, axum::http::HeaderMap>>>,
     multipart_parts: Arc<tokio::sync::Mutex<HashMap<String, Vec<u8>>>>,
     block_destination_put: Arc<AtomicBool>,
     destination_put_count: Arc<AtomicUsize>,
@@ -797,6 +874,13 @@ async fn mock_s3_handler(
             } else {
                 bytes.to_vec()
             };
+            if !path.starts_with(&format!("{MOCK_STAGING_BUCKET}/")) {
+                state
+                    .destination_headers
+                    .lock()
+                    .await
+                    .insert(key.clone(), parts.headers.clone());
+            }
             state.objects.lock().await.insert(key, decoded);
             axum::response::Response::builder()
                 .status(StatusCode::OK)
@@ -851,11 +935,22 @@ async fn mock_s3_handler(
         Method::GET => {
             let objects = state.objects.lock().await;
             match objects.get(&key) {
-                Some(bytes) => axum::response::Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_LENGTH, bytes.len().to_string())
-                    .body(Body::from(bytes.clone()))
-                    .unwrap(),
+                Some(bytes) => {
+                    let mut response = axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_LENGTH, bytes.len().to_string());
+                    if let Some(headers) = state.destination_headers.lock().await.get(&key) {
+                        for (name, value) in headers {
+                            if name == header::CONTENT_TYPE
+                                || name == header::CONTENT_ENCODING
+                                || name.as_str().starts_with("x-amz-meta-")
+                            {
+                                response = response.header(name, value);
+                            }
+                        }
+                    }
+                    response.body(Body::from(bytes.clone())).unwrap()
+                }
                 None => axum::response::Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(Body::empty())
@@ -871,6 +966,16 @@ async fn mock_s3_handler(
                         .header(header::ETAG, "\"mock-etag\"");
                     if !state.omit_destination_head_length.load(Ordering::Acquire) {
                         response = response.header(header::CONTENT_LENGTH, bytes.len().to_string());
+                    }
+                    if let Some(headers) = state.destination_headers.lock().await.get(&key) {
+                        for (name, value) in headers {
+                            if name == header::CONTENT_TYPE
+                                || name == header::CONTENT_ENCODING
+                                || name.as_str().starts_with("x-amz-meta-")
+                            {
+                                response = response.header(name, value);
+                            }
+                        }
                     }
                     response.body(Body::new(UnknownSizeEmptyBody)).unwrap()
                 }
@@ -1011,5 +1116,7 @@ async fn state_assertions_for_unknown_head_and_ambiguous_delete(
 mod journal;
 mod keys;
 mod managed;
+mod managed_release;
+mod managed_release_fixture;
 mod migrations;
 mod multipart;

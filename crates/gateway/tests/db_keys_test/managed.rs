@@ -1,5 +1,309 @@
 use super::*;
 
+async fn cleanup_owned_recovery_case(
+    db: &DatabaseConnection,
+    intent: &ManagedLogicalOperationIntent,
+) {
+    let tenant = &intent.logical.tenant_id;
+    macro_rules! delete_owned_rows {
+        ($entity:ident $(, $filter:expr)?) => {{
+            $entity::Entity::delete_many()
+                .filter($entity::Column::TenantId.eq(tenant))
+                $(.filter($filter))?
+                .exec(db)
+                .await
+                .expect(concat!("delete owned recovery ", stringify!($entity), " rows"));
+            assert_eq!(
+                $entity::Entity::find()
+                    .filter($entity::Column::TenantId.eq(tenant))
+                    .count(db)
+                    .await
+                    .expect(concat!("count owned recovery ", stringify!($entity), " rows")),
+                0,
+                concat!("owned recovery ", stringify!($entity), " rows must not escape fixture")
+            );
+        }};
+    }
+
+    delete_owned_rows!(
+        managed_object_repair,
+        managed_object_repair::Column::Generation.eq(intent.generation)
+    );
+    delete_owned_rows!(
+        managed_object_authority,
+        managed_object_authority::Column::Generation.eq(intent.generation)
+    );
+    delete_owned_rows!(
+        managed_physical_object_version,
+        managed_physical_object_version::Column::WriteOperationId
+            .eq(intent.primary_child_operation_id)
+    );
+    delete_owned_rows!(
+        managed_physical_write_intent,
+        managed_physical_write_intent::Column::IntentId.eq(intent.primary_child_operation_id)
+    );
+    // Usage may still reference a RECOVERY_BLOCKED logical operation through
+    // active_operation_id (ON DELETE RESTRICT), so remove usage first.
+    delete_owned_rows!(managed_workspace_usage);
+    delete_owned_rows!(
+        managed_logical_operation,
+        managed_logical_operation::Column::OperationId.eq(intent.operation_id)
+    );
+    // Only the exact child journal belongs to this case. Its parts/evidence
+    // reference object_operations with ON DELETE CASCADE.
+    delete_owned_rows!(
+        object_operation,
+        object_operation::Column::Id.eq(intent.primary_child_operation_id)
+    );
+    delete_owned_rows!(managed_namespace);
+}
+
+#[test]
+fn postgres_recovery_binds_versioned_metadata_and_rejects_tampering() {
+    with_pool(|pool| async move {
+        let db = sea_db(pool.clone());
+        let repository = PostgresManagedRepository::new(pool.clone());
+        let initially_had_authority = repository.any_authority().await.unwrap();
+        let mut control = None;
+        for case in [
+            "valid",
+            "multipart-valid",
+            "multipart-tamper",
+            "wrong-user",
+            "wrong-encoding",
+            "wrong-identity",
+            "unknown-version",
+            "legacy-empty",
+            "legacy-ambiguous",
+        ] {
+            let tenant = format!("metadata-recovery-{case}-{}", uuid::Uuid::new_v4());
+            let logical = LogicalObjectKey::new(&tenant, "bucket", "synthetic");
+            let generation = uuid::Uuid::now_v7();
+            let mut recipe = publication_recipe("primary");
+            if case != "legacy-empty" && case != "legacy-ambiguous" {
+                recipe.metadata = BTreeMap::from([
+                    (":maskura:metadata-version".into(), "1".into()),
+                    ("content-type".into(), "text/plain".into()),
+                    (
+                        ":maskura:representation:content-encoding".into(),
+                        "gzip".into(),
+                    ),
+                    (":maskura:user:content-encoding".into(), "customer".into()),
+                ]);
+            } else if case == "legacy-ambiguous" {
+                recipe.metadata.insert("project".into(), "ambiguous".into());
+            }
+            let intent = ManagedLogicalOperationIntent {
+                operation_id: uuid::Uuid::now_v7(),
+                receipt_id: uuid::Uuid::now_v7(),
+                logical: logical.clone(),
+                kind: ManagedMutationKind::Put,
+                generation,
+                fence: repository.route_fence(&tenant).await.unwrap(),
+                expected_authority_cas: None,
+                prior_logical_size: 0,
+                primary_child_operation_id: uuid::Uuid::now_v7(),
+                backend_id: "primary".into(),
+                provider_bucket: "provider-bucket".into(),
+                physical_key: generation_physical_key(&logical, generation),
+                occurred_at_ms: unix_time_ms(),
+                rate_version: 1,
+                // Managed multipart has a PUT intent; its actual route is in usage evidence.
+                route: UsageRoute::PutObject,
+                request_kind: RequestKind::Write,
+                max_processed_bytes: 64,
+                publication_recipe: Some(recipe.clone()),
+            };
+            repository
+                .admit_logical_operation(intent.clone(), 6)
+                .await
+                .unwrap();
+            let child = PhysicalWriteIntent {
+                intent_id: intent.primary_child_operation_id,
+                tenant_id: tenant.clone(),
+                backend_id: intent.backend_id.clone(),
+                storage_identity: test_storage_identity(),
+                credential_epoch: 1,
+                provider_bucket: intent.provider_bucket.clone(),
+                physical_key: intent.physical_key.clone(),
+                versioning_mode: BackendVersioningMode::Enabled,
+                versioning_capability: BackendVersioningCapability::Required,
+                lease_owner: "request".into(),
+            };
+            repository.begin_physical_write(child).await.unwrap();
+            repository
+                .record_logical_usage_and_begin_completion(
+                    intent.operation_id,
+                    ManagedUsageEvidence {
+                        expected_output_digest: Some("digest".into()),
+                        expected_output_size: 3,
+                        source_bytes: 3,
+                        processed_bytes: 3,
+                        payload: serde_json::json!({
+                            "synthetic": true,
+                            "route": if case.starts_with("multipart-") {
+                                UsageRoute::CompleteMultipartUpload.as_str()
+                            } else {
+                                UsageRoute::PutObject.as_str()
+                            },
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+            let result = ExactPhysicalCommit {
+                selected_version_id: Some("version".into()),
+                superseded_version_ids: Vec::new(),
+                version_history_complete: true,
+            };
+            let mut child_metadata = recipe.metadata.clone();
+            if case != "legacy-empty" {
+                child_metadata.extend(BTreeMap::from([
+                    ("maskura-generation".into(), generation.to_string()),
+                    ("maskura-provider-instance".into(), "managed-primary".into()),
+                    ("maskura-provider-account".into(), "test-account".into()),
+                    ("maskura-credential-epoch".into(), "1".into()),
+                ]));
+            }
+            match case {
+                "wrong-user" | "multipart-tamper" => {
+                    child_metadata
+                        .insert(":maskura:user:content-encoding".into(), "tampered".into());
+                }
+                "wrong-encoding" => {
+                    child_metadata.insert(
+                        ":maskura:representation:content-encoding".into(),
+                        "br".into(),
+                    );
+                }
+                "wrong-identity" => {
+                    child_metadata.insert("maskura-provider-account".into(), "other".into());
+                }
+                "unknown-version" => {
+                    child_metadata.insert(":maskura:metadata-version".into(), "99".into());
+                }
+                _ => {}
+            }
+            insert_committed_child_with_metadata(
+                &pool,
+                &intent,
+                "digest",
+                3,
+                &result,
+                child_metadata,
+            )
+            .await;
+            managed_logical_operation::Entity::update_many()
+                .col_expr(
+                    managed_logical_operation::Column::UpdatedAtMs,
+                    Expr::value(0_i64),
+                )
+                .filter(managed_logical_operation::Column::OperationId.eq(intent.operation_id))
+                .exec(&db)
+                .await
+                .unwrap();
+            managed_physical_write_intent::Entity::update_many()
+                .col_expr(
+                    managed_physical_write_intent::Column::LeaseExpiresAtMs,
+                    Expr::value(0_i64),
+                )
+                .filter(
+                    managed_physical_write_intent::Column::IntentId
+                        .eq(intent.primary_child_operation_id),
+                )
+                .exec(&db)
+                .await
+                .unwrap();
+            let expiry = unix_time_ms() + 60_000;
+            let claim = repository
+                .claim_stale_logical_operations("test-recovery", 1, expiry, 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|claim| claim.operation.intent.operation_id == intent.operation_id)
+                .unwrap();
+            let lease = repository
+                .claim_logical_physical_write_intent(&claim, expiry)
+                .await
+                .unwrap()
+                .unwrap();
+            let outcome = repository
+                .finalize_logical_put(intent.operation_id, &lease, result, Some(&claim))
+                .await;
+            if matches!(case, "valid" | "multipart-valid" | "legacy-empty") {
+                let committed = outcome.unwrap();
+                assert_eq!(committed.authority.metadata, recipe.metadata, "{case}");
+                if case.starts_with("multipart-") {
+                    assert_eq!(
+                        committed.operation.evidence.as_ref().unwrap().payload["route"],
+                        UsageRoute::CompleteMultipartUpload.as_str()
+                    );
+                }
+                assert_eq!(
+                    repository.get(&logical).await.unwrap().unwrap().metadata,
+                    recipe.metadata
+                );
+            } else {
+                assert!(
+                    matches!(
+                        &outcome,
+                        Err(maskura_gateway::managed::ManagedError::RecoveryBlocked(_))
+                    ),
+                    "{case}: {outcome:?}"
+                );
+                assert!(repository.get(&logical).await.unwrap().is_none(), "{case}");
+                repository
+                    .mark_logical_recovery_blocked(&claim, "metadata_mismatch")
+                    .await
+                    .unwrap();
+            }
+            // Preserve one fully committed case as an unrelated owned control
+            // while cleaning every other case. Cleanup follows the assertions,
+            // rather than running during unwinding and masking their failures.
+            if case == "valid" {
+                control = Some(intent);
+            } else {
+                cleanup_owned_recovery_case(&db, &intent).await;
+            }
+        }
+
+        let control = control.expect("positive recovery control was exercised");
+        let tenant = &control.logical.tenant_id;
+        macro_rules! assert_control_survives {
+            ($entity:ident) => {
+                assert!(
+                    $entity::Entity::find()
+                        .filter($entity::Column::TenantId.eq(tenant))
+                        .count(&db)
+                        .await
+                        .expect(concat!(
+                            "count recovery control ",
+                            stringify!($entity),
+                            " rows"
+                        ))
+                        > 0,
+                    concat!(
+                        "other-case cleanup must preserve recovery control ",
+                        stringify!($entity)
+                    )
+                );
+            };
+        }
+        assert_control_survives!(managed_object_authority);
+        assert_control_survives!(managed_physical_object_version);
+        assert_control_survives!(managed_workspace_usage);
+        assert_control_survives!(managed_logical_operation);
+        assert_control_survives!(object_operation);
+        assert_control_survives!(managed_namespace);
+        cleanup_owned_recovery_case(&db, &control).await;
+        assert_eq!(
+            repository.any_authority().await.unwrap(),
+            initially_had_authority,
+            "recovery fixture must not change the authority floor for later router startup"
+        );
+    });
+}
+
 #[test]
 fn physical_intent_duplicate_contract_matches_memory_and_postgres() {
     with_pool(|pool| async move {
@@ -314,10 +618,18 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             generation,
             digest: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string(),
             size: 3,
-            metadata: std::collections::BTreeMap::from([(
-                "content-type".to_string(),
-                "text/plain".to_string(),
-            )]),
+            metadata: std::collections::BTreeMap::from([
+                (":maskura:metadata-version".to_string(), "1".to_string()),
+                ("content-type".to_string(), "text/plain".to_string()),
+                (
+                    ":maskura:representation:content-encoding".to_string(),
+                    "gzip".to_string(),
+                ),
+                (
+                    ":maskura:user:content-encoding".to_string(),
+                    "customer".to_string(),
+                ),
+            ]),
             placement_version: 1,
             primary_backend_id: "primary".to_string(),
             primary_version_id: Some(primary_version_id),
@@ -361,6 +673,7 @@ fn postgres_managed_authority_publish_repair_lease_and_tombstone_are_atomic() {
             .await
             .unwrap();
         assert_eq!(restarted_claim.len(), 1);
+        assert_eq!(restarted_claim[0].metadata, authority.metadata);
         assert!(
             repository
                 .renew_repair(uuid::Uuid::now_v7(), unix_time_ms() + 60_000)

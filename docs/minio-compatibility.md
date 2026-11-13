@@ -38,7 +38,7 @@ same change.
 | GetObject | `GET /{bucket}/{key}` | Supported | [`s3_frontdoor_test::streaming_memory_get_preserves_range_and_head_metadata`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_frontdoor_test/main.rs), [`s3_frontdoor_test::conditional_get_and_head_preserve_object_identity_without_a_body`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_frontdoor_test/main.rs) | Supports `Range` and conditional request headers. |
 | HeadObject | `HEAD /{bucket}/{key}` | Supported | [`s3_frontdoor_test::head_and_delete_remain_available`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_frontdoor_test/main.rs) | Metadata only; no body. |
 | DeleteObject | `DELETE /{bucket}/{key}` | Supported | [`s3_frontdoor_test::head_and_delete_remain_available`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_frontdoor_test/main.rs) | Missing key → `404 NoSuchKey`. |
-| CreateMultipartUpload | `POST /{bucket}/{key}?uploads` | Supported | [`s3_multipart_conformance::sdk_multipart_lifecycle_completes_over_real_tcp`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_multipart_conformance.rs) | Staged and durable; requires the local staged multipart store (enabled on the appliance). |
+| CreateMultipartUpload | `POST /{bucket}/{key}?uploads` | Supported | [`s3_multipart_conformance::sdk_multipart_lifecycle_completes_over_real_tcp`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_multipart_conformance.rs) | Staged and durable; requires the local staged multipart store (enabled on the appliance). An absent initiation Content-Type defaults to `application/octet-stream`; part/completion transport headers do not replace the frozen representation type. |
 | UploadPart | `PUT /{bucket}/{key}?partNumber&uploadId` | Supported | [`s3_multipart_conformance::sdk_multipart_lifecycle_completes_over_real_tcp`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_multipart_conformance.rs), [`local_filesystem_multipart::local_filesystem_multipart_lifecycle_over_http`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/local_filesystem_multipart.rs) | Parts persist across restart. |
 | CompleteMultipartUpload | `POST /{bucket}/{key}?uploadId` | Supported | [`s3_multipart_conformance::http_conformance_completion_errors_pagination_helpers_and_replay`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_multipart_conformance.rs) | Completion replaces any existing single-PUT object atomically. |
 | AbortMultipartUpload | `DELETE /{bucket}/{key}?uploadId` | Supported | [`s3_multipart_conformance::sdk_multipart_abort_list_uploads_and_no_such_upload`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_multipart_conformance.rs) | Unknown upload → `NoSuchUpload`. |
@@ -46,8 +46,25 @@ same change.
 | ListMultipartUploads | `GET /{bucket}?uploads` | Supported | [`s3_multipart_conformance::sdk_multipart_abort_list_uploads_and_no_such_upload`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_multipart_conformance.rs) | In-progress uploads for the bucket. |
 | CopyObject | `PUT /{bucket}/{key}` + `x-amz-copy-source` | Not implemented | [`s3_protocol::s3_not_implemented_returns_501`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_protocol.rs), [`crates/gateway/src/server.rs`](https://github.com/231self/maskura/blob/main/crates/gateway/src/server.rs) (`x-amz-copy-source` pre-dispatch gate) | Rejected before the body is polled. |
 | UploadPartCopy | `PUT ?partNumber&uploadId` + `x-amz-copy-source` | Not implemented | [`crates/gateway/src/server.rs`](https://github.com/231self/maskura/blob/main/crates/gateway/src/server.rs) (`s3_upload_part` copy-source check) | Rejected before any part is stored. |
-| DeleteObjects (batch) | `POST /{bucket}?delete` | Supported | [`s3_frontdoor_test::filestore_batch_delete_answers_every_key_and_is_idempotent`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_frontdoor_test/batch_delete.rs) | Per-key `<Deleted>`/`<Error>` under one request (N gated deletes, one usage receipt per key); ≤1000 keys / 128 KiB; `Quiet` supported; idempotent (missing key → `<Deleted>`); malformed, `VersionId`-bearing, and oversized requests fail as `MalformedXML`/`EntityTooLarge` before any key is touched. |
+| DeleteObjects (batch) | `POST /{bucket}?delete` | Supported | [`s3_frontdoor_test::filestore_batch_delete_answers_every_key_and_is_idempotent`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_frontdoor_test/batch_delete.rs) | Per-key `<Deleted>`/`<Error>` under one request (N gated deletes, one usage receipt per key); ≤1000 keys / 128 KiB; `Quiet` supported; idempotent (missing key → `<Deleted>`); malformed, `VersionId`-bearing, oversized, or invalid Content-MD5 requests fail before any key is touched. Supplied Content-MD5 validates the decoded XML body in addition to existing signed-body checks. |
 | SelectObjectContent | `POST /{bucket}/{key}?select` | Not implemented | [`s3_protocol::s3_not_implemented_returns_501`](https://github.com/231self/maskura/blob/main/crates/gateway/tests/s3_protocol.rs), [`crates/gateway/src/server.rs`](https://github.com/231self/maskura/blob/main/crates/gateway/src/server.rs) (`select` subresource gate) | Rejected before dispatch. |
+
+## Object metadata
+
+Customer `x-amz-meta-*` values are retained on ordinary PUT and multipart
+publication across memory, FileStore, direct S3, and managed storage. FileStore
+persists them across reopen. Representation headers and customer names use
+separate internal namespaces; provider-reserved transaction names are rejected
+before acquiring a write sink. Decoded `aws-chunked` transport framing is not a
+stored representation encoding.
+
+Protected/transformed GETs deliberately withhold custom metadata: metadata is
+outside the transformed-body protection boundary. There is no request-header
+bypass to retrieve an unprotected representation. Historical ambiguous metadata
+cannot be reconstructed after it has already been lost; see
+[ADR 0013](adr/0013-durable-local-multipart-storage.md) and
+[ADR 0018](adr/0018-atomic-managed-write-finalization-and-recovery.md) for the
+snapshot and recovery contracts.
 
 ## How to run the evidence
 

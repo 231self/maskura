@@ -195,7 +195,7 @@ async fn filestore_conformance_bucket_object_lifecycle_survives_restart() {
     .await
     .unwrap();
     assert!(!String::from_utf8_lossy(&body).contains("<Name>conformance</Name>"));
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 #[tokio::test]
@@ -274,7 +274,7 @@ async fn filestore_list_and_head_on_missing_bucket_return_no_such_bucket() {
     let xml = String::from_utf8_lossy(&body);
     assert!(xml.contains("<KeyCount>0</KeyCount>"), "{xml}");
 
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 #[tokio::test]
@@ -398,7 +398,7 @@ async fn filestore_conformance_lists_v1_v2_prefix_delimiter_and_pages() {
             StatusCode::BAD_REQUEST
         );
     }
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 #[tokio::test]
@@ -488,7 +488,7 @@ async fn filestore_conformance_preserves_encoded_key_identity_and_list_encoding(
     assert!(xml.contains("<Key>literal%2Fkey</Key>"));
     assert!(xml.contains("<Key>xml&amp;&lt;key</Key>"));
     assert!(xml.contains("<Key>café</Key>"));
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 #[tokio::test]
@@ -565,7 +565,7 @@ async fn filestore_conformance_conditions_and_missing_key_precede_range() {
     let xml = String::from_utf8_lossy(&body);
     assert!(xml.contains("<Code>NoSuchKey</Code>"));
     assert!(!xml.contains("InvalidRange"));
-    std::fs::remove_dir_all(root).unwrap();
+    // The launcher cleans its owned TMPDIR after the child exits.
 }
 
 #[tokio::test]

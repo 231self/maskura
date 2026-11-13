@@ -48,6 +48,12 @@ valid only when no recovery claim exists. Deterministically missing or corrupt
 evidence enters `RECOVERY_BLOCKED`; persistence, concurrency, and lease races
 remain retryable. Legacy rows without recipes are never inferred.
 
+Versioned metadata in the publication recipe and physical child is bound to the
+same customer values, representation headers, and independently admitted
+physical identity. Provider-reserved identity names are not customer fields.
+Authoritative reads and repair sources validate those values rather than
+reconstructing missing or ambiguous metadata from a provider response.
+
 All participating transactions use the lock order namespace, logical operation,
 workspace usage, current authority, then physical intent.
 

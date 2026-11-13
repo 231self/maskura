@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1
+# Preparation only. Runtime never installs or fetches anything.
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 openssl libc6 libgcc-s1 libstdc++6 libssl3t64 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/managed_release_linux/__init__.py \
+     scripts/managed_release_linux/controller.py \
+     scripts/managed_release_linux/coordinator.py \
+     scripts/managed_release_linux/protocol.py \
+     scripts/managed_release_linux/supervisor.py \
+     scripts/managed_release_linux/probe.py /opt/managed_release_linux/
+COPY .managed-release-prepared/product-guard /usr/local/bin/maskura-product-guard
+RUN chmod -R a-w /opt/managed_release_linux \
+    && chmod 0555 /usr/local/bin/maskura-product-guard
+ENV LANG=C LC_ALL=C PYTHONDONTWRITEBYTECODE=1
+ENTRYPOINT ["/usr/bin/python3", "-I", "-B", "/opt/managed_release_linux/controller.py"]
