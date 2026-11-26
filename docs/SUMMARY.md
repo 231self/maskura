@@ -16,6 +16,7 @@
 - [Benchmarks](benchmarks.md)
 - [Avro gate](avro.md)
 - [Binary adapters](binary-adapters.md)
+- [External catalog storage](external-catalog-storage.md)
 - [MCP](mcp.md)
 - [End-to-end suite](e2e.md)
 - [Configuration reference](reference/configuration.md)
@@ -56,3 +57,5 @@
 - [ADR 0031: Native final-output validation for single PUT](adr/0031-native-final-output-validation.md)
 - [ADR 0032: Temporary inactive SQLite advisory exception](adr/0032-temporary-sqlite-advisory-exception.md)
 - [ADR 0035: FileStore object versioning](adr/0035-proposed-filestore-object-versioning.md)
+- [ADR 0036: Byte-preserving storage scopes](adr/0036-byte-preserving-storage-scopes.md)
+- [ADR 0037: Conditional object writes](adr/0037-conditional-object-writes.md)

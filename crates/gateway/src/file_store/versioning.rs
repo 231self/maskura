@@ -1124,7 +1124,9 @@ mod tests {
         store.prepare_transaction(&context).await.unwrap();
         store.persistence.fail_once(FaultPoint::ParentSync);
         assert!(matches!(
-            store.publish_transaction(&path, &context, "\"etag\"").await,
+            store
+                .publish_transaction(&path, &context, "\"etag\"", None)
+                .await,
             Err(FileStoreError::MutationUnknown(_))
         ));
         store.delete_version("bucket", "key", None).await.unwrap();
@@ -1149,7 +1151,7 @@ mod tests {
             .unwrap();
         assert_eq!(proof, repaired);
         let replay = store
-            .publish_transaction(&path, &context, "\"etag\"")
+            .publish_transaction(&path, &context, "\"etag\"", None)
             .await
             .unwrap();
         assert_eq!(replay, repaired);

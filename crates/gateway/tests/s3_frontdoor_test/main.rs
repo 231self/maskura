@@ -1319,6 +1319,7 @@ async fn demo_response_json(response: axum::response::Response) -> serde_json::V
 
 mod auth;
 mod batch_delete;
+mod byte_preserving;
 mod demo;
 mod iceberg;
 mod managed;

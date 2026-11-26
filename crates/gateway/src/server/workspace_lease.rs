@@ -206,8 +206,17 @@ pub(crate) async fn begin_streaming_sink(
     content_type: &str,
     multipart_publication: Option<(&MultipartCompletionCoordinator, &MultipartIdentity, &str)>,
     metadata: Option<MultipartStoredMetadata>,
+    precondition: Option<crate::transaction::WritePrecondition>,
 ) -> Result<Box<dyn ObjectSinkTransaction>, StreamingPutError> {
     validate_streaming_backend(state, &backend)?;
+    // Managed service storage cannot enforce a conditional mutation, and
+    // emulating the check would be racy. Fail closed when the request asks.
+    if precondition.is_some() && matches!(backend, ResolvedBackend::Managed(_)) {
+        return Err(StreamingPutError::Unsupported(
+            "conditional writes (If-Match / If-None-Match) are not supported for managed storage"
+                .to_string(),
+        ));
+    }
     // Validate before any backend acquires a sink or admits a durable intent.
     // File and memory stores obey the same reserved-name boundary as S3.
     let expected_metadata = match metadata.as_ref() {
@@ -406,6 +415,7 @@ pub(crate) async fn begin_streaming_sink(
                 )
                 .await
             };
+            let sink = sink.map(|sink| sink.with_precondition(precondition.clone()));
             match (sink, workspace_lease) {
                 (Ok(inner), Some(_)) => Ok(Box::new(WorkspaceLeasedSink {
                     inner,
@@ -464,7 +474,8 @@ pub(crate) async fn begin_streaming_sink(
                         destination_operation_id,
                         metadata.clone().unwrap_or_default(),
                     )
-                    .await?,
+                    .await?
+                    .with_precondition(precondition.clone()),
                 ))
             } else {
                 Ok(Box::new(
@@ -476,7 +487,8 @@ pub(crate) async fn begin_streaming_sink(
                         state.max_pipeline_output_bytes,
                         metadata.clone().unwrap_or_default(),
                     )
-                    .await?,
+                    .await?
+                    .with_precondition(precondition.clone()),
                 ))
             }
         }
@@ -488,7 +500,8 @@ pub(crate) async fn begin_streaming_sink(
                 content_type,
                 state.dev_memory_max_object_bytes,
             )?
-            .with_metadata(metadata.clone().unwrap_or_default()),
+            .with_metadata(metadata.clone().unwrap_or_default())
+            .with_precondition(precondition.clone()),
         )),
         ResolvedBackend::Memory(_) => Err(StreamingPutError::Unsupported(
             "development memory streaming is not enabled".to_string(),

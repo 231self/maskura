@@ -124,20 +124,48 @@ impl MemoryStore {
         content_type: &str,
         metadata: crate::transaction::MultipartStoredMetadata,
     ) -> StoredObject {
+        self.put_with_metadata_if(bucket, key, data, content_type, metadata, None)
+            .expect("an unconditional memory write cannot fail a precondition")
+    }
+
+    /// Conditional publication: the precondition and the insert happen under
+    /// the same write lock, so no writer can slip between the check and the
+    /// commit.
+    pub(crate) fn put_with_metadata_if(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: impl Into<Bytes>,
+        content_type: &str,
+        metadata: crate::transaction::MultipartStoredMetadata,
+        precondition: Option<&crate::transaction::WritePrecondition>,
+    ) -> Result<StoredObject, crate::transaction::TransactionError> {
+        let mut objects = self.objects.write().unwrap();
+        if let Some(precondition) = precondition {
+            let current = objects.get(&Self::object_key(bucket, key)).map(|entry| {
+                crate::transaction::StoredObjectMeta {
+                    etag: Some(entry.object.etag.clone()),
+                    ..crate::transaction::StoredObjectMeta::default()
+                }
+            });
+            if !precondition.matches(current.as_ref()) {
+                return Err(crate::transaction::TransactionError::PreconditionFailed);
+            }
+        }
         let etag = format!("\"{}\"", Uuid::new_v4());
         let obj = StoredObject {
             data: data.into(),
             content_type: content_type.to_string(),
             etag: etag.clone(),
         };
-        self.objects.write().unwrap().insert(
+        objects.insert(
             Self::object_key(bucket, key),
             MemoryStoredObject {
                 object: obj.clone(),
                 metadata,
             },
         );
-        obj
+        Ok(obj)
     }
 
     pub fn get(&self, bucket: &str, key: &str) -> Option<StoredObject> {

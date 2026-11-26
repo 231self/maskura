@@ -8,7 +8,7 @@ use crate::store::MemoryStore;
 
 use super::{
     DestinationCommitAuthority, MultipartStoredMetadata, ObjectSinkTransaction, SinkCommitState,
-    StoredObjectMeta, TransactionError,
+    StoredObjectMeta, TransactionError, WritePrecondition,
 };
 
 /// Development-only atomic sink. Its configured limit is a hard memory bound;
@@ -24,6 +24,9 @@ pub struct MemorySinkTransaction {
     hasher: Sha256,
     output_verified: bool,
     finished: bool,
+    /// Conditional-write precondition, enforced under the store's write lock
+    /// at publication time.
+    precondition: Option<WritePrecondition>,
 }
 
 impl MemorySinkTransaction {
@@ -48,11 +51,18 @@ impl MemorySinkTransaction {
             hasher: Sha256::new(),
             output_verified: false,
             finished: false,
+            precondition: None,
         })
     }
 
     pub fn with_metadata(mut self, metadata: MultipartStoredMetadata) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Applies the conditional-write precondition parsed from the request.
+    pub fn with_precondition(mut self, precondition: Option<WritePrecondition>) -> Self {
+        self.precondition = precondition;
         self
     }
 }
@@ -105,13 +115,14 @@ impl ObjectSinkTransaction for MemorySinkTransaction {
             return Err(TransactionError::OutputMismatch);
         }
         authority.validate(None, &self.bucket, &self.key).await?;
-        let object = self.store.put_with_metadata(
+        let object = self.store.put_with_metadata_if(
             &self.bucket,
             &self.key,
             self.buffer.split().freeze(),
             &self.content_type,
             self.metadata.clone(),
-        );
+            self.precondition.as_ref(),
+        )?;
         self.finished = true;
         Ok(StoredObjectMeta {
             etag: Some(object.etag),

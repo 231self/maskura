@@ -54,6 +54,29 @@ pub enum FileStoreError {
     MutationUnknown(String),
     #[error("local storage commit proof does not match the requested operation generation")]
     CommitProofMismatch,
+    #[error("the conditional write precondition did not match the current object")]
+    PreconditionFailed,
+}
+
+/// Evaluates a conditional-write precondition against the current object
+/// metadata while the store's mutation lock is held.
+fn enforce_write_precondition(
+    precondition: Option<&crate::transaction::WritePrecondition>,
+    previous: Option<&FileObjectMetadata>,
+) -> Result<(), FileStoreError> {
+    let Some(precondition) = precondition else {
+        return Ok(());
+    };
+    let current = previous.map(|previous| crate::transaction::StoredObjectMeta {
+        etag: Some(previous.etag.clone()),
+        version_id: previous.version_id.clone(),
+        ..crate::transaction::StoredObjectMeta::default()
+    });
+    if precondition.matches(current.as_ref()) {
+        Ok(())
+    } else {
+        Err(FileStoreError::PreconditionFailed)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -545,6 +568,7 @@ impl FileStore {
             size,
             etag,
             &Default::default(),
+            None,
         )
         .await
         .map(|_| ())
@@ -560,6 +584,7 @@ impl FileStore {
         size: u64,
         etag: &str,
         stored: &crate::transaction::MultipartStoredMetadata,
+        precondition: Option<crate::transaction::WritePrecondition>,
     ) -> Result<Option<String>, FileStoreError> {
         let store = self.clone();
         let (bucket, key, temp_path, content_type, etag, stored) = (
@@ -581,6 +606,7 @@ impl FileStore {
                         size,
                         &etag,
                         &stored,
+                        precondition.as_ref(),
                     )
                     .await
             })
@@ -598,6 +624,7 @@ impl FileStore {
         size: u64,
         etag: &str,
         stored: &crate::transaction::MultipartStoredMetadata,
+        precondition: Option<&crate::transaction::WritePrecondition>,
     ) -> Result<Option<String>, FileStoreError> {
         let _guard = self.mutation_lock.lock().await;
         self.ensure_bucket_layout(bucket).await?;
@@ -606,6 +633,9 @@ impl FileStore {
         let metadata_path = self.metadata_path(bucket, key)?;
         let versioning = self.versioning(bucket).await?;
         let previous = self.load_metadata(bucket, key).await?;
+        // Conditional writes compare and swap under the same lock that
+        // publishes, so no writer can slip between the check and the commit.
+        enforce_write_precondition(precondition, previous.as_ref())?;
         if let Some(previous) = previous.as_ref() {
             self.backfill_metadata_proof(bucket, previous).await?;
         }
@@ -679,13 +709,14 @@ impl FileStore {
         temp_path: &Path,
         context: &LocalCommitContext,
         etag: &str,
+        precondition: Option<crate::transaction::WritePrecondition>,
     ) -> Result<CommittedLocalCommitProof, FileStoreError> {
         let store = self.clone();
         let (temp_path, context, etag) = (temp_path.to_owned(), context.clone(), etag.to_owned());
         versioning::joined(
             tokio::spawn(async move {
                 store
-                    .publish_transaction_inner(&temp_path, &context, &etag)
+                    .publish_transaction_inner(&temp_path, &context, &etag, precondition.as_ref())
                     .await
             })
             .await,
@@ -697,6 +728,7 @@ impl FileStore {
         temp_path: &Path,
         context: &LocalCommitContext,
         etag: &str,
+        precondition: Option<&crate::transaction::WritePrecondition>,
     ) -> Result<CommittedLocalCommitProof, FileStoreError> {
         validate_commit_context(context)?;
         let _guard = self.mutation_lock.lock().await;
@@ -731,6 +763,7 @@ impl FileStore {
         self.ensure_bucket_layout(&context.bucket).await?;
         let versioning = self.versioning(&context.bucket).await?;
         let previous = self.load_metadata(&context.bucket, &context.key).await?;
+        enforce_write_precondition(precondition, previous.as_ref())?;
         if let Some(previous) = previous.as_ref() {
             self.backfill_metadata_proof(&context.bucket, previous)
                 .await?;
@@ -1420,6 +1453,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conditional_commit_compares_and_swaps_under_the_mutation_lock() {
+        let root = test_root();
+        let store = Arc::new(FileStore::new(root.clone()).await.unwrap());
+        store.create_bucket("bucket").await.unwrap();
+        let first = store
+            .put(
+                "bucket",
+                "object",
+                b"first".to_vec(),
+                "application/octet-stream",
+            )
+            .await
+            .unwrap();
+        let stored = crate::transaction::MultipartStoredMetadata::default();
+
+        // A stale entity tag never publishes and leaves the object unchanged.
+        let (temp, mut file) = store.create_temp_file("bucket", "object").await.unwrap();
+        file.write_all(b"second").await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+        let error = store
+            .commit_temp_with_metadata(
+                "bucket",
+                "object",
+                &temp,
+                "application/octet-stream",
+                6,
+                "\"second\"",
+                &stored,
+                Some(crate::transaction::WritePrecondition::IfEtag(
+                    "\"stale\"".to_string(),
+                )),
+            )
+            .await
+            .expect_err("stale If-Match must fail");
+        assert!(matches!(error, FileStoreError::PreconditionFailed));
+        assert_eq!(
+            store.get("bucket", "object").await.unwrap().unwrap().data,
+            Bytes::from_static(b"first")
+        );
+
+        // Create-if-absent fails while the object exists.
+        let (temp, mut file) = store.create_temp_file("bucket", "object").await.unwrap();
+        file.write_all(b"second").await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+        let error = store
+            .commit_temp_with_metadata(
+                "bucket",
+                "object",
+                &temp,
+                "application/octet-stream",
+                6,
+                "\"second\"",
+                &stored,
+                Some(crate::transaction::WritePrecondition::IfAbsent),
+            )
+            .await
+            .expect_err("If-None-Match: * must fail while the object exists");
+        assert!(matches!(error, FileStoreError::PreconditionFailed));
+
+        // The matching entity tag publishes.
+        let (temp, mut file) = store.create_temp_file("bucket", "object").await.unwrap();
+        file.write_all(b"second").await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+        store
+            .commit_temp_with_metadata(
+                "bucket",
+                "object",
+                &temp,
+                "application/octet-stream",
+                6,
+                "\"second\"",
+                &stored,
+                Some(crate::transaction::WritePrecondition::IfEtag(
+                    first.etag.clone(),
+                )),
+            )
+            .await
+            .expect("matching If-Match publishes");
+
+        // The byte-preserving object survives a store restart.
+        drop(store);
+        let reopened = FileStore::new(root.clone()).await.unwrap();
+        let object = reopened
+            .get("bucket", "object")
+            .await
+            .unwrap()
+            .expect("object survives restart");
+        assert_eq!(object.data, Bytes::from_static(b"second"));
+        assert_eq!(object.content_type, "application/octet-stream");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn bucket_exists_distinguishes_missing_and_present_buckets() {
         let root = test_root();
         let store = FileStore::new(root.clone()).await.unwrap();
@@ -1467,7 +1596,7 @@ mod tests {
         store.prepare_transaction(context).await.unwrap();
         let temp = transaction_temp(store).await;
         store
-            .publish_transaction(&temp, context, "\"5d41402abc4b2a76b9719d911017c592\"")
+            .publish_transaction(&temp, context, "\"5d41402abc4b2a76b9719d911017c592\"", None)
             .await
             .unwrap()
     }
@@ -1605,7 +1734,12 @@ mod tests {
 
         assert!(matches!(
             store
-                .publish_transaction(&temp, &context, "\"5d41402abc4b2a76b9719d911017c592\"")
+                .publish_transaction(
+                    &temp,
+                    &context,
+                    "\"5d41402abc4b2a76b9719d911017c592\"",
+                    None
+                )
                 .await,
             Err(FileStoreError::MutationUnknown(_))
         ));
@@ -1696,7 +1830,12 @@ mod tests {
 
         assert!(matches!(
             store
-                .publish_transaction(&temp, &context, "\"5d41402abc4b2a76b9719d911017c592\"")
+                .publish_transaction(
+                    &temp,
+                    &context,
+                    "\"5d41402abc4b2a76b9719d911017c592\"",
+                    None
+                )
                 .await,
             Err(FileStoreError::MutationUnknown(_))
         ));

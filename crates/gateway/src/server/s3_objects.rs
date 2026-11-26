@@ -1980,15 +1980,17 @@ pub(crate) async fn s3_get(
     // scope. An unassigned scope denies (silence is never passthrough); the
     // resolved `explicit_passthrough` assignment is the only route to stored
     // bytes, and a non-passthrough resolution is the only route to a
-    // projection. No client input selects a representation.
-    let resolution = match state
-        .gateway
-        .resolve(
-            auth.workspace_id().as_str(),
-            &bucket,
-            crate::pipeline::PipelineDirection::Read,
-        )
-        .await
+    // projection. No client input selects a representation. A key in an
+    // operator byte-preserving scope resolves to the explicit passthrough
+    // assignment (ADR 0036).
+    let resolution = match resolve_request_pipeline(
+        &state,
+        auth.workspace_id().as_str(),
+        &bucket,
+        &key,
+        crate::pipeline::PipelineDirection::Read,
+    )
+    .await
     {
         Ok(resolution) => resolution,
         Err(error) => {
@@ -2080,6 +2082,16 @@ pub(crate) async fn s3_get(
     }
     freeze_read_placement(&mut selection, auth.workspace_id().as_str(), &bucket, &key).await;
     let backend = &selection.backend;
+    if let Some(error) = byte_preserving_backend_rejection(&state, &bucket, &key, backend) {
+        return release_failure(
+            state.control.as_ref(),
+            &auth.context,
+            &grant,
+            &key,
+            pipeline_error_response(&key, &error),
+        )
+        .await;
+    }
     let policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
@@ -2525,15 +2537,16 @@ pub(crate) async fn s3_head(
     // Mandatory read pipeline: HEAD follows the read assignment. An explicit
     // passthrough scope serves stored object metadata; a protected scope
     // denies until transformed metadata is available; an unassigned scope
-    // denies.
-    let resolution = match state
-        .gateway
-        .resolve(
-            auth.workspace_id().as_str(),
-            &bucket,
-            crate::pipeline::PipelineDirection::Read,
-        )
-        .await
+    // denies. A key in an operator byte-preserving scope is an explicit
+    // passthrough assignment (ADR 0036).
+    let resolution = match resolve_request_pipeline(
+        &state,
+        auth.workspace_id().as_str(),
+        &bucket,
+        &key,
+        crate::pipeline::PipelineDirection::Read,
+    )
+    .await
     {
         Ok(resolution) => resolution,
         Err(error) => {
@@ -2609,6 +2622,16 @@ pub(crate) async fn s3_head(
     }
     freeze_read_placement(&mut selection, auth.workspace_id().as_str(), &bucket, &key).await;
     let backend = &selection.backend;
+    if let Some(error) = byte_preserving_backend_rejection(&state, &bucket, &key, backend) {
+        return release_failure(
+            state.control.as_ref(),
+            &auth.context,
+            &grant,
+            &key,
+            pipeline_error_response(&key, &error),
+        )
+        .await;
+    }
     let policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
@@ -3021,6 +3044,10 @@ pub(crate) async fn s3_post(
         if let Some(response) = client_metering_id_rejection(&parts.headers, &key) {
             return response;
         }
+        let precondition = match write_precondition(&parts.headers) {
+            Ok(precondition) => precondition,
+            Err(error) => return streaming_put_error_response(&key, error),
+        };
         let Some(staging) = staged_multipart(&state).cloned() else {
             return s3_error::multipart_not_supported(&key);
         };
@@ -3188,6 +3215,12 @@ pub(crate) async fn s3_post(
             Err(error) => {
                 return s3_error::internal_error(&key, &error.to_string());
             }
+        };
+        // A retry that declares a different condition is a different
+        // operation, so the precondition is part of the completion identity.
+        let fingerprint = match &precondition {
+            Some(precondition) => format!("{fingerprint}-{}", precondition.fingerprint()),
+            None => fingerprint,
         };
         // Exact retries share an operation; conflicting canonical requests do not.
         let operation = multipart_completion_operation_identity(upload_id, &fingerprint);
@@ -3393,6 +3426,7 @@ pub(crate) async fn s3_post(
                     backend.clone(),
                     &persisted_resolution,
                     effective_policy_limits.as_ref(),
+                    precondition,
                 ),
             )
             .await;
@@ -3454,14 +3488,14 @@ pub(crate) async fn s3_post(
     }
     if params.uploads.is_some() {
         let resolution_started = Instant::now();
-        let resolution = match state
-            .gateway
-            .resolve(
-                auth.workspace_id().as_str(),
-                &bucket,
-                crate::pipeline::PipelineDirection::Write,
-            )
-            .await
+        let resolution = match resolve_request_pipeline(
+            &state,
+            auth.workspace_id().as_str(),
+            &bucket,
+            &key,
+            crate::pipeline::PipelineDirection::Write,
+        )
+        .await
         {
             Ok(resolution) => resolution,
             Err(error) => {
@@ -3488,6 +3522,9 @@ pub(crate) async fn s3_post(
             };
         selection.resolve_managed_placement(auth.workspace_id().as_str(), &bucket, &key);
         let backend = &selection.backend;
+        if let Some(error) = byte_preserving_backend_rejection(&state, &bucket, &key, backend) {
+            return pipeline_error_response(&key, &error);
+        }
         let policy = match enforce_policy(
             state.policy_gate.as_ref(),
             PolicyRequest {

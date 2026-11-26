@@ -493,6 +493,10 @@ pub enum BackendErrorKind {
 pub struct BackendError {
     pub kind: BackendErrorKind,
     pub message: String,
+    /// The provider rejected the mutation because the conditional-write
+    /// precondition did not match. The stored object is unchanged and the
+    /// result is definitive, never retried.
+    pub precondition_failed: bool,
 }
 
 impl BackendError {
@@ -500,6 +504,7 @@ impl BackendError {
         Self {
             kind: BackendErrorKind::Definitive,
             message: message.into(),
+            precondition_failed: false,
         }
     }
 
@@ -507,8 +512,76 @@ impl BackendError {
         Self {
             kind: BackendErrorKind::Ambiguous,
             message: message.into(),
+            precondition_failed: false,
         }
     }
+
+    /// The provider enforced a conditional write and the current object did
+    /// not match. The prior object is unchanged.
+    pub fn precondition_failed() -> Self {
+        Self {
+            kind: BackendErrorKind::Definitive,
+            message: "conditional write precondition did not match the current object".to_string(),
+            precondition_failed: true,
+        }
+    }
+}
+
+/// The precondition a conditional write places on the *current* stored object.
+///
+/// It is enforced atomically at the commit point: the local stores compare and
+/// swap under their mutation lock, and the S3 backend sends the native
+/// conditional header. It is never resolved from the request body or key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WritePrecondition {
+    /// `If-None-Match: *` — publish only when no current object exists.
+    IfAbsent,
+    /// `If-Match: *` — publish only when a current object exists.
+    IfExists,
+    /// `If-Match: <etag>` — publish only when the current object matches.
+    IfEtag(String),
+}
+
+impl WritePrecondition {
+    /// Stable identity of the precondition, used to keep completion retries
+    /// that declare a different condition as distinct operations.
+    pub fn fingerprint(&self) -> String {
+        let canonical = match self {
+            Self::IfAbsent => "if-absent".to_string(),
+            Self::IfExists => "if-exists".to_string(),
+            Self::IfEtag(etag) => format!("if-etag:{etag}"),
+        };
+        sha256_hex(canonical.as_bytes())
+    }
+
+    /// Whether the precondition holds for the current stored object.
+    pub fn matches(&self, current: Option<&StoredObjectMeta>) -> bool {
+        match (self, current) {
+            (Self::IfAbsent, None) => true,
+            (Self::IfAbsent, Some(_)) => false,
+            (Self::IfExists, Some(_)) => true,
+            (Self::IfExists, None) => false,
+            (Self::IfEtag(expected), Some(meta)) => meta
+                .etag
+                .as_deref()
+                .is_some_and(|stored| etag_matches(expected, stored)),
+            (Self::IfEtag(_), None) => false,
+        }
+    }
+}
+
+/// Compares entity tags allowing for the optional weakness prefix and quoting
+/// that HTTP transports around them.
+pub fn etag_matches(expected: &str, stored: &str) -> bool {
+    normalized_etag(expected) == normalized_etag(stored)
+}
+
+fn normalized_etag(value: &str) -> &str {
+    value
+        .trim()
+        .strip_prefix("W/")
+        .unwrap_or_else(|| value.trim())
+        .trim_matches('"')
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -582,6 +655,7 @@ pub trait TransactionBackend: Send + Sync {
         &self,
         operation: &OperationRecord,
         body: Bytes,
+        precondition: Option<&WritePrecondition>,
     ) -> Result<StoredObjectMeta, BackendError>;
     async fn create_multipart(&self, operation: &OperationRecord) -> Result<String, BackendError>;
     async fn upload_part(
@@ -596,6 +670,7 @@ pub trait TransactionBackend: Send + Sync {
         operation: &OperationRecord,
         upload_id: &str,
         parts: &[UploadedPart],
+        precondition: Option<&WritePrecondition>,
     ) -> Result<StoredObjectMeta, BackendError>;
     async fn abort_multipart(
         &self,
@@ -661,6 +736,8 @@ pub enum TransactionError {
     Publication(String),
     #[error("destination commit authority rejected: {0}")]
     CommitAuthority(String),
+    #[error("the conditional write precondition did not match the current object")]
+    PreconditionFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1065,6 +1142,50 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn stored(etag: &str) -> StoredObjectMeta {
+        StoredObjectMeta {
+            etag: Some(etag.to_string()),
+            ..StoredObjectMeta::default()
+        }
+    }
+
+    #[test]
+    fn conditional_write_preconditions_match_the_current_object() {
+        assert!(WritePrecondition::IfAbsent.matches(None));
+        assert!(!WritePrecondition::IfAbsent.matches(Some(&stored("\"etag\""))));
+        assert!(WritePrecondition::IfExists.matches(Some(&stored("\"etag\""))));
+        assert!(!WritePrecondition::IfExists.matches(None));
+
+        let conditional = WritePrecondition::IfEtag("\"abc\"".to_string());
+        assert!(conditional.matches(Some(&stored("\"abc\""))));
+        assert!(!conditional.matches(Some(&stored("\"def\""))));
+        assert!(!conditional.matches(None));
+    }
+
+    #[test]
+    fn entity_tags_compare_ignoring_http_quoting() {
+        assert!(etag_matches("\"abc\"", "abc"));
+        assert!(etag_matches("abc", "\"abc\""));
+        assert!(etag_matches("W/\"abc\"", "\"abc\""));
+        assert!(!etag_matches("\"abc\"", "\"abcd\""));
+    }
+
+    #[test]
+    fn precondition_fingerprints_distinguish_the_declared_condition() {
+        assert_eq!(
+            WritePrecondition::IfAbsent.fingerprint(),
+            WritePrecondition::IfAbsent.fingerprint()
+        );
+        assert_ne!(
+            WritePrecondition::IfAbsent.fingerprint(),
+            WritePrecondition::IfExists.fingerprint()
+        );
+        assert_ne!(
+            WritePrecondition::IfEtag("\"a\"".to_string()).fingerprint(),
+            WritePrecondition::IfEtag("\"b\"".to_string()).fingerprint()
+        );
+    }
 
     fn expected_transition(from: OperationState, to: OperationState) -> bool {
         [

@@ -101,6 +101,17 @@ pub fn no_such_key(key: &str) -> axum::response::Response {
     )
 }
 
+/// The conditional-write precondition (`If-Match` / `If-None-Match`) did not
+/// match the current object. The previous object is unchanged.
+pub fn precondition_failed(key: &str) -> axum::response::Response {
+    s3_error_xml(
+        "PreconditionFailed",
+        "At least one of the preconditions you specified did not hold.",
+        key,
+        StatusCode::PRECONDITION_FAILED,
+    )
+}
+
 pub fn no_such_version(key: &str) -> axum::response::Response {
     s3_error_xml(
         "NoSuchVersion",

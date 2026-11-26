@@ -3,6 +3,7 @@ pub mod backend;
 pub mod binary_ir;
 pub mod binary_pump;
 pub mod binary_reductor;
+pub mod byte_preserving;
 pub mod control;
 pub mod customer_headers;
 pub mod entity;
