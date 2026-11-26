@@ -1,6 +1,6 @@
 # Known S3 compatibility gaps
 
-Last reviewed: 2026-11-13, against published v0.7.35.
+Last reviewed: 2026-11-26, against main after v0.7.35.
 
 These are unresolved capabilities. The v0.7.35 FileStore versioning and published-image
 qualification do not establish support for them. See the current
@@ -9,7 +9,6 @@ qualification do not establish support for them. See the current
 | Gap | Current state / evidence | Delivery scope |
 | --- | --- | --- |
 | Versioning outside Docker/FileStore | v0.7.35 ships persistent FileStore settings/history, exact versions, markers, suspension/null semantics and paginated listing. Both native published Linux children passed all 35 feedback cases and replay. Version operations on managed, customer S3, presigned and memory destinations remain unsupported. | **Docker/FileStore only**; [plan and evidence](plans/2026-11-13-filestore-versioning.md), [ADR 0035](adr/0035-proposed-filestore-object-versioning.md). No broader backend versioning support is claimed. |
-| Atomic create-only writes | `If-None-Match: *` is not enforced as an atomic write condition. Conditional GET/HEAD handling in `server/s3_objects.rs` does not supply write exclusion. The reported two successful overwriting writes have not been independently rerun for this documentation update. | Deferred from the current scope. Future acceptance must prove existing keys return `412 PreconditionFailed` and concurrent create-only writers have exactly one winner, including applicable multipart paths. |
 | Enforced bucket/prefix access policies | `server/routing.rs` rejects the bucket-policy API with `501 NotImplemented`. Existing authentication/workspace and pipeline-policy gates do not establish S3 bucket-policy support or the requested worker-specific prefix restrictions. | Deferred from the current scope. Future acceptance must prove worker credentials cannot overwrite/delete protected reservations, receipts or claims, bypass required conditional writes, or change their policy to grant themselves access. |
 
 ## Versioning boundaries
