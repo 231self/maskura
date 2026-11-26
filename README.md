@@ -204,6 +204,8 @@ Rust, Python, JavaScript/TypeScript, and workflow code.
 - [Lance format](docs/lance.md) — **New!** columnar ML tables (ADR 0026)
 - [Apache Parquet](docs/parquet.md) — **New!** typed columnar processing (ADR 0027)
 - [Iceberg table format](docs/iceberg.md) — **New!** table-aware policy layer (ADR 0028)
+- [External catalog storage](docs/external-catalog-storage.md) — **New!** byte-preserving scopes for Iceberg REST catalogs (ADR 0036)
+- [Conditional writes](docs/adr/0037-conditional-object-writes.md) — `If-Match` / `If-None-Match` on PUT and multipart completion (ADR 0037)
 - [Benchmarks](docs/benchmarks.md)
 - [Open-source and hosted Maskura](https://maskura.dev/open-source/)
 

@@ -298,6 +298,179 @@ async fn scope_round_trips_signed_fixed_length_and_chunked_puts() {
     }
 }
 
+/// AWS SigV4 chunk signing (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`), the exact
+/// transport the reported catalog request used. The seed signature comes from
+/// the normal request signer; the chunk signatures are derived from it.
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac as _};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).expect("hmac key");
+    mac.update(data);
+    mac.finalize().into_bytes().into()
+}
+
+fn signing_key(secret: &str, date: &str) -> [u8; 32] {
+    let date_key = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+    let region_key = hmac_sha256(&date_key, b"us-east-1");
+    let service_key = hmac_sha256(&region_key, b"s3");
+    hmac_sha256(&service_key, b"aws4_request")
+}
+
+fn chunk_signature(
+    key: &[u8; 32],
+    timestamp: &str,
+    scope: &str,
+    previous: &str,
+    data: &[u8],
+) -> String {
+    use sha2::Digest as _;
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
+        timestamp,
+        scope,
+        previous,
+        hex::encode(sha2::Sha256::digest(b"")),
+        hex::encode(sha2::Sha256::digest(data)),
+    );
+    hex::encode(hmac_sha256(key, string_to_sign.as_bytes()))
+}
+
+fn chunk_signed_put(
+    access_key: &str,
+    secret: &str,
+    uri: &str,
+    content_type: &str,
+    data: &[u8],
+) -> Request<Body> {
+    use aws_sigv4::http_request::SignableBody;
+    let decoded_length = data.len().to_string();
+    let request = signed_request_with_signable(
+        access_key,
+        secret,
+        "PUT",
+        uri,
+        data,
+        &[
+            ("content-type", content_type),
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+            ("x-amz-decoded-content-length", decoded_length.as_str()),
+        ],
+        SignableBody::Precomputed("STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string()),
+    );
+    let authorization = request
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .expect("signed request carries authorization")
+        .to_string();
+    let timestamp = request
+        .headers()
+        .get("x-amz-date")
+        .and_then(|value| value.to_str().ok())
+        .expect("signed request carries x-amz-date")
+        .to_string();
+    let seed = authorization
+        .rsplit("Signature=")
+        .next()
+        .expect("authorization carries a signature")
+        .trim()
+        .to_string();
+    let credential = authorization
+        .split("Credential=")
+        .nth(1)
+        .and_then(|value| value.split(',').next())
+        .expect("authorization carries a credential scope");
+    let scope = credential
+        .split_once('/')
+        .map(|(_, scope)| scope)
+        .expect("credential scope");
+    let key = signing_key(secret, &timestamp[..8]);
+    let mut framed = String::new();
+    let signature = chunk_signature(&key, &timestamp, scope, &seed, data);
+    framed.push_str(&format!(
+        "{:X};chunk-signature={signature}\r\n{}\r\n",
+        data.len(),
+        String::from_utf8_lossy(data)
+    ));
+    let final_signature = chunk_signature(&key, &timestamp, scope, &signature, b"");
+    framed.push_str(&format!("0;chunk-signature={final_signature}\r\n\r\n"));
+    let (parts, _) = request.into_parts();
+    Request::from_parts(parts, Body::from(framed))
+}
+
+#[tokio::test]
+async fn scope_round_trips_chunk_signed_sigv4_puts() {
+    let mut state = scoped_state(false, Some("warehouse")).await;
+    Arc::get_mut(&mut state)
+        .expect("test state is uniquely owned")
+        .sigv4_policy = SigV4Policy::new("us-east-1", true);
+    let app = build_router(state.clone());
+    let (access_key, secret_key) = make_key(&state).await;
+    let uri = "http://maskura.local/warehouse/signed/metadata/00000-signed.metadata.json";
+    let read_uri = "/warehouse/signed/metadata/00000-signed.metadata.json";
+    let headers = auth_headers(&access_key, &secret_key);
+
+    let response = app
+        .clone()
+        .oneshot(chunk_signed_put(
+            &access_key,
+            &secret_key,
+            uri,
+            "application/octet-stream",
+            FIRST_METADATA_JSON,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "chunk-signed SigV4 PUT must store the catalog object"
+    );
+    let response = app
+        .clone()
+        .oneshot(simple_request("GET", read_uri, &headers))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_body(response).await, FIRST_METADATA_JSON);
+
+    // A tampered chunk signature is rejected and stores nothing new.
+    let tampered_uri = "http://maskura.local/warehouse/signed/metadata/00001-signed.metadata.json";
+    let request = chunk_signed_put(
+        &access_key,
+        &secret_key,
+        tampered_uri,
+        "application/octet-stream",
+        FIRST_METADATA_JSON,
+    );
+    let (mut parts, body) = request.into_parts();
+    let framed = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let mut tampered = String::from_utf8(framed.to_vec()).unwrap();
+    let signature_start = tampered.find("chunk-signature=").unwrap() + "chunk-signature=".len();
+    let replacement = if tampered.as_bytes()[signature_start] == b'a' {
+        "b"
+    } else {
+        "a"
+    };
+    tampered.replace_range(signature_start..signature_start + 1, replacement);
+    parts
+        .headers
+        .insert(header::CONTENT_LENGTH, tampered.len().into());
+    let request = Request::from_parts(parts, Body::from(tampered));
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a tampered chunk signature must fail closed"
+    );
+    assert!(
+        state
+            .store
+            .get("warehouse", "signed/metadata/00001-signed.metadata.json")
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn the_scope_cannot_be_selected_by_a_request() {
     let gate_closed = scoped_state(false, Some("warehouse/probe")).await;

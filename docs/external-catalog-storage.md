@@ -73,15 +73,39 @@ This probe is not part of CI; run it against a disposable deployment.
 6. Restart the gateway over the same storage directory and repeat the
    `SELECT`; the metadata and data must survive the restart.
 
+## Verified probe (2026-11-26)
+
+Ran `scripts/probe-polaris-trino.sh` against this revision: Apache Polaris
+1.8.0 (in-memory metastore, static S3 credentials, path-style) and Trino 484
+(Iceberg REST connector) against the gateway with a local FileStore and
+`MASKURA_BYTE_PRESERVING_SCOPES=warehouse`.
+
+- `CREATE SCHEMA iceberg.probe`, `CREATE TABLE iceberg.probe.sample
+  (x integer)`, `INSERT` of three rows, and `SELECT` returned `1, 2, 3`;
+- the Iceberg snapshot count advanced after the insert;
+- restarting the gateway over the same FileStore returned the same rows.
+
+The run disables credential vending
+(`iceberg.rest-catalog.vended-credentials-enabled=false`); Polaris and Trino
+use static S3 credentials, and the scope stores every catalog object
+unchanged. Reproduce with:
+
+```bash
+MASKURA_GATEWAY_BIN=target/debug/maskura-gateway bash scripts/probe-polaris-trino.sh
+```
+
+Docker must have `apache/polaris:1.8.0`, `trinodb/trino:484`, and `postgres`
+is not required for Polaris's in-memory mode.
+
 ## In-repo coverage
 
 The automated tests cover the same shapes without Polaris or Trino:
 
 - `crates/gateway/tests/s3_frontdoor_test/byte_preserving.rs` — first metadata
-  JSON write (fixed-length and `aws-chunked` signed PUTs), manifest and
-  data-file media types, exact byte/metadata readback, `HEAD`, scope selection
-  boundaries, gate-closed/gate-open verdicts outside the scope, signature and
-  checksum rejection, and conditional writes.
+  JSON write (fixed-length, `aws-chunked`, and per-chunk-signed SigV4 PUTs),
+  manifest and data-file media types, exact byte/metadata readback, `HEAD`,
+  scope selection boundaries, gate-closed/gate-open verdicts outside the scope,
+  signature and checksum rejection, and conditional writes.
 - `crates/gateway/tests/byte_preserving_filestore.rs` — the FileStore backend
   with staged multipart, a failed conditional write, and survival across a
   FileStore restart.
