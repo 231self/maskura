@@ -13,7 +13,7 @@ use crate::file_store::{FileStore, LocalChecksumState, LocalCommitContext};
 
 use super::{
     DestinationCommitAuthority, ObjectSinkTransaction, SinkCommitState, StoredObjectMeta,
-    TransactionError,
+    TransactionError, WritePrecondition,
 };
 
 /// Single-object local storage sink. Bytes are streamed to a private temp file;
@@ -37,6 +37,9 @@ pub struct FileSinkTransaction {
     user_metadata: BTreeMap<String, String>,
     tags: BTreeMap<String, String>,
     checksum_algorithm: Option<String>,
+    /// Conditional-write precondition the request declared. Enforced inside
+    /// the store's mutation lock at commit time.
+    precondition: Option<WritePrecondition>,
 }
 
 /// Metadata captured at multipart initiation that must survive completion into
@@ -85,7 +88,14 @@ impl FileSinkTransaction {
             user_metadata: BTreeMap::new(),
             tags: BTreeMap::new(),
             checksum_algorithm: None,
+            precondition: None,
         })
+    }
+
+    /// Applies the conditional-write precondition parsed from the request.
+    pub fn with_precondition(mut self, precondition: Option<WritePrecondition>) -> Self {
+        self.precondition = precondition;
+        self
     }
 
     pub async fn new_for_operation(
@@ -227,6 +237,7 @@ impl ObjectSinkTransaction for FileSinkTransaction {
                         self.bytes,
                         &etag,
                         &metadata,
+                        self.precondition.clone(),
                     )
                     .await
                 {
@@ -234,7 +245,7 @@ impl ObjectSinkTransaction for FileSinkTransaction {
                     Err(error) => {
                         self.publication_started =
                             matches!(error, crate::file_store::FileStoreError::MutationUnknown(_));
-                        return Err(file_error(error));
+                        return Err(file_store_error(error));
                     }
                 }
             }
@@ -270,14 +281,19 @@ impl ObjectSinkTransaction for FileSinkTransaction {
                 self.publication_started = true;
                 match self
                     .store
-                    .publish_transaction(&self.temp_path, &context, &etag)
+                    .publish_transaction(
+                        &self.temp_path,
+                        &context,
+                        &etag,
+                        self.precondition.clone(),
+                    )
                     .await
                 {
                     Ok(proof) => proof.version_id,
                     Err(error) => {
                         self.publication_started =
                             matches!(error, crate::file_store::FileStoreError::MutationUnknown(_));
-                        return Err(file_error(error));
+                        return Err(file_store_error(error));
                     }
                 }
             }
@@ -311,6 +327,17 @@ impl ObjectSinkTransaction for FileSinkTransaction {
 
 fn file_error(error: impl std::fmt::Display) -> TransactionError {
     TransactionError::Spool(format!("local FileStore: {error}"))
+}
+
+/// Maps a store error to the transaction error while preserving the
+/// conditional-write verdict the HTTP layer turns into `412 PreconditionFailed`.
+fn file_store_error(error: crate::file_store::FileStoreError) -> TransactionError {
+    match error {
+        crate::file_store::FileStoreError::PreconditionFailed => {
+            TransactionError::PreconditionFailed
+        }
+        error => file_error(error),
+    }
 }
 
 #[cfg(test)]

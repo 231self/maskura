@@ -941,6 +941,7 @@ pub(crate) async fn complete_staged_multipart(
     backend: ResolvedBackend,
     resolution: &crate::pipeline::PipelineResolution,
     policy_limits: Option<&maskura_pipeline_config::PolicyLimits>,
+    precondition: Option<crate::transaction::WritePrecondition>,
 ) -> Result<MultipartCompletionResult, MultipartCompletionError> {
     use sha2::Digest as _;
 
@@ -984,6 +985,9 @@ pub(crate) async fn complete_staged_multipart(
         .ok_or_else(|| {
             MultipartCompletionError::Invalid("multipart Content-Type is missing".to_string())
         })?;
+    // Byte-preserving scopes publish the exact part bytes (ADR 0036), so the
+    // table-unit rejection and the format adapters below do not apply.
+    let byte_preserving = byte_preserving_covers(state, &identity.bucket, &identity.key);
     // Table units are single-object operations (ADR 0028): a staged
     // multipart completion targeting a table root document or sub-unit fails
     // closed rather than publishing a per-object processed write.
@@ -1000,7 +1004,7 @@ pub(crate) async fn complete_staged_multipart(
             StreamingPutError::Pipeline(error),
         ));
     }
-    if lance_media_type(content_type).is_some() {
+    if !byte_preserving && lance_media_type(content_type).is_some() {
         if !state.binary_lance_enabled {
             return Err(MultipartCompletionError::Streaming(
                 StreamingPutError::Unsupported(
@@ -1017,10 +1021,11 @@ pub(crate) async fn complete_staged_multipart(
             operation,
             backend,
             content_type,
+            precondition,
         )
         .await;
     }
-    if avro_media_type(content_type).is_some() {
+    if !byte_preserving && avro_media_type(content_type).is_some() {
         if !state.binary_avro_enabled {
             return Err(MultipartCompletionError::Streaming(
                 StreamingPutError::Unsupported(
@@ -1037,10 +1042,16 @@ pub(crate) async fn complete_staged_multipart(
             operation,
             backend,
             content_type,
+            precondition,
         )
         .await;
     }
-    let (format, session_content_type) = streaming_format_content_type(content_type)?;
+    let (format, session_content_type) = if byte_preserving {
+        // The bytes are the object: no decoder and no re-serialization.
+        (Format::Binary, content_type.to_string())
+    } else {
+        streaming_format_content_type(content_type)?
+    };
     let stored_metadata = multipart_stored_metadata(&upload.snapshot)
         .map_err(|detail| MultipartCompletionError::Invalid(detail.to_string()))?;
     validate_multipart_checksum_mode(&upload.snapshot)
@@ -1070,6 +1081,7 @@ pub(crate) async fn complete_staged_multipart(
         content_type,
         Some((&coordinator, identity, fingerprint)),
         Some(stored_metadata),
+        precondition,
     )
     .await?;
     coordinator
@@ -1727,6 +1739,7 @@ pub(crate) async fn complete_staged_avro_multipart(
     operation: AuthorizedOperation<'_>,
     backend: ResolvedBackend,
     content_type: &str,
+    precondition: Option<crate::transaction::WritePrecondition>,
 ) -> Result<MultipartCompletionResult, MultipartCompletionError> {
     use sha2::Digest as _;
 
@@ -1759,6 +1772,7 @@ pub(crate) async fn complete_staged_avro_multipart(
         content_type,
         Some((&coordinator, identity, fingerprint)),
         Some(stored_metadata),
+        precondition,
     )
     .await?;
     coordinator
@@ -1893,6 +1907,7 @@ pub(crate) async fn complete_staged_lance_multipart(
     operation: AuthorizedOperation<'_>,
     backend: ResolvedBackend,
     content_type: &str,
+    precondition: Option<crate::transaction::WritePrecondition>,
 ) -> Result<MultipartCompletionResult, MultipartCompletionError> {
     use sha2::Digest as _;
 
@@ -1925,6 +1940,7 @@ pub(crate) async fn complete_staged_lance_multipart(
         content_type,
         Some((&coordinator, identity, fingerprint)),
         Some(stored_metadata),
+        precondition,
     )
     .await?;
     coordinator

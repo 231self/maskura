@@ -165,6 +165,11 @@ pub(crate) async fn streaming_iceberg_single_put(
     if !is_candidate(key, content_type_of(headers)) {
         return None;
     }
+    // External-catalog storage is stored byte-for-byte (ADR 0036): no table
+    // classification, no gate, no walk.
+    if byte_preserving_covers(state, usage.grant.bucket(), key) {
+        return None;
+    }
     let bucket = usage.grant.bucket().to_string();
     let store = table_store(backend, &bucket);
     let target = match classify(store.as_ref(), &bucket, key, claims_table(headers)).await {
@@ -509,13 +514,18 @@ async fn table_root_read(
 /// feature gate: a table unit must not fall through to per-object processing
 /// whether or not the table surface is enabled.
 pub(crate) async fn multipart_table_rejection(
-    _state: &AppState,
+    state: &AppState,
     backend: &ResolvedBackend,
     bucket: &str,
     key: &str,
     content_type: Option<&str>,
 ) -> Option<MaskuraError> {
     if !is_candidate(key, content_type) {
+        return None;
+    }
+    // Byte-preserving scopes store catalog objects as plain objects, so a
+    // multipart upload of a table-unit key is not a table operation there.
+    if byte_preserving_covers(state, bucket, key) {
         return None;
     }
     let store = table_store(backend, bucket);

@@ -85,6 +85,55 @@ pub fn default_listen_addr(config: &Config) -> &'static str {
     }
 }
 
+/// Parses and validates the operator byte-preserving scopes (ADR 0036).
+///
+/// Empty by default. Startup fails closed when one write would be assigned
+/// both opaque storage and transforms: a managed service bucket or a
+/// bucket-scoped pipeline assignment cannot also be a byte-preserving scope.
+fn byte_preserving_scopes(
+    service_backends: &[crate::service_storage::ServiceBackend],
+    pipeline: Option<&ConfiguredPipelineFile>,
+) -> anyhow::Result<crate::byte_preserving::BytePreservingScopes> {
+    let raw = std::env::var("MASKURA_BYTE_PRESERVING_SCOPES").ok();
+    let managed: Vec<&str> = service_backends
+        .iter()
+        .map(|backend| backend.bucket.as_str())
+        .collect();
+    let pipeline_buckets = pipeline
+        .map(ConfiguredPipelineFile::bucket_scopes)
+        .unwrap_or_default();
+    byte_preserving_scopes_from(raw.as_deref(), &managed, &pipeline_buckets)
+}
+
+/// Pure form of [`byte_preserving_scopes`] so the ambiguity rules are testable
+/// without process-global environment mutation.
+fn byte_preserving_scopes_from(
+    raw: Option<&str>,
+    managed_buckets: &[&str],
+    pipeline_buckets: &[String],
+) -> anyhow::Result<crate::byte_preserving::BytePreservingScopes> {
+    let scopes = crate::byte_preserving::BytePreservingScopes::parse(raw)
+        .map_err(|error| anyhow::anyhow!("invalid MASKURA_BYTE_PRESERVING_SCOPES: {error}"))?;
+    if scopes.is_empty() {
+        return Ok(scopes);
+    }
+    for bucket in managed_buckets {
+        if scopes.conflicts_with_bucket(bucket) {
+            anyhow::bail!(
+                "MASKURA_BYTE_PRESERVING_SCOPES names bucket {bucket:?}, which is also a managed service bucket; one write cannot be both byte-preserving and transformed"
+            );
+        }
+    }
+    for bucket in pipeline_buckets {
+        if scopes.conflicts_with_bucket(bucket) {
+            anyhow::bail!(
+                "MASKURA_BYTE_PRESERVING_SCOPES names bucket {bucket:?}, which also has a bucket-scoped pipeline assignment; one write cannot be both byte-preserving and transformed"
+            );
+        }
+    }
+    Ok(scopes)
+}
+
 pub(crate) fn effective_multipart_mode(config: &Config, auto_local: bool) -> MultipartMode {
     if auto_local && !config.multipart_mode_is_explicit() {
         MultipartMode::Staged
@@ -346,6 +395,8 @@ pub async fn build_state_with_pipeline_template(
 
     let source_body_limits = source_body_limits(config)?;
     let max_pipeline_output_bytes = pipeline_template.max_pipeline_output_bytes;
+    let byte_preserving =
+        byte_preserving_scopes(&service_backends, pipeline_template.pipeline.as_ref())?;
     let local_appliance_default =
         local_appliance_default_pipeline(config, auto_local, pipeline_template.pipeline.is_some());
     let (gateway, plugins, demo_pipelines) =
@@ -871,6 +922,7 @@ pub async fn build_state_with_pipeline_template(
         binary_avro_enabled: config.features.enable_avro,
         binary_lance_enabled: config.features.enable_lance,
         binary_iceberg_enabled: config.features.enable_iceberg,
+        byte_preserving,
         dev_memory_max_object_bytes,
         dev_memory_streaming_enabled,
         demo_pipelines,
@@ -1293,5 +1345,49 @@ pub async fn invoke_mcp(
             Interrupted::Cancelled => Err(InvocationError::Cancelled),
             Interrupted::Timeout => Err(InvocationError::Timeout),
         },
+    }
+}
+
+#[cfg(test)]
+mod byte_preserving_startup_tests {
+    use super::*;
+
+    #[test]
+    fn an_absent_or_empty_scope_list_keeps_every_existing_assignment() {
+        assert!(
+            byte_preserving_scopes_from(None, &["managed"], &["tenant".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            byte_preserving_scopes_from(Some(""), &["managed"], &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn overlapping_opaque_and_transformed_assignments_fail_startup() {
+        let error = byte_preserving_scopes_from(Some("warehouse"), &["warehouse"], &[])
+            .expect_err("managed bucket overlap must be rejected");
+        assert!(error.to_string().contains("managed service bucket"));
+
+        let error = byte_preserving_scopes_from(Some("warehouse"), &[], &["warehouse".to_string()])
+            .expect_err("pipeline assignment overlap must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("bucket-scoped pipeline assignment")
+        );
+
+        byte_preserving_scopes_from(Some("warehouse"), &["other"], &["tenant".to_string()])
+            .expect("distinct buckets are not ambiguous");
+    }
+
+    #[test]
+    fn malformed_scope_configuration_fails_startup() {
+        let error = byte_preserving_scopes_from(Some("warehouse,warehouse/logs"), &[], &[])
+            .expect_err("overlapping entries must be rejected");
+        assert!(error.to_string().contains("overlap"));
     }
 }

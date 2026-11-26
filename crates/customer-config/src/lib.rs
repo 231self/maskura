@@ -176,6 +176,7 @@ mod tests {
         for operator_only in [
             "MASKURA_SECRET_KEK",
             "MASKURA_SERVICE_BUCKETS",
+            "MASKURA_BYTE_PRESERVING_SCOPES",
             "MASKURA_SIGV4_REGION",
             "MASKURA_WORKSPACE_ENDPOINT_ALLOWLIST",
             "MASKURA_PRESIGNED_HTTP_ALLOWLIST",

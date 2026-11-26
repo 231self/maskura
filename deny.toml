@@ -4,6 +4,12 @@
 # and rustls-webpki at 0.103.16. scripts/audit-rust.sh fails closed if any
 # holder other than sqlx-core appears on the 0.26 line. Re-review on any
 # sqlx/sea-orm bump.
+# RUSTSEC-2026-0543: chrono 0.4.x is unmaintained (no vulnerability, no patched
+# release). It is a direct dependency and is also held by sea-orm, sqlx, rmcp,
+# and schemars; cargo-audit reports it as an allowed warning. cargo-deny fails
+# on unmaintained advisories by default, so the warning is ignored here to keep
+# `just deny`/`pre-push` green. Replacing chrono (and the sqlx/sea-orm chrono
+# features) is a tracked follow-up; re-review on any chrono/sqlx/sea-orm bump.
 # RUSTSEC-2026-0387: crypto-bigint 0.5.5 timing variability in "constant-time"
 # operations (fixes >=0.7.6); held by aws-sigv4 1.6.0 (no newer release,
 # checked 2026-10-24) and elliptic-curve 0.13.8 via p256 0.13.2 in
@@ -11,29 +17,10 @@
 # elliptic-curve/p256 0.14 major crypto-stack upgrade). scripts/audit-rust.sh
 # fails closed if the holder set changes. Re-review on any
 # aws-sigv4/elliptic-curve/p256 bump.
-# RUSTSEC-2026-0391/0395-0406/0410 (the zstd family; fixes zstd >=0.14.3 /
-# zstd-safe >=8.2.0): held by apache-avro 0.22 (latest, pins zstd ^0.13) and
-# wasmtime-internal-cache 48 (needs the wasmtime 50 major).
-# scripts/audit-rust.sh fails closed if the holder set changes. Named
-# follow-ups: evaluate wasmtime 50 and dropping apache-avro's zstandard
-# feature. Re-review on any apache-avro/wasmtime bump.
 ignore = [
   "RUSTSEC-2026-0381",
   "RUSTSEC-2026-0387",
-  "RUSTSEC-2026-0391",
-  "RUSTSEC-2026-0395",
-  "RUSTSEC-2026-0396",
-  "RUSTSEC-2026-0397",
-  "RUSTSEC-2026-0398",
-  "RUSTSEC-2026-0399",
-  "RUSTSEC-2026-0400",
-  "RUSTSEC-2026-0401",
-  "RUSTSEC-2026-0402",
-  "RUSTSEC-2026-0403",
-  "RUSTSEC-2026-0404",
-  "RUSTSEC-2026-0405",
-  "RUSTSEC-2026-0406",
-  "RUSTSEC-2026-0410",
+  "RUSTSEC-2026-0543",
 ]
 
 [graph]
@@ -44,6 +31,7 @@ allow = [
   "MIT",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
   "BSD-3-Clause",
   "ISC",
   "MPL-2.0",

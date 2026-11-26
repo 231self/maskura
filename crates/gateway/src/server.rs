@@ -115,6 +115,7 @@ pub(crate) mod iceberg;
 mod lifecycle;
 mod multipart;
 mod openapi;
+mod pipeline_scope;
 mod routing;
 mod s3_batch_delete;
 mod s3_objects;
@@ -139,6 +140,7 @@ pub use lifecycle::{
 pub use multipart::reconcile_workspace_streaming_operation;
 pub(crate) use multipart::*;
 pub(crate) use openapi::*;
+pub(crate) use pipeline_scope::*;
 pub use routing::build_router;
 pub(crate) use s3_batch_delete::*;
 pub(crate) use s3_objects::*;

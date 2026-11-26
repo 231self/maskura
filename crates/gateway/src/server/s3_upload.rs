@@ -51,7 +51,9 @@ impl StreamingPutError {
                 Self::PreserveReservation(Box::new(error.sanitized_for_validation()))
             }
             Self::Transaction(
-                TransactionError::CapacityExceeded | TransactionError::TooManyParts,
+                TransactionError::CapacityExceeded
+                | TransactionError::TooManyParts
+                | TransactionError::PreconditionFailed,
             ) => self,
             Self::Transaction(_) => Self::Validation,
             Self::Integrity(error) => Self::SanitizedIntegrity(error),
@@ -90,6 +92,9 @@ pub(crate) fn streaming_put_error_response(
         ) => s3_error::bad_digest(key, &error.to_string()),
         StreamingPutError::Integrity(error) => s3_error::invalid_request(key, &error.to_string()),
         StreamingPutError::Pipeline(error) => pipeline_error_response(key, &error),
+        StreamingPutError::Transaction(TransactionError::PreconditionFailed) => {
+            s3_error::precondition_failed(key)
+        }
         StreamingPutError::Transaction(
             TransactionError::CapacityExceeded | TransactionError::TooManyParts,
         ) => s3_error::entity_too_large(key),
@@ -272,6 +277,53 @@ pub(crate) fn streaming_format_content_type(
     Ok((format, media_type))
 }
 
+/// Parses the S3 conditional-write headers.
+///
+/// `If-None-Match` supports only `*` (create-if-absent). `If-Match` supports a
+/// concrete entity tag or `*` (must-exist). The two headers cannot be combined.
+pub(crate) fn write_precondition(
+    headers: &HeaderMap,
+) -> Result<Option<crate::transaction::WritePrecondition>, StreamingPutError> {
+    let if_match = headers.get(header::IF_MATCH);
+    let if_none_match = headers.get(header::IF_NONE_MATCH);
+    match (if_match, if_none_match) {
+        (Some(_), Some(_)) => Err(StreamingPutError::InvalidRequest(
+            "If-Match and If-None-Match cannot be combined".to_string(),
+        )),
+        (None, None) => Ok(None),
+        (Some(value), None) => {
+            let value = value.to_str().map_err(|_| {
+                StreamingPutError::InvalidRequest("If-Match is not a valid header".to_string())
+            })?;
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(StreamingPutError::InvalidRequest(
+                    "If-Match is empty".to_string(),
+                ));
+            }
+            if value == "*" {
+                Ok(Some(crate::transaction::WritePrecondition::IfExists))
+            } else {
+                Ok(Some(crate::transaction::WritePrecondition::IfEtag(
+                    value.to_string(),
+                )))
+            }
+        }
+        (None, Some(value)) => {
+            let value = value.to_str().map_err(|_| {
+                StreamingPutError::InvalidRequest("If-None-Match is not a valid header".to_string())
+            })?;
+            if value.trim() == "*" {
+                Ok(Some(crate::transaction::WritePrecondition::IfAbsent))
+            } else {
+                Err(StreamingPutError::InvalidRequest(
+                    "If-None-Match supports only *".to_string(),
+                ))
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn streaming_single_put(
     state: &AppState,
@@ -287,6 +339,7 @@ pub(crate) async fn streaming_single_put(
         Instant,
         tokio_util::sync::CancellationToken,
     )>,
+    precondition: Option<crate::transaction::WritePrecondition>,
 ) -> Result<
     (
         Auth,
@@ -300,8 +353,15 @@ pub(crate) async fn streaming_single_put(
     use http_body_util::BodyExt as _;
     use sha2::Digest as _;
     let grant = usage.grant;
+    // External-catalog storage (ADR 0036): the body is opaque. Neither the
+    // content type nor the plugin catalog may select a transform, so every
+    // format dispatch below is skipped and the exact bytes are stored.
+    let byte_preserving = byte_preserving_covers(state, grant.bucket(), key);
 
-    if authentication.body_verifier.is_none() && headers.contains_key(header::CONTENT_ENCODING) {
+    if !byte_preserving
+        && authentication.body_verifier.is_none()
+        && headers.contains_key(header::CONTENT_ENCODING)
+    {
         return Err(StreamingPutError::InvalidRequest(
             "Content-Encoding is unsupported for transformed streaming".to_string(),
         ));
@@ -310,21 +370,22 @@ pub(crate) async fn streaming_single_put(
     // processed write inside a table root is a table operation or a named
     // fail-closed rejection (ADR 0028), never an ordinary object write.
     let mut authentication = Some(authentication);
-    if let Some(result) = crate::server::iceberg::streaming_iceberg_single_put(
-        state,
-        &mut authentication,
-        &backend,
-        usage,
-        headers,
-        &mut body,
-        key,
-    )
-    .await
+    if !byte_preserving
+        && let Some(result) = crate::server::iceberg::streaming_iceberg_single_put(
+            state,
+            &mut authentication,
+            &backend,
+            usage,
+            headers,
+            &mut body,
+            key,
+        )
+        .await
     {
         return result;
     }
     let mut authentication = authentication.expect("untouched when the table dispatch declines");
-    if is_lance_content_type(headers) {
+    if !byte_preserving && is_lance_content_type(headers) {
         if !state.binary_lance_enabled {
             return Err(StreamingPutError::Unsupported(
                 "Lance processing is disabled; set MASKURA_ENABLE_LANCE=true".to_string(),
@@ -338,10 +399,11 @@ pub(crate) async fn streaming_single_put(
             headers,
             body,
             key,
+            precondition,
         )
         .await;
     }
-    if is_avro_content_type(headers) {
+    if !byte_preserving && is_avro_content_type(headers) {
         if !state.binary_avro_enabled {
             return Err(StreamingPutError::Unsupported(
                 "Avro processing is disabled; set MASKURA_ENABLE_AVRO=true".to_string(),
@@ -355,13 +417,20 @@ pub(crate) async fn streaming_single_put(
             headers,
             body,
             key,
+            precondition,
         )
         .await;
     }
-    let (format, content_type) = streaming_format(headers)?;
     // Format/session selection remains normalized; object representation does
     // not lose valid parameters or spelling from the supplied header.
     let representation_content_type = stored_content_type(headers)?;
+    let (format, content_type) = if byte_preserving {
+        // The stored bytes are the written bytes: no decoder and no re-
+        // serialization, whatever the declared media type.
+        (Format::Binary, representation_content_type.clone())
+    } else {
+        streaming_format_content_type(&representation_content_type)?
+    };
     let mut content_md5 =
         ContentMd5Verifier::from_headers(headers).map_err(StreamingPutError::Integrity)?;
     let decoder_limits = crate::record::DecoderLimits {
@@ -384,6 +453,7 @@ pub(crate) async fn streaming_single_put(
         &representation_content_type,
         None,
         Some(single_put_stored_metadata(headers)),
+        precondition,
     )
     .await?;
     let mut sink_guard = SinkAbortGuard::new(sink);
@@ -786,6 +856,7 @@ pub(crate) fn avro_pump(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn streaming_avro_single_put(
     state: &AppState,
     mut authentication: HeaderAuthentication,
@@ -794,6 +865,7 @@ pub(crate) async fn streaming_avro_single_put(
     headers: &HeaderMap,
     mut body: axum::body::Body,
     key: &str,
+    precondition: Option<crate::transaction::WritePrecondition>,
 ) -> Result<
     (
         Auth,
@@ -828,6 +900,7 @@ pub(crate) async fn streaming_avro_single_put(
         &content_type,
         None,
         Some(single_put_stored_metadata(headers)),
+        precondition,
     )
     .await?;
     let mut sink_guard = SinkAbortGuard::new(sink);
@@ -929,6 +1002,7 @@ pub(crate) async fn streaming_avro_single_put(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn streaming_lance_single_put(
     state: &AppState,
     mut authentication: HeaderAuthentication,
@@ -937,6 +1011,7 @@ pub(crate) async fn streaming_lance_single_put(
     headers: &HeaderMap,
     mut body: axum::body::Body,
     key: &str,
+    precondition: Option<crate::transaction::WritePrecondition>,
 ) -> Result<
     (
         Auth,
@@ -971,6 +1046,7 @@ pub(crate) async fn streaming_lance_single_put(
         &content_type,
         None,
         Some(single_put_stored_metadata(headers)),
+        precondition,
     )
     .await?;
     let mut sink_guard = SinkAbortGuard::new(sink);
@@ -1206,16 +1282,20 @@ async fn s3_put_inner(
     if let Some(response) = client_metering_id_rejection(&parts.headers, response_key) {
         return response;
     }
+    let precondition = match write_precondition(&parts.headers) {
+        Ok(precondition) => precondition,
+        Err(error) => return streaming_put_error_response(response_key, error),
+    };
     let operation = request_operation_identity();
     let resolution_started = Instant::now();
-    let resolution = match state
-        .gateway
-        .resolve(
-            auth.workspace_id().as_str(),
-            &bucket,
-            crate::pipeline::PipelineDirection::Write,
-        )
-        .await
+    let resolution = match resolve_request_pipeline(
+        &state,
+        auth.workspace_id().as_str(),
+        &bucket,
+        &key,
+        crate::pipeline::PipelineDirection::Write,
+    )
+    .await
     {
         Ok(resolution) => resolution,
         Err(error) => {
@@ -1299,6 +1379,18 @@ async fn s3_put_inner(
         };
     selection.resolve_managed_placement(auth.workspace_id().as_str(), &bucket, &key);
     let backend = &selection.backend;
+    // A covered key must never silently degrade to a transformed managed
+    // write; the operator scope and the destination assignment conflict.
+    if let Some(error) = byte_preserving_backend_rejection(&state, &bucket, &key, backend) {
+        return release_failure(
+            state.control.as_ref(),
+            &auth_context,
+            &grant,
+            response_key,
+            pipeline_error_response(response_key, &error),
+        )
+        .await;
+    }
     let policy = match enforce_policy(
         state.policy_gate.as_ref(),
         PolicyRequest {
@@ -1471,6 +1563,7 @@ async fn s3_put_inner(
         request_body,
         &key,
         validation,
+        precondition,
     )
     .await
     {

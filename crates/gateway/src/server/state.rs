@@ -50,6 +50,10 @@ pub struct AppState {
     /// default: table-root writes and processed reads are rejected until an
     /// operator opts in with `MASKURA_ENABLE_ICEBERG`.
     pub binary_iceberg_enabled: bool,
+    /// Operator-declared external-catalog storage (ADR 0036). Covered requests
+    /// bypass table classification and every format adapter and execute the
+    /// byte-preserving passthrough pipeline instead. Empty by default.
+    pub byte_preserving: crate::byte_preserving::BytePreservingScopes,
     pub dev_memory_max_object_bytes: usize,
     pub dev_memory_streaming_enabled: bool,
     pub(crate) demo_pipelines: DemoPipelines,
@@ -99,6 +103,21 @@ pub struct StatePipelineTemplate {
 pub(crate) struct ConfiguredPipelineFile {
     file: maskura_pipeline_config::PipelineFile,
     revision: String,
+}
+
+impl ConfiguredPipelineFile {
+    /// Every bucket named by a bucket-scoped assignment, including workspace
+    /// overrides. Startup validation rejects overlap with byte-preserving
+    /// scopes so one write is never assigned both storage modes (ADR 0036).
+    pub(crate) fn bucket_scopes(&self) -> Vec<String> {
+        let mut buckets: Vec<String> = self.file.buckets.keys().cloned().collect();
+        for workspace in self.file.workspaces.values() {
+            buckets.extend(workspace.buckets.keys().cloned());
+        }
+        buckets.sort();
+        buckets.dedup();
+        buckets
+    }
 }
 
 impl StatePipelineTemplate {

@@ -219,6 +219,7 @@ ignoring them.
 | `SUPABASE_ANON_KEY` | Supabase public/anonymous client key. Defaults to the local Supabase development value. |
 | `MASKURA_SECRET_KEK` | Base64-encoded 32-byte local key-encryption key. Without it, non-local OSS wrapping is ephemeral; automatic local storage persists its own root wrapping key. |
 | `MASKURA_SERVICE_BUCKETS` | Semicolon-separated service-storage backends. Each backend is pipe-separated as `provider|endpoint|region|bucket|access_key|secret_key`, `provider|instance|account|credential_epoch|endpoint|region|bucket|access_key|secret_key`, or the latter with `placement_weight|placement_capacity_units` inserted before `endpoint`. Multi-tenant mode requires a non-empty value. |
+| `MASKURA_BYTE_PRESERVING_SCOPES` | Comma-separated `bucket` or `bucket/prefix` entries that store an external catalog's objects byte-for-byte, unfiltered (ADR 0036). Default empty. Startup rejects overlap with managed service buckets or bucket-scoped pipeline assignments. |
 | `MASKURA_MULTIPART_STAGING_ACCESS_KEY_ID`, `MASKURA_MULTIPART_STAGING_SECRET_ACCESS_KEY` | Required credential pair for hosted multipart staging. |
 | `MASKURA_BOOTSTRAP_SECRET` | Secret paired with `keys.bootstrap_key` / `MASKURA_BOOTSTRAP_KEY`; both must be present or absent. |
 | `MASKURA_ROOT_USER`, `MASKURA_ROOT_PASSWORD` | Optional local-appliance root access key and secret; set both or neither. Otherwise Maskura generates and displays a credential once. On restart, configured values must match the saved credential or Maskura will not start. |

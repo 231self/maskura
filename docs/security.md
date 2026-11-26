@@ -375,6 +375,32 @@ The guarantees are deliberately strict:
   authorization binds the resolved policy identity, so the fingerprint covers
   every read — passthrough assignments included.
 
+### Byte-preserving external-catalog scopes
+
+`MASKURA_BYTE_PRESERVING_SCOPES` (empty by default) declares buckets or key
+prefixes that store another system's opaque objects — normally an external
+table catalog such as Apache Polaris (ADR 0036). The rules that keep the rest
+of the read mandate intact still apply:
+
+- Selection is **operator configuration plus the authenticated request's
+  bucket**. No header, query parameter, key suffix, or body shape can grant
+  the scope, and the control-plane grant still has to admit the operation.
+- Covered writes and reads bypass table classification, every format adapter,
+  **and the plugin pipeline**. The stored object is exactly the bytes written;
+  the served object is exactly the stored bytes. This is the one
+  operator-declared exception to "every read applies a pipeline": the scope
+  *is* an authored explicit-passthrough assignment.
+- **Data in a scope is unfiltered.** No PII filter, encryption, or format
+  transform runs on it. Operators must not point a scope at protected customer
+  data.
+- A covered request whose destination resolves to managed storage fails
+  closed, and startup rejects a scope that overlaps a managed service bucket or
+  a bucket-scoped pipeline assignment. One write is never assigned both modes.
+- The scope also overrides the local appliance's file-backend-only passthrough
+  guard for the buckets the operator named.
+- Conditional writes (`If-Match` / `If-None-Match`) remain enforced inside and
+  outside the scope (ADR 0037).
+
 ## 6. Storage backends
 
 - **Presigned URL proxy (`x-maskura-backend-url`)** — the user generates a presigned
@@ -389,6 +415,10 @@ The guarantees are deliberately strict:
 - **Service storage** — Maskura-managed multi-cloud buckets (`MASKURA_SERVICE_BUCKETS`),
   tenant-namespaced by workspace and optionally backed by authoritative
   placement metadata (see §9).
+- **Byte-preserving scopes** — operator-declared buckets/prefixes that store
+  external-catalog objects unchanged (`MASKURA_BYTE_PRESERVING_SCOPES`); they
+  cannot overlap managed service buckets or bucket-scoped pipeline
+  assignments (see §5).
 - **Resolution contract** — an explicit `x-maskura-storage-mode: managed` request is
   resolved first, followed by a presigned URL, a per-workspace configuration,
   and configured service storage as the default. Only explicit single-tenant

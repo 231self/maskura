@@ -19,7 +19,8 @@ use super::{
     EXACT_ABSENCE_CONFIRMATION_DELAY, EvidenceRecord, MultipartUploadInspection, ObjectDestination,
     ObjectSinkTransaction, OperationJournal, OperationRecord, OperationState,
     PROVIDER_MUTATION_AMBIGUITY_WINDOW, PartRecord, ProviderMutationFence, SinkCommitState,
-    StoredObjectMeta, TransactionBackend, TransactionError, UploadedPart, sha256_hex, unix_time_ms,
+    StoredObjectMeta, TransactionBackend, TransactionError, UploadedPart, WritePrecondition,
+    sha256_hex, unix_time_ms,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -622,6 +623,26 @@ where
     }
 }
 
+/// Whether the provider rejected the mutation because its native conditional
+/// header did not match. This is definitive and must never be retried.
+fn provider_precondition_failed<E>(
+    error: &aws_smithy_runtime_api::client::result::SdkError<
+        E,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    match error {
+        aws_smithy_runtime_api::client::result::SdkError::ServiceError(context) => {
+            context.raw().status().as_u16() == 412
+                || context.err().code() == Some("PreconditionFailed")
+        }
+        _ => false,
+    }
+}
+
 #[async_trait]
 impl TransactionBackend for AwsS3TransactionBackend {
     fn capabilities(&self) -> BackendCapabilities {
@@ -636,24 +657,31 @@ impl TransactionBackend for AwsS3TransactionBackend {
         &self,
         operation: &OperationRecord,
         body: Bytes,
+        precondition: Option<&WritePrecondition>,
     ) -> Result<StoredObjectMeta, BackendError> {
-        let output = self
-            .fenced(
-                self.client
-                    .put_object()
-                    .bucket(&operation.destination.bucket)
-                    .key(&operation.destination.physical_key)
-                    .set_content_type(operation.expected.metadata.get("content-type").cloned())
-                    .set_content_encoding(object_content_encoding(operation)?)
-                    .set_metadata(Some(object_metadata(operation)?))
-                    .set_server_side_encryption(
-                        self.server_side_encryption.map(|value| value.sdk_value()),
-                    )
-                    .body(ByteStream::from(body))
-                    .send(),
-            )
-            .await?
-            .map_err(|error| provider_error("put_object", ProviderErrorPhase::Mutation, &error))?;
+        let request = self
+            .client
+            .put_object()
+            .bucket(&operation.destination.bucket)
+            .key(&operation.destination.physical_key)
+            .set_content_type(operation.expected.metadata.get("content-type").cloned())
+            .set_content_encoding(object_content_encoding(operation)?)
+            .set_metadata(Some(object_metadata(operation)?))
+            .set_server_side_encryption(self.server_side_encryption.map(|value| value.sdk_value()))
+            .body(ByteStream::from(body));
+        let request = match precondition {
+            Some(WritePrecondition::IfAbsent) => request.if_none_match("*"),
+            Some(WritePrecondition::IfExists) => request.if_match("*"),
+            Some(WritePrecondition::IfEtag(etag)) => request.if_match(etag.clone()),
+            None => request,
+        };
+        let output = self.fenced(request.send()).await?.map_err(|error| {
+            if provider_precondition_failed(&error) {
+                BackendError::precondition_failed()
+            } else {
+                provider_error("put_object", ProviderErrorPhase::Mutation, &error)
+            }
+        })?;
         let stored = StoredObjectMeta {
             etag: output.e_tag().map(ToOwned::to_owned),
             version_id: output.version_id().map(ToOwned::to_owned),
@@ -733,6 +761,7 @@ impl TransactionBackend for AwsS3TransactionBackend {
         operation: &OperationRecord,
         upload_id: &str,
         parts: &[UploadedPart],
+        precondition: Option<&WritePrecondition>,
     ) -> Result<StoredObjectMeta, BackendError> {
         if let CompletionProbe::Committed(meta) = self.finalized_multipart(operation).await? {
             return Ok(meta);
@@ -750,24 +779,30 @@ impl TransactionBackend for AwsS3TransactionBackend {
                     .collect(),
             ))
             .build();
-        let first = self
-            .fenced(
-                self.client
-                    .complete_multipart_upload()
-                    .bucket(&operation.destination.bucket)
-                    .key(&operation.destination.physical_key)
-                    .upload_id(upload_id)
-                    .multipart_upload(completed)
-                    .send(),
-            )
-            .await?
-            .map_err(|error| {
+        let request = self
+            .client
+            .complete_multipart_upload()
+            .bucket(&operation.destination.bucket)
+            .key(&operation.destination.physical_key)
+            .upload_id(upload_id)
+            .multipart_upload(completed);
+        let request = match precondition {
+            Some(WritePrecondition::IfAbsent) => request.if_none_match("*"),
+            Some(WritePrecondition::IfExists) => request.if_match("*"),
+            Some(WritePrecondition::IfEtag(etag)) => request.if_match(etag.clone()),
+            None => request,
+        };
+        let first = self.fenced(request.send()).await?.map_err(|error| {
+            if provider_precondition_failed(&error) {
+                BackendError::precondition_failed()
+            } else {
                 provider_error(
                     "complete_multipart",
                     ProviderErrorPhase::CompleteMultipart,
                     &error,
                 )
-            })?;
+            }
+        })?;
         // Observe the completed version before the metadata-only copy. A
         // successful CompleteMultipartUpload is not proof of its metadata.
         let mut rewritten = match self
@@ -1136,6 +1171,9 @@ pub struct DirectS3Sink {
     finished: bool,
     mutation_ambiguity_window: std::time::Duration,
     exact_absence_confirmation_delay: std::time::Duration,
+    /// Conditional-write precondition, sent as the native provider condition
+    /// on the publishing mutation.
+    precondition: Option<WritePrecondition>,
 }
 
 impl DirectS3Sink {
@@ -1253,7 +1291,14 @@ impl DirectS3Sink {
             finished: false,
             mutation_ambiguity_window: PROVIDER_MUTATION_AMBIGUITY_WINDOW,
             exact_absence_confirmation_delay: EXACT_ABSENCE_CONFIRMATION_DELAY,
+            precondition: None,
         })
+    }
+
+    /// Applies the conditional-write precondition parsed from the request.
+    pub fn with_precondition(mut self, precondition: Option<WritePrecondition>) -> Self {
+        self.precondition = precondition;
+        self
     }
 
     pub fn operation_id(&self) -> uuid::Uuid {
@@ -1415,7 +1460,11 @@ impl DirectS3Sink {
             )
             .await?;
             self.record_mutation_launch().await?;
-            match self.backend.put_object(&self.operation, body.clone()).await {
+            match self
+                .backend
+                .put_object(&self.operation, body.clone(), self.precondition.as_ref())
+                .await
+            {
                 Ok(mut meta) => {
                     if attempt > 1 && !self.backend.has_exact_version_recovery() {
                         meta.version_history_complete = false;
@@ -1458,6 +1507,22 @@ impl DirectS3Sink {
                     return Ok(meta);
                 }
                 Err(error) => {
+                    // A provider-enforced precondition failure is definitive:
+                    // nothing was written and retrying the same condition is
+                    // pointless.
+                    if error.precondition_failed {
+                        self.journal
+                            .transition(
+                                self.operation.id,
+                                OperationState::Completing,
+                                OperationState::ProvenAborted,
+                                None,
+                            )
+                            .await?;
+                        self.operation.state = OperationState::ProvenAborted;
+                        self.finished = true;
+                        return Err(TransactionError::PreconditionFailed);
+                    }
                     let definitive =
                         error.kind == super::BackendErrorKind::Definitive && !prior_ambiguous;
                     prior_ambiguous |= !definitive;
@@ -1485,6 +1550,13 @@ impl DirectS3Sink {
                         return Err(error.into());
                     }
                     last_error = Some(error);
+                    // A conditional write is not idempotent under retry: after
+                    // an ambiguous outcome, re-sending the same condition could
+                    // fail because our own write committed, or overwrite a
+                    // newer object. Reconcile by observation instead.
+                    if self.precondition.is_some() {
+                        break;
+                    }
                 }
             }
         }
@@ -1526,7 +1598,12 @@ impl DirectS3Sink {
             self.record_mutation_launch().await?;
             match self
                 .backend
-                .complete_multipart(&self.operation, upload_id, &self.parts)
+                .complete_multipart(
+                    &self.operation,
+                    upload_id,
+                    &self.parts,
+                    self.precondition.as_ref(),
+                )
                 .await
             {
                 Ok(mut meta) => {
@@ -1570,6 +1647,25 @@ impl DirectS3Sink {
                         .await;
                     return Ok(meta);
                 }
+                Err(error) if error.precondition_failed => {
+                    if let Some(upload_id) = &self.upload_id {
+                        self.backend
+                            .abort_multipart(&self.operation, upload_id)
+                            .await?;
+                    }
+                    self.abort_discovered().await?;
+                    self.journal
+                        .transition(
+                            self.operation.id,
+                            OperationState::Completing,
+                            OperationState::ProvenAborted,
+                            None,
+                        )
+                        .await?;
+                    self.operation.state = OperationState::ProvenAborted;
+                    self.finished = true;
+                    return Err(TransactionError::PreconditionFailed);
+                }
                 Err(error) => {
                     let definitive =
                         error.kind == super::BackendErrorKind::Definitive && !prior_ambiguous;
@@ -1604,6 +1700,11 @@ impl DirectS3Sink {
                         return Err(error.into());
                     }
                     last_error = Some(error);
+                    // Conditional completions are not idempotent under retry;
+                    // reconcile the ambiguous outcome by observation.
+                    if self.precondition.is_some() {
+                        break;
+                    }
                 }
             }
         }
@@ -2164,6 +2265,7 @@ mod tests {
             &self,
             _operation: &OperationRecord,
             _body: Bytes,
+            _precondition: Option<&WritePrecondition>,
         ) -> Result<StoredObjectMeta, BackendError> {
             let committed = self.committed.clone();
             tokio::spawn(async move {
@@ -2200,6 +2302,7 @@ mod tests {
             _operation: &OperationRecord,
             _upload_id: &str,
             _parts: &[UploadedPart],
+            _precondition: Option<&WritePrecondition>,
         ) -> Result<StoredObjectMeta, BackendError> {
             Err(BackendError::definitive("unused"))
         }
@@ -2305,6 +2408,7 @@ mod tests {
             &self,
             operation: &OperationRecord,
             body: Bytes,
+            _precondition: Option<&WritePrecondition>,
         ) -> Result<StoredObjectMeta, BackendError> {
             self.state
                 .lock()
@@ -2365,6 +2469,7 @@ mod tests {
             operation: &OperationRecord,
             _upload_id: &str,
             _parts: &[UploadedPart],
+            _precondition: Option<&WritePrecondition>,
         ) -> Result<StoredObjectMeta, BackendError> {
             let meta = StoredObjectMeta {
                 etag: Some("multipart-etag".to_string()),
@@ -2520,7 +2625,7 @@ mod tests {
 
         let direct = AwsS3TransactionBackend::new(client.clone(), capabilities);
         direct
-            .put_object(&operation, Bytes::from_static(b"direct"))
+            .put_object(&operation, Bytes::from_static(b"direct"), None)
             .await
             .unwrap();
         assert!(
@@ -2533,7 +2638,7 @@ mod tests {
         let encrypted = AwsS3TransactionBackend::new(client, capabilities)
             .with_server_side_encryption(S3ServerSideEncryption::Aes256);
         encrypted
-            .put_object(&operation, Bytes::from_static(b"managed"))
+            .put_object(&operation, Bytes::from_static(b"managed"), None)
             .await
             .unwrap();
         encrypted.create_multipart(&operation).await.unwrap();
@@ -2639,7 +2744,7 @@ mod tests {
             },
         );
         AwsS3TransactionBackend::new(client, ScriptBackend::default().capabilities())
-            .put_object(&operation, Bytes::from_static(b"synthetic"))
+            .put_object(&operation, Bytes::from_static(b"synthetic"), None)
             .await
             .unwrap();
         let requests = requests.lock().unwrap();
@@ -2680,7 +2785,7 @@ mod tests {
         let backend = AwsS3TransactionBackend::new(client, ScriptBackend::default().capabilities());
         assert!(
             backend
-                .put_object(&operation, Bytes::from_static(b"synthetic"))
+                .put_object(&operation, Bytes::from_static(b"synthetic"), None)
                 .await
                 .is_err()
         );
@@ -3090,7 +3195,8 @@ mod tests {
                         &[UploadedPart {
                             part_number: 1,
                             etag: "etag".into()
-                        }]
+                        }],
+                        None
                     )
                     .await
                     .is_err()
@@ -3132,6 +3238,7 @@ mod tests {
                         part_number: 1,
                         etag: "part-etag".into(),
                     }],
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3161,7 +3268,7 @@ mod tests {
         let operation = OperationRecord::intent(destination(), ExpectedObject::default());
         let stored = AwsS3TransactionBackend::new(client, ScriptBackend::default().capabilities())
             .with_server_side_encryption(S3ServerSideEncryption::Aes256)
-            .put_object(&operation, Bytes::new())
+            .put_object(&operation, Bytes::new(), None)
             .await
             .unwrap();
 
@@ -3218,7 +3325,7 @@ mod tests {
             "a missing response version must not fall back to another matching retry"
         );
         let error = backend
-            .put_object(&operation, Bytes::from_static(b"new"))
+            .put_object(&operation, Bytes::from_static(b"new"), None)
             .await
             .unwrap_err();
         assert!(
@@ -3538,6 +3645,7 @@ mod tests {
                 .put_object(
                     &OperationRecord::intent(destination(), ExpectedObject::default()),
                     Bytes::from_static(b"body"),
+                    None,
                 )
                 .await
                 .unwrap_err();
@@ -3568,6 +3676,7 @@ mod tests {
                     part_number: 1,
                     etag: "etag".to_string(),
                 }],
+                None,
             )
             .await
             .unwrap_err();
@@ -3591,6 +3700,7 @@ mod tests {
             .put_object(
                 &OperationRecord::intent(destination(), ExpectedObject::default()),
                 Bytes::from_static(b"body"),
+                None,
             )
             .await
             .unwrap_err();
@@ -3615,6 +3725,7 @@ mod tests {
                     part_number: 1,
                     etag: "etag".to_string(),
                 }],
+                None,
             )
             .await
             .unwrap_err();
@@ -3688,6 +3799,7 @@ mod tests {
             .put_object(
                 &OperationRecord::intent(destination(), ExpectedObject::default()),
                 Bytes::from_static(b"body"),
+                None,
             )
             .await
             .unwrap();
@@ -3714,6 +3826,7 @@ mod tests {
             .put_object(
                 &OperationRecord::intent(destination(), ExpectedObject::default()),
                 Bytes::from_static(b"body"),
+                None,
             )
             .await
             .unwrap_err();

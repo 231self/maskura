@@ -68,6 +68,43 @@ for table operations. v1 non-goals, each fail-closed: ORC data files, Delta
 Lake, Hive tables, REST catalog integration, merge-on-read delete files, and
 table statistics files.
 
+## External catalogs: byte-preserving storage scopes
+
+An Iceberg REST catalog (for example Apache Polaris) owns its commit lifecycle.
+It writes table metadata JSON, manifests, and data files as individual objects
+and commits by writing the next metadata document itself. The table-aware
+adapter is the wrong unit for that workflow: on `CREATE TABLE` the first
+`metadata/00000-<uuid>.metadata.json` has no committed table state to walk, so
+the write is rejected (501 with the gate closed, 400 with it open).
+
+Operators declare those buckets or prefixes as **byte-preserving storage
+scopes** ([ADR 0036](adr/0036-byte-preserving-storage-scopes.md)):
+
+```bash
+MASKURA_BYTE_PRESERVING_SCOPES=warehouse,catalogs/polaris
+```
+
+- Covered writes skip table classification and every format adapter and store
+  the exact bytes, content type, encoding, metadata, and tags.
+- Covered reads serve the stored bytes (`GET`/`HEAD`, including `Range`).
+- Multipart uploads publish the exact part bytes.
+- The scope is selected only by operator configuration plus the authenticated
+  request's bucket. A header, query parameter, or key suffix cannot grant it.
+- Data in the scope is **unfiltered**: no plugin runs on it.
+- Startup rejects a scope that overlaps a managed service bucket or a
+  bucket-scoped pipeline assignment.
+
+Out of scope for the adapter itself: catalog service integration. The catalog
+keeps owning commits; Maskura stores the objects.
+
+## Conditional writes
+
+`PutObject` and `CompleteMultipartUpload` honor `If-Match` and
+`If-None-Match: *` ([ADR 0037](adr/0037-conditional-object-writes.md)), so a
+catalog can guard a first commit or a concurrent update. A mismatch returns
+`412 PreconditionFailed` and leaves the previous object unchanged. Managed and
+presigned backends return `501` for conditional writes.
+
 ## Feature gate
 
 `MASKURA_ENABLE_ICEBERG=true` (or `features.enable_iceberg = true`) opens the
