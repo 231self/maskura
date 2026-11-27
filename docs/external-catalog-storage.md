@@ -1,8 +1,10 @@
 # External catalog storage (Polaris, Iceberg REST)
 
 Maskura can store the objects of an external table catalog byte-for-byte while
-the catalog keeps owning its commits. This is the operator setup and a manual
-reproducible probe. The design is [ADR 0036](adr/0036-byte-preserving-storage-scopes.md).
+the catalog keeps owning its commits. This page covers the self-hosted operator
+setup, the hosted per-workspace declaration, and a manual reproducible probe.
+The design is [ADR 0036](adr/0036-byte-preserving-storage-scopes.md) and
+[ADR 0038](adr/0038-key-aware-resolver-scope-seam.md).
 
 ## When to use it
 
@@ -13,7 +15,7 @@ lifecycle. Maskura must not treat those objects as a table to transform.
 Do **not** use a scope for protected customer data: no plugin, encryption, or
 format transform runs inside it, so the stored bytes are unfiltered.
 
-## Operator setup
+## Self-hosted operator setup
 
 1. Run the gateway with an explicit scope list and, if you need conditional
    commits, a backend that can enforce them (FileStore, in-memory, or an
@@ -34,6 +36,37 @@ format transform runs inside it, so the stored bytes are unfiltered.
    select it.
 
 3. Data in the scope is unfiltered. Keep it out of protected assignments.
+
+## Hosted service (per-workspace declaration)
+
+In the hosted service the scope is a **per-workspace declaration**, not a
+server setting (ADR 0038). The control plane answers the engine's key-aware
+resolver with a resolution built from the workspace's signed effective state,
+so the policy gate accepts it through the same exact-state match as any
+approved pipeline.
+
+- Declare it in the dashboard's **Storage** tab ("External catalog storage")
+  on a workspace with a customer-owned S3-compatible connection: pick the
+  bucket, add optional key prefixes, and confirm the explicit warning that
+  **data in the scope is stored and served unfiltered**. Maskura-hosted
+  (managed) storage cannot be declared.
+- The declaration is owner-only and lands through the same staged,
+  passkey-approved publication as pipeline changes; it becomes a signed
+  `format: "bytes"` route covered by the envelope digest. Removing it returns
+  covered keys to the normal enforced pipeline.
+- Prefix scopes coexist with bucket-wide pipeline assignments; a whole-bucket
+  declaration replaces that bucket's assignment routes. Nothing in a request
+  can select or grant a scope.
+
+**Verified hosted probe (2026-11-27).** `scripts/probe-hosted-catalog.sh` in
+the private operations repo ran against the live hosted service with an
+ephemeral identity and a BYO B2 bucket: the table-shaped write answered `501`
+before declaration; after declaring the scope through the real API it stored
+and served exact bytes; Apache Polaris 1.8.0 + Trino 484 then ran
+`CREATE SCHEMA` / `CREATE TABLE` / a 3-row `INSERT` / `SELECT` returning
+`1,2,3` through the hosted gateway, and the Iceberg snapshot advanced; after
+revoking the declaration the same key shape answered `501` again. The
+ephemeral identity was deleted afterwards.
 
 ## Manual probe (Polaris 1.8.0 + Trino 484)
 
