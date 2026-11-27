@@ -987,12 +987,19 @@ pub(crate) async fn complete_staged_multipart(
         })?;
     // Byte-preserving scopes publish the exact part bytes (ADR 0036), so the
     // table-unit rejection and the format adapters below do not apply.
-    let byte_preserving = byte_preserving_covers(state, &identity.bucket, &identity.key);
+    let byte_preserving = byte_preserving_covers_async(
+        state,
+        operation.auth.workspace_id().as_str(),
+        &identity.bucket,
+        &identity.key,
+    )
+    .await;
     // Table units are single-object operations (ADR 0028): a staged
     // multipart completion targeting a table root document or sub-unit fails
     // closed rather than publishing a per-object processed write.
     if let Some(error) = crate::server::iceberg::multipart_table_rejection(
         state,
+        operation.auth.workspace_id().as_str(),
         &backend,
         &identity.bucket,
         &identity.key,

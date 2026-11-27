@@ -186,6 +186,20 @@ pub trait PipelineResolver: Send + Sync {
         bucket: &str,
         direction: PipelineDirection,
     ) -> Result<PipelineResolution, MaskuraError>;
+
+    /// Key-aware override for signed byte-preserving scopes (ADR 0038).
+    /// `Some` wins over both the operator env scope and `resolve`; the
+    /// returned resolution must already carry the signed route's locator,
+    /// fingerprint, and limits. Default: no key-aware scopes.
+    async fn resolve_for_key(
+        &self,
+        _workspace_id: &str,
+        _bucket: &str,
+        _key: &str,
+        _direction: PipelineDirection,
+    ) -> Result<Option<PipelineResolution>, MaskuraError> {
+        Ok(None)
+    }
 }
 
 /// Loads immutable component bytes by content address.

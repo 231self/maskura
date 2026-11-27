@@ -59,3 +59,4 @@
 - [ADR 0035: FileStore object versioning](adr/0035-proposed-filestore-object-versioning.md)
 - [ADR 0036: Byte-preserving storage scopes](adr/0036-byte-preserving-storage-scopes.md)
 - [ADR 0037: Conditional object writes](adr/0037-conditional-object-writes.md)
+- [ADR 0038: Key-aware resolver seam for signed byte-preserving scopes](adr/0038-key-aware-resolver-scope-seam.md)

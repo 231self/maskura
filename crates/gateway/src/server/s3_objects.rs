@@ -1983,7 +1983,7 @@ pub(crate) async fn s3_get(
     // projection. No client input selects a representation. A key in an
     // operator byte-preserving scope resolves to the explicit passthrough
     // assignment (ADR 0036).
-    let resolution = match resolve_request_pipeline(
+    let (resolution, byte_preserving) = match resolve_request_pipeline(
         &state,
         auth.workspace_id().as_str(),
         &bucket,
@@ -1992,7 +1992,7 @@ pub(crate) async fn s3_get(
     )
     .await
     {
-        Ok(resolution) => resolution,
+        Ok(scoped) => (scoped.resolution, scoped.byte_preserving),
         Err(error) => {
             record_failed_pipeline_attempt(
                 state.control.as_ref(),
@@ -2082,7 +2082,7 @@ pub(crate) async fn s3_get(
     }
     freeze_read_placement(&mut selection, auth.workspace_id().as_str(), &bucket, &key).await;
     let backend = &selection.backend;
-    if let Some(error) = byte_preserving_backend_rejection(&state, &bucket, &key, backend) {
+    if let Some(error) = byte_preserving_backend_rejection(byte_preserving, backend) {
         return release_failure(
             state.control.as_ref(),
             &auth.context,
@@ -2539,7 +2539,7 @@ pub(crate) async fn s3_head(
     // denies until transformed metadata is available; an unassigned scope
     // denies. A key in an operator byte-preserving scope is an explicit
     // passthrough assignment (ADR 0036).
-    let resolution = match resolve_request_pipeline(
+    let (resolution, byte_preserving) = match resolve_request_pipeline(
         &state,
         auth.workspace_id().as_str(),
         &bucket,
@@ -2548,7 +2548,7 @@ pub(crate) async fn s3_head(
     )
     .await
     {
-        Ok(resolution) => resolution,
+        Ok(scoped) => (scoped.resolution, scoped.byte_preserving),
         Err(error) => {
             record_failed_pipeline_attempt(
                 state.control.as_ref(),
@@ -2622,7 +2622,7 @@ pub(crate) async fn s3_head(
     }
     freeze_read_placement(&mut selection, auth.workspace_id().as_str(), &bucket, &key).await;
     let backend = &selection.backend;
-    if let Some(error) = byte_preserving_backend_rejection(&state, &bucket, &key, backend) {
+    if let Some(error) = byte_preserving_backend_rejection(byte_preserving, backend) {
         return release_failure(
             state.control.as_ref(),
             &auth.context,
@@ -3488,7 +3488,7 @@ pub(crate) async fn s3_post(
     }
     if params.uploads.is_some() {
         let resolution_started = Instant::now();
-        let resolution = match resolve_request_pipeline(
+        let (resolution, byte_preserving) = match resolve_request_pipeline(
             &state,
             auth.workspace_id().as_str(),
             &bucket,
@@ -3497,7 +3497,7 @@ pub(crate) async fn s3_post(
         )
         .await
         {
-            Ok(resolution) => resolution,
+            Ok(scoped) => (scoped.resolution, scoped.byte_preserving),
             Err(error) => {
                 let operation = request_operation_identity();
                 record_failed_pipeline_attempt(
@@ -3522,7 +3522,7 @@ pub(crate) async fn s3_post(
             };
         selection.resolve_managed_placement(auth.workspace_id().as_str(), &bucket, &key);
         let backend = &selection.backend;
-        if let Some(error) = byte_preserving_backend_rejection(&state, &bucket, &key, backend) {
+        if let Some(error) = byte_preserving_backend_rejection(byte_preserving, backend) {
             return pipeline_error_response(&key, &error);
         }
         let policy = match enforce_policy(
@@ -3553,6 +3553,7 @@ pub(crate) async fn s3_post(
         // policy gate has covered the request.
         if let Some(error) = crate::server::iceberg::multipart_table_rejection(
             &state,
+            auth.workspace_id().as_str(),
             backend,
             &bucket,
             &key,

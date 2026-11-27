@@ -356,7 +356,13 @@ pub(crate) async fn streaming_single_put(
     // External-catalog storage (ADR 0036): the body is opaque. Neither the
     // content type nor the plugin catalog may select a transform, so every
     // format dispatch below is skipped and the exact bytes are stored.
-    let byte_preserving = byte_preserving_covers(state, grant.bucket(), key);
+    let byte_preserving = byte_preserving_covers_async(
+        state,
+        authentication.auth.workspace_id().as_str(),
+        grant.bucket(),
+        key,
+    )
+    .await;
 
     if !byte_preserving
         && authentication.body_verifier.is_none()
@@ -1288,7 +1294,7 @@ async fn s3_put_inner(
     };
     let operation = request_operation_identity();
     let resolution_started = Instant::now();
-    let resolution = match resolve_request_pipeline(
+    let (resolution, byte_preserving) = match resolve_request_pipeline(
         &state,
         auth.workspace_id().as_str(),
         &bucket,
@@ -1297,7 +1303,7 @@ async fn s3_put_inner(
     )
     .await
     {
-        Ok(resolution) => resolution,
+        Ok(scoped) => (scoped.resolution, scoped.byte_preserving),
         Err(error) => {
             record_failed_pipeline_attempt(
                 state.control.as_ref(),
@@ -1381,7 +1387,7 @@ async fn s3_put_inner(
     let backend = &selection.backend;
     // A covered key must never silently degrade to a transformed managed
     // write; the operator scope and the destination assignment conflict.
-    if let Some(error) = byte_preserving_backend_rejection(&state, &bucket, &key, backend) {
+    if let Some(error) = byte_preserving_backend_rejection(byte_preserving, backend) {
         return release_failure(
             state.control.as_ref(),
             &auth_context,

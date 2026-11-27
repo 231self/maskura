@@ -726,3 +726,219 @@ async fn conditional_writes_compare_and_swap_and_keep_the_previous_object() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+// --- ADR 0038: resolver-provided signed key scopes (the hosted seam) ---
+
+/// A resolver that declares a signed byte-preserving scope for one
+/// bucket/prefix, delegating everything else to the inner resolver. The
+/// returned resolution carries its own revision, exactly like the hosted
+/// control plane's signed-route resolution.
+struct KeyScopeResolver {
+    inner: Arc<dyn PipelineResolver>,
+    bucket: String,
+    prefix: String,
+    revision: &'static str,
+}
+
+#[async_trait::async_trait]
+impl PipelineResolver for KeyScopeResolver {
+    async fn resolve(
+        &self,
+        workspace_id: &str,
+        bucket: &str,
+        direction: PipelineDirection,
+    ) -> Result<PipelineResolution, maskura_error::MaskuraError> {
+        self.inner.resolve(workspace_id, bucket, direction).await
+    }
+
+    async fn resolve_for_key(
+        &self,
+        _workspace_id: &str,
+        bucket: &str,
+        key: &str,
+        direction: PipelineDirection,
+    ) -> Result<Option<PipelineResolution>, maskura_error::MaskuraError> {
+        if bucket != self.bucket || !key.starts_with(&self.prefix) {
+            return Ok(None);
+        }
+        let limits = PipelineLimits::default();
+        let steps = Vec::new();
+        let fingerprint =
+            maskura_gateway::pipeline::resolution_fingerprint(direction, &steps, true, limits);
+        Ok(Some(PipelineResolution {
+            locator: PipelineLocator {
+                revision: self.revision.to_string(),
+                fingerprint,
+                assignment_id: None,
+            },
+            steps,
+            policy_generation: None,
+            explicit_passthrough: true,
+            limits,
+        }))
+    }
+}
+
+/// State whose resolver declares the signed scope `warehouse/probe/`, with an
+/// optional operator env scope and an optional recording control plane.
+async fn resolver_scoped_state(
+    gate_open: bool,
+    env_scopes: Option<&str>,
+    control: Option<Arc<dyn ControlPlane>>,
+) -> Arc<AppState> {
+    let mut config = test_config();
+    config.features.enable_iceberg = gate_open;
+    let mut state = build_state_with_pipeline_template(
+        control.unwrap_or_else(|| Arc::new(NoopControlPlane)),
+        fixture_wrapping(),
+        Arc::new(InMemoryWorkspaceStorageRepository::new()),
+        test_pipeline_template(),
+        &config,
+    )
+    .await
+    .expect("build resolver-scoped state");
+    let state_mut = Arc::get_mut(&mut state).expect("test state is uniquely owned");
+    state_mut.byte_preserving =
+        BytePreservingScopes::parse(env_scopes).expect("valid scope configuration");
+    let inner = state_mut
+        .gateway
+        .resolver
+        .clone()
+        .expect("resolver configured");
+    let source = state_mut
+        .gateway
+        .component_source
+        .clone()
+        .expect("component source configured");
+    let gateway = state_mut.gateway.as_ref().clone().with_resolver(
+        Arc::new(KeyScopeResolver {
+            inner,
+            bucket: "warehouse".to_string(),
+            prefix: "probe/".to_string(),
+            revision: "signed-catalog-scope-v1",
+        }),
+        source,
+    );
+    state_mut.gateway = Arc::new(gateway);
+    state
+}
+
+#[tokio::test]
+async fn resolver_scope_stores_catalog_objects_byte_for_byte() {
+    // No operator env scope: coverage comes only from the resolver's signed
+    // key-aware declaration, exactly as in the hosted service.
+    let state = resolver_scoped_state(false, None, None).await;
+    let app = build_router(state.clone());
+    let (access_key, secret_key) = make_key(&state).await;
+    let headers = auth_headers(&access_key, &secret_key);
+    let metadata_uri = "/warehouse/probe/metadata/00000-resolver.metadata.json";
+
+    let response = app
+        .clone()
+        .oneshot(put_request(
+            metadata_uri,
+            "application/octet-stream",
+            FIRST_METADATA_JSON,
+            &headers,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a resolver-scoped catalog write must not hit the Iceberg gate"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(simple_request("GET", metadata_uri, &headers))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_body(response).await, FIRST_METADATA_JSON);
+
+    // The JSON content type would be re-serialized by the record decoder; the
+    // signed scope must bypass it just like the operator scope.
+    let json_uri = "/warehouse/probe/metadata/00001-resolver.metadata.json";
+    let json_body = br#"{ "format-version" : 2,  "snapshots": [ { "snapshot-id": 1 } ] }"#;
+    let response = app
+        .clone()
+        .oneshot(put_request(
+            json_uri,
+            "application/json",
+            json_body,
+            &headers,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(simple_request("GET", json_uri, &headers))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_body(response).await, json_body);
+}
+
+#[tokio::test]
+async fn resolver_scope_uncovered_table_key_keeps_the_gate() {
+    let state = resolver_scoped_state(false, None, None).await;
+    let app = build_router(state.clone());
+    let (access_key, secret_key) = make_key(&state).await;
+    let headers = auth_headers(&access_key, &secret_key);
+
+    // Outside the declared prefix the normal path is unchanged: gate closed,
+    // table-root write fails closed with 501.
+    let response = app
+        .clone()
+        .oneshot(put_request(
+            "/warehouse/other/metadata/00000-uncovered.metadata.json",
+            "application/octet-stream",
+            FIRST_METADATA_JSON,
+            &headers,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn resolver_scope_wins_over_the_operator_env_scope() {
+    // Both sources cover the same key. The resolver's signed resolution must
+    // execute: the recorded authorization carries its revision, not the env
+    // scope's local revision.
+    let control = Arc::new(RecordingMeteringControl::default());
+    let state = resolver_scoped_state(false, Some("warehouse/probe"), Some(control.clone())).await;
+    let app = build_router(state.clone());
+    let (access_key, secret_key) = make_key(&state).await;
+    let headers = auth_headers(&access_key, &secret_key);
+
+    let response = app
+        .clone()
+        .oneshot(put_request(
+            "/warehouse/probe/metadata/00000-precedence.metadata.json",
+            "application/octet-stream",
+            FIRST_METADATA_JSON,
+            &headers,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let authorizations = control.authorizations.lock().unwrap().clone();
+    assert!(
+        authorizations
+            .iter()
+            .any(|(_, authorization)| authorization.pipeline_revision()
+                == Some("signed-catalog-scope-v1")),
+        "the resolver's signed resolution must win over the env scope: {authorizations:?}"
+    );
+    assert!(
+        !authorizations
+            .iter()
+            .any(|(_, authorization)| authorization.pipeline_revision()
+                == Some(maskura_gateway::byte_preserving::BYTE_PRESERVING_REVISION)),
+        "the env scope's local revision must not execute when the resolver covers the key"
+    );
+}
