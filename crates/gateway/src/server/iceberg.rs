@@ -167,7 +167,11 @@ pub(crate) async fn streaming_iceberg_single_put(
     }
     // External-catalog storage is stored byte-for-byte (ADR 0036): no table
     // classification, no gate, no walk.
-    if byte_preserving_covers(state, usage.grant.bucket(), key) {
+    let scope_workspace = authentication
+        .as_ref()
+        .map(|a| a.auth.workspace_id().as_str())
+        .unwrap_or("");
+    if byte_preserving_covers_async(state, scope_workspace, usage.grant.bucket(), key).await {
         return None;
     }
     let bucket = usage.grant.bucket().to_string();
@@ -515,6 +519,7 @@ async fn table_root_read(
 /// whether or not the table surface is enabled.
 pub(crate) async fn multipart_table_rejection(
     state: &AppState,
+    workspace_id: &str,
     backend: &ResolvedBackend,
     bucket: &str,
     key: &str,
@@ -525,7 +530,7 @@ pub(crate) async fn multipart_table_rejection(
     }
     // Byte-preserving scopes store catalog objects as plain objects, so a
     // multipart upload of a table-unit key is not a table operation there.
-    if byte_preserving_covers(state, bucket, key) {
+    if byte_preserving_covers_async(state, workspace_id, bucket, key).await {
         return None;
     }
     let store = table_store(backend, bucket);

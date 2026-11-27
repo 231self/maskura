@@ -129,6 +129,29 @@ impl Gateway {
         Ok(resolution)
     }
 
+    /// Key-aware scope override (ADR 0038). `None` when no resolver is
+    /// configured or the resolver declares no scope for the key. A returned
+    /// resolution is fingerprint-verified exactly like `resolve`.
+    pub async fn resolve_for_key(
+        &self,
+        workspace_id: &str,
+        bucket: &str,
+        key: &str,
+        direction: PipelineDirection,
+    ) -> Result<Option<pipeline::PipelineResolution>, maskura_error::MaskuraError> {
+        let Some(resolver) = self.resolver.as_ref() else {
+            return Ok(None);
+        };
+        let Some(resolution) = resolver
+            .resolve_for_key(workspace_id, bucket, key, direction)
+            .await?
+        else {
+            return Ok(None);
+        };
+        resolution.verify_fingerprint(direction)?;
+        Ok(Some(resolution))
+    }
+
     /// Resolve the effective pipeline after authentication, before
     /// authorization. The immutable revision is frozen before any body or
     /// source disclosure so in-flight work cannot be repointed mid-stream.
